@@ -788,16 +788,22 @@ impl Book {
     }
 
     fn read(log: &Log, context: &Context) -> Self {
-        Self::from_eligible(&log.eligible(), context)
+        Self::from_eligible_iter(log.eligible_iter(), context)
     }
 
     fn from_eligible(
         eligible: &[(&crate::documents::log::Operation, &Command)],
         context: &Context,
     ) -> Self {
+        Self::from_eligible_iter(eligible.iter().copied(), context)
+    }
+
+    fn from_eligible_iter<'a>(
+        eligible: impl Iterator<Item = (&'a crate::documents::log::Operation, &'a Command)>,
+        context: &Context,
+    ) -> Self {
         let entries = eligible
-            .iter()
-            .filter_map(|&(operation, command)| {
+            .filter_map(|(operation, command)| {
                 decoded_record(command).map(|record| Entry {
                     actor: operation.header.actor,
                     sequence: operation.header.sequence,
@@ -893,14 +899,13 @@ pub fn observe(paths: &Paths) -> Result<Observation> {
     crate::documents::application::observe_store(paths, descriptor, |session, store, scope| {
         let context = context(&facts, session, scope, at_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
-        let (eligible, merges) = log.eligible_and_merges();
-        let book = Book::from_eligible(&eligible, &context);
+        let book = Book::read(&log, &context);
         Ok(Observation {
             observer: session.actor(),
             members: context.members,
             at_ms,
             retained_operations: log.retained(),
-            interpreted_operations: eligible.len() + merges.len(),
+            interpreted_operations: log.eligible_count(),
             book,
         })
     })
@@ -1229,7 +1234,6 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 commit(session, store, &log, &Record::new("sweep", &pass_id, body))?;
             }
         }
-        report.threads = book.threads.values().cloned().collect();
         report.inert = std::mem::take(&mut book.inert);
         Ok((report, scope.trust().network, book))
     })?;
@@ -1243,6 +1247,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         })
         .count();
     source::cleanup(paths, network, &book, now_ms)?;
+    report.threads = book.threads.into_values().collect();
     Ok(report)
 }
 

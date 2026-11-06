@@ -311,6 +311,50 @@ fn windows(rows: &[(Subject, Row)]) -> Vec<&aterm_metrics::row::WindowRecord> {
         .collect()
 }
 
+/// A READ THAT NAMED NO RESET PUBLISHES ITS FIGURE AND NO RESET: a survey holds the latest such a
+/// window can end to judge a wall, and that bound is no vendor's reset, which `merge::usage` takes a
+/// window's identity from, so across two Macs an ended window's figure would outrank a real one.
+/// NEGATIVE CONTROL: the row carried the bound. CONTROL: a read that names one publishes it.
+#[test]
+fn a_read_that_named_no_reset_publishes_its_figure_and_no_reset() {
+    let scratch = Scratch::new();
+    let now = scratch.now;
+    let store = accounts::Store::at(&scratch.harness());
+    let (mut state, _) = store.load(now).expect("the accounts store");
+    accounts::note_sample(
+        &mut state,
+        "pool-a",
+        accounts::Sample {
+            session_pct: Some(41),
+            week_pct: Some(30),
+            at: now - 30,
+            ..accounts::Sample::default()
+        },
+        now,
+    );
+    state.accounts.entry("pool-a".to_owned()).or_default().pk = Some(POOL_A.to_owned());
+    store.save(&state).expect("the accounts store saves");
+    let publisher = Publisher::new(scratch.places());
+    let log = Kept::new();
+    pass(&publisher, &log, now);
+    let rows = log.since(0);
+    let figures = quota_rows(&rows)
+        .iter()
+        .find(|q| q.label.as_str() == "pool-a")
+        .map(|q| (q.pct5, q.five_hour_reset, q.pct7, q.week_reset));
+    assert_eq!(figures, Some((Some(41), None, Some(30), None)));
+
+    scratch.sample("pool-a", 45, now - 10);
+    pass(&publisher, &log, now);
+    let rows = log.since(0);
+    let named = quota_rows(&rows)
+        .into_iter()
+        .rfind(|q| q.label.as_str() == "pool-a")
+        .and_then(|q| q.five_hour_reset);
+    let two_hours = u64::try_from(now + 2 * 3600).expect("after the epoch");
+    assert_eq!(named, Some(two_hours), "CONTROL: {rows:?}");
+}
+
 /// The first pass publishes one quota row per keyed account row, the agy home's row and the
 /// windows of what was served; a second, unchanged pass publishes nothing; a one-point change
 /// publishes one row; and none of it asks a provider.

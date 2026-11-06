@@ -3,6 +3,7 @@
 
 //! The local `aterm init` desktop preferences.
 
+use crate::facts::{KeyboardCohorts, KeyboardCoverage};
 use crate::init_observe::{LastReading, Reading};
 use crate::items::catalog::{CATALOG, CatalogRow, Lit};
 use crate::items::defaults::{self, Target};
@@ -11,7 +12,6 @@ use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::Entries;
 use crate::port::{Cmd, KeyboardMapChange, KeyboardPrefix, System};
 use aterm_types::macos_setup::{Selection, Setting};
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -35,33 +35,30 @@ const DOCK_APPS: [(&str, &str, &str); 3] = [
 
 type PreferenceItem = (Setting, Box<dyn Item>);
 
-/// The preferred keyboard, widget and Dock settings for the resolved local user.
-/// # Errors
-/// An absent or ambiguous user, or an invalid keyboard model.
-pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
-    selected_items(ctx, Selection::all())
-}
-
 /// Build only the selected preferences, before reading any preference domain.
 /// # Errors
 /// An absent or ambiguous user, or an invalid selected keyboard model.
-pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
-    Ok(selected_tagged_items(ctx, selected)?
-        .into_iter()
-        .map(|(_, item)| item)
-        .collect())
+#[cfg(test)]
+pub(crate) fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
+    Ok(
+        selected_tagged_items(ctx, selected, &KeyboardCohorts::EMPTY)?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect(),
+    )
 }
 
-/// [`selected_items`], each item with the setting whose System State row it reports to. Build a
+/// Selected items, each with the setting whose System State row it reports to. Build a
 /// pass's preference items with one call: its widget, desktop and Dock items share one
 /// [`DesktopActivation`], and the engine settles an id once, with its last item's activation, so
 /// a second call's activation under the same id would never relaunch its families.
 ///
 /// # Errors
 /// An absent or ambiguous user, or an invalid selected keyboard model.
-pub fn selected_tagged_items(
+pub(crate) fn selected_tagged_items(
     ctx: &Ctx,
     selected: Selection,
+    cohorts: &KeyboardCohorts,
 ) -> Result<Vec<PreferenceItem>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init preferences require exactly one local user".into());
@@ -82,7 +79,7 @@ pub fn selected_tagged_items(
         items.extend(
             persistent
                 .into_iter()
-                .chain(attached_keyboard_items(ctx)?)
+                .chain(attached_keyboard_items(ctx, cohorts)?)
                 .map(|item| (Setting::CapsLock, item)),
         );
     }
@@ -212,7 +209,10 @@ pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<PreferenceIt
 /// preferences.
 /// # Errors
 /// The setup did not resolve exactly one local user.
-pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+pub(crate) fn attached_keyboard_items(
+    ctx: &Ctx,
+    cohorts: &KeyboardCohorts,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("input activation requires exactly one local user".into());
     };
@@ -233,6 +233,7 @@ pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
             model,
             user: user.clone(),
             reading: LastReading::default(),
+            expected: cohorts.expected(model.vendor, model.product)?,
         }));
     }
     Ok(items)
@@ -256,6 +257,7 @@ pub fn accept_native_caps_control(vendor: u32, product: u32, registry: u64) -> R
         model: keyboard::Model { vendor, product },
         user: user.clone(),
         reading: LastReading::default(),
+        expected: KeyboardCoverage::of([registry]),
     };
     let before = item.mappings(&sys)?;
     let targets: Vec<_> = before
@@ -330,6 +332,7 @@ pub(crate) fn attachment_items(ctx: &Ctx, registries: &[u64]) -> Result<Vec<Atta
                 model,
                 user: user.clone(),
                 reading: LastReading::default(),
+                expected: KeyboardCoverage::default(),
             },
             registries: registries.to_vec(),
             observed: Mutex::default(),
@@ -337,43 +340,23 @@ pub(crate) fn attachment_items(ctx: &Ctx, registries: &[u64]) -> Result<Vec<Atta
         .collect())
 }
 
-/// Requested services actually resolved by a mapping read, including intentional holds.
-#[derive(Clone, Default)]
-pub(crate) struct AttachmentCoverage(BTreeSet<u64>);
-
-impl AttachmentCoverage {
-    fn of(ids: impl IntoIterator<Item = u64>) -> Self {
-        Self(ids.into_iter().collect())
-    }
-
-    /// Include another item's actual observations from this pass.
-    pub(crate) fn include(&mut self, other: Self) {
-        self.0.extend(other.0);
-    }
-
-    /// Every requested identity was resolved, including intentional per-device holds.
-    pub(crate) fn covers(&self, registries: &[u64]) -> bool {
-        registries.iter().all(|registry| self.0.contains(registry))
-    }
-}
-
 /// One model's requested-service item and its most recent mapping coverage.
 pub(crate) struct Attachment {
     inner: AttachedKeyboard,
     registries: Vec<u64>,
-    observed: Mutex<AttachmentCoverage>,
+    observed: Mutex<KeyboardCoverage>,
 }
 
 impl Attachment {
     /// A held model needs only its matching identities, never its activation or defaults.
-    pub(crate) fn inspect_kept(&self, sys: &dyn System) -> Result<AttachmentCoverage, String> {
+    pub(crate) fn inspect_kept(&self, sys: &dyn System) -> Result<KeyboardCoverage, String> {
         self.inner
             .matching_services(sys, Some(&self.registries))
-            .map(|matched| AttachmentCoverage::of(matched.into_iter().map(|(id, _)| id)))
+            .map(|matched| KeyboardCoverage::of(matched.into_iter().map(|(id, _)| id)))
     }
 
     /// The latest probe or apply observation, never a previous successful cohort.
-    pub(crate) fn observed_services(&self) -> AttachmentCoverage {
+    pub(crate) fn observed_services(&self) -> KeyboardCoverage {
         self.observed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -381,11 +364,10 @@ impl Attachment {
     }
 
     fn maps(&self, sys: &dyn System) -> Result<Option<Vec<HidMapping>>, String> {
-        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) =
-            AttachmentCoverage::default();
+        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = KeyboardCoverage::default();
         let maps = self.inner.mappings_for(sys, Some(&self.registries))?;
         *self.observed.lock().unwrap_or_else(PoisonError::into_inner) =
-            AttachmentCoverage::of(maps.iter().map(|map| map.registry));
+            KeyboardCoverage::of(maps.iter().map(|map| map.registry));
         if maps.is_empty() {
             return Ok(None);
         }
@@ -495,6 +477,7 @@ struct AttachedKeyboard {
     user: User,
     /// Whether the last probe found Caps Lock unmapped, for System State.
     reading: LastReading,
+    expected: KeyboardCoverage,
 }
 
 impl AttachedKeyboard {
@@ -509,7 +492,13 @@ impl AttachedKeyboard {
     }
 
     fn mappings(&self, sys: &dyn System) -> Result<Vec<HidMapping>, String> {
-        self.mappings_for(sys, None)
+        let maps = self.mappings_for(sys, None)?;
+        if !KeyboardCoverage::of(maps.iter().map(|map| map.registry)).covers_all(&self.expected) {
+            return Err(
+                "the live keyboard mapping read did not observe every assigned service".into(),
+            );
+        }
+        Ok(maps)
     }
 
     fn mappings_for(
@@ -1938,9 +1927,9 @@ pub(crate) mod tests {
         }
     }
 
-    type HidDumpRow<'a> = (u64, &'a [(i64, i64)], &'a [(i64, i64)]);
+    pub(crate) type HidDumpRow<'a> = (u64, &'a [(i64, i64)], &'a [(i64, i64)]);
 
-    fn hid_dump(maps: &[HidDumpRow<'_>]) -> String {
+    pub(crate) fn hid_dump(maps: &[HidDumpRow<'_>]) -> String {
         hid_dump_with_prefix(maps, &crate::port::keyboard_prefix::tests::fields())
     }
 
@@ -2007,6 +1996,7 @@ pub(crate) mod tests {
                 model: keyboard::Model { vendor, product },
                 user: who.clone(),
                 reading: LastReading::default(),
+                expected: KeyboardCoverage::default(),
             },
             registries: vec![2],
             observed: Mutex::default(),
@@ -2236,6 +2226,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2433,6 +2424,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2483,6 +2475,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2515,6 +2508,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2599,6 +2593,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         for actor in [0, 502] {
             let mut sys = Fake::root();
@@ -2619,6 +2614,7 @@ pub(crate) mod tests {
             },
             user: who.clone(),
             reading: LastReading::default(),
+            expected: KeyboardCoverage::default(),
         };
         let sys = Fake::root();
         let get = item.command().args(["--get", "UserKeyMapping"]).display();

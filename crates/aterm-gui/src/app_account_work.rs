@@ -20,8 +20,6 @@ pub(crate) enum Continuation {
         attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
         same_image: Option<crate::app_update_handoff::SameImageHandoff>,
         #[cfg(unix)]
-        activity: u64,
-        #[cfg(unix)]
         next_attempt: u64,
     },
 }
@@ -305,63 +303,277 @@ impl App {
                     self.resume_drained_accounts();
                 }
             }
-            Continuation::Handoff {
-                mode,
-                attempt,
-                same_image,
-                #[cfg(unix)]
-                activity,
-                #[cfg(unix)]
-                next_attempt,
-            } => {
-                #[cfg(unix)]
-                if self.update_handoff_activity_epoch != activity
-                    || self.next_update_handoff_id != next_attempt
-                {
-                    self.retire_account_drain_handoff(
-                        Continuation::Handoff {
-                            mode,
-                            attempt,
-                            same_image,
-                            activity,
-                            next_attempt,
-                        },
-                        "the handoff changed while account work drained",
-                    );
-                    self.resume_drained_accounts();
-                    return;
-                }
-                if attempt.as_ref().is_some_and(|attempt| {
-                    !self.native_updater_service.apply_ticket_is_current(attempt)
-                }) {
-                    self.resume_drained_accounts();
-                    return;
-                }
-                let retained_attempt = attempt.clone();
-                let result = self
-                    .revalidate_native_update_safety()
-                    .map_err(|reasons| reasons.join("; "))
-                    .and_then(|safety| {
-                        self.apply_staged_update_now(safety, mode, attempt, same_image)
-                            .map_err(|error| error.to_string())
-                    });
-                if let Err(error) = result {
-                    if let Some(attempt) = retained_attempt
-                        && self.native_updater_service.abort_apply(&attempt, &error)
-                    {
-                        self.publish_native_update_state();
-                    }
-                    self.resume_drained_accounts();
-                    aterm_log::info!("update waits after account work drained: {error}");
-                }
+            handoff @ Continuation::Handoff { .. } => self.finish_account_handoff(handoff),
+        }
+    }
+
+    /// Nothing has been captured while account work drains. Re-read safety now; activity
+    /// before this point cannot invalidate a snapshot that has not been taken.
+    fn finish_account_handoff(&mut self, handoff: Continuation) {
+        let Continuation::Handoff {
+            mode,
+            attempt,
+            same_image,
+            #[cfg(unix)]
+            next_attempt,
+        } = handoff
+        else {
+            unreachable!("only a handoff continuation reaches its completion");
+        };
+        #[cfg(unix)]
+        if self.next_update_handoff_id != next_attempt {
+            self.retire_account_drain_handoff(
+                Continuation::Handoff {
+                    mode,
+                    attempt,
+                    same_image,
+                    next_attempt,
+                },
+                "the handoff changed while account work drained",
+            );
+            self.resume_drained_accounts();
+            return;
+        }
+        if attempt
+            .as_ref()
+            .is_some_and(|attempt| !self.native_updater_service.apply_ticket_is_current(attempt))
+        {
+            self.resume_drained_accounts();
+            return;
+        }
+        let retained_attempt = attempt.clone();
+        let result = self
+            .revalidate_native_update_safety()
+            .map_err(|reasons| crate::UpdateHandoffStartError::refused(reasons.join("; ")))
+            .and_then(|safety| self.apply_staged_update_now(safety, mode, attempt, same_image));
+        if let Err(error) = result {
+            self.resume_drained_accounts();
+            if let Some(attempt) = retained_attempt {
+                let outcome = self.account_update_start_outcome(&attempt, mode, error);
+                self.surface_update_apply_outcome_for_target(
+                    "account settlement",
+                    outcome,
+                    false,
+                    attempt.target_build(),
+                );
+            } else {
+                aterm_log::info!("update waits after account work drained: {error}");
             }
         }
+    }
+
+    /// Account settlement completed after the original request was accepted. A temporary
+    /// refusal retains that request's artifact and retry cadence instead of waiting for a check.
+    fn account_update_start_outcome(
+        &mut self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+        mode: crate::native_updater_service::ApplyMode,
+        error: crate::UpdateHandoffStartError,
+    ) -> crate::native_app::UpdateOutcome {
+        let outcome = self.unstarted_native_apply_outcome(attempt, mode, error);
+        #[cfg(unix)]
+        if mode.is_automatic() && self.auto_apply_intent.is_none() {
+            match &outcome {
+                crate::native_app::UpdateOutcome::Deferred { .. } => {
+                    self.arm_activity_revoked_overlap_retry(attempt);
+                }
+                crate::native_app::UpdateOutcome::Blocked { .. } => {
+                    self.arm_account_preflight_retry(attempt);
+                }
+                _ => {}
+            }
+        }
+        outcome
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn activity_during_account_retirement_reaches_the_fresh_handoff_preflight() {
+        if !crate::test_alone::alone() {
+            return;
+        }
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+        let mut app = App::headless_for_test();
+        let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
+        attempt.make_current_apply_for_test(&mut app.native_updater_service);
+        let work = app.account_work.enter().unwrap();
+        assert!(!app.accounts_drained_before(Continuation::Handoff {
+            mode: ApplyMode::AutomaticPastGrace,
+            attempt: Some(attempt),
+            same_image: None,
+            next_attempt: app.next_update_handoff_id,
+        }));
+        app.note_update_handoff_activity();
+        // A real blocker appearing while the accounts retire must be read now, rather
+        // than discarding the request merely because the earlier activity counter moved.
+        app.land_install_session_for_test(0);
+        drop(work);
+        let drained = app.take_retired_account_pause().unwrap();
+        let handoff = app
+            .accept_account_drain(app.account_drain.serial, drained)
+            .unwrap();
+        app.finish_account_handoff(handoff);
+        assert_eq!(
+            app.native_updater_service.snapshot().error.as_deref(),
+            Some("a System State Apply or Restore is still pending")
+        );
+        assert!(
+            app.auto_apply_intent.is_some(),
+            "the automatic request remains owed"
+        );
+        assert!(
+            app.account_work.enter().is_some(),
+            "the deferred handoff reopened account work"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_or_artifact_that_superseded_the_drain_is_never_resumed() {
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+        for new_artifact in [false, true] {
+            let mut app = App::headless_for_test();
+            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
+            attempt.make_current_apply_for_test(&mut app.native_updater_service);
+            let work = app.account_work.enter().unwrap();
+            assert!(!app.accounts_drained_before(Continuation::Handoff {
+                mode: ApplyMode::AutomaticPastGrace,
+                attempt: Some(attempt.clone()),
+                same_image: None,
+                next_attempt: app.next_update_handoff_id,
+            }));
+            let newer = ApplyAttemptTicket::for_test(43, "newer-build", &"cd".repeat(32));
+            if new_artifact {
+                newer.make_current_apply_for_test(&mut app.native_updater_service);
+            } else {
+                app.next_update_handoff_id += 1;
+            }
+            drop(work);
+            let drained = app.take_retired_account_pause().unwrap();
+            let handoff = app
+                .accept_account_drain(app.account_drain.serial, drained)
+                .unwrap();
+            app.finish_account_handoff(handoff);
+            assert!(app.auto_apply_intent.is_none());
+            assert!(app.account_work.enter().is_some());
+            if new_artifact {
+                assert!(app.native_updater_service.apply_ticket_is_current(&newer));
+            } else {
+                assert!(!app.native_updater_service.apply_ticket_is_current(&attempt));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_account_deferral_retries_only_the_automatic_request_and_keeps_its_artifact() {
+        use crate::native_app::UpdateOutcome;
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode, UpdaterPhase};
+
+        for mode in [ApplyMode::AutomaticPastGrace, ApplyMode::Immediate] {
+            let mut app = App::headless_for_test();
+            let digest = "ab".repeat(32);
+            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &digest);
+            attempt.make_current_apply_for_test(&mut app.native_updater_service);
+            let outcome = app.account_update_start_outcome(
+                &attempt,
+                mode,
+                crate::UpdateHandoffStartError::activity("a tab is still starting"),
+            );
+            assert_eq!(
+                outcome,
+                UpdateOutcome::Deferred {
+                    reason: "a tab is still starting".into()
+                }
+            );
+            let snapshot = app.native_updater_service.snapshot();
+            assert_eq!(snapshot.phase, UpdaterPhase::Staged);
+            assert_eq!(snapshot.error.as_deref(), Some("a tab is still starting"));
+            assert_eq!(snapshot.staged.as_ref().unwrap().dmg_sha256, digest);
+            if mode.is_automatic() {
+                let retry = app
+                    .auto_apply_intent
+                    .expect("the accepted automatic request remains owed");
+                assert_eq!(retry.build, 42);
+                assert_eq!(retry.dmg_sha256, [0xab; 32]);
+            } else {
+                assert!(app.auto_apply_intent.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_account_refusal_or_failure_keeps_its_verdict() {
+        use crate::native_app::UpdateOutcome;
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+
+        for (error, expected) in [
+            (
+                crate::UpdateHandoffStartError::refused("draft changed"),
+                UpdateOutcome::Blocked {
+                    reasons: vec!["draft changed".into()],
+                },
+            ),
+            (
+                crate::UpdateHandoffStartError::failed("launch failed"),
+                UpdateOutcome::Failed {
+                    message: "launch failed".into(),
+                },
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
+            attempt.make_current_apply_for_test(&mut app.native_updater_service);
+            assert_eq!(
+                app.account_update_start_outcome(&attempt, ApplyMode::Immediate, error),
+                expected
+            );
+            assert!(app.auto_apply_intent.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_preflight_block_keeps_a_bounded_retry_for_the_same_artifact() {
+        use crate::native_app::UpdateOutcome;
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+        let mut app = App::headless_for_test();
+        let attempt = ApplyAttemptTicket::for_test(42, "committed-build", &"ab".repeat(32));
+        attempt.make_current_apply_for_test(&mut app.native_updater_service);
+        assert_eq!(
+            app.account_update_start_outcome(
+                &attempt,
+                ApplyMode::AutomaticPastGrace,
+                crate::UpdateHandoffStartError::refused("draft changed"),
+            ),
+            UpdateOutcome::Blocked {
+                reasons: vec!["draft changed".into()]
+            },
+        );
+        let retry = app.auto_apply_intent.unwrap();
+        assert_eq!(retry.build, 42);
+        assert_eq!(retry.dmg_sha256, [0xab; 32]);
+        app.auto_overlap_retry.as_mut().unwrap().cycles = u8::MAX;
+        let cooldown = app.arm_account_preflight_retry(&attempt).unwrap();
+        assert!(cooldown > std::time::Duration::ZERO);
+        assert!(cooldown <= std::time::Duration::from_secs(60));
+        app.auto_apply_intent = None;
+        attempt.make_current_apply_for_test(&mut app.native_updater_service);
+        let _ = app.account_update_start_outcome(
+            &attempt,
+            ApplyMode::AutomaticPastGrace,
+            crate::UpdateHandoffStartError::failed("launch failed"),
+        );
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "a real failure is not a cheap preflight retry"
+        );
+    }
 
     #[test]
     fn an_empty_quit_closes_admission_without_a_worker_or_completion_channel() {

@@ -105,12 +105,20 @@ and old news never fires twice.
   on its terminal waits there: bound the wait with `await task … timeout=`.
 - `exited`: the agent exited and nothing relaunches it: `conclusion=finished` if the task had
   finished, whatever word finished it (a landing keeps `why=landed`), else `conclusion=failed`.
-- `stalled`: its shell ended or a person used it before its first prompt (`why=shell`), no
-  composer within 2 minutes, a shell still drawing no prompt or a launch held for its account
-  pool included, an install that makes no progress for 45 minutes, or sooner where its launcher
-  gave up (`why=startup`, with the cause and, where known, the member in `attention=`: place the
-  next worker elsewhere), or 2 minutes at a screen
-  the harness could not handle (`why=held`).
+- `stalled`: its task is not moving. What each `why=` gives you:
+  - `why=startup`: no composer within 2 minutes, a shell still drawing no prompt, a launch held
+    for its account pool, a program atpkg keeps off, or an install or sign-in check that makes no
+    progress for 45 minutes, or sooner where its launcher gave up. `attention=` holds the cause and
+    the member, where its label is known: mend what it leads with, or place the next worker
+    elsewhere. It reads plain `working`, with no `why=`, if its agent starts after all.
+  - `why=shell`: its shell ended or a person used it before its first prompt. `attention=` says
+    nothing of it: start it again.
+  - `why=signin`: that member's login is signed out for that program, named in `attention=`. Only
+    a person signs in: place that program on another member meanwhile.
+  - `why=install`: atpkg could not install that program there, the line that says why and the
+    member in `attention=`. Keep that program off that member until the line is mended.
+  - `why=held`: it started and stands 2 minutes at a screen the harness could not handle. It reads
+    `working why=moved` when it moves.
 - `attention=`: something the harness could not settle, or a `NEEDS YOU:` line from the
   worker (`owner=needs`, raised immediately while the host keeps the worker going); inspect
   with `aterm ctl @<sid> text tail=40 trim`.

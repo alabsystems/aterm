@@ -110,7 +110,15 @@ impl Channel {
     /// # Errors
     /// It does not encode, or the socket failed.
     pub fn send_request(&self, request: &Request) -> Result<(), ProtoError> {
-        send(&self.stream, &request.encode()?, None)?;
+        self.send_request_bytes(&request.encode()?)
+    }
+
+    /// Send an already-encoded request message.
+    ///
+    /// # Errors
+    /// The socket failed.
+    pub fn send_request_bytes(&self, bytes: &[u8]) -> Result<(), ProtoError> {
+        send(&self.stream, bytes, None)?;
         Ok(())
     }
 

@@ -840,9 +840,11 @@ struct Host {
 }
 
 impl Host {
-    /// Wire `t` as the host does: notifications allowed, the callback into this host's list.
+    /// Wire `t` as the host does: notifications allowed, the callback into this host's list, and
+    /// the app events queued for its poll.
     fn attach(&self, t: &mut Terminal) {
         t.set_allow_notifications(true);
+        t.set_osc_event_polling(true);
         let sink = std::sync::Arc::clone(&self.notified);
         t.set_notification_callback(move |text| {
             sink.lock()

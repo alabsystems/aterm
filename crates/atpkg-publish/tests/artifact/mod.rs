@@ -18,6 +18,7 @@ mod pack;
 #[cfg(target_os = "macos")]
 mod package;
 mod pkgdoc;
+mod project_toolchain;
 mod sign;
 mod tarwrite;
 mod toolchain;

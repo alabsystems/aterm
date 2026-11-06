@@ -253,3 +253,159 @@ fn disk_report_output_delivered_refusal_preserves_existing_status() {
         assert!(tmp.path().join("cache/blob").is_file());
     }
 }
+
+fn metadata(
+    report: &mut disk::Report,
+    watch: &mut DiskWatchStatus,
+    applied: &mut Option<disk::Applied>,
+    value: &str,
+) {
+    let path = PathBuf::from(format!("/fixture/{value}"));
+    report.root = path.clone();
+    report.rows[0].path = path.clone();
+    if let disk::Witness::StaleBuildDir { marker, leaves, .. } = &mut report.rows[0].witness {
+        *marker = value.into();
+        *leaves = vec![path.clone()];
+    }
+    report.notes = vec![value.into()];
+    report.hogs[0].path = path.clone();
+    report.hogs[0].why = value.into();
+    watch.line = format!("watch: {value}");
+    watch.json = aterm_json::json!({"kind":"disk-watch","source":value});
+    if let Some(done) = applied {
+        done.removed[0].0 = report.rows[0].clone();
+        done.removed[0].1.units = vec![path.clone()];
+        done.removed[0].1.skipped = vec![(path.clone(), value.into())];
+        done.removed[0].1.trouble = vec![value.into()];
+        done.denials = vec![disk::Refusal::Blocked(path, value.into())];
+    }
+}
+
+fn render_metadata(apply: bool, json: bool, value: &str) -> String {
+    let (_tmp, env, mut report, mut watch, mut applied) = fixture(apply);
+    // These are display snapshots only. No file with this metadata is created or removed.
+    metadata(&mut report, &mut watch, &mut applied, value);
+    let config_path = PathBuf::from(format!("/config/{value}"));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        DiskOutput {
+            report: &report,
+            watch: &watch,
+            applied: applied.as_ref(),
+            json,
+            config_path: Some(&config_path),
+            off_by_fault: false,
+        }
+        .print(&mut out, &mut err),
+        ExitCode::SUCCESS
+    );
+    assert!(err.is_empty());
+    assert!(env.disk_ledger().is_file());
+    String::from_utf8(out).expect("UTF-8 output")
+}
+
+#[test]
+fn disk_report_text_controls_are_visible_with_intended_line_boundaries() {
+    let cases = [
+        ('\0', "\\x00"),
+        ('\t', "\\t"),
+        ('\n', "\\n"),
+        ('\r', "\\r"),
+        ('\u{1b}', "\\x1b"),
+        ('\u{7f}', "\\x7f"),
+        ('\u{9b}', "\\u{009b}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{202e}', "\\u{202e}"),
+        ('\u{2066}', "\\u{2066}"),
+        ('\u{2069}', "\\u{2069}"),
+    ];
+    let mut failures = Vec::new();
+    for apply in [false, true] {
+        let baseline = render_metadata(apply, false, "startend");
+        let lines = baseline.bytes().filter(|b| *b == b'\n').count();
+        for (control, escaped) in cases {
+            let output = render_metadata(apply, false, &format!("start{control}end"));
+            let framed = output.bytes().filter(|b| *b == b'\n').count() == lines;
+            let visible = output.contains(&format!("start{escaped}end"));
+            let inactive = output
+                .chars()
+                .all(|c| c == '\n' || !aterm_codec::tty::is_active(c));
+            if !framed || !visible || !inactive {
+                failures.push(format!(
+                    "apply={apply} control={control:?}: framed={framed}, visible={visible}, inactive={inactive}"
+                ));
+            }
+        }
+    }
+    // Diagnostics contain only character Debug representations, never live control sequences.
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn disk_report_text_error_diagnostic_is_one_safe_line() {
+    struct Failed;
+    impl Write for Failed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("failureA\n\u{1b}[2JfailureB"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut failures = Vec::new();
+    for json in [false, true] {
+        let (_tmp, env, report, watch, applied) = fixture(false);
+        let mut err = Vec::new();
+        assert_eq!(
+            DiskOutput {
+                report: &report,
+                watch: &watch,
+                applied: applied.as_ref(),
+                json,
+                config_path: env.config.as_deref(),
+                off_by_fault: false,
+            }
+            .print(&mut Failed, &mut err),
+            ExitCode::from(1)
+        );
+        let diagnostic = String::from_utf8(err).unwrap();
+        if diagnostic.bytes().filter(|b| *b == b'\n').count() != 1
+            || !diagnostic.contains("failureA\\n\\x1b[2JfailureB")
+            || diagnostic
+                .chars()
+                .any(|c| c != '\n' && aterm_codec::tty::is_active(c))
+        {
+            failures.push(format!("unsafe diagnostic for json={json}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn disk_report_text_json_round_trips_original_metadata() {
+    let value = "start\n\r\t\u{1b}\u{9b}\u{2028}\u{202e}end";
+    for apply in [false, true] {
+        let output = render_metadata(apply, true, value);
+        let rows: Vec<Value> = output
+            .split('\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| aterm_json::from_str(l).expect("JSON result"))
+            .collect();
+        assert_eq!(rows.len(), if apply { 3 } else { 2 });
+        assert_eq!(rows[0]["root"], Value::from(format!("/fixture/{value}")));
+        assert_eq!(rows[1]["source"], Value::from(value));
+        if apply {
+            assert_eq!(rows[2]["rows"][0]["path"], rows[0]["root"]);
+            assert_eq!(rows[2]["rows"][0]["units"][0], rows[0]["root"]);
+        }
+    }
+}
+
+#[test]
+fn disk_report_text_ordinary_unicode_and_backslashes_remain_literal() {
+    let value = "café 名字 \u{1f469}\u{200d}\u{1f4bb}\\normal trust=literal";
+    for apply in [false, true] {
+        let output = render_metadata(apply, false, value);
+        assert!(output.contains(value));
+    }
+}

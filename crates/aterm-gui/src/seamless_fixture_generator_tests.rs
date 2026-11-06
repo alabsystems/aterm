@@ -4647,8 +4647,10 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("layout", "TerminalLeafRestore.held"),
     ("layout", "TerminalLeafRestore.holds"),
     ("layout", "TerminalLeafRestore.profile"),
-    // Only a quit's desk writes a leaf's told-once ids (`App::quit_agents`); a seamless update
-    // carries them in the session's status row (`SessionRecord::status_seen`'s `told_ids=`).
+    // Only a layout a cold restore reads writes a leaf's told-once ids
+    // (`App::capture_desk_manifest`: a quit's, the crash journal's, an end of session's); a
+    // seamless update carries them in the session's status row (`SessionRecord::status_seen`'s
+    // `told_ids=`).
     ("layout", "TerminalLeafRestore.told"),
     ("layout", "CodexRestore.carried"),
     // Context::of_exec_env returns no profile for an unknown filename selector,

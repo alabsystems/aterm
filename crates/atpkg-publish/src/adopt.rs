@@ -627,16 +627,16 @@ fn facts(prefix: &Path, build: u64) -> Result<(Facts, atpkg::lease::Lease)> {
 }
 
 /// What a build's `LINEAGE` says that the lock records.
-struct Lineage {
-    compiler_commit: String,
+pub(crate) struct Lineage {
+    pub(crate) compiler_commit: String,
     /// `<lineage_receipt> sha256:<lineage_receipt_sha256>`.
-    receipt: String,
+    pub(crate) receipt: String,
 }
 
 impl Lineage {
     /// The `LINEAGE` of the build at `dir`: `schema`, `compiler_commit`, `lineage_receipt` and
     /// `lineage_receipt_sha256`, one `key=value` per line, `#` comments.
-    fn read(dir: &Path) -> Result<Lineage> {
+    pub(crate) fn read(dir: &Path) -> Result<Lineage> {
         use std::io::Read as _;
         let path = dir.join(atpkg::lineage::LINEAGE_FILE);
         let unreadable = |why: String| {

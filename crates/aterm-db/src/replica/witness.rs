@@ -63,14 +63,14 @@ pub(super) fn ask(salt: [u8; 16]) -> Digest {
 
 /// `received` without its asks and chunks, and those. No ask or chunk is ever a table: never
 /// common, selected, adopted or pushed.
-pub(super) fn split(received: BTreeSet<Digest>) -> (BTreeSet<Digest>, Heard) {
-    let mut tables = BTreeSet::new();
+pub(super) fn split(mut received: BTreeSet<Digest>) -> (BTreeSet<Digest>, Heard) {
     let mut heard = Heard::default();
-    for entry in received {
+    received.retain(|entry| {
         if entry[..16] == ASK[..] {
             heard
                 .asks
                 .push(entry[16..].try_into().expect("sixteen bytes"));
+            false
         } else if entry[..CHUNK.len()] == CHUNK[..] {
             let at = CHUNK.len();
             let witnesses = std::array::from_fn(|n| {
@@ -79,11 +79,12 @@ pub(super) fn split(received: BTreeSet<Digest>) -> (BTreeSet<Digest>, Heard) {
                     .expect("four bytes")
             });
             heard.chunks.insert(entry[at], (entry[at + 1], witnesses));
+            false
         } else {
-            tables.insert(entry);
+            true
         }
-    }
-    (tables, heard)
+    });
+    (received, heard)
 }
 
 /// The witness of `table` under `salt`, where `content` is what its table round reads of it; none

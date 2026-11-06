@@ -1029,6 +1029,10 @@ fn within(e: Error, what: &str) -> Error {
         Error::Refused(m) => Error::Refused(format!("{what}: {m}")),
         Error::CannotRun(m) => Error::CannotRun(format!("{what}: {m}")),
         Error::Usage(m) => Error::Usage(format!("{what}: {m}")),
+        Error::ChildExit { code, message } => Error::ChildExit {
+            code,
+            message: format!("{what}: {message}"),
+        },
     }
 }
 

@@ -62,11 +62,10 @@ impl Proton {
 
     /// Delete only a message the provider still identifies as a draft.
     pub fn discard_draft(&mut self, id: &str) -> Result<(), String> {
-        let response = self.call(
-            Method::Get,
-            &format!("/mail/v4/messages/{}", crate::oauth::encode(id)),
-            None,
-        )?;
+        let mut path = String::with_capacity(18 + id.len());
+        path.push_str("/mail/v4/messages/");
+        crate::oauth::encode_into(&mut path, id);
+        let response = self.call(Method::Get, &path, None)?;
         if !response["Message"]["LabelIDs"]
             .as_array()
             .is_some_and(|labels| labels.iter().any(|label| label.as_str() == Some("1")))
@@ -98,12 +97,12 @@ impl Proton {
         if recipients.len() > 100 {
             return Err("A message may have at most 100 recipients".into());
         }
+        let mut path = String::with_capacity(64);
         for address in recipients {
-            let lookup = self.call(
-                Method::Get,
-                &format!("/core/v4/keys?Email={}", crate::oauth::encode(address)),
-                None,
-            )?;
+            path.clear();
+            path.push_str("/core/v4/keys?Email=");
+            crate::oauth::encode_into(&mut path, address);
+            let lookup = self.call(Method::Get, &path, None)?;
             let recipient_type = lookup["RecipientType"]
                 .as_u64()
                 .ok_or("Proton did not classify a recipient")?;

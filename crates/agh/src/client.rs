@@ -21,7 +21,7 @@ use crate::policy::{
     Access, AnonymousWhy, Decision, Permit, PermitTarget, Presence, Refusal, RefusalCode,
     RouteRequest, RouteTarget, Router,
 };
-use crate::rate::{RateBook, RateSnapshot, book_key, resource_for};
+use crate::rate::{RateBook, RateSnapshot, book_key_str, resource_for};
 use crate::redact::Redactor;
 use crate::retry::{Idempotency, RetryPolicy, should_retry};
 use crate::slug::Slug;
@@ -292,15 +292,25 @@ impl Call {
         self
     }
 
+    /// Encoded path and query string, borrowing `self.path` when `self.query` is empty.
+    #[must_use]
+    pub(crate) fn path_and_query_cow(&self) -> std::borrow::Cow<'_, str> {
+        if self.query.is_empty() {
+            std::borrow::Cow::Borrowed(&self.path)
+        } else {
+            let join = if self.path.contains('?') { '&' } else { '?' };
+            std::borrow::Cow::Owned(format!(
+                "{}{join}{}",
+                self.path,
+                crate::path::query(&self.query)
+            ))
+        }
+    }
+
     /// Encoded path and query string.
     #[must_use]
     pub fn path_and_query(&self) -> String {
-        if self.query.is_empty() {
-            self.path.clone()
-        } else {
-            let join = if self.path.contains('?') { '&' } else { '?' };
-            format!("{}{join}{}", self.path, crate::path::query(&self.query))
-        }
+        self.path_and_query_cow().into_owned()
     }
 }
 
@@ -408,6 +418,16 @@ impl Meter {
     #[inline]
     pub(crate) fn label(&self) -> &str {
         self.as_.as_ref().map_or("anonymous", IdentityRef::label)
+    }
+
+    /// Record one REST request sent as `as_` without allocating a key when already present.
+    pub(crate) fn note_rest_request(&mut self, as_: &IdentityRef) {
+        let label = as_.label();
+        if let Some(count) = self.rest_requests.get_mut(label) {
+            *count = count.saturating_add(1);
+        } else {
+            self.rest_requests.insert(label.to_string(), 1);
+        }
     }
 }
 
@@ -1876,7 +1896,7 @@ fn open_unchanged(path: &std::path::Path, len: u64) -> Result<std::fs::File> {
 fn file_digest(file: &mut std::fs::File, path: &std::path::Path, len: u64) -> Result<String> {
     use std::io::{Seek, SeekFrom};
     let mut hasher = aterm_digest::Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; 16 * 1024];
     let mut read = 0u64;
     loop {
         match file.read(&mut buf) {
@@ -2192,12 +2212,12 @@ impl Github {
     ) -> Result<Answered> {
         let prepared = self.prepare_write(call, decided);
         self.check_anonymous_api(&prepared)?;
-        let key = book_key(&decided.identity);
+        let key = book_key_str(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
         if booked && consult_book {
             let now = self.inner.fx.wall_secs()?;
             let resource = resource_for(&call.path);
-            if let Some(refused) = self.inner.rate_book.refuse_before_send(&key, resource, now) {
+            if let Some(refused) = self.inner.rate_book.refuse_before_send(key, resource, now) {
                 return Err(self.finish_error(refused, call, &prepared.as_, None));
             }
         }
@@ -2209,11 +2229,7 @@ impl Github {
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
             if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
-                let count = meter
-                    .rest_requests
-                    .entry(prepared.as_.label().to_string())
-                    .or_default();
-                *count = count.saturating_add(1);
+                meter.note_rest_request(&prepared.as_);
             }
         }
         let exchanged = self
@@ -2251,7 +2267,7 @@ impl Github {
         if let Some(snapshot) = &rate {
             self.lock_meter().rate = Some(snapshot.clone());
             if booked {
-                self.inner.rate_book.record(&key, snapshot);
+                self.inner.rate_book.record(key, snapshot);
             }
         }
         let status = response.status;
@@ -2298,10 +2314,9 @@ impl Github {
 
     fn prepare(&self, call: &Call, decided: &Decided, reading: Reading) -> Prepared {
         let endpoints = &self.inner.endpoints;
-        let mut headers = vec![
-            ("Accept".to_string(), call.accept.header_value().to_string()),
-            ("User-Agent".to_string(), self.inner.user_agent.clone()),
-        ];
+        let mut headers = Vec::with_capacity(5);
+        headers.push(("Accept".to_string(), call.accept.header_value().to_string()));
+        headers.push(("User-Agent".to_string(), self.inner.user_agent.clone()));
         if matches!(call.origin, OriginRole::Api | OriginRole::Uploads) {
             headers.push((
                 "X-GitHub-Api-Version".to_string(),
@@ -2337,7 +2352,7 @@ impl Github {
             atomic_refs: call.atomic_refs.clone(),
             repo_create: call.repo_create.clone(),
             method: call.method,
-            url: endpoints.url(call.origin, &call.path_and_query()),
+            url: endpoints.url(call.origin, &call.path_and_query_cow()),
             headers,
             auth,
             as_,
@@ -2367,11 +2382,7 @@ impl Github {
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
             if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
-                let count = meter
-                    .rest_requests
-                    .entry(prepared.as_.label().to_string())
-                    .or_default();
-                *count = count.saturating_add(1);
+                meter.note_rest_request(&prepared.as_);
             }
         }
         let transport = &*self.inner.transport;
@@ -2425,13 +2436,13 @@ impl Github {
         sent: &mut u32,
     ) -> Result<Got> {
         let prepared = self.prepare(call, decided, reading);
-        let key = book_key(&decided.identity);
+        let key = book_key_str(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
         let free = path_only(&call.path) == "/rate_limit";
         if booked && !free && call.rate_book {
             let now = self.inner.fx.wall_secs()?;
             let resource = resource_for(&call.path);
-            if let Some(refused) = self.inner.rate_book.refuse_before_send(&key, resource, now) {
+            if let Some(refused) = self.inner.rate_book.refuse_before_send(key, resource, now) {
                 return Err(self.finish_error(refused, call, &prepared.as_, None));
             }
         }
@@ -2455,7 +2466,7 @@ impl Github {
                     if let Some(snapshot) = &rate {
                         self.lock_meter().rate = Some(snapshot.clone());
                         if booked {
-                            self.inner.rate_book.record(&key, snapshot);
+                            self.inner.rate_book.record(key, snapshot);
                         }
                     }
                     if call.answer_any || is_success(response.status, reading) {

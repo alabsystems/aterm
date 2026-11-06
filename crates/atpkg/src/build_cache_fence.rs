@@ -3,33 +3,16 @@
 
 //! Process ownership at the build-cache removal boundary.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
+use super::{KeepReason, RetainedCheck};
 use aterm_uds::holders::PathScan;
 
 pub type Processes<'a> = &'a dyn Fn(&[PathBuf], &[u32]) -> std::io::Result<PathScan>;
 
-/// One bounded reason a pass keeps a cache, without retaining a process table or its paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Blocked {
-    Used(u32, &'static str),
-    Unreadable(u32),
-    Unavailable,
-}
-
-impl std::fmt::Display for Blocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Used(pid, how) => write!(f, "process {pid} uses it ({how})"),
-            Self::Unreadable(pid) => write!(f, "process {pid} could not be ruled out"),
-            Self::Unavailable => f.write_str("the process ownership scan is unavailable"),
-        }
-    }
-}
-
-fn unused(scan: std::io::Result<PathScan>) -> Result<(), Blocked> {
-    let scan = scan.map_err(|_| Blocked::Unavailable)?;
+fn unused(scan: std::io::Result<PathScan>) -> Result<(), KeepReason> {
+    let scan = scan.map_err(|_| KeepReason::ProcessUnavailable)?;
     if let Some(user) = scan.users.first() {
         let how = match user.how {
             "cwd" => "working directory",
@@ -37,14 +20,18 @@ fn unused(scan: std::io::Result<PathScan>) -> Result<(), Blocked> {
             "map" => "mapped file",
             _ => "open file",
         };
-        return Err(Blocked::Used(user.pid, how));
+        return Err(KeepReason::ProcessUsed {
+            pid: user.pid,
+            how,
+            observed: user.path.clone(),
+        });
     }
     if let Some((pid, _)) = scan
         .unreadable
         .iter()
         .find(|(_, exe)| !aterm_uds::holders::unix_platform_service(exe.as_deref()))
     {
-        return Err(Blocked::Unreadable(*pid));
+        return Err(KeepReason::ProcessUnreadable(*pid));
     }
     Ok(())
 }
@@ -53,6 +40,7 @@ fn unused(scan: std::io::Result<PathScan>) -> Result<(), Blocked> {
 pub(super) struct Fence<'a> {
     processes: Processes<'a>,
     told: Cell<bool>,
+    kept: Option<RefCell<Vec<RetainedCheck>>>,
 }
 
 impl<'a> Fence<'a> {
@@ -60,16 +48,43 @@ impl<'a> Fence<'a> {
         Self {
             processes,
             told: Cell::new(false),
+            kept: None,
         }
+    }
+
+    pub(super) fn with_reporting(mut self) -> Self {
+        self.kept = Some(RefCell::new(Vec::new()));
+        self
+    }
+
+    pub(super) fn note(&self, path: &Path, reason: KeepReason) {
+        if let Some(kept) = &self.kept {
+            super::report::add(&mut kept.borrow_mut(), path, reason);
+        }
+    }
+
+    pub(super) fn admit(&self, path: &Path, reason: KeepReason, allowed: bool) -> bool {
+        if !allowed {
+            self.note(path, reason);
+        }
+        allowed
+    }
+
+    pub(super) fn retained(&self) -> Vec<RetainedCheck> {
+        self.kept
+            .as_ref()
+            .map_or_else(Vec::new, |kept| kept.borrow().clone())
     }
 
     /// Both spellings matter after a rename: a running image's recorded path may still name
     /// its original cache. Neither a resumed stage nor its replacement may hide that holder.
     pub(super) fn clear(&self, original: &Path, current: &Path) -> bool {
-        self.clear_all(&[original, current])
+        self.clear_all(current, &[original, current])
     }
 
-    pub(super) fn clear_all(&self, paths: &[&Path]) -> bool {
+    /// Scan every spelling as before, but report the current candidate alone.
+    /// An original image spelling need not still name a directory after staging.
+    pub(super) fn clear_all(&self, subject: &Path, paths: &[&Path]) -> bool {
         let mut dirs = Vec::new();
         for &path in paths {
             if !dirs.iter().any(|dir: &PathBuf| dir == path) {
@@ -98,9 +113,10 @@ impl<'a> Fence<'a> {
         match unused((self.processes)(&dirs, &[std::process::id()])) {
             Ok(()) => true,
             Err(reason) => {
+                self.note(subject, reason.clone());
                 // One bounded explanation per pass, including a failed or incomplete scan.
                 if !self.told.replace(true) {
-                    aterm_log::warn!("build cache kept: {reason}");
+                    aterm_log::warn!("build cache cleanup check stopped: {reason}");
                 }
                 false
             }
@@ -156,7 +172,7 @@ mod tests {
     fn unavailable_ownership_keeps_a_cache_but_platform_services_do_not_poison_the_scan() {
         assert_eq!(
             unused(Err(std::io::Error::other("unavailable"))),
-            Err(Blocked::Unavailable)
+            Err(KeepReason::ProcessUnavailable)
         );
         let mut scan = PathScan {
             unreadable: vec![(17, Some(PathBuf::from("/System/Library/service")))],
@@ -165,13 +181,23 @@ mod tests {
         assert_eq!(unused(Ok(scan.clone())), Ok(()));
         scan.unreadable
             .push((18, Some(PathBuf::from("/Users//u/tool"))));
-        assert_eq!(unused(Ok(scan.clone())), Err(Blocked::Unreadable(18)));
+        assert_eq!(
+            unused(Ok(scan.clone())),
+            Err(KeepReason::ProcessUnreadable(18))
+        );
         scan.users.push(PathUse {
             pid: 19,
             how: "exe",
             path: PathBuf::from("/cache/program"),
         });
-        assert_eq!(unused(Ok(scan)), Err(Blocked::Used(19, "executable")));
+        assert_eq!(
+            unused(Ok(scan)),
+            Err(KeepReason::ProcessUsed {
+                pid: 19,
+                how: "executable",
+                observed: PathBuf::from("/cache/program")
+            })
+        );
     }
 
     #[test]
@@ -194,6 +220,53 @@ mod tests {
             assert!(!Fence::new(&processes).clear(original, stage));
         }
         assert!(Fence::new(&|_, _| Ok(PathScan::default())).clear(original, stage));
+    }
+
+    #[test]
+    fn cleanup_reports_the_observed_union_path_without_attributing_use_to_every_path() {
+        let original = Path::new("/fixture/original");
+        let current = Path::new("/fixture/current");
+        for used in [original, current] {
+            let observed = used.join("program");
+            let processes = |_: &[PathBuf], _: &[u32]| {
+                Ok(PathScan {
+                    users: vec![PathUse {
+                        pid: 43,
+                        how: "exe",
+                        path: observed.clone(),
+                    }],
+                    ..PathScan::default()
+                })
+            };
+            let fence = Fence::new(&processes).with_reporting();
+            assert!(!fence.clear(original, current));
+            let retained = fence.retained();
+            assert_eq!(
+                retained.len(),
+                1,
+                "an old image spelling is no second retained candidate"
+            );
+            let record = &retained[0];
+            assert_eq!(record.path, current);
+            assert_eq!(
+                record.reason,
+                KeepReason::ProcessUsed {
+                    pid: 43,
+                    how: "executable",
+                    observed: observed.clone()
+                }
+            );
+            let words = record.words();
+            assert!(words.contains(&format!("a checked removal path {}", observed.display())));
+            let other = if used == original { current } else { original };
+            assert!(
+                !words.contains(&format!(
+                    "a checked removal path {}",
+                    other.join("program").display()
+                )),
+                "a union scan supplies no use observation for that other path: {words}"
+            );
+        }
     }
 
     #[test]

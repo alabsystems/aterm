@@ -33,6 +33,7 @@ dev-seams = []
 # Socket naming and discovery, shared with the server so the two cannot drift.
 aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
+aterm-json = { workspace = true }
 # The portable control-socket stream and `latest`-alias resolution.
 aterm-uds = { workspace = true }
 # The control wire's percent escape (`sessions` titles, `conn`), the one copy

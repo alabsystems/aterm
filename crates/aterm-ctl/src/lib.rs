@@ -27,11 +27,17 @@ aterm_durable::plain_durable_flushes_in_tests!();
 pub mod allocation_monitor;
 /// The `aterm-askpass` role.
 pub mod askpass;
+pub mod native_resource_inspection;
+#[cfg(unix)]
+pub mod resource_admission_transport;
+#[cfg(unix)]
+pub mod resource_subgroup_client;
 pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
 mod sudo_run;
 pub use conn::conn_main_entry;
+pub use conn::resource_inspect_main_entry;
 pub use conn::resource_run_main_entry;
 mod await_legs;
 mod await_task;
@@ -83,14 +89,22 @@ OPTIONS:
                   task board, its board of the workers it started (a spawn's
                   label=<word> stays on this Mac's). `aterm help workers`.
                   `--host any spawn agent=<claude|codex> - < task` picks the
-                  member: of those that let this Mac drive them and have an
-                  enrolled, unwalled account of that program, one read working
-                  before an unseen one and an unseen one before a low one, then
-                  the least used week, five hours and the fewest busy sessions,
-                  named on stderr (`--host any: chose <host> (<addr>): …`). An
-                  account that says `usable` and not when it was read, from an
-                  aterm too old to say, is never chosen: update that member, or
-                  name it with `--host <node>`.
+                  member: of those that let this Mac drive them and would start
+                  it on an account of that program with no known wall or
+                  sign-out, one read working before an unseen one and an unseen
+                  one before a low one, then the least used week, five hours and
+                  the fewest busy sessions, named on stderr (`--host any: chose
+                  <host> (<addr>): …`). A Claude account with no `dir` counts
+                  with no look at its login, so a worker there can meet a
+                  sign-in. Each member is weighed by the one account its survey
+                  says a launch there starts on, under its accounts mode, pin
+                  and Codex build. A member that says no account takes its
+                  launch, which then runs on a login no account lists or is
+                  refused, is never chosen: `--host <node>` still starts a
+                  worker there unless it is refused. An account that says
+                  `usable` and not when it was read, from an aterm too old to
+                  say, is never chosen: update that member, or name it with
+                  `--host <node>`.
                   `--host H survey` is `survey --host H`, a fleet read that
                   needs no drive grant (and names no --fleet or --host of
                   its own).
@@ -316,7 +330,15 @@ PUSH FRAMES (subscribe):
                                  this watch had not been shown); `log-lost=<n>
                                  why=<w> resync_to=<seq> ep=<e> base=<b>` (log
                                  records the ring no longer holds, or a cursor
-                                 of another log: why=reset); `replaced`
+                                 of another log: why=reset);
+                                 `cells-too-large=<bytes> cap=<cap>` (the
+                                 styled frame passes the reply line cap: no
+                                 `cells` frame until one fits; <bytes> is
+                                 where its build stopped, or a floor on its
+                                 size when the grid alone passes the cap);
+                                 `cells-watches=<cap>` (the session serves
+                                 <cap> `cells` watches: none for this one);
+                                 `replaced`
                                  (written by this client when the stream
                                  resumed on a successor: output, mail and
                                  records between the two were not delivered;

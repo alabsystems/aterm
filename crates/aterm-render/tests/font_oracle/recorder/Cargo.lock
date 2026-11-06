@@ -73,7 +73,29 @@ name = "aterm-log"
 version = "0.0.0"
 
 [[package]]
+name = "aterm-macro-support"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-serde"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-spec-anchor"
+version = "0.0.0"
+dependencies = [
+ "aterm-spec-macros",
+]
+
+[[package]]
+name = "aterm-spec-macros"
+version = "0.0.0"
+dependencies = [
+ "aterm-macro-support",
+]
+
+[[package]]
+name = "aterm-stamp"
 version = "0.0.0"
 
 [[package]]
@@ -97,11 +119,14 @@ version = "0.0.0"
 name = "aterm-types"
 version = "0.0.0"
 dependencies = [
+ "astream-wire",
  "aterm-alloc",
  "aterm-codec",
  "aterm-durable",
  "aterm-hash",
+ "aterm-json",
  "aterm-log",
+ "aterm-spec-anchor",
  "aterm-tempfile",
  "aterm-time",
  "aterm-uds",
@@ -113,6 +138,7 @@ version = "0.0.0"
 dependencies = [
  "astream-sys",
  "aterm-durable",
+ "aterm-stamp",
  "aterm-sysprobe",
  "aterm-vitals",
  "libc",

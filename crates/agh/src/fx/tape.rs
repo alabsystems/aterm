@@ -857,7 +857,7 @@ impl TapeSink {
             state.remedy = Remedy::Refused;
             return;
         }
-        if Redactor::shapes(&text) != text {
+        if Redactor::shapes_cow(&text) != text {
             state.failed = Some(format!(
                 "a {} record whose tape line the shapes would change",
                 record.kind()
@@ -938,7 +938,7 @@ fn holds_a_secret(bytes: &[u8], redactor: &Redactor) -> bool {
 #[cfg(unix)]
 fn text_holds_a_secret(text: &str, redactor: &Redactor) -> bool {
     // Nothing `apply` would change holds nothing: the common case, one pass.
-    if text.is_empty() || redactor.apply(text) == text {
+    if text.is_empty() || redactor.apply_cow(text) == text {
         return false;
     }
     let learned =
@@ -951,17 +951,17 @@ fn text_holds_a_secret(text: &str, redactor: &Redactor) -> bool {
     // Rules 2 to 4 alone: every token prefix holds `_`, and `-` is no byte rules 2 to 4 read
     // otherwise than `_` (neither is blank, a quote or base64), so no rule 1 run is left.
     let masked = text.replace('_', "-");
-    if Redactor::shapes(&masked) != masked {
+    if Redactor::shapes_cow(&masked) != masked {
         return true;
     }
     // Rule 1, word by word: a run starts at a word's first prefix and takes the rest of the
     // word, so it has `TOKEN_TAIL_MIN` bytes after its prefix exactly when the word less its
     // last `TOKEN_TAIL_MIN - 1` bytes still holds a prefix and one byte after it.
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|word| Redactor::shapes(word) != *word)
+        .filter(|word| Redactor::shapes_cow(word) != *word)
         .any(|word| {
             let head = word.get(..word.len().saturating_sub(TOKEN_TAIL_MIN - 1));
-            let long = head.is_some_and(|head| Redactor::shapes(head) != head);
+            let long = head.is_some_and(|head| Redactor::shapes_cow(head) != head);
             // A short run that is a learned credential: one more word byte grows rule 1's
             // run, never the credential, so the two redactions part.
             long || ["Z", "0"]
@@ -1187,13 +1187,16 @@ impl std::io::Read for DigestReader {
 
 /// `bytes` through `Redactor::shapes`: each valid UTF-8 run shaped, each invalid byte kept as it is.
 pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
-    per_run(bytes, Redactor::shapes)
+    per_run(bytes, Redactor::shapes_cow)
 }
 
 /// `bytes` with each valid UTF-8 run through `f` and each invalid byte kept as it is.
-fn per_run(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+fn per_run<'f>(
+    bytes: &[u8],
+    f: impl for<'a> Fn(&'a str) -> std::borrow::Cow<'a, str> + 'f,
+) -> Vec<u8> {
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return f(text).into_bytes();
+        return f(text).into_owned().into_bytes();
     }
     let mut out = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
@@ -1217,7 +1220,7 @@ fn shaped_header(header: &TapeHeader) -> TapeHeader {
 /// Whether the header item a sink would write for `header` holds a line the shapes would change: two arguments that read as one shape once joined (`Bearer` then a long word).
 pub(crate) fn head_redacts(header: &TapeHeader) -> bool {
     let head = head_text(&shaped_header(header));
-    Redactor::shapes(&head) != head
+    Redactor::shapes_cow(&head) != head
 }
 
 /// Why a credentialed sink refuses its header item (`TapeSink::create_redacted`, `finish`).
@@ -1227,14 +1230,14 @@ const HEAD_CREDENTIAL: &str = "its command line holds a credential this run used
 /// token shape (a legacy classic token is any long printable run) passes the shapes the header
 /// was written through.
 fn head_holds_a_credential(head: &str, redactor: &Redactor) -> bool {
-    redactor.apply(head) != head
+    redactor.apply_cow(head) != head
 }
 
 /// `bytes` through `redactor.apply` (the learned credentials, then the shapes), each valid UTF-8
 /// run redacted and each invalid byte kept; with no redactor, `shaped`.
 fn redacted(bytes: &[u8], redactor: Option<&Redactor>) -> Vec<u8> {
     match redactor {
-        Some(redactor) => per_run(bytes, |text| redactor.apply(text)),
+        Some(redactor) => per_run(bytes, |text| redactor.apply_cow(text)),
         None => shaped(bytes),
     }
 }
@@ -1262,7 +1265,7 @@ fn redacted_record(record: &EffectRecord, redactor: Option<&Redactor>) -> Effect
 pub(crate) fn redacts(bytes: &[u8]) -> bool {
     bytes.utf8_chunks().any(|chunk| {
         let valid = chunk.valid();
-        Redactor::shapes(valid) != valid
+        Redactor::shapes_cow(valid) != valid
     })
 }
 
@@ -1280,7 +1283,7 @@ pub(crate) fn redacts_a_reply(reply: &[u8]) -> bool {
 }
 
 fn json_redacts(value: &aterm_json::Value) -> bool {
-    let changes = |text: &str| Redactor::shapes(text) != text;
+    let changes = |text: &str| Redactor::shapes_cow(text) != text;
     match value {
         aterm_json::Value::String(text) => changes(text),
         aterm_json::Value::Array(items) => items.iter().any(json_redacts),

@@ -267,7 +267,11 @@ fn parts(token: &str) -> Result<(Digest, Vec<u8>)> {
 /// `true`, `y`, `n` and their kin, or anything shorter than six characters. Never says which. A
 /// `Secret` column refuses such a value wherever it is written (the import, the grid, `set`).
 pub fn flag_like(value: &Secret) -> bool {
-    let text = value.plaintext().trim();
+    flag_like_str(value.plaintext())
+}
+
+pub(crate) fn flag_like_str(raw: &str) -> bool {
+    let text = raw.trim();
     text.chars().count() < 6
         || ["true", "false", "yes", "no", "set", "none", "null"]
             .iter()

@@ -111,8 +111,10 @@ impl<'a> Protocol<'a> {
             || capture.origin.0[..2] != self.capture.origin.0[..2]
             || capture.origin.0[3..6] != self.capture.origin.0[3..6]
             || capture.origin.0[2].as_u64() != Some(capture.text.len() as u64)
-            || !(capture.text == self.capture.text
-                || known_record_update(&capture.text, &self.capture.text))
+            // The immutable declaration never changes. Semantic updates are checked
+            // between adjacent original generations below: complete snapshots need not
+            // retain a textual prefix of all earlier custody events.
+            || capture.text.lines().next() != self.capture.text.lines().next()
             || (capture.retired && capture != &self.capture)
         {
             return Err(bad(
@@ -247,6 +249,7 @@ impl History {
         }
         history.origin = Some(directory_origin(root)?);
         let mut seen = BTreeSet::new();
+        let mut generations = BTreeMap::new();
         for item in fd::Dir::read_from(root.as_fd())? {
             let item = item?;
             let name = item
@@ -286,12 +289,15 @@ impl History {
                         return Err(bad("archived epoch member changed or was restored"));
                     }
                     if child == "base.json" {
-                        base = Some((protocol.base(name, &body)?, stamp.clone()));
+                        let capture = protocol.base(name, &body)?;
+                        remember_generation(&mut generations, &capture)?;
+                        base = Some((capture, stamp.clone()));
                     } else {
                         let ordinal = envelope::checkpoint_ordinal(child)
                             .ok_or_else(|| bad("unknown archived checkpoint name"))?;
                         let capture = Capture::decode(&body)?;
                         protocol.capture(&capture)?;
+                        remember_generation(&mut generations, &capture)?;
                         if capture.ordinal != ordinal {
                             return Err(bad("archived checkpoint ordinal differs from its name"));
                         }
@@ -346,7 +352,7 @@ impl History {
                             "archived epoch inventory has a gapped or exhausted ordinal range",
                         ));
                     }
-                    let mut previous = (base.ordinal, stamp);
+                    let mut previous = (base.ordinal, stamp, base.text);
                     for (ordinal, (capture, stamp)) in captures {
                         let original_previous = protocol
                             .finite
@@ -355,7 +361,8 @@ impl History {
                             .or_else(|| (ordinal == first).then_some(&previous.1));
                         if ordinal <= previous.0
                             || (ordinal == previous.0 + 1
-                                && capture.previous.as_ref() != Some(&previous.1))
+                                && (capture.previous.as_ref() != Some(&previous.1)
+                                    || !known_record_update(&previous.2, &capture.text)))
                             || original_previous
                                 .is_some_and(|expected| capture.previous.as_ref() != Some(expected))
                         {
@@ -363,7 +370,7 @@ impl History {
                                 "archived epoch has a changed or reversed checkpoint chain",
                             ));
                         }
-                        previous = (ordinal, stamp);
+                        previous = (ordinal, stamp, capture.text);
                     }
                 }
                 history.directories.push(HeldDirectory {
@@ -468,4 +475,22 @@ impl History {
         self.origin = None;
         Ok(())
     }
+}
+
+/// Rotation copies the SAME complete capture into the successor epoch base. Original
+/// tip/base files may have different metadata stamps, but never different semantic bytes.
+fn remember_generation(
+    generations: &mut BTreeMap<u64, Capture>,
+    capture: &Capture,
+) -> io::Result<()> {
+    if generations
+        .get(&capture.ordinal)
+        .is_some_and(|known| known != capture)
+    {
+        return Err(bad(
+            "archived epoch base differs from its original generation",
+        ));
+    }
+    generations.insert(capture.ordinal, capture.clone());
+    Ok(())
 }

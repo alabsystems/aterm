@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bounded, volatile address hints. Tokens rotate within a transport lifetime,
-//! not hashes of a public network or device identity. A hint grants nothing.
+//! Bounded, volatile address hints. A beacon's token names no device: its nonce rotates within a
+//! transport lifetime. A serving or enrolling node's token also carries a tag of its lab
+//! ([`LabKey`]) drawn with that nonce, so a node that knows the lab's pins leaves another lab's
+//! beacons undialled and dials its own lab's first (CR2), while a node that does not cannot link
+//! one beacon to the next. A hint grants nothing, a tag included: only an authenticated round
+//! verifies an endpoint.
 
 use crate::control::{Repair, Report};
 use std::{
@@ -22,6 +26,55 @@ const VERIFIED_EXPIRES: Duration = Duration::from_secs(600);
 const WIRE_LEN: usize = 38;
 /// Progress can take three extra turns before ordinary discovery gets another turn.
 const FOLLOW_UP_BURST: usize = 3;
+
+/// The key a node's beacons tag its lab with (`crate::control::beacon_key`): a digest of its
+/// rounds' TLS discriminator, so two nodes' keys differ exactly when no round between them can get
+/// past TLS. Members and enrollees know the pins it is made from; a node on the LAN that does not
+/// can neither read a tag nor link two of them.
+pub(super) type LabKey = [u8; 32];
+/// What a tagged token starts with. A token without it (one an older build drew whole at random)
+/// names no lab; one with it names a lab by the tag that follows. Any change to how the tag is
+/// drawn takes a new mark, which an older reader reads as naming no lab.
+const LAB_MARK: &[u8; 4] = b"ACL1";
+/// A tagged token: [`LAB_MARK`], then the tag ([`tag`]), then this many bytes of the rotating
+/// nonce, the tag's salt.
+const LAB_NONCE: usize = 32 - LAB_MARK.len() - 8;
+
+/// The tag a node of the lab `key` draws with `nonce`: 8 bytes of SHA-256 over a label, the key
+/// and the nonce. A new nonce (every rotation) draws a new tag.
+fn tag(key: &LabKey, nonce: &[u8]) -> [u8; 8] {
+    let mut sha = aterm_digest::Sha256::new();
+    sha.update(b"aterm/commons/beacon-tag/1\0");
+    sha.update(key);
+    sha.update(nonce);
+    sha.finalize()[..8].try_into().expect("eight bytes")
+}
+
+/// The token a node of the lab `key` beacons with `nonce`: [`LAB_MARK`], its [`tag`] and the
+/// nonce's first [`LAB_NONCE`] bytes. With no lab (a presence-only transport) it is the nonce
+/// whole.
+fn token(key: Option<&LabKey>, nonce: [u8; 32]) -> [u8; 32] {
+    let Some(key) = key else {
+        return nonce;
+    };
+    let mut token = [0; 32];
+    token[..4].copy_from_slice(LAB_MARK);
+    token[4..12].copy_from_slice(&tag(key, &nonce[..LAB_NONCE]));
+    token[12..].copy_from_slice(&nonce[..LAB_NONCE]);
+    token
+}
+
+/// Whose lab a beacon's token names, as this node reads it ([`Hints::sender`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sender {
+    /// Its tag is this node's lab's: it may be a peer.
+    Ours,
+    /// Its tag is another lab's: no round with it can get past TLS. An older build's random token
+    /// reads so once in 2^32 rotations, which leaves it undialled until its next rotation.
+    Theirs,
+    /// It names no lab (an older build), or this node has none to read it by.
+    Unnamed,
+}
 
 fn delay_hash(own: &[u8; 32], attempt: u64) -> astream_wire::sync::Digest {
     let mut sha = aterm_digest::Sha256::new();
@@ -126,14 +179,20 @@ fn repair_transferred(repair: &Repair) -> bool {
         })
 }
 
-/// Why an unverified endpoint is dialled ahead of ordinary discovery (CR1). Neither reason is
+/// Why an unverified endpoint is dialled ahead of ordinary discovery (CR1, CR2). No reason is
 /// trust: a lead orders dials, and only an authenticated round verifies an endpoint. It lasts
-/// until a dial of the endpoint fails without authenticating anyone ([`Hints::finish`]), so one
-/// that is not the peer it looked like gets one early dial and then waits its turn.
+/// until a dial of the endpoint shows no peer of this lab is there ([`Repair::disowned`]: nothing
+/// accepted the connection, or another lab's listener did), so one that is not the peer it looked
+/// like gets one early dial and then waits its turn. A dial that stalls or goes unanswered keeps
+/// it: a busy peer of this lab looks the same, and backs off ([`Hints::finish`]). Endpoints of one
+/// lead go in an order each node draws for itself ([`Hints::spread`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum Lead {
     #[default]
     None,
+    /// It beaconed this node's lab's tag ([`LabKey`]): a Mac that remembers nothing dials its own
+    /// lab's endpoints before the rest of the LAN's.
+    Tagged,
     /// An endpoint this Mac verified before it restarted ([`Hints::remember`]), not heard since.
     Remembered,
     /// An endpoint at an address a peer authenticated from ([`Hints::kin`]): it beaconed from
@@ -192,6 +251,11 @@ impl Peer {
     /// established peer or rediscovered by its own turn.
     fn lead(&self) -> Lead {
         if self.verified { Lead::None } else { self.lead }
+    }
+    /// Whether what is heard of it may raise its lead: it is unverified, and it leads already or
+    /// no dial of it has failed.
+    fn may_lead(&self) -> bool {
+        !self.verified && (self.lead > Lead::None || (self.failures == 0 && !self.failed))
     }
 }
 
@@ -299,8 +363,19 @@ thread_local! {
     /// remembers its endpoint, so a seat on two attachments changes it every round.
     pub(super) static FLAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// MUTANT of CR1's first cut, on for one test thread: a led dial that authenticated nobody
-    /// spends nothing ([`Hints::kin_spent`]).
+    /// spends nothing ([`Hints::spent`]).
     pub(super) static UNSPENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR2's lab tag, on for one test thread: a beacon's tag is read as no lab's
+    /// ([`Sender::Unnamed`]), as before CR2, so another lab's endpoints are candidates in address
+    /// order and this lab's lead nothing.
+    pub(super) static UNTAGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR2's spread, on for one test thread: endpoints go in address order on every
+    /// node ([`Hints::spread`]), as before CR2.
+    pub(super) static UNSPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR2's spend rule, on for one test thread: every led dial that authenticated
+    /// nobody drops its endpoint's lead, a stalled one included, as CR1 did
+    /// ([`Repair::disowned`]).
+    pub(super) static STALL_DISOWNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the mutant `cell` is on (tests); never in a build.
@@ -311,6 +386,12 @@ fn mutant(cell: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
 
 #[derive(Debug)]
 pub(super) struct Hints {
+    /// This node's lab's key, which its token's tag is drawn with ([`token`]); none on a
+    /// presence-only transport, which reads every beacon as [`Sender::Unnamed`].
+    lab: Option<LabKey>,
+    /// This node's private draw for the order it dials endpoints in ([`Self::spread`]): random
+    /// once per transport and never sent. None: address order (a test that names an order).
+    seed: Option<[u8; 32]>,
     own: [u8; 32],
     previous: Option<[u8; 32]>,
     attempt: u64,
@@ -333,11 +414,19 @@ pub(super) struct Hints {
     /// ([`Self::remember`]). A beacon from one leads ([`Lead::Kin`]). At most [`MAX_PEERS`],
     /// each kept [`VERIFIED_EXPIRES`].
     vouched: BTreeMap<IpAddr, Instant>,
-    /// Addresses where a dial led as kin ([`Lead::Kin`]) authenticated nobody, each when: a new
-    /// port beaconed from one leads again only once a peer authenticates from there again, so
-    /// beacons forged from a peer's address lead at most one dial per round the peer makes. At
-    /// most [`MAX_PEERS`], each kept [`VERIFIED_EXPIRES`].
-    kin_spent: BTreeMap<IpAddr, Instant>,
+    /// Addresses where a dial led by a beacon ([`Lead::Kin`] or [`Lead::Tagged`]) authenticated
+    /// nobody, each when: a port beaconed from one, new or heard again once its endpoint expired,
+    /// leads again only once a peer authenticates from there, or [`VERIFIED_EXPIRES`] later. The
+    /// endpoint dialled keeps its lead unless the dial showed no peer of this lab is there
+    /// ([`Repair::disowned`]), and backs off. Beacons forged from a peer's address lead at most
+    /// [`PER_IP`] endpoints per round the peer makes from there. A tag is copied from any beacon
+    /// heard and replayed from any address on the link, so forged tagged beacons lead at most
+    /// [`PER_IP`] endpoints per address per [`VERIFIED_EXPIRES`], each dialled ahead of the crowd
+    /// under its own backoff until it expires ([`EXPIRES`]), while fewer than [`MAX_PEERS`]
+    /// addresses are spent, and the oldest is forgotten past that: the tag orders dials and
+    /// protects nothing from an active attacker on the LAN, as no beacon did before it. At most
+    /// [`MAX_PEERS`].
+    spent: BTreeMap<IpAddr, Instant>,
     /// Each seat's endpoint that a round this side dialled last completed with, and when: what
     /// this Mac remembers across a restart ([`Self::remember`], [`Self::remembered`]). At most
     /// [`MAX_REMEMBERED`], the most recent.
@@ -365,9 +454,23 @@ fn speaks_bus(
 }
 
 impl Hints {
+    /// Hints whose beacons carry `own` whole, naming no lab: a presence-only transport's.
     pub(super) fn new(own: [u8; 32]) -> Self {
+        Self::of(None, own)
+    }
+    /// Hints of a node of the lab `key`, whose token carries its tag drawn with `nonce`
+    /// ([`token`]), dialling in the order `seed` draws ([`Self::spread`]).
+    pub(super) fn tagged(key: LabKey, nonce: [u8; 32], seed: [u8; 32]) -> Self {
         Self {
-            own,
+            seed: Some(seed),
+            ..Self::of(Some(key), nonce)
+        }
+    }
+    fn of(lab: Option<LabKey>, nonce: [u8; 32]) -> Self {
+        Self {
+            lab,
+            seed: None,
+            own: token(lab.as_ref(), nonce),
             previous: None,
             attempt: 0,
             peers: BTreeMap::new(),
@@ -382,7 +485,7 @@ impl Hints {
             addresses: BTreeMap::new(),
             bus: BTreeSet::new(),
             vouched: BTreeMap::new(),
-            kin_spent: BTreeMap::new(),
+            spent: BTreeMap::new(),
             remembered: BTreeMap::new(),
             remembered_changed: false,
             remembered_read: None,
@@ -474,7 +577,7 @@ impl Hints {
     }
     /// Note that a peer authenticated from `ip` at `now`, within the bounds of [`Self::vouched`].
     fn vouch_address(&mut self, ip: IpAddr, now: Instant) {
-        self.kin_spent.remove(&ip);
+        self.spent.remove(&ip);
         self.vouched
             .retain(|_, at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES);
         if !self.vouched.contains_key(&ip)
@@ -489,31 +592,35 @@ impl Hints {
         }
         self.vouched.insert(ip, now);
     }
-    /// A dial led as kin to `ip` authenticated nobody at `now` ([`Self::kin_spent`]).
-    fn spend_kin(&mut self, ip: IpAddr, now: Instant) {
-        self.kin_spent
+    /// A dial a beacon from `ip` led authenticated nobody at `now` ([`Self::spent`]).
+    fn spend(&mut self, ip: IpAddr, now: Instant) {
+        self.spent
             .retain(|_, at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES);
-        if !self.kin_spent.contains_key(&ip)
-            && self.kin_spent.len() >= MAX_PEERS
+        if !self.spent.contains_key(&ip)
+            && self.spent.len() >= MAX_PEERS
             && let Some(oldest) = self
-                .kin_spent
+                .spent
                 .iter()
                 .min_by_key(|(_, at)| **at)
                 .map(|(ip, _)| *ip)
         {
-            self.kin_spent.remove(&oldest);
+            self.spent.remove(&oldest);
         }
-        self.kin_spent.insert(ip, now);
+        self.spent.insert(ip, now);
     }
-    /// Whether a beacon from `ip` leads ([`Lead::Kin`]): a peer authenticated from there
-    /// within [`VERIFIED_EXPIRES`], or an endpoint there is verified, and no dial led there since
-    /// has authenticated nobody ([`Self::kin_spent`]).
-    fn kin(&self, ip: IpAddr, now: Instant) -> bool {
-        if self
-            .kin_spent
+    /// Whether a dial a beacon from `ip` led has authenticated nobody since a peer last
+    /// authenticated from there, within [`VERIFIED_EXPIRES`] ([`Self::spent`]): a beacon from
+    /// there leads nothing.
+    fn is_spent(&self, ip: IpAddr, now: Instant) -> bool {
+        self.spent
             .get(&ip)
             .is_some_and(|at| now.saturating_duration_since(*at) < VERIFIED_EXPIRES)
-        {
+    }
+    /// Whether a beacon from `ip` leads as kin ([`Lead::Kin`]): a peer authenticated from there
+    /// within [`VERIFIED_EXPIRES`], or an endpoint there is verified, and the address is not
+    /// [`Self::is_spent`].
+    fn kin(&self, ip: IpAddr, now: Instant) -> bool {
+        if self.is_spent(ip, now) {
             return false;
         }
         self.vouched
@@ -570,9 +677,51 @@ impl Hints {
     pub(super) fn bus_speakers(&mut self, bus: BTreeSet<astream_wire::sync::Actor>) {
         self.bus = bus;
     }
-    pub(super) fn rotate(&mut self, own: [u8; 32]) {
+    /// Draw a new token from `nonce`, keeping this node's lab ([`token`]); beacons of the last
+    /// token are still known as this node's own.
+    pub(super) fn rotate(&mut self, nonce: [u8; 32]) {
         self.previous = Some(self.own);
-        self.own = own;
+        self.own = token(self.lab.as_ref(), nonce);
+    }
+    /// Whose lab the sender of `token` names ([`Sender`]).
+    fn sender(&self, token: &[u8]) -> Sender {
+        #[cfg(test)]
+        if mutant(&UNTAGGED) {
+            return Sender::Unnamed;
+        }
+        match (&self.lab, token.strip_prefix(LAB_MARK.as_slice())) {
+            (Some(key), Some(rest)) if rest.len() == 8 + LAB_NONCE => {
+                if rest[..8] == tag(key, &rest[8..]) {
+                    Sender::Ours
+                } else {
+                    Sender::Theirs
+                }
+            }
+            _ => Sender::Unnamed,
+        }
+    }
+    /// Where `address` falls in this node's dial order, among endpoints of one lead and in the
+    /// ordinary scan: a hash of it under this node's private [`Self::seed`], so nodes that start
+    /// together each dial in a different order rather than all the lowest address first, and the
+    /// order holds across token rotations. Nothing a sender chooses or a listener learns. With no
+    /// seed, every address falls at 0: address order.
+    fn spread(&self, address: &SocketAddr) -> u64 {
+        #[cfg(test)]
+        if mutant(&UNSPREAD) {
+            return 0;
+        }
+        let Some(seed) = &self.seed else {
+            return 0;
+        };
+        let mut sha = aterm_digest::Sha256::new();
+        sha.update(b"aterm/commons/discovery-spread/1\0");
+        sha.update(seed);
+        match address {
+            SocketAddr::V4(v4) => sha.update(v4.ip().octets()),
+            SocketAddr::V6(v6) => sha.update(v6.ip().octets()),
+        }
+        sha.update(address.port().to_be_bytes());
+        u64::from_be_bytes(sha.finalize()[..8].try_into().expect("eight bytes"))
     }
     /// Only signed advertised builds from the local fleet book reach this method. A missing
     /// entry is no evidence of an update. The clock is supplied by the transport or test.
@@ -633,7 +782,11 @@ impl Hints {
             return;
         }
         let token: [u8; 32] = wire[4..].try_into().unwrap();
-        if token == self.own || self.previous == Some(token) {
+        // Another lab's enrollee asks none of this lab's Macs for anything.
+        if token == self.own
+            || self.previous == Some(token)
+            || self.sender(&token) == Sender::Theirs
+        {
             return;
         }
         let IpAddr::V4(ip) = source.ip() else {
@@ -686,14 +839,9 @@ impl Hints {
             .min_by_key(|(_, peer)| (peer.verified, peer.seen))
             .map(|(address, _)| *address)
     }
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "DbDiscoveryReplacement",
-            action = "Observe",
-            project = "aterm_db::runtime::discovery::admission_tests::replacement_transition"
-        )
-    )]
+    /// Read a beacon `wire` heard from `source`: one that is malformed, this node's own, or
+    /// another lab's is dropped here, and any other is admitted ([`Self::admit`], the model's
+    /// `Observe`) with the lead its sender and address give it.
     pub(super) fn observe(&mut self, wire: &[u8], source: SocketAddr, now: Instant) {
         if wire.len() != WIRE_LEN
             || &wire[..4] != b"ACH2"
@@ -716,24 +864,37 @@ impl Hints {
         }
         let address = SocketAddr::from((ip, port));
         // A peer that restarted beacons a new port from the address it authenticated from: that
-        // endpoint is dialled ahead of the crowd ([`Lead::Kin`]), and is still only a hint.
-        let lead = if self.kin(address.ip(), now) {
-            Lead::Kin
-        } else {
-            Lead::None
+        // endpoint is dialled ahead of the crowd ([`Lead::Kin`]); one that beacons this lab's tag
+        // is dialled ahead of those that name none ([`Lead::Tagged`]); another lab's is never
+        // dialled, since no round with it can complete. Each is still only a hint.
+        let lead = match self.sender(&wire[4..36]) {
+            Sender::Theirs => return,
+            _ if self.kin(address.ip(), now) => Lead::Kin,
+            Sender::Ours if !self.is_spent(address.ip(), now) => Lead::Tagged,
+            Sender::Ours | Sender::Unnamed => Lead::None,
         };
         self.admit(address, lead, now);
     }
     /// Take `address` as a candidate leading by `lead`, within the per-IP and total bounds: a
     /// new one replaces only a failed endpoint ([`Self::replacement`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDiscoveryReplacement",
+            action = "Observe",
+            project = "aterm_db::runtime::discovery::admission_tests::replacement_transition"
+        )
+    )]
     fn admit(&mut self, address: SocketAddr, lead: Lead, now: Instant) {
         self.expire(now);
         // Repeated untrusted claims cannot pin either an untried or failed
         // endpoint forever. Only a successful authenticated round renews it.
         if let Some(peer) = self.peers.get_mut(&address) {
             // A remembered endpoint heard again from its vouched address is up: it leads as kin.
-            if peer.lead == Lead::Remembered && lead == Lead::Kin {
-                peer.lead = Lead::Kin;
+            // One first heard naming no lab (a forged beacon can come first) leads once its own
+            // tagged beacon is heard, while no dial of it has failed unauthenticated.
+            if lead > peer.lead && peer.may_lead() {
+                peer.lead = lead;
             }
             return;
         }
@@ -842,8 +1003,9 @@ impl Hints {
         } else {
             self.established_cursor
         };
-        // A candidate that leads ([`Lead`]) goes before the ordinary scan, kin before remembered,
-        // and leaves the scan's place where it was.
+        // A candidate that leads ([`Lead`]) goes before the ordinary scan, kin before remembered
+        // before tagged, each lead in this node's own order ([`Self::spread`]), and leaves the
+        // scan's place where it was.
         #[cfg(test)]
         let unled = UNLED.with(std::cell::Cell::get);
         #[cfg(not(test))]
@@ -852,24 +1014,28 @@ impl Hints {
             self.peers
                 .iter()
                 .filter(|(a, p)| p.lead() > Lead::None && eligible(a, p))
-                .max_by_key(|(a, p)| (p.lead(), std::cmp::Reverse(**a)))
+                .max_by_key(|(a, p)| (p.lead(), std::cmp::Reverse((self.spread(a), **a))))
                 .map(|(a, _)| *a)
         } else {
             None
         };
+        // The ordinary scan goes round every endpoint in this node's order ([`Self::spread`]),
+        // from the one after where it last stopped.
         let address = follow_up.or(led).or_else(|| {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let tail = match cursor {
-                Some(cursor) => self.peers.range((Excluded(cursor), Unbounded)),
-                None => self.peers.range(..),
-            };
-            let head = cursor
-                .into_iter()
-                .flat_map(|cursor| self.peers.range(..=cursor));
-            tail.chain(head)
-                .filter(|(a, p)| eligible(a, p))
-                .map(|(a, _)| *a)
-                .next()
+            let place = |a: &SocketAddr| (self.spread(a), *a);
+            let after = cursor.as_ref().map(place);
+            let mut first = None;
+            let mut next = None;
+            for (a, _) in self.peers.iter().filter(|(a, p)| eligible(a, p)) {
+                let at = place(a);
+                if first.is_none_or(|first| at < first) {
+                    first = Some(at);
+                }
+                if after.is_none_or(|after| at > after) && next.is_none_or(|next| at < next) {
+                    next = Some(at);
+                }
+            }
+            next.or(first).map(|(_, a)| a)
         })?;
         let peer = self.peers.get_mut(&address).unwrap();
         peer.busy = true;
@@ -1001,10 +1167,18 @@ impl Hints {
         }
         let mut spent = false;
         if !completed && repair.authenticated_actor().is_none() {
-            // Whatever answers there authenticated no seat: it was not the peer it looked like,
-            // and takes its turn with the crowd. Contention with a peer that did keeps its lead.
-            spent = peer.lead() == Lead::Kin;
-            peer.lead = Lead::None;
+            // A lead a beacon gave spends its address ([`Self::spent`]): what else is heard from
+            // there takes its turn with the crowd. This endpoint loses its lead only where no peer
+            // of this lab is there; one that stalled or went unanswered keeps it and backs off,
+            // as a busy peer looks.
+            spent = matches!(peer.lead(), Lead::Kin | Lead::Tagged);
+            #[cfg(test)]
+            let disowned = repair.disowned() || mutant(&STALL_DISOWNS);
+            #[cfg(not(test))]
+            let disowned = repair.disowned();
+            if disowned {
+                peer.lead = Lead::None;
+            }
         }
         peer.busy = false;
         peer.failed = !completed;
@@ -1012,7 +1186,7 @@ impl Hints {
         #[cfg(test)]
         let spent = spent && !mutant(&UNSPENT);
         if spent {
-            self.spend_kin(address.ip(), now);
+            self.spend(address.ip(), now);
         }
         if let Some(actor) = verified {
             self.vouch_address(address.ip(), now);
@@ -1079,10 +1253,18 @@ pub fn db_discovery_replacement_environment() {}
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod lab_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a round leaves when nothing accepted its connection ([`Repair::disowned`]).
+    fn nothing_there(mut repair: Repair) -> Repair {
+        repair.disown();
+        repair
+    }
     #[test]
     fn needs_update_waits_for_an_advertised_version_change() {
         use aterm_types::network_state::RepairCause;
@@ -1250,8 +1432,8 @@ mod tests {
             // The ordinary scan did not move: the crowd's first is next.
             let (second, _) = hints.next(now).unwrap();
             assert_eq!(second, first_of_crowd);
-            // Something else answering there that authenticates no seat loses the lead.
-            hints.finish(first, repair, Outcome::Refused, now);
+            // Nothing listening there loses the lead.
+            hints.finish(first, nothing_there(repair), Outcome::Refused, now);
             assert_eq!(hints.peers[&new].lead(), Lead::None);
             let again = hints.peers[&new].next;
             assert_ne!(
@@ -1361,7 +1543,7 @@ mod tests {
             let (second, repair) = after.next(now).unwrap();
             assert_eq!((first, second), (heard, unheard));
             assert_eq!(after.next(now).unwrap().0, first_of_crowd);
-            after.finish(unheard, repair, Outcome::Refused, now);
+            after.finish(unheard, nothing_there(repair), Outcome::Refused, now);
             assert_eq!(after.peers[&unheard].lead(), Lead::None);
             // What it remembers stays to be kept again, though nothing was verified since.
             let again = after.remembered(now, wall_ms + 60_000).unwrap();
@@ -1408,7 +1590,7 @@ mod tests {
                 "a new port from a peer's address leads"
             );
             UNSPENT.with(|cell| cell.set(unspent));
-            hints.finish(first, repair, Outcome::Refused, now);
+            hints.finish(first, nothing_there(repair), Outcome::Refused, now);
             UNSPENT.with(|cell| cell.set(false));
             hints.observe(&wire(2001), forged(2001), now);
             let (next, _) = hints.next(now).unwrap();

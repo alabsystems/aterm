@@ -4,7 +4,7 @@
 //! The broker's socket, its admission of each client, and its one request per connection.
 
 use std::io::{self, Write as _};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -153,13 +153,26 @@ pub(crate) struct Server {
     shared: Arc<Shared>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     admission: Admission,
     bonjour: Box<dyn Bonjour>,
     live: AtomicUsize,
     /// The test seam the server was bound under, carried into each connection's thread.
     #[cfg(any(test, debug_assertions))]
     seam: aterm_uds::lan::Seam,
+}
+
+impl Shared {
+    /// What serving needs, under this thread's seam.
+    pub(crate) fn new(admission: Admission, bonjour: Box<dyn Bonjour>) -> Self {
+        Self {
+            admission,
+            bonjour,
+            live: AtomicUsize::new(0),
+            #[cfg(any(test, debug_assertions))]
+            seam: aterm_uds::lan::seam(),
+        }
+    }
 }
 
 /// One live connection's count, given back when it ends.
@@ -239,13 +252,7 @@ impl Server {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
         Ok(Self {
             listener,
-            shared: Arc::new(Shared {
-                admission,
-                bonjour,
-                live: AtomicUsize::new(0),
-                #[cfg(any(test, debug_assertions))]
-                seam: aterm_uds::lan::seam(),
-            }),
+            shared: Arc::new(Shared::new(admission, bonjour)),
         })
     }
 
@@ -289,7 +296,7 @@ impl Server {
 }
 
 /// Serve one connection: admit its peer, exchange hellos, and answer its one request.
-fn connection(shared: &Shared, stream: &CtlStream) {
+pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
     if let Err(why) = shared.admission.check(stream) {
         log(format_args!("refused pid {pid}: {why}"));
@@ -396,32 +403,32 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
         } => {
             let within = within(within_ms)?;
             let deadline = Instant::now() + within;
-            let addrs: Vec<SocketAddr> = match &target {
-                Target::Addr(addr) => {
-                    let mut addr = *addr;
-                    addr.set_port(port);
-                    vec![addr]
-                }
-                Target::Host(name) => here::resolve(name, port, within).map_err(|e| failure(&e))?,
-            };
-            let local: Vec<SocketAddr> = addrs
-                .iter()
-                .copied()
-                .filter(|addr| aterm_uds::lan::is_local_network(&addr.ip()))
-                .collect();
-            if local.is_empty() {
-                return Err(match target {
-                    Target::Host(name) => not_local(format_args!("{name} ({addrs:?})")),
-                    Target::Addr(addr) => not_local(addr),
-                });
-            }
             let options = ConnectOptions {
                 bound_if,
                 source,
                 hop_limit,
             };
-            let (connected, reached) =
-                here::dial_any(&local, deadline, options).map_err(|e| failure(&e))?;
+            let (connected, reached) = match target {
+                Target::Addr(mut addr) => {
+                    addr.set_port(port);
+                    if !aterm_uds::lan::is_local_network(&addr.ip()) {
+                        return Err(not_local(addr));
+                    }
+                    here::dial_any(std::slice::from_ref(&addr), deadline, options)
+                        .map_err(|e| failure(&e))?
+                }
+                Target::Host(name) => {
+                    let mut addrs = here::resolve(&name, port, within).map_err(|e| failure(&e))?;
+                    if !addrs
+                        .iter()
+                        .any(|addr| aterm_uds::lan::is_local_network(&addr.ip()))
+                    {
+                        return Err(not_local(format_args!("{name} ({addrs:?})")));
+                    }
+                    addrs.retain(|addr| aterm_uds::lan::is_local_network(&addr.ip()));
+                    here::dial_any(&addrs, deadline, options).map_err(|e| failure(&e))?
+                }
+            };
             wire::pass(
                 stream,
                 &Frame::Socket {

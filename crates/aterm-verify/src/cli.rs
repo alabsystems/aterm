@@ -42,7 +42,7 @@ pub struct Args {
     pub no_windows: bool,
     /// Only the GUI cursor-pacing burst, with no release-only AOS assertion.
     pub cursor_pacing: bool,
-    /// Compile selected tests without executing them or qualifying a release.
+    /// Compile selected tests or measurement benches without executing them or qualifying a release.
     pub compile_only: bool,
     /// `--as-release`: with `test` or `doc` and `--all`, that check as `release` runs it, pulling
     /// nothing ([`Args::wanted`]), the command a release's red row prints; with
@@ -257,10 +257,10 @@ where
             || a.checks.is_empty()
             || a.checks
                 .iter()
-                .any(|c| !matches!(c, Check::Test | Check::Checkers)))
+                .any(|c| !matches!(c, Check::Test | Check::Checkers | Check::Measure)))
     {
         return usage(
-            "--compile-only requires test or checkers; it cannot qualify a release".into(),
+            "--compile-only requires test, checkers or measure; it cannot qualify a release".into(),
         );
     }
     if a.background && !(a.release && tree && !bundle) {
@@ -275,7 +275,9 @@ where
     {
         return usage("--as-release goes with `test` or `doc`, and `--all`".into());
     }
-    if a.cursor_pacing && (a.release || a.checks != [Check::Measure] || a.app.is_none()) {
+    if a.cursor_pacing
+        && (a.release || a.compile_only || a.checks != [Check::Measure] || a.app.is_none())
+    {
         return usage(
             "--cursor-pacing requires only measure and --app; it cannot qualify a release".into(),
         );
@@ -458,7 +460,7 @@ Options:
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
-      --compile-only      with test/checkers: compile tests without executing them
+      --compile-only      with test/checkers/measure: compile tests or measuring benches without executing them
       --as-release        with test or doc and --all: as release runs them, with
                           ATERM_SPEC_CHECKERS=1, and test owes the golden frame
                           test (--compile-only: what release's test stage compiles)

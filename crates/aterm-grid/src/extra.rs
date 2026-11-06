@@ -39,14 +39,7 @@ mod extra_flags {
     pub(crate) const EXTENDED_SHIFT: u32 = 3;
 }
 
-/// Hyperlink data: URL and optional ID from OSC 8 sequences.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HyperlinkData {
-    /// Hyperlink URL (OSC 8).
-    pub url: Arc<str>,
-    /// Hyperlink ID (OSC 8 `id=` parameter).
-    pub id: Option<Arc<str>>,
-}
+pub use aterm_types::HyperlinkData;
 
 pub use aterm_types::{ImageData, ImageFormat, ImageScaling, KittyPlacementTag, SourceRect};
 
@@ -152,6 +145,13 @@ impl CellExtra {
     #[inline]
     pub fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
         self.hyperlink = data;
+    }
+
+    /// Borrow the shared URL/ID payload for transport to a history span.
+    #[must_use]
+    #[inline]
+    pub fn hyperlink_data(&self) -> Option<&Arc<HyperlinkData>> {
+        self.hyperlink.as_ref()
     }
 
     /// Get the hyperlink ID (OSC 8 `id=` parameter).
@@ -349,6 +349,25 @@ impl CellExtra {
         self.underline_color_idx = None;
         self.flags &= extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB;
         self.colors[..3].fill(0);
+        self.has_data()
+    }
+
+    /// Reset a cell for refill while retaining its owned image-layer allocation.
+    pub(crate) fn prepare_image_refill(&mut self) -> bool {
+        let Some(mut layers) = self.image.take() else {
+            return false;
+        };
+        layers.clear();
+        *self = Self::default();
+        self.image = Some(layers);
+        true
+    }
+
+    /// Release unused image storage after refill and report remaining data.
+    pub(crate) fn finish_image_refill(&mut self) -> bool {
+        if self.image.as_ref().is_some_and(|layers| layers.is_empty()) {
+            self.image = None;
+        }
         self.has_data()
     }
 

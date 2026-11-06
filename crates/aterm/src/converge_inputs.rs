@@ -72,7 +72,7 @@ impl Metadata {
 struct Inputs {
     paths: Paths,
     metadata: Option<Metadata>,
-    seen: Option<(RepositoryInputMark, Admission)>,
+    seen: Option<RepositoryInputMark>,
     held: bool,
 }
 
@@ -104,10 +104,14 @@ impl Inputs {
         let Ok(mark) = repository_input_mark(sys) else {
             return false;
         };
-        let observed = (mark, metadata.admission.clone());
-        let changed = self.held || self.seen.as_ref() != Some(&observed);
+        let changed = self.held
+            || self.seen.as_ref() != Some(&mark)
+            || self
+                .metadata
+                .as_ref()
+                .is_none_or(|prev| prev.admission != metadata.admission);
         self.metadata = Some(metadata);
-        self.seen = Some(observed);
+        self.seen = Some(mark);
         self.held = false;
         changed
     }

@@ -1064,10 +1064,11 @@ impl Lane<'_> {
 
     /// The ask's lease, as the window last wrote it.
     fn lease(&self) -> Result<ask::Lease, Fail> {
-        let Some(state) = self.ledger.parent() else {
-            return Ok(ask::Lease::default());
-        };
-        ask::read(state).map_err(|e| Fail::die(format!("disk-ask: the lease: {e}")))
+        let parent = self
+            .ledger
+            .parent()
+            .ok_or_else(|| Fail::die("disk-ask: lease ledger has no parent"))?;
+        ask::read(parent).map_err(|error| Fail::die(format!("disk-ask: lease read: {error}")))
     }
 
     fn since(&self, at: Instant) -> String {

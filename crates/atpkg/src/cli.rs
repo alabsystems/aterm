@@ -660,7 +660,16 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         }
         return refusal;
     }
-    if let Some(v) = verb
+    let install_request = if verb == Some("install") {
+        match parse_install_argv(&args[1..]) {
+            Ok(request) => Some(request),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        None
+    };
+    if install_request.is_none()
+        && let Some(v) = verb
         && let Some(refusal) = arity_refusal(&args[1..], v)
     {
         return refusal;
@@ -681,15 +690,14 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     if let Some(bound) = link_request.as_ref().and_then(|request| request.wait_lock) {
         configure_wait_lock(&args, bound);
     }
-    let machine_settings = verb.is_some_and(|v| {
-        verb_applies_machine_settings(v)
-            && !(v == "update"
-                && args
-                    .get(1)
-                    .is_some_and(|p| crate::vendor_direct::is_vendor(p)))
-    }) && !under_private_state_root()
-        && machine_table_changed();
-    let mut machine_edit = machine_settings.then(MachineEdit::start);
+    let mut machine_edit = machine_edit_for_request(
+        &args,
+        install_request.as_ref(),
+        under_private_state_root(),
+        machine_table_changed,
+        MachineEdit::start,
+    );
+    let machine_settings = machine_edit.is_some();
     let mut store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock(link_request.as_ref().and_then(|r| r.if_prefix)) {
             Ok(guard) => guard,
@@ -749,7 +757,10 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         roll_forward_interrupted_activations(&layout, || cached_index(&layout));
     }
     let _meter = pass_layout.and_then(|layout| typed_pass_meter(verb.unwrap_or_default(), &layout));
-    let code = run_verb(verb, &args);
+    let code = match install_request {
+        Some(request) => cmd_install_request(request),
+        None => run_verb(verb, &args),
+    };
     #[cfg(target_os = "macos")]
     if let Some((layout, before)) = agents_before {
         crate::activation_notice::note_if_changed(&layout, &before);
@@ -6634,6 +6645,25 @@ fn verb_applies_machine_settings(verb: &str) -> bool {
     verb_row(verb).is_some_and(|v| v.applies_machine)
 }
 
+/// A validated named Trust build is staged beside `current`; it neither probes
+/// nor applies an unrelated machine plan. Ordinary install policy stays in force.
+fn machine_edit_for_request<T>(
+    args: &[String],
+    install: Option<&InstallArgs<'_>>,
+    private_state: bool,
+    changed: impl FnOnce() -> bool,
+    start: impl FnOnce() -> T,
+) -> Option<T> {
+    let verb = args.first()?.as_str();
+    let applies = verb_applies_machine_settings(verb)
+        && !install.is_some_and(|request| request.build.is_some())
+        && !(verb == "update"
+            && args
+                .get(1)
+                .is_some_and(|program| crate::vendor_direct::is_vendor(program)));
+    (applies && !private_state && changed()).then(start)
+}
+
 fn machine_table_changed() -> bool {
     crate::store::resolve_configured().is_some_and(|layout| {
         crate::machine::changed_since_applied(&layout, crate::config::cached_machine())
@@ -6879,7 +6909,10 @@ fn retire_verify_gate() -> usize {
 fn reclaim_build_cache() -> usize {
     use crate::build_cache::Unused;
     let retired = retire_verify_gate();
-    let removed = crate::build_cache::reclaim_home();
+    let (removed, kept_checks) = crate::build_cache::reclaim_home_report();
+    for kept in kept_checks {
+        println!("{}", kept.words());
+    }
     let (mut stayed, mut kept) = (0, 0);
     for (stage, why) in &removed {
         match *why {
@@ -7098,7 +7131,9 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 "Sum of candidate footprints: {} across {} cache candidate(s){} (nothing removed \
                  now)\nCleanup rechecks eligibility and active use. Candidates may be kept.\n\
                  Candidates may overlap; the sum can count \
-                 the same bytes more than once.",
+                 the same bytes more than once.\n\
+                 `machine cache clean` reports checks that keep entries; shared-cache and \
+                 tooling candidates use that command, not registered-root `cache retire`.",
                 crate::cost::human_bytes(total),
                 planned.len(),
                 if gate > 0 {
@@ -7808,6 +7843,7 @@ fn do_install_with_index(
     // On a person's meter's file or the one `--progress-file` named: aterm's startup deadline judges
     // a worker's install by that file's work (aterm-gui's `harness_host::INSTALL_QUIET_LIMIT`).
     let pass = TypedPass::on(seams.progress, "install");
+    let mut door_pass = None;
     let result = match crate::vendor_direct::spec(program) {
         Some(spec) => {
             let owned = pre_resolved
@@ -7827,7 +7863,12 @@ fn do_install_with_index(
                     Some(index),
                     &mut resolved_assets,
                 ),
-                None => install_vendor_door(layout, fetcher, channel, spec, seams),
+                None => {
+                    let (result, landed) =
+                        install_vendor_door(layout, fetcher, channel, spec, seams);
+                    door_pass = Some(landed);
+                    result
+                }
             }
         }
         None => crate::flow::install_collecting_assets_with_index(
@@ -7881,16 +7922,24 @@ fn do_install_with_index(
             None => record_outcome(layout, format!("install {program}: {e}")),
         },
     }
+    // Outside the typed pass, as an index-owned landing's sweep and hooks are above: they write no
+    // progress and have no bound of their own, which aterm-gui's
+    // `harness_host::INSTALL_QUIET_LIMIT` allows only past the pass's end.
+    if let Some(door_pass) = door_pass {
+        let _ = settle_vendor_pass(layout, &door_pass, seams);
+    }
     result
 }
 
+/// The vendor door's install of `spec`: what it answers, and the [`VendorPass`] its caller settles
+/// ([`settle_vendor_pass`]) once the typed pass around this has ended.
 fn install_vendor_door(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     channel: &str,
     spec: &'static crate::vendor_direct::VendorSpec,
     seams: &PassSeams<'_>,
-) -> Result<crate::InstallReport, crate::FlowError> {
+) -> (Result<crate::InstallReport, crate::FlowError>, VendorPass) {
     let now = (seams.now)();
     let req = crate::InstallRequest {
         channel,
@@ -7925,19 +7974,24 @@ fn install_vendor_door(
     record_vendor_status(layout, &outcome, now);
     note_landed(&mut pass, &outcome);
     warm_landed(layout, &mut pass, seams);
-    let _ = settle_vendor_pass(layout, &pass, seams);
-    outcome.into_install(layout)
+    (outcome.into_install(layout), pass)
 }
 
 fn cmd_install_argv(rest: &[String]) -> ExitCode {
     match parse_install_argv(rest) {
-        Ok(InstallArgs {
+        Ok(request) => cmd_install_request(request),
+        Err(refusal) => refusal,
+    }
+}
+
+fn cmd_install_request(request: InstallArgs<'_>) -> ExitCode {
+    match request {
+        InstallArgs {
             program: Some(program),
             build: Some(build),
             retry,
-        }) => cmd_install_build(program, build, retry),
-        Ok(InstallArgs { program, .. }) => cmd_install(program, "install"),
-        Err(refusal) => refusal,
+        } => cmd_install_build(program, build, retry),
+        InstallArgs { program, .. } => cmd_install(program, "install"),
     }
 }
 

@@ -26,7 +26,7 @@ use std::process::ExitStatus;
 pub const BRIDGE_VERB_FD: RawFd = 3;
 pub const BRIDGE_PUSH_FD: RawFd = 4;
 /// A bounded guard set, including a source worker's capacity and source/cache lock custody.
-pub const MAX_GUARD_FDS: usize = 8;
+pub const MAX_GUARD_FDS: usize = 130;
 
 const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 
@@ -2316,6 +2316,10 @@ const X_OK: i32 = 1;
 #[cfg(test)]
 #[path = "spawnfd_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "spawnfd_mapped_tests.rs"]
+mod mapped_tests;
 
 #[cfg(test)]
 #[path = "spawnfd_command_tests.rs"]

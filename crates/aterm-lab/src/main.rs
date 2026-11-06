@@ -247,6 +247,10 @@ mod mac_nux;
 #[cfg(target_os = "macos")]
 mod mac_nux_guest;
 #[cfg(target_os = "macos")]
+mod mac_runtime;
+#[cfg(target_os = "macos")]
+mod mac_slots;
+#[cfg(target_os = "macos")]
 mod measure;
 #[cfg(target_os = "macos")]
 mod mesh_churn;

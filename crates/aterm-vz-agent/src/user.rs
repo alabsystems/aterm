@@ -52,48 +52,40 @@ fn accounts(passwd: &str) -> impl Iterator<Item = (&str, u32, u32, &str)> + '_ {
 /// # Errors
 /// None is, or more than one is, or its uid or gid is 0: which.
 pub fn lane_user(passwd: &str) -> Result<User, String> {
-    let mut found: Vec<User> = accounts(passwd)
-        .filter(|(name, _, _, home)| {
-            !name.contains('/')
-                && home
-                    .strip_prefix("/home/")
-                    .and_then(|s| s.strip_suffix(".guest"))
-                    == Some(*name)
-        })
-        .map(|(name, uid, gid, home)| User {
-            name: name.to_string(),
-            uid,
-            gid,
-            home: home.to_string(),
-        })
-        .collect();
-    match found.len() {
-        1 => {
-            let user = found.remove(0);
-            if user.uid == 0 {
-                return Err(format!(
-                    "lane user '{}' in /etc/passwd has uid 0 (root)",
-                    user.name
-                ));
-            }
-            if user.gid == 0 {
-                return Err(format!(
-                    "lane user '{}' in /etc/passwd has gid 0 (root)",
-                    user.name
-                ));
-            }
-            Ok(user)
-        }
-        0 => Err("no lane user: no account in /etc/passwd has home /home/<name>.guest".into()),
-        _ => Err(format!(
+    let mut matches = accounts(passwd).filter(|(name, _, _, home)| {
+        !name.contains('/')
+            && home
+                .strip_prefix("/home/")
+                .and_then(|s| s.strip_suffix(".guest"))
+                == Some(*name)
+    });
+    let Some((name, uid, gid, home)) = matches.next() else {
+        return Err("no lane user: no account in /etc/passwd has home /home/<name>.guest".into());
+    };
+    if let Some((second, _, _, _)) = matches.next() {
+        let mut names = vec![name, second];
+        names.extend(matches.map(|(n, _, _, _)| n));
+        return Err(format!(
             "more than one lane user in /etc/passwd: {}",
-            found
-                .iter()
-                .map(|u| u.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+            names.join(", ")
+        ));
     }
+    if uid == 0 {
+        return Err(format!(
+            "lane user '{name}' in /etc/passwd has uid 0 (root)"
+        ));
+    }
+    if gid == 0 {
+        return Err(format!(
+            "lane user '{name}' in /etc/passwd has gid 0 (root)"
+        ));
+    }
+    Ok(User {
+        name: name.to_string(),
+        uid,
+        gid,
+        home: home.to_string(),
+    })
 }
 
 /// `user`'s groups from `group`'s text (`name:x:gid:member,member`): its primary gid

@@ -1,9 +1,10 @@
 # Native CPU leases
 
 This leaf library provides one kernel-held lease per executing build unit.
-It has no daemon and no whole-build CPU reservation. Production code depends
-only on `std` and `libc`; Targo, the compiler, and aterm can share this one
-implementation without depending on UI or verification-engine crates.
+Native workers have no whole-build CPU reservation. Explicit external custodians
+can retain fixed-width bundles through `ExternalDebt`. Production dependencies
+are `std`, `libc`, and the dependency-free first-party `trust-sha2` commitment
+leaf; no UI or verification-engine crate is required.
 
 `Pool::for_current_user` resolves the account's home from the Unix account
 database and opens `Library/Caches/aterm/capacity/build-cpu-v1` on macOS or
@@ -60,3 +61,21 @@ Successful settlement confirms durable Free. An error or crash once writing
 starts can leave Retained, malformed or Free state, so an error does not promise
 continued debt. The library does not establish descendant completion or supply
 a production host scheduler, global migration, or post-crash recovery policy.
+
+## Original recovery authority
+
+`ExternalDebt::prepare_recoverable` generates private material before grant. Its
+`persist` creates and flushes an original private authority file and its directory
+before returning a one-use `PreparedRecovery`; room refusal preserves that token.
+Only then can `try_reserve_recoverable` publish nonce-and-secret commitments under
+the shared native manifest transaction. The custodian must separately persist
+its actual memory-cohort epoch and attempt context before issuance.
+
+After controller death, `restore_recovery` verifies the original private secret,
+actual native/retained domain, context, width, slot and generation. The returned
+`RecoveredReservation` restores original settlement ownership and cannot issue
+or launch new work. Public identities and nonces cannot construct it. The host
+must establish authenticated original memory closure or applicable later-boot
+closure **before** settlement; neither a PID nor the secret proves completion.
+Partial or malformed records remain unavailable. No recovery path repairs them
+or interprets damaged/missing data as free capacity.

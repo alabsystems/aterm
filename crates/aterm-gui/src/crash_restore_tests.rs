@@ -213,7 +213,9 @@ fn a_reply_an_osc_event_and_a_bell_from_the_replay_never_reach_the_adopted_engin
     let restore = rig.restore(0).expect("a screen");
     assert_eq!(restore.report.rung, Rung::Exact, "{:?}", restore.report);
     let land = |checkpoint: &TerminalCheckpoint| {
-        let term = Mutex::new(crate::spawn::new_live_terminal(6, 40, None, None));
+        let mut live = crate::spawn::new_live_terminal(6, 40, None, None);
+        live.set_osc_event_polling(true);
+        let term = Mutex::new(live);
         let mut history = crate::handoff_history::AdoptedHistory::default();
         crate::spawn::hydrate_adopted_engine(
             &term,

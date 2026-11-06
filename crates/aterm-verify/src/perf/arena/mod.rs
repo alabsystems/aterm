@@ -573,6 +573,50 @@ pub(crate) fn build_aterm() -> Result<Aterm, String> {
     })
 }
 
+/// An explicitly supplied product is the entire subject of this run. In particular, a VM
+/// qualification must never replace a profile arm's bundle with a fresh default-profile build.
+pub(crate) fn supplied_or_build(binary: Option<&Path>) -> Result<Aterm, String> {
+    supplied_or(binary, build_aterm)
+}
+
+fn supplied_or(
+    binary: Option<&Path>,
+    build: impl FnOnce() -> Result<Aterm, String>,
+) -> Result<Aterm, String> {
+    let Some(binary) = binary else {
+        return build();
+    };
+    let bin = std::fs::canonicalize(binary).map_err(|e| format!("{}: {e}", binary.display()))?;
+    Ok(Aterm {
+        sha256: sha256_file(&bin)?,
+        git: "supplied binary".into(),
+        bin,
+    })
+}
+
+#[cfg(test)]
+mod supplied_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_product_never_builds_or_falls_back_to_another_one() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("aterm");
+        std::fs::write(&bin, b"one exact profile arm").unwrap();
+        let got = supplied_or(Some(&bin), || panic!("must not build a different product")).unwrap();
+        assert_eq!(got.bin, bin.canonicalize().unwrap());
+        assert_eq!(got.sha256, sha256_file(&bin).unwrap());
+        // NEGATIVE CONTROL: a missing supplied arm must refuse, never build the default arm.
+        assert!(
+            supplied_or(Some(&tmp.path().join("missing")), || panic!(
+                "must not fall back"
+            ))
+            .is_err()
+        );
+        assert!(supplied_or(None, || Err("build requested".into())).is_err());
+    }
+}
+
 /// The checkout at `dir`: `HEAD`'s short sha, `-dirty` when its tracked files
 /// have changes, `unknown` when git cannot say.
 pub(crate) fn git_provenance(dir: &Path) -> String {

@@ -5,6 +5,74 @@
 
 use super::*;
 
+/// Current Caps authority, or a pending setting whose hardware facts may wake its worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSetupScope {
+    /// No current Caps setting has work this observer may do.
+    Inactive,
+    /// Caps was verified or carried; only this revision admits attachment activation.
+    Applied(u64),
+    /// Caps is still owed; this revision permits observations that wake its existing pass.
+    Pending(u64),
+}
+
+/// One bounded, canonical set of native keyboard service identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputServiceSet(Vec<u64>);
+
+impl InputServiceSet {
+    /// Normalize one native census, refusing an ambiguous or unbounded observation.
+    ///
+    /// # Errors
+    /// More than 4096 services, a zero identity, or a duplicate identity.
+    pub fn new(mut ids: Vec<u64>) -> Result<Self, String> {
+        if ids.len() > 4096 || ids.contains(&0) {
+            return Err("invalid keyboard service identities".into());
+        }
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("duplicate keyboard service identity".into());
+        }
+        Ok(Self(ids))
+    }
+
+    /// Take the normalized identities without another allocation.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u64> {
+        self.0
+    }
+}
+
+fn scope_at(root: &Path) -> Result<InputSetupScope, String> {
+    let records = observation_at(root).map_err(|why| why.to_string())?.records;
+    Ok(if let Some(revision) = accepted(&records) {
+        InputSetupScope::Applied(revision)
+    } else if let Some(revision) = pending_inputs::caps_revision(root, &records) {
+        InputSetupScope::Pending(revision)
+    } else {
+        InputSetupScope::Inactive
+    })
+}
+
+/// Read the accepted or pending Caps scope from one canonical observation. Pending scope
+/// authorizes a hardware observation only, never a setter or another setup stage.
+///
+/// # Errors
+/// This account's scope or setup records cannot be read.
+pub fn input_setup_scope() -> Result<InputSetupScope, String> {
+    ensure_person_scope()?;
+    scope_at(&state_root()?)
+}
+
+/// The same input-scope reader over inert scratch records, with no live account scope.
+///
+/// # Errors
+/// The scratch setup records cannot be read.
+#[cfg(any(test, debug_assertions))]
+pub fn input_setup_scope_at(root: &Path) -> Result<InputSetupScope, String> {
+    scope_at(root)
+}
+
 fn accepted(records: &Records) -> Option<u64> {
     let (plan, _) = records.plan.as_ref()?;
     let held = holds(records);
@@ -169,6 +237,180 @@ mod tests {
     }
 
     #[test]
+    fn a_first_caps_pass_enrolls_attachments_while_an_unrelated_preference_stays_pending() {
+        use crate::macos_doctor::NativeHost;
+        use aterm_machines::items::keyboard::{Model, caps_to_control};
+        use aterm_machines::model::{PValue, User};
+        use aterm_machines::port::{Fake, Ran, Stat};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Caps {
+            Applied,
+            Failed,
+            Unread,
+            Unobserved,
+        }
+        for (caps, legacy, dock_pending) in [
+            (Caps::Applied, false, true),
+            (Caps::Failed, false, true),
+            (Caps::Unread, false, true),
+            (Caps::Unobserved, false, true),
+            (Caps::Applied, true, true),
+            (Caps::Applied, true, false),
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let mut plan = caps_plan();
+            plan.selection.set(Setting::Dock, dock_pending);
+            let current = if legacy {
+                crate::macos_doctor::authorize_automatic_setup_at(root, plan.selection).unwrap();
+                0
+            } else {
+                choose(root, &plan)
+            };
+            let user = User {
+                name: "alice".into(),
+                uid: 501,
+                gid: 20,
+                home: "/Users//alice".into(),
+                shell: "/bin/zsh".into(),
+                admin: false,
+            };
+            let mut sys = Fake::root();
+            sys.euid = user.uid;
+            sys.keyboard_services = Some(Ok(if caps == Caps::Unobserved {
+                vec![41]
+            } else {
+                Vec::new()
+            }));
+            sys.logged_in(&user);
+            sys.stat_of(
+                "/dev/console",
+                Stat {
+                    uid: user.uid,
+                    gid: user.gid,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys.on(
+                &aterm_machines::facts::hidutil_keyboards().display(),
+                Ran::ok("Services:\n\nDevices:\n"),
+            );
+            sys.on(
+                "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -",
+                Ran::ok(&aterm_machines::plist::document(&PValue::Dict(Vec::new()))),
+            );
+            let mapped = Arc::new(AtomicBool::new(false));
+            let reading = Arc::clone(&mapped);
+            let key = Model {
+                vendor: 0,
+                product: 0,
+            }
+            .key();
+            sys.simulate(move |_, cmd| {
+                if cmd.display() == "alice$ /usr/bin/defaults -currentHost export -g -" {
+                    if caps == Caps::Unread {
+                        return Some(Ran::exit(1, "inert unread preference domain"));
+                    }
+                    let entries = if reading.load(Ordering::SeqCst) {
+                        vec![(key.clone(), PValue::Array(vec![caps_to_control()]))]
+                    } else {
+                        Vec::new()
+                    };
+                    Some(Ran::ok(&aterm_machines::plist::document(&PValue::Dict(
+                        entries,
+                    ))))
+                } else if cmd.program == Path::new("/usr/bin/defaults")
+                    && cmd.args.get(1).is_some_and(|arg| arg == "write")
+                    && cmd.args.get(3).is_some_and(|arg| arg == key.as_str())
+                {
+                    assert_eq!(cmd.user.as_ref().unwrap().uid, 501);
+                    if caps == Caps::Failed {
+                        return Some(Ran::exit(1, "inert failed Caps write"));
+                    }
+                    reading.store(true, Ordering::SeqCst);
+                    Some(Ran::ok(""))
+                } else {
+                    None
+                }
+            });
+            let mut native = NativeHost::over(
+                Box::new(sys),
+                Box::new(aterm_machines::init::prepare_workstation_selected),
+            );
+            let report = if legacy {
+                // The selection-only first-run entry has no modern progress. A partial cohort
+                // cannot complete its older whole-pass decision.
+                crate::macos_doctor::apply_on_first_run_with(
+                    root,
+                    &crate::macos_doctor::tests::Inert::default(),
+                    &mut native,
+                    "inert-legacy-preference-completion",
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+                )
+                .unwrap()
+                .unwrap()
+            } else {
+                let mut host = super::super::tests::Fake::default().with_workstation(native);
+                execute_initial(&mut host, root, &mut None)
+                    .unwrap()
+                    .unwrap()
+            };
+            let applied = caps == Caps::Applied;
+            assert_eq!(mapped.load(Ordering::SeqCst), applied, "{caps:?}");
+            assert_eq!(
+                report.complete(),
+                !dock_pending,
+                "the unread Dock still owes its pass"
+            );
+            assert_eq!(first_run_complete(root).unwrap(), !dock_pending);
+            if !legacy {
+                assert_eq!(
+                    progress(root).unwrap().unwrap().done & Stage::Workstation.bit(),
+                    0
+                );
+            }
+            if applied && !legacy {
+                let remaining = progress(root).unwrap().unwrap().only.unwrap();
+                assert!(remaining.contains(Setting::Dock));
+                assert!(!remaining.contains(Setting::CapsLock));
+            }
+            let enrolled = applied && (!legacy || !dock_pending);
+            assert_eq!(
+                revision_at(root).unwrap(),
+                enrolled.then_some(current),
+                "{caps:?}: Caps completion cannot be borrowed from the unfinished Dock"
+            );
+            assert_eq!(
+                activate_at(root, current, &|_| false, |_, continues| Ok(continues())).unwrap(),
+                enrolled.then_some(true)
+            );
+            if enrolled {
+                let before = observation_at(root).unwrap();
+                assert_eq!(
+                    activate_at(root, current + 1, &|_| false, |_, _| panic!(
+                        "other revision"
+                    ))
+                    .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    activate_at(root, current, &|_| true, |_, _| panic!("immediate Stop")).unwrap(),
+                    None
+                );
+                assert_eq!(observation_at(root).unwrap(), before);
+                request_stop_at(root, current).unwrap();
+                assert_eq!(revision_at(root).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
     fn unfinished_caps_work_is_not_carried_as_an_applied_setting() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -187,7 +429,14 @@ mod tests {
         assert_eq!(revision_at(root).unwrap(), None, "partial stage completion");
         plan.selection.set(Setting::Dock, true);
         choose(root, &plan);
-        assert!(progress(root).unwrap().unwrap().only.is_none());
+        assert!(
+            progress(root)
+                .unwrap()
+                .unwrap()
+                .only
+                .unwrap()
+                .contains(Setting::CapsLock)
+        );
         let before = observation_at(root).unwrap();
         assert_eq!(
             revision_at(root).unwrap(),

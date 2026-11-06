@@ -717,6 +717,7 @@ mod tests {
             pid: vm.id(),
             ppid: 1,
             footprint: 14 << 30,
+            whole: 14 << 30,
             written: 0,
             cpu_ns: 0,
         }])));

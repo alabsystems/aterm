@@ -416,6 +416,22 @@ impl Origin {
 
     /// Settle a fresh lease on `high`, the highest sequence number of this Mac's a neighbour
     /// holds: an incarnation at or above the one numbered now moves this one above it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Rebuild",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "RebuildReuse",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
     pub(crate) fn settle(&mut self, high: Option<u64>) -> io::Result<()> {
         if self.settled {
             return Ok(());
@@ -476,6 +492,14 @@ fn owns(log: MeshLog, principal: &str, subject: &str) -> bool {
 /// [`Mesh::publish`]: sign `payload` for `subject`, number it, and publish it on the local log. A
 /// fresh number answered "already held" means another life of this Mac used it: the lease moves
 /// to a new incarnation and the record goes once more, above it.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "PublishRow",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
 pub(crate) fn publish(
     mesh: &Mesh,
     log: MeshLog,
@@ -960,20 +984,31 @@ struct Row {
 
 /// The newest row of every `now` and `quota` subject `log` holds, each with its origin's key.
 fn newest_rows(mesh: &Mesh, log: MeshLog) -> io::Result<Vec<Row>> {
-    let hosted = mesh.hosted(log);
     let mut rows = Vec::new();
     if log != MeshLog::Metrics {
         return Ok(rows);
     }
-    for filter in [
-        aterm_metrics::rules::NOW_FILTER,
-        aterm_metrics::rules::QUOTA_FILTER,
-    ] {
-        let grant = [hosted.mint(&format!("ro:{filter}"))?];
-        let mut reader = client_over(hosted.adopt(mesh.me.key)?, &grant)?;
-        let (last, _) = reader.last_all(filter)?;
-        let wanted: BTreeSet<u64> = last.iter().map(|(offset, _, _)| *offset).collect();
-        rows.extend(stamped(reader, filter, &wanted)?);
+    let hosted = mesh.hosted(log);
+    let now_filter = aterm_metrics::rules::NOW_FILTER;
+    let quota_filter = aterm_metrics::rules::QUOTA_FILTER;
+    let grants = [
+        hosted.mint(&format!("ro:{now_filter}"))?,
+        hosted.mint(&format!("ro:{quota_filter}"))?,
+    ];
+    let mut reader = client_over(hosted.adopt(mesh.me.key)?, &grants)?;
+    let (now_last, _) = reader.last_all(now_filter)?;
+    let (quota_last, _) = reader.last_all(quota_filter)?;
+    let now_wanted: BTreeSet<u64> = now_last.iter().map(|(offset, _, _)| *offset).collect();
+    let quota_wanted: BTreeSet<u64> = quota_last.iter().map(|(offset, _, _)| *offset).collect();
+    match (!now_wanted.is_empty(), !quota_wanted.is_empty()) {
+        (false, false) => {}
+        (true, false) => rows.extend(stamped(reader, now_filter, &now_wanted)?),
+        (false, true) => rows.extend(stamped(reader, quota_filter, &quota_wanted)?),
+        (true, true) => {
+            rows.extend(stamped(reader, now_filter, &now_wanted)?);
+            let quota_reader = client_over(hosted.adopt(mesh.me.key)?, &grants[1..])?;
+            rows.extend(stamped(quota_reader, quota_filter, &quota_wanted)?);
+        }
     }
     Ok(rows)
 }
@@ -1184,6 +1219,62 @@ pub(crate) fn next_backoff(backoff: Duration, kicked: bool) -> Duration {
 
 /// One run of a relay: open, settle a fresh lease, resume the cursor or start at the head, then
 /// follow.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayCA",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayCB",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayAB",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayBA",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayAC",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayBC",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "MeshRelay",
+        action = "RelayAD",
+        project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+    )
+)]
 fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
     let hosted = mesh.hosted(slot.log);
     let dial = Arc::new(BusDial::new(Arc::clone(&slot.link), slot.log));
@@ -1401,3 +1492,100 @@ fn start_at_head(
     local.commit_before(group, head)?;
     Ok(())
 }
+
+/// Host for `MeshRelay`'s environment markers (one-mesh §9; B8's conformance,
+/// `tests::tables::relay_conformance`), so `spec_xref_closure` accounts for every model action:
+/// links that go down and heal, a node service that stops and starts, a new Mac, a size cut, the
+/// wall clock passing 7 days and a forger are what happens around the relay, the egress,
+/// `Inventory` and the revocation pass (the relay's answer to a cursor past 7 days is
+/// `relay_once`'s).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "Split",
+        reason = "Environment: C's links go down while it keeps running (the lab's partition)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "Join",
+        reason = "Environment: the partition heals and the overlays dial again"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "AwayC",
+        reason = "Environment: C's node service stops while it is cut off"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "ReturnC",
+        reason = "Environment: C's node service starts again"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "Arrive",
+        reason = "Environment: a new Mac with empty stores is seated and starts"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "AwayB",
+        reason = "Environment: B's node service stops (a Mac asleep)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "ReturnB",
+        reason = "Environment: B's node service starts again"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "Expire",
+        reason = "Environment: 7 days pass on the wall clock while B is away"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "CutC",
+        reason = "Environment: the tables log's size cut passes B's cursor on C"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "CutA",
+        reason = "Environment: the tables log's size cut passes B's cursor on A"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "MeshRelay",
+        action = "Forge",
+        reason = "Environment: a neighbour offers a record under C's subject that C's key did not sign"
+    )
+)]
+#[doc(hidden)]
+pub fn mesh_relay_environment() {}

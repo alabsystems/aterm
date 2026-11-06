@@ -214,6 +214,7 @@ fn journal_view(
 struct Cache {
     paths: Paths,
     config: PathBuf,
+    spool: Option<Spool>,
     held: Mutex<Option<Arc<alab_seen::Seen>>>,
     /// The last view of the registry projected here, and the inventory it was projected from.
     lab: Mutex<Option<(Arc<LabView>, Inventory)>>,
@@ -253,8 +254,8 @@ impl Cache {
             }
         };
         drop(last);
-        let spool = Spool::local();
-        let heard = spool
+        let heard = self
+            .spool
             .as_ref()
             .map(|spool| (spool, now.saturating_sub(HEARD_BACK_S)));
         match seen::read(&self.paths, heard, now) {
@@ -292,21 +293,21 @@ impl alab_seen::Source for &'static Cache {
         ) {
             return None;
         }
-        let held = self
+        let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if held.is_none() && wait {
             self.read();
-        }
-        self.start_reader();
-        held.or_else(|| {
-            self.held
+            held = self
+                .held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        })
+                .clone();
+        }
+        self.start_reader();
+        held
     }
 }
 
@@ -329,6 +330,7 @@ pub(crate) fn install() {
     let cache = CACHE.get_or_init(|| Cache {
         paths: Paths::for_home(&home),
         config,
+        spool: Spool::local(),
         held: Mutex::new(None),
         lab: Mutex::new(None),
         reader: OnceLock::new(),
@@ -353,6 +355,7 @@ mod tests {
         let cache: &'static Cache = Box::leak(Box::new(Cache {
             paths: Paths::for_home(home.path()),
             config: config.clone(),
+            spool: None,
             held: Mutex::new(Some(Arc::clone(&history))),
             lab: Mutex::new(None),
             reader: OnceLock::from(()),

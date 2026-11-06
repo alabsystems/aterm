@@ -42,6 +42,42 @@ fn cpu_pool_width(fixture: &CohortFixture, width: u32) -> RetainedPool {
 }
 
 #[test]
+fn retained_bundle_covers_registered_subgroup_after_original_root_exits() {
+    let fixture = CohortFixture::new();
+    let other = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let foreign = Fence::acquire(&other.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let mut root = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    assert!(
+        retained
+            .launch_subgroup(&foreign, &mut root.owned, &mut cat())
+            .is_err()
+    );
+    let mut subgroup = Running::new(
+        retained
+            .launch_subgroup(&fence, &mut root.owned, &mut cat())
+            .unwrap(),
+    );
+    assert_ne!(root.owned.cohort(), subgroup.owned.cohort());
+    assert!(retained.retire_subgroup(&fence, &subgroup.owned).is_err());
+    root.end();
+    assert!(retained.try_finish(&fence).is_err());
+    assert_cpu_denied(&pool);
+    subgroup.end();
+    assert!(retained.retire_subgroup(&foreign, &subgroup.owned).is_err());
+    retained.retire_subgroup(&fence, &subgroup.owned).unwrap();
+    retained.try_finish(&fence).unwrap();
+    assert_settled_cpu_available(&pool).settle().unwrap();
+}
+
+#[test]
 fn cpu_bundle_releases_only_after_the_original_group_drains() {
     let fixture = CohortFixture::new();
     let pool = cpu_pool_width(&fixture, 3);
@@ -51,7 +87,17 @@ fn cpu_bundle_releases_only_after_the_original_group_drains() {
         .collect();
     let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
     assert_eq!(retained.cpu_units(), 3);
+    assert!(retained.observation(&fence).is_err());
     let mut leader = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    let observation = retained.observation(&fence).unwrap();
+    assert_eq!(observation.cpu.len(), 3);
+    assert_eq!(observation.memory_bytes, 30 * 1024 * 1024 * 1024);
+    assert!(
+        observation
+            .cpu
+            .iter()
+            .all(|cpu| cpu.manifest == observation.cpu[0].manifest)
+    );
     let mut member = Running::new(
         retained
             .launch_member(&fence, &mut leader.owned, &mut cat())
@@ -63,6 +109,7 @@ fn cpu_bundle_releases_only_after_the_original_group_drains() {
     member.end();
     retained.try_finish(&fence).unwrap();
     assert!(retained.is_settled());
+    assert!(retained.observation(&fence).is_err());
     assert_eq!(retained.cpu_units(), 3);
     assert!(
         pool.snapshot()

@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "trust-resource-provenance"
+version = "0.13.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Read-only native provenance for retained resource custodians"
+
+[dependencies]
+libc = { path = "../../crates/aterm-libc" }
+serde = { package = "aterm-serde", path = "../../crates/aterm-serde" }
+serde_json = { package = "aterm-json", path = "../../crates/aterm-json" }
+sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false }
+
+[dev-dependencies]
+tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
+
+[package.metadata.aterm-vendor]
+upstream = "https://github.com/alabsystems/trust"
+commit = "c1256ef3a39692eef82fc8ef99b3a2f2bef4f852"
+subdir = "crates/trust-resource-provenance"

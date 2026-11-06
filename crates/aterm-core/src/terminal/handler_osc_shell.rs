@@ -267,11 +267,13 @@ impl TerminalHandler<'_> {
             return;
         };
         if self.dispatch_shell_mark(cmd, row, col, params) {
-            let payload = match cmd {
-                'D' => format!("D;exit={}", Self::parse_exit_code(params)),
-                _ => format!("{cmd};row={row};col={col}"),
-            };
-            self.queue_osc_event(133, payload);
+            match cmd {
+                'D' => {
+                    let exit = Self::parse_exit_code(params);
+                    self.queue_osc_event(133, || format!("D;exit={exit}"));
+                }
+                _ => self.transient.osc_events.push_mark(cmd, row, col),
+            }
         }
     }
 
@@ -1178,6 +1180,7 @@ mod reported_cwd_tests {
 
     fn gated_at_first_prompt() -> Terminal {
         let mut t = Terminal::new(6, 60);
+        t.set_osc_event_polling(true);
         t.authorize_shell_integration(KEY);
         t.set_require_shell_integration_nonce(true);
         t.process(&osc7("/home/me"));
@@ -1210,6 +1213,7 @@ mod reported_cwd_tests {
 
     fn signing_at_prompt() -> Terminal {
         let mut t = Terminal::new(6, 60);
+        t.set_osc_event_polling(true);
         t.authorize_shell_integration(KEY);
         t.set_require_shell_integration_nonce(true);
         for line in ["", "true\r\n"] {
@@ -1297,6 +1301,7 @@ mod reported_cwd_tests {
     #[test]
     fn without_the_nonce_gate_every_report_lands_at_once() {
         let mut t = Terminal::new(6, 60);
+        t.set_osc_event_polling(true);
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         t.process(&osc7("/elsewhere"));
         assert_eq!(t.current_working_directory(), Some("/elsewhere"));
@@ -1559,6 +1564,7 @@ mod reported_cwd_tests {
         assert_eq!(t.current_working_directory(), Some("/srv"));
         assert_eq!(cwd_events(&mut t), vec!["//host/srv".to_owned()]);
         let mut t = Terminal::new(6, 60);
+        t.set_osc_event_polling(true);
         t.process(b"\x1b]7;file://host/a;id=b\x07");
         assert_eq!(t.current_working_directory(), Some("/a;id=b"));
     }

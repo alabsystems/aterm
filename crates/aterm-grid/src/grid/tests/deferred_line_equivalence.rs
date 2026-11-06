@@ -85,12 +85,8 @@ fn deferred_line_matches_the_eager_conversion() {
             .map(|&b| Cell::with_style(char::from(b), fg, bg, flags))
             .collect()
     };
-    let link = |start_col, end_col, url: &str| HyperlinkSpan {
-        start_col,
-        end_col,
-        url: Arc::from(url),
-        id: None,
-    };
+    let link =
+        |start_col, end_col, url: &str| HyperlinkSpan::new(start_col, end_col, Arc::from(url));
     let complex = |cells: &mut Vec<Cell>, col: usize| cells[col].set_overflow_index(0);
     let mut cases: Vec<(&str, Vec<Cell>, ScrolledRowExtras, bool)> = vec![
         ("empty", Vec::new(), ScrolledRowExtras::default(), false),

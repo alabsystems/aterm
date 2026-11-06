@@ -1417,15 +1417,23 @@ fn capture_owning_wait(
 /// reads the birth and the kernel unique id `watched` read at its spawn and its thread has run
 /// ([`aterm_uds::tether::end_watched`]), whose answer this is. A child that already exited, its
 /// zombie unreaped, reads as gone and gets nothing. This does not reap or settle capture custody.
+/// In this crate's tests the grace is the one-minute hang detector
+/// (`aterm_spec::wait::MUST_HAPPEN`, as for the group kill after it): a test's child must answer
+/// its `SIGTERM`, and how soon a loaded machine schedules it to is no latency budget
+/// (`end_proven`'s own tests hold the grace itself).
 ///
 /// [`END_GRACE`]: aterm_uds::process::END_GRACE
 #[cfg(unix)]
 fn end_owned(
     watched: aterm_uds::tether::Watched,
 ) -> Result<aterm_uds::process::Ended, aterm_uds::process::EndRefusal> {
+    #[cfg(not(test))]
+    let grace = aterm_uds::process::END_GRACE;
+    #[cfg(test)]
+    let grace = aterm_spec::wait::MUST_HAPPEN;
     aterm_uds::tether::end_watched(
         watched,
-        aterm_uds::process::END_GRACE,
+        grace,
         &mut aterm_uds::process::EndControlLive,
         |pid| {
             Some(aterm_uds::tether::Proof {

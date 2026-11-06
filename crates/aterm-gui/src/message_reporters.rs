@@ -3448,7 +3448,8 @@ fn fitted_title(head: &str, place: &str) -> String {
     }
 }
 
-fn host_record_key(kind: &str, sid: &str) -> String {
+/// The key of a host record of `kind` about session `sid`.
+pub(crate) fn host_record_key(kind: &str, sid: &str) -> String {
     format!(
         "harness.host.{kind}.{}",
         atpkg::progress::sanitize_for_tty(sid, 40)
@@ -3510,6 +3511,30 @@ pub(crate) fn worker_failed_record(sid: &str, place: &str, words: &str) -> Messa
     ))
     .record()
     .key(&host_record_key("worker-failed", sid))
+}
+
+/// The record in Messages of a worker's mail to its manager that nothing took
+/// ([`crate::worker_mail`]): worker `sid`, its manager as `manager` names it, the mail's `subject`
+/// and why it went nowhere. Each mail has its own record (`key`, the mail's key), never sent
+/// again. No alert: nobody acts on it, and the worker's state reads the same everywhere else.
+pub(crate) fn worker_mail_unsent_record(
+    sid: &str,
+    manager: &str,
+    subject: &str,
+    why: &str,
+    key: &str,
+) -> Message {
+    let line =
+        |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);
+    Message::new(tags::HARNESS, Severity::Info, "Worker mail not delivered")
+        .line(line(&format!("{sid} to its manager {manager}: {subject}")))
+        .line(line(why))
+        .record()
+        .key(&format!(
+            "{}.{:016x}",
+            host_record_key("worker-mail", sid),
+            aterm_hash::fnv1a_64(key.as_bytes())
+        ))
 }
 
 /// Builds the exceptions digest entry of a worker that ended unfinished with nobody waiting on it:

@@ -27,7 +27,7 @@ use super::{
     visible_char,
 };
 use crate::frame_key::FrameKey;
-use crate::frame_memo::{FrameSlot, ScreenText, Styled};
+use crate::frame_memo::{FrameSlot, ScreenText, Styled, styled_body_within};
 use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::metrics::wire::{
     FieldSink, FlagWords, Form, JsonSink, ReadCtx, Request, Syntax, TextSink,
@@ -2468,12 +2468,62 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
     }
 }
 
-/// Serialize a gathered [`StyledFrameSnapshot`] to the single-line JSON frame, lock-free.
+/// Serialize a gathered [`StyledFrameSnapshot`] to the single-line JSON frame, lock-free and
+/// unbounded, for the tests: a reply builds its frame within its cap
+/// ([`serialize_styled_frame_within`]).
+#[cfg(test)]
 pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
     let payloads = styled_frame_payloads(snap);
     let mut out = String::with_capacity(styled_frame_estimate(snap, &payloads));
-    write_styled_frame(&mut out, snap, &payloads);
+    write_styled_frame(&mut out, snap, &payloads, usize::MAX);
     out
+}
+
+/// The fewest bytes [`write_styled_cell_json`] writes for one cell: its keys and the shortest
+/// value each can take (232 bytes) less a margin, so a grid of `cells` serializes to no fewer
+/// than `cells` times this.
+pub(crate) const STYLED_CELL_FLOOR_BYTES: usize = 200;
+
+/// A lower bound on the styled frame of a `rows` by `cols` grid, known before anything is
+/// gathered: a frame past a cap by this bound need not be built to be refused.
+pub(crate) const fn styled_frame_floor(rows: usize, cols: usize) -> usize {
+    rows.saturating_mul(cols)
+        .saturating_mul(STYLED_CELL_FLOOR_BYTES)
+}
+
+/// Serialize `snap` (its image payloads only when `with_payloads`) within `cap` bytes, or
+/// `Err` with the bytes written when it passed `cap`: the writer stops at the row or image
+/// that passes it, so it holds at most `cap` and one row or image more. Payloads are encoded
+/// only when their base64 and the grid's [`styled_frame_floor`] fit `cap` together, else `Err`
+/// with that sum, nothing encoded.
+pub(crate) fn serialize_styled_frame_within(
+    snap: &StyledFrameSnapshot,
+    with_payloads: bool,
+    cap: usize,
+) -> Result<String, usize> {
+    let payloads = if with_payloads && snap.image_payloads {
+        let charge = snap
+            .images
+            .iter()
+            .filter(|(_, _, img)| img.bytes.len() <= control_media::MAX_IMAGE_PAYLOAD_BYTES)
+            .map(|(_, _, img)| img.bytes.len().div_ceil(3).saturating_mul(4))
+            .fold(
+                styled_frame_floor(snap.rows, snap.cols),
+                usize::saturating_add,
+            );
+        if charge > cap {
+            return Err(charge);
+        }
+        styled_frame_payloads(snap)
+    } else {
+        vec![ImagePayload::TRUNCATED; snap.images.len()]
+    };
+    let mut out = String::with_capacity(styled_frame_estimate(snap, &payloads).min(cap));
+    if write_styled_frame(&mut out, snap, &payloads, cap) {
+        Ok(out)
+    } else {
+        Err(out.len())
+    }
 }
 
 fn styled_frame_payloads(snap: &StyledFrameSnapshot) -> Vec<ImagePayload> {
@@ -2492,7 +2542,13 @@ fn styled_frame_estimate(snap: &StyledFrameSnapshot, payloads: &[ImagePayload]) 
             .sum::<usize>()
 }
 
-fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot, payloads: &[ImagePayload]) {
+/// Write the frame, `false` (the frame cut short) as soon as `out` holds more than `budget`.
+fn write_styled_frame(
+    out: &mut String,
+    snap: &StyledFrameSnapshot,
+    payloads: &[ImagePayload],
+    budget: usize,
+) -> bool {
     use std::fmt::Write as _;
     let cursor_color = styled_optional_rgb(snap.cursor_color, "default");
     let selection_json = styled_selection_json(snap.selection.as_ref());
@@ -2523,6 +2579,9 @@ fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot, payloads: &[
             write_styled_cell_json(out, cell, row.glyph(c), &snap.links);
         }
         out.push(']');
+        if out.len() > budget {
+            return false;
+        }
     }
     out.push_str("],\"line_sizes\":[");
     for (i, s) in snap.line_sizes.iter().enumerate() {
@@ -2545,8 +2604,12 @@ fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot, payloads: &[
             out.push(',');
         }
         styled_image_json(out, *ar, *ac, img, payload);
+        if out.len() > budget {
+            return false;
+        }
     }
     out.push_str("]}");
+    out.len() <= budget
 }
 
 /// The styled frame (`{"seq":N,"dims":{...},"cursor":{...},"rows":[[StyledCell,...],...],"line_sizes":[...],"selection":...,"selection_bg":...,"selection_fg":...,"images":[...]}`) gathered and serialized in one call, for the tests.
@@ -2649,6 +2712,10 @@ const fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
 
 /// `screen` -> the lossless engine-styled grid as a single-line JSON frame in the `OK 1\n<json>\n` read framing.
 /// Read in a whole frame ([`term_lock_whole`]); a reply read on one still unfinished closes with `"frame":"open"`.
+/// A frame past the reply-line cap is never built: a grid whose [`styled_frame_floor`] passes it,
+/// or whose frame a `cells` watch already refused ([`crate::frame_memo::Look::refused`]), is
+/// refused ungathered, and any other frame is serialized only up to the cap
+/// ([`styled_body_within`]), its pictures left out when they do not fit.
 pub(crate) fn cmd_screen_styled_json(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
@@ -2657,6 +2724,12 @@ pub(crate) fn cmd_screen_styled_json(
     let since = match screen_args(rest) {
         Ok(since) => since,
         Err(usage) => return usage,
+    };
+    let cap = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
+    let too_large = |bytes: usize| {
+        format!(
+            "ERR screen: frame too large ({bytes} bytes > {cap}); `text` or `cell` reads a grid this size\n"
+        )
     };
     let mut look = frame.look_frame();
     let (styled, key, tail) = {
@@ -2671,13 +2744,20 @@ pub(crate) fn cmd_screen_styled_json(
                 frame_open_field(&t),
             ));
         }
+        let floor = styled_frame_floor(t.rows() as usize, t.cols() as usize);
+        if floor > cap {
+            return too_large(floor);
+        }
+        if let Some(reached) = look.refused(&key) {
+            return too_large(reached);
+        }
         let tail = ScreenTail {
             etag,
             open: crate::frame_unfinished_now(&t),
         };
         (look.styled(&t, &key), key, tail)
     };
-    let reply = |frame: &str| {
+    let reply = |frame: &str, tail: ScreenTail| {
         let mut out = String::with_capacity(32 + frame.len());
         out.push_str("OK 1\n");
         out.push_str(frame);
@@ -2685,62 +2765,42 @@ pub(crate) fn cmd_screen_styled_json(
     };
     let (out, lighter) = match styled {
         Styled::Hit(published) => (
-            reply(published.body()),
-            Lighter::Published(published.carries_image_payloads()),
+            Ok(reply(published.body(), tail)),
+            published.carries_image_payloads(),
         ),
         Styled::Miss(snap) => {
-            let out = if look.keeps_styled() {
-                reply(look.publish_styled(key, &snap).body())
+            let built = if look.keeps_styled() {
+                look.publish_styled_within(key, &snap)
+                    .map(|frame| reply(frame.body(), tail))
             } else {
-                screen_frame_reply(&snap, tail)
+                styled_body_within(&snap).map(|(body, _)| reply(&body, tail))
             };
-            (out, Lighter::Gathered(snap))
+            (built, false)
         }
     };
     drop(look);
-    let cap = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
-    if frame_line_len(&out) <= cap {
-        return out;
-    }
-    let out = match lighter {
-        Lighter::Gathered(mut snap) if snap.carries_image_payloads() => {
-            snap.image_payloads = false;
-            screen_frame_reply(&snap, tail)
-        }
-        Lighter::Published(true) => {
-            let (mut snap, tail) = {
+    let out = match out {
+        Ok(out) if frame_line_len(&out) > cap && lighter => {
+            let (snap, tail) = {
                 let t = term_lock_whole(term);
+                if styled_frame_floor(t.rows() as usize, t.cols() as usize) > cap {
+                    return too_large(frame_line_len(&out));
+                }
                 let tail = ScreenTail {
                     etag: FrameKey::read(&t).etag(),
                     open: crate::frame_unfinished_now(&t),
                 };
                 (gather_styled_frame(&t), tail)
             };
-            snap.image_payloads = false;
-            screen_frame_reply(&snap, tail)
+            serialize_styled_frame_within(&snap, false, cap).map(|body| reply(&body, tail))
         }
-        Lighter::Gathered(_) | Lighter::Published(false) => out,
+        out => out,
     };
-    let len = frame_line_len(&out);
-    if len > cap {
-        return format!(
-            "ERR screen: frame too large ({len} bytes > {cap}); `text` or `cell` reads a grid this size\n"
-        );
+    match out {
+        Ok(out) if frame_line_len(&out) <= cap => out,
+        Ok(out) => too_large(frame_line_len(&out)),
+        Err(reached) => too_large(reached),
     }
-    out
-}
-
-enum Lighter {
-    Gathered(StyledFrameSnapshot),
-    Published(bool),
-}
-
-fn screen_frame_reply(snap: &StyledFrameSnapshot, tail: ScreenTail) -> String {
-    let payloads = styled_frame_payloads(snap);
-    let mut out = String::with_capacity(32 + styled_frame_estimate(snap, &payloads));
-    out.push_str("OK 1\n");
-    write_styled_frame(&mut out, snap, &payloads);
-    close_with_etag(out, tail)
 }
 
 /// The keys a full `screen` reply closes with, read in its frame's hold; neither is in the published frame.

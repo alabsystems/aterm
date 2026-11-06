@@ -4,49 +4,64 @@
 
 //! OSC 8 hyperlink spans, kept when lines scroll from the grid into scrollback.
 
+use aterm_types::HyperlinkData;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-/// A contiguous column range of a line that shares one OSC 8 hyperlink.
+/// A contiguous column range sharing one OSC 8 value. URL/ID edits detach that
+/// value through copy-on-write; changing the range keeps its payload shared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HyperlinkSpan {
     /// Start column (inclusive).
     pub start_col: u16,
     /// End column (exclusive).
     pub end_col: u16,
-    /// URL (shared for efficiency when the same URL spans multiple positions).
-    pub url: Arc<str>,
-    /// OSC 8 `id=` parameter (shared). `None` if the hyperlink had no explicit ID.
-    pub id: Option<Arc<str>>,
+    /// URL and optional ID, shared with cells and other ranges of the same link.
+    pub payload: Arc<HyperlinkData>,
 }
 
 impl HyperlinkSpan {
     /// Create a new hyperlink span (no explicit ID).
     #[must_use]
     #[inline]
-    pub const fn new(start_col: u16, end_col: u16, url: Arc<str>) -> Self {
-        Self {
-            start_col,
-            end_col,
-            url,
-            id: None,
-        }
+    pub fn new(start_col: u16, end_col: u16, url: Arc<str>) -> Self {
+        Self::with_id(start_col, end_col, url, None)
     }
 
     /// Create a new hyperlink span with an explicit OSC 8 ID.
     #[must_use]
     #[inline]
-    pub const fn with_id(
-        start_col: u16,
-        end_col: u16,
-        url: Arc<str>,
-        id: Option<Arc<str>>,
-    ) -> Self {
+    pub fn with_id(start_col: u16, end_col: u16, url: Arc<str>, id: Option<Arc<str>>) -> Self {
+        Self::from_shared(start_col, end_col, Arc::new(HyperlinkData { url, id }))
+    }
+
+    /// Attach a range to an existing shared hyperlink value.
+    #[must_use]
+    #[inline]
+    pub const fn from_shared(start_col: u16, end_col: u16, payload: Arc<HyperlinkData>) -> Self {
         Self {
             start_col,
             end_col,
-            url,
-            id,
+            payload,
         }
+    }
+
+    /// Give the same hyperlink value a different column range.
+    #[must_use]
+    #[inline]
+    pub fn with_range(&self, start_col: u16, end_col: u16) -> Self {
+        Self::from_shared(start_col, end_col, Arc::clone(&self.payload))
+    }
+
+    /// Per-reference heap charge for the payload and string bytes. Includes a
+    /// modeled two-word Arc header; shared payloads may be charged more than once.
+    #[must_use]
+    #[inline]
+    pub fn retained_payload_bytes(&self) -> usize {
+        std::mem::size_of::<HyperlinkData>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(self.url.len())
+            .saturating_add(self.id.as_ref().map_or(0, |id| id.len()))
     }
 
     /// Check if a column is within this span.
@@ -68,5 +83,48 @@ impl HyperlinkSpan {
         12usize
             .saturating_add(self.url.len())
             .saturating_add(id_len)
+    }
+}
+
+impl Deref for HyperlinkSpan {
+    type Target = HyperlinkData;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+impl DerefMut for HyperlinkSpan {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_changes_share_but_value_edits_detach() {
+        let original = HyperlinkSpan::with_id(
+            0,
+            80,
+            Arc::from("https://example.com"),
+            Some(Arc::from("original")),
+        );
+        let mut clipped = original.with_range(2, 4);
+        assert!(Arc::ptr_eq(&original.payload, &clipped.payload));
+        clipped.start_col = 1;
+        assert_eq!((original.start_col, original.end_col), (0, 80));
+        assert!(Arc::ptr_eq(&original.payload, &clipped.payload));
+        clipped.id = Some(Arc::from("edited"));
+        assert_eq!(original.id.as_deref(), Some("original"));
+        assert_eq!(clipped.id.as_deref(), Some("edited"));
+        assert!(!Arc::ptr_eq(&original.payload, &clipped.payload));
+        assert!(Arc::ptr_eq(&original.url, &clipped.url));
+        drop(original);
+        assert_eq!(clipped.url.as_ref(), "https://example.com");
     }
 }

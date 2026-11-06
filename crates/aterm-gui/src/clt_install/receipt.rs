@@ -278,6 +278,21 @@ impl Receipt {
         self.sid == sid && self.pid == pid && Some(self.birth) == birth && self.matches()
     }
 
+    /// The successor may have claimed the receipt before the outgoing process commits.
+    /// Only that build claim may change; custody must still name the exact same child.
+    pub(super) fn transferable(
+        &self,
+        mark: &Path,
+        sid: &str,
+        pid: i32,
+        birth: Option<u64>,
+    ) -> bool {
+        self.sid == sid
+            && self.pid == pid
+            && Some(self.birth) == birth
+            && Self::adopt(mark, sid, pid, birth).is_some_and(|current| current.path == self.path)
+    }
+
     pub(super) fn remove_if_matching(&self) {
         if self.matches()
             && let Err(error) = std::fs::remove_file(&self.path)

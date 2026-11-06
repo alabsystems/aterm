@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use aterm_capacity::CpuObservation;
+use aterm_capacity::{CpuHolder, CpuObservation};
 use aterm_json::Value;
 
 /// The command's presentation of the same facts native views consume.
@@ -38,25 +38,46 @@ impl Report {
             CpuObservation::Initializing => {
                 vec!["cpu-leases initializing; occupancy unavailable".to_owned()]
             }
+            CpuObservation::Busy => {
+                vec!["cpu-leases admission snapshot busy; occupancy unavailable".to_owned()]
+            }
             CpuObservation::Unreadable(error) => vec![format!("cpu-leases unreadable: {error}")],
-            CpuObservation::Ready { total, holders } => {
+            CpuObservation::Ready {
+                total,
+                holders,
+                external,
+            } => {
                 let mut lines = vec![format!(
-                    "cpu-leases {} held, {} available of {total}",
-                    holders.len(),
-                    total - holders.len(),
+                    "cpu-leases {} {}, {} available of {total}",
+                    self.0.occupied().unwrap_or(0),
+                    if external.is_some() {
+                        "occupied"
+                    } else {
+                        "held"
+                    },
+                    self.0.available().unwrap_or(0),
                 )];
-                lines.extend(holders.iter().map(|holder| {
-                    format!(
-                        "  slot {} reported_pid={} reported_birth={}",
-                        holder.slot,
-                        holder
-                            .reported_pid
-                            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
-                        holder
-                            .reported_birth
-                            .map_or_else(|| "unknown".to_owned(), |birth| birth.to_string()),
-                    )
-                }));
+                lines.extend(holders.iter().map(|holder| holder_line("", holder)));
+                if let Some(external) = external {
+                    lines.push(format!(
+                        "  shared backing: {} native, {} external held, {} crash-retained",
+                        holders.len(),
+                        external.holders.len(),
+                        external.retained.len()
+                    ));
+                    lines.extend(
+                        external
+                            .holders
+                            .iter()
+                            .map(|holder| holder_line("external ", holder)),
+                    );
+                    lines.extend(
+                        external
+                            .retained
+                            .iter()
+                            .map(|holder| holder_line("retained ", holder)),
+                    );
+                }
                 lines
             }
         }
@@ -65,6 +86,19 @@ impl Report {
     pub(super) fn json(&self) -> Value {
         self.0.json()
     }
+}
+
+fn holder_line(kind: &str, holder: &CpuHolder) -> String {
+    format!(
+        "  {kind}slot {} reported_pid={} reported_birth={}",
+        holder.slot,
+        holder
+            .reported_pid
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+        holder
+            .reported_birth
+            .map_or_else(|| "unknown".to_owned(), |birth| birth.to_string())
+    )
 }
 
 #[cfg(test)]
@@ -77,6 +111,7 @@ mod tests {
     fn rendering_preserves_cpu_lease_counts_and_reported_identities() {
         let report = Report(CpuObservation::Ready {
             total: 2,
+            external: None,
             holders: vec![CpuHolder {
                 slot: 1,
                 reported_pid: Some(42),
@@ -95,6 +130,7 @@ mod tests {
         assert_eq!(report.json().get("total"), Some(&Value::from(2u64)));
         let unknown = Report(CpuObservation::Ready {
             total: 1,
+            external: None,
             holders: vec![CpuHolder {
                 slot: 0,
                 reported_pid: None,

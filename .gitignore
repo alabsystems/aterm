@@ -2,6 +2,7 @@
 # will have compiled files and executables
 debug
 target
+.build.noindex
 
 # The Trust lane's target root (`ship trust run`), and `target-trust`, which
 # older runs left.

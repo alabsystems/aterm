@@ -140,6 +140,17 @@ impl Stores for VaultStores {
             .collect())
     }
 
+    fn table_length(&self, key: TableKey) -> io::Result<Option<u64>> {
+        aterm_db::table::store::held_length(&self.paths, key.table, key.recovery)
+            .map_err(|e| io_of(&e))
+    }
+
+    fn tables_summary(&self) -> io::Result<Vec<super::TableSummary>> {
+        self.replica()
+            .and_then(|replica| replica.mesh_tables_summary())
+            .map_err(|e| io_of(&e))
+    }
+
     fn table_held(&self, key: TableKey, from: u64, upto: u64) -> io::Result<Vec<Held>> {
         Ok(
             aterm_db::table::store::read_held(&self.paths, key.table, key.recovery, from, upto)
@@ -173,6 +184,16 @@ impl Stores for VaultStores {
     fn tables(&self) -> io::Result<BTreeSet<Digest>> {
         self.replica()
             .and_then(|replica| replica.mesh_tables())
+            .map_err(|e| io_of(&e))
+    }
+
+    /// The vault takes what its Commons selection lists, which is what `mesh_ingest` admits (the
+    /// catalog, the ring window's held tables and each subscribed declaration, one that entered
+    /// a moment ago included), and a ring window's table it does not hold yet, which it takes up
+    /// as a repair round does one a peer offers (`Replica::mesh_takes`).
+    fn takes(&self, table: Digest) -> io::Result<bool> {
+        self.replica()
+            .and_then(|replica| replica.mesh_takes(table))
             .map_err(|e| io_of(&e))
     }
 

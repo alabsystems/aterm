@@ -35,6 +35,7 @@ use super::{
 use crate::Result;
 use crate::age::Recipient;
 use aterm_digest::Sha256;
+use aterm_mesh_core::gap_heal::{self, gap, heals_omission};
 use std::collections::BTreeSet;
 
 /// Epochs of an admission, each with its audience, by audience then id.
@@ -272,22 +273,8 @@ impl Log {
             && !self.recipient_is_removed(&seat.binding.recipient())
     }
 
-    /// The wrap gaps in `audiences` that the member that opened `opened` can close (M5): for each
-    /// epoch of [`Log::admission_epochs`] it unwrapped, each current seat
-    /// ([`Log::current_recipients`]) with no effective `Wrap` of it where either
-    ///
-    /// - the epoch is a causally newest one of its audience that wraps no removed Mac (one that
-    ///   does is due a re-key, which wraps every current seat), whether or not its minter knew
-    ///   the seat: a missing `Wrap` is never a revocation; or
-    /// - the seat's entry (its `Admit`, or the genesis) is not in the epoch's causal past, so the
-    ///   minter could not have known it: a Mac admitted beside the rotation, which needs every
-    ///   epoch an admission hands on.
-    ///
-    /// Only an explicit `Remove` (or a node removal) takes a seat out, so a removed Mac is never
-    /// named; the client drops the seats its roster denies. Whether the epoch's batch has settled
-    /// is the client's hold (`close_wrap_gaps`), not this. With [`old_gap_rule`] on, the rule of
-    /// 0.154.0 and before: no newest-epoch omission is a gap, and a seat any newest epoch leaves
-    /// out ([`Log::left_out`]) is skipped.
+    /// The wrap gaps in `audiences` that the member that opened `opened` can close (M5), read with
+    /// no roster: [`Log::wrap_gaps_denying`] with no seat denied.
     ///
     /// `audiences` are [`SeatAudience`]s, so a host list, which names its Macs, cannot be asked:
     /// read as a seat audience it would name every seat outside the list.
@@ -311,37 +298,69 @@ impl Log {
         opened: &OpenedAudienceEntries,
         audiences: &[SeatAudience],
     ) -> Vec<Gap> {
+        self.wrap_gaps_denying(opened, audiences, |_| false)
+    }
+
+    /// The wrap gaps in `audiences` that the member that opened `opened` can close (M5,
+    /// one-mesh proofs P2, `aterm_mesh_core::gap_heal::gap`): for each epoch of
+    /// [`Log::admission_epochs`] it unwrapped, each current seat ([`Log::current_recipients`])
+    /// with no effective `Wrap` of it where either
+    ///
+    /// - the epoch heals omissions (`heals_omissions`): it is a causally newest one of its
+    ///   audience, and it wraps no removed Mac or no carrier holds every newest epoch there.
+    ///   Whether or not its minter knew the seat, a missing `Wrap` is never a revocation; or
+    /// - the seat's entry (its `Admit`, or the genesis) is not in the epoch's causal past, so the
+    ///   minter could not have known it: a Mac admitted beside the rotation, which needs every
+    ///   epoch an admission hands on.
+    ///
+    /// Only an explicit `Remove` (or a node removal) takes a seat out, so a removed Mac is never
+    /// named. `denied` is the client's one deny (both rosters): it decides who can carry a re-key,
+    /// and the client drops the gaps of the seats it denies. Whether the epoch's batch has settled
+    /// is the client's hold (`close_wrap_gaps`), not this. With [`old_gap_rule`] on, the rule of
+    /// 0.154.0 and before: no omission the minter knew is a gap, and a seat any newest epoch
+    /// leaves out ([`Log::left_out`]) is skipped.
+    #[must_use]
+    pub fn wrap_gaps_denying(
+        &self,
+        opened: &OpenedAudienceEntries,
+        audiences: &[SeatAudience],
+        denied: impl Fn(&Member) -> bool,
+    ) -> Vec<Gap> {
         let old = old_gap_rule();
         let effective = self.effective();
         let membership = self.membership();
         let removed = self.removed_recipients();
         let mut gaps = Vec::new();
         for (audience, epoch) in Self::admission_epochs(opened, audiences) {
-            if !opened.unwrapped_keys.contains_key(&epoch) {
+            let opens = opened.unwrapped_keys.contains_key(&epoch);
+            if !opens {
                 continue;
             }
             let Some(&epoch_at) = self.held.get(&epoch) else {
                 continue;
             };
             let wrapped = opened.wrapped_recipients.get(&epoch);
-            let heals_omission = !old && Self::heals_omissions(opened, &audience, &epoch, &removed);
+            let heals = !old
+                && self.heals_omissions(opened, &membership, &audience, &epoch, &removed, &denied);
             for (actor, member) in membership.members() {
-                if (!old && !self.seat_is_current(&membership, member))
-                    || (old
-                        && (self.left_out(opened, &audience, actor)
-                            || self.left_out(opened, &EpochAudience::Everyone, actor)))
+                if old
+                    && (self.left_out(opened, &audience, actor)
+                        || self.left_out(opened, &EpochAudience::Everyone, actor))
                 {
                     continue;
                 }
                 let recipient = member.binding.recipient();
-                if wrapped.is_some_and(|set| set.contains(&recipient)) {
-                    continue;
-                }
                 let Some(&entry_at) = self.held.get(&member.entry) else {
                     continue;
                 };
                 let known = entry_at == epoch_at || effective.before(entry_at, epoch_at);
-                if known && !heals_omission {
+                if !gap(
+                    opens,
+                    old || self.seat_is_current(&membership, member),
+                    wrapped.is_some_and(|set| set.contains(&recipient)),
+                    known,
+                    heals,
+                ) {
                     continue;
                 }
                 let opened_ms = self.order[epoch_at]
@@ -360,30 +379,56 @@ impl Log {
         gaps
     }
 
-    /// Whether a current seat `epoch` omits is a gap of it whatever its minter knew: `epoch` is a
-    /// causally newest epoch of `audience` that wraps no removed Mac. An older epoch is handed on
-    /// only to a Mac admitted beside it, and a newest one that still wraps a removed Mac is due a
-    /// re-key that wraps every current seat, so healing either would only add records.
+    /// Whether a current seat `epoch` omits is a gap of it whatever its minter knew (one-mesh
+    /// proofs P2, `aterm_mesh_core::gap_heal::heals_omission`): `epoch` is a causally newest epoch
+    /// of `audience`, and it wraps no removed Mac or no carrier holds every newest epoch there (a
+    /// current seat `denied` does not name, which may mint the audience's next epoch). An older
+    /// epoch is handed on only to a Mac admitted beside it. A newest one that wraps a removed Mac
+    /// is due a re-key, which wraps every current seat, so with a carrier a heal would only add
+    /// records; with none, the heal is how a carrier comes to be. The rule before PF2 skipped
+    /// every newest epoch that wrapped a removed Mac, so two concurrent heads that each did, with
+    /// no seat holding both, could neither heal nor re-key.
     fn heals_omissions(
+        &self,
         opened: &OpenedAudienceEntries,
+        membership: &Membership,
         audience: &EpochAudience,
         epoch: &RecordId,
         removed: &BTreeSet<Recipient>,
+        denied: &impl Fn(&Member) -> bool,
     ) -> bool {
-        opened
+        let newest = opened
             .maximal_epochs
             .get(audience)
-            .is_some_and(|newest| newest.contains(epoch))
-            && opened
+            .map_or(&[][..], Vec::as_slice);
+        let wraps = |at: &RecordId, r: &Recipient| {
+            opened
                 .wrapped_recipients
-                .get(epoch)
-                .is_none_or(|set| set.is_disjoint(removed))
+                .get(at)
+                .is_some_and(|set| set.contains(r))
+        };
+        let wraps_revoked =
+            gap_heal::wraps_revoked(removed.iter().map(|r| (true, wraps(epoch, r))));
+        let carried = gap_heal::carrier(membership.members().values().map(|seat| {
+            let recipient = seat.binding.recipient();
+            (
+                self.seat_is_current(membership, seat),
+                denied(seat),
+                newest.iter().all(|at| wraps(at, &recipient)),
+            )
+        }));
+        // NEGATIVE CONTROL `shipped-heal-rule`: every audience reads as carried, so an omission of
+        // an epoch that wraps a removed Mac never heals (the rule before PF2).
+        #[cfg(any(test, debug_assertions))]
+        let carried = carried || aterm_types::negative_control::on("shipped-heal-rule");
+        heals_omission(newest.contains(epoch), wraps_revoked, carried)
     }
 
     /// Whether `member` lacks `epoch` as a wrap gap ([`Log::wrap_gaps`]): it is a current seat
-    /// with no effective `Wrap` of the epoch, and the epoch is a newest one of its audience that
-    /// wraps no removed Mac, or the member's entry (its `Admit`, or the genesis) is not in the
-    /// epoch's causal past. Read from `member`'s side, so the caller need not hold the epoch: a
+    /// with no effective `Wrap` of the epoch, and the epoch heals omissions (a newest one of its
+    /// audience that wraps no removed Mac, or that no current seat carries: no roster is read
+    /// here), or the member's entry (its `Admit`, or the genesis) is not in the epoch's causal
+    /// past. Read from `member`'s side, so the caller need not hold the epoch: a
     /// member left out of a newest epoch, or admitted beside a concurrent rotation, asks this of
     /// itself before it admits another Mac, whose seat the same holders heal. A host list's epoch
     /// is no gap of any seat: the list names its Macs ([`SeatAudience`]).
@@ -421,7 +466,16 @@ impl Log {
         {
             return false;
         }
-        if !old && Self::heals_omissions(opened, audience, epoch, &self.removed_recipients()) {
+        if !old
+            && self.heals_omissions(
+                opened,
+                &membership,
+                audience,
+                epoch,
+                &self.removed_recipients(),
+                &|_: &Member| false,
+            )
+        {
             return true;
         }
         let (Some(&epoch_at), Some(&entry_at)) = (self.held.get(epoch), self.held.get(&seat.entry))
@@ -988,6 +1042,60 @@ mod tests {
         assert!(
             store.insert(admit).is_err(),
             "a store held a non-member's Admit"
+        );
+    }
+
+    /// One-mesh proofs P2, law 4 (no lockout): two concurrent heads that each wrap a Mac removed
+    /// after both, with no seat holding both, are each a gap of the other side's minter, so a
+    /// heal makes a carrier (a seat holding every newest epoch) that can re-key. Founders m1, m2
+    /// and m3 hold `[everyone]` epoch 1; m1 mints epoch 2a for m1 and m3 while m2 mints epoch 2b
+    /// for m2 and m3; then m1 removes m3. Both heads are due (each wraps m3) and no seat holds
+    /// both: m1's closer names m2's gap of 2a and m2's names m1's of 2b. Once m1 heals m2 into
+    /// 2a, m2 holds both heads, a carrier whose re-key wraps m1, and neither names a gap.
+    ///
+    /// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=shipped-heal-rule` heals no omission of an
+    /// epoch that wraps a removed Mac (the rule before PF2): neither side names a gap, no seat
+    /// comes to hold both heads, and the first assert fails.
+    #[test]
+    fn two_due_heads_with_no_carrier_heal_each_other_instead_of_locking_out() {
+        let (m1, m2, m3) = (Mac::new(1, "m1"), Mac::new(2, "m2"), Mac::new(3, "m3"));
+        let founders = vec![m1.entrant.clone(), m2.entrant.clone(), m3.entrant.clone()];
+        let genesis = Record::found(&[9; 32], founders, 1_000).expect("genesis");
+        let mut base = Log::new(genesis).expect("log");
+        m1.mint(&mut base, 1_001, 1, &[&m1, &m2, &m3]);
+        let mut log = base.clone();
+        let (a, key_a) = m1.mint(&mut log, 1_100, 2, &[&m1, &m3]);
+        let mut side_b = base;
+        let (b, _) = m2.mint(&mut side_b, 1_100, 2, &[&m2, &m3]);
+        log.merge(&side_b).expect("merge");
+        let cutoff = *log.network();
+        m1.sign(
+            &mut log,
+            1_200,
+            Body::Remove {
+                member: m3.actor,
+                cutoff,
+            },
+        );
+        let gaps_of = |log: &Log, mac: &Mac| -> BTreeSet<(RecordId, MemberId)> {
+            log.wrap_gaps(&mac.opened(log), &[SeatAudience::Everyone])
+                .into_iter()
+                .map(|gap| (gap.epoch, gap.member))
+                .collect()
+        };
+        assert_eq!(gaps_of(&log, &m1), BTreeSet::from([(a, m2.actor)]));
+        assert_eq!(gaps_of(&log, &m2), BTreeSet::from([(b, m1.actor)]));
+
+        let heal = log
+            .draft_wrap(&m1.actor, 1_300, a, &key_a, m2.identity.recipient())
+            .expect("wrap")
+            .sign(&m1.seed, m1.incarnation)
+            .expect("sign");
+        log.insert(heal).expect("insert heal");
+        assert!(gaps_of(&log, &m1).is_empty());
+        assert!(
+            gaps_of(&log, &m2).is_empty(),
+            "m2 holds both heads, so it re-keys rather than heals"
         );
     }
 

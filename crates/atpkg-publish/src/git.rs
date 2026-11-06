@@ -11,6 +11,69 @@ use aterm_uds::deadline::{CompleteOutputError, MAX_COMPLETE_STDOUT_BYTES, RunErr
 
 use crate::error::{Error, Result};
 
+/// A caller-owned, frozen repository admitted by Agh's native local-read guard.
+/// No credentials or network route is loaded. Admission does not freeze the caller's
+/// directory against concurrent replacement; publication owns that source lifetime.
+pub struct SourceRepo {
+    root: std::path::PathBuf,
+}
+
+impl SourceRepo {
+    /// Admit a local repository without changing its configuration, refs or objects.
+    /// # Errors
+    /// Native source/discovery/config/physical-path admission refusal.
+    pub fn open(root: &Path) -> Result<Self> {
+        let root =
+            std::fs::canonicalize(root).map_err(|e| Error::io("resolve source repository", &e))?;
+        let gh = agh::GithubBuilder::new(agh::policy::Router::empty())
+            .fx(std::sync::Arc::new(agh::Fx::live()))
+            .build();
+        let slug = agh::Slug::new("alab", "local").map_err(|e| Error::refused(e.to_string()))?;
+        gh.run_git(&agh::git::GitRun::check_local(&slug, &root))
+            .map_err(|e| Error::refused(format!("source read admission: {e}")))?;
+        Ok(Self { root })
+    }
+
+    /// The canonical repository admitted for these object reads.
+    #[must_use]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Read one immutable object query with no ambient Git routing/replacement/lazy fetch.
+    /// # Errors
+    /// Missing objects, invalid output, spawn or bounded collection failure.
+    pub(crate) fn query(&self, args: &[&str]) -> Result<String> {
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        for (key, _) in
+            std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+        {
+            cmd.env_remove(key);
+        }
+        cmd.args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+        ])
+        .arg(&self.root)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+        let out = output_within(&mut cmd, LOCAL_GIT_BOUND)
+            .map_err(|e| Error::cannot_run(format!("read immutable source object: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::refused("immutable source objects could not be read"));
+        }
+        String::from_utf8(out.stdout).map_err(|_| Error::refused("source metadata is not UTF-8"))
+    }
+}
+
 /// How long a local git query or checkout ([`run`]) may take before it is taken for hung and
 /// killed: ten minutes, where a checkout of a compiler's tree on a loaded machine takes one or two.
 pub const LOCAL_GIT_BOUND: Duration = Duration::from_mins(10);

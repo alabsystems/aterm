@@ -1126,6 +1126,49 @@ fn install_takes_a_build_by_number_for_trust_only() {
 }
 
 #[test]
+fn named_trust_staging_never_starts_a_changed_machine_plan() {
+    use std::cell::Cell;
+
+    for (words, private_state, expected) in [
+        (&["install", "trust", "--build", "15698"][..], false, 0),
+        (
+            &["install", "trust", "--build", "15698", "--retry"],
+            false,
+            0,
+        ),
+        (&["install", "trust"], false, 1),
+        (&["install", "ay"], false, 1),
+        (&["install", "--default-set"], false, 1),
+        (&["install", "trust"], true, 0),
+        (&["update", "claude"], false, 0),
+        (&["update", "ay"], false, 1),
+        (&["list"], false, 0),
+    ] {
+        let args = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        let request = (args[0] == "install")
+            .then(|| parse_install_argv(&args[1..]).expect("validated install request"));
+        let probes = Cell::new(0);
+        let starts = Cell::new(0);
+        let edit = machine_edit_for_request(
+            &args,
+            request.as_ref(),
+            private_state,
+            || {
+                probes.set(probes.get() + 1);
+                true
+            },
+            || starts.set(starts.get() + 1),
+        );
+        assert_eq!(probes.get(), expected, "machine plan probe for {words:?}");
+        assert_eq!(starts.get(), expected, "machine edit start for {words:?}");
+        assert_eq!(edit.is_some(), expected == 1, "machine edit for {words:?}");
+    }
+}
+
+#[test]
 fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
     let none: Vec<&str> = TABLE
         .iter()
@@ -11580,10 +11623,14 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     assert_eq!(take_warmed(), ["claude"], "a person's landing");
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let layout = world::layout("warm-install-door");
-    install_vendor_door(&layout, &f, "stable", claude, &seams).expect("installs");
+    install_vendor_door(&layout, &f, "stable", claude, &seams)
+        .0
+        .expect("installs");
     assert!(crate::active_builds(&layout).contains_key("claude"));
     assert_eq!(take_warmed(), ["claude"], "the install door's landing");
-    install_vendor_door(&layout, &f, "stable", claude, &seams).expect("current");
+    install_vendor_door(&layout, &f, "stable", claude, &seams)
+        .0
+        .expect("current");
     assert!(take_warmed().is_empty(), "current: nothing landed");
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
@@ -11980,7 +12027,11 @@ fn a_yank_published_after_the_last_pass_binds_a_first_launch_install() {
         other => panic!("{other:?}"),
     };
     let layout = world::layout("first-launch-yank");
-    yanked(install_vendor_door(&layout, &f, "stable", claude, &world_seams(&trust)).unwrap_err());
+    yanked(
+        install_vendor_door(&layout, &f, "stable", claude, &world_seams(&trust))
+            .0
+            .unwrap_err(),
+    );
     assert_eq!(crate::active_builds(&layout).get("claude"), None);
     let layout = world::layout("first-launch-yank-flow");
     yanked(
@@ -12038,7 +12089,9 @@ fn a_failing_resolve_never_blocks_a_vendor_door() {
         };
         f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
         let reads = f.index_reads.get();
-        install_vendor_door(&layout, &f, "stable", claude, &seams).expect(label);
+        install_vendor_door(&layout, &f, "stable", claude, &seams)
+            .0
+            .expect(label);
         let reads = tried(reads);
         assert_eq!(active(), Some(vendor_version("2.1.281").build_id()));
         f.publish_claude("2.1.282", &native_exe("claude 2.1.282"));
@@ -13285,6 +13338,44 @@ fn an_install_given_a_progress_file_writes_its_pass_there() {
         "its work is on the file: {file:?}"
     );
     let _ = std::fs::remove_dir_all(&unnamed.prefix);
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// A VENDOR DOOR'S SWEEP AND HOOKS RUN OUTSIDE ITS PASS, as an index-owned landing's do. They write
+/// no progress and have no bound of their own, so inside the pass they would make false the rule the
+/// startup deadline's limit rests on: that every step of a pass that waits moves its file or ends by
+/// a bound. The hook runs last of them, so a pass already ended there ended before the sweep too.
+#[test]
+fn a_vendor_doors_sweep_and_hooks_run_after_its_pass_ends() {
+    use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+    thread_local! {
+        static PASS_ENDED_AT_HOOKS: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+    fn note_the_pass(layout: &crate::store::Layout) {
+        let ended = crate::progress::read_progress(layout)
+            .expect("a progress file")
+            .ended_unix
+            .is_some();
+        PASS_ENDED_AT_HOOKS.with(|at| at.set(Some(ended)));
+    }
+    let _slot = crate::progress::own_pass_slot();
+    let f = Fake::default();
+    f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    let trust = world::trust();
+    let layout = world::layout("door-settles-after-pass");
+    let progress = layout.progress_file();
+    let seams = PassSeams {
+        progress: Some(&progress),
+        shell_hooks: note_the_pass,
+        ..world_seams(&trust)
+    };
+    do_install_with(&layout, &f, "stable", "claude", &seams).expect("installed");
+    assert_eq!(
+        PASS_ENDED_AT_HOOKS.with(std::cell::Cell::get),
+        Some(true),
+        "the hooks ran, once the pass had ended"
+    );
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 

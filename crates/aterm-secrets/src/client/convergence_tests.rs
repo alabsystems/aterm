@@ -1017,6 +1017,94 @@ fn a_removal_over_a_prefix_of_a_host_list_rotation_carries_the_hosts_it_may_stil
     );
 }
 
+/// A host list dropped whole over a prefix of another Mac's rotation of it. Of six Macs in
+/// recipient order, X, the lower of the two admins, and A, `r5`'s Mac, share a ring X publishes.
+/// A re-keys the ring ([`rekey`]: its `Epoch`, then `Wrap`s to X and A, in recipient order), and
+/// X holds that batch only through its own `Wrap`, so A's may still arrive. X's text then drops
+/// the ring: its tombstones go under A's epoch, which the rest of A's batch hands A, rather than
+/// under a fresh epoch that leaves A out of the list for good and seals the `Delete`s where A
+/// never reads them (one-mesh proofs P1b: the writer's flight covers each host list).
+///
+/// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=tombstone-reader-flight` reads the writer's
+/// flight for `[everyone]` and Commons alone: X reads A's missing `Wrap` as left out on purpose
+/// and mints a fresh ring epoch for the tombstones, and the asserts that it seals them under A's
+/// epoch fail.
+#[test]
+fn a_host_list_dropped_over_a_prefix_of_its_rotation_keeps_the_hosts_it_may_still_wrap() {
+    const NAMES: [&str; 6] = ["m22", "m7", "m40", "m41", "m42", "m43"];
+    let lab = six_with(true);
+    let (_, order) = in_order(&lab);
+    let x_at = usize::from(lab.recipients[1] < lab.recipients[0]);
+    let a_at = order[5];
+    let mut hosts = vec![NAMES[x_at].to_owned(), NAMES[a_at].to_owned()];
+    hosts.sort();
+    let ring = Audience::Hosts(hosts);
+    let x = &lab.all[x_at];
+    let admin = admin_open(x).expect("X is an admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&ring, "ring-cred", b"ring-v1").expect("ring");
+    admin_publish(x, &admin, &doc).expect("X publishes the ring");
+    carry(&lab.all, x_at);
+    let list = EpochAudience::from(&ring);
+    let in_ring = BTreeSet::from([lab.recipients[x_at], lab.recipients[a_at]]);
+    let batch = rekey(&lab.all[a_at], &list, |recipient| {
+        in_ring.contains(recipient)
+    });
+    assert!(
+        matches!(batch[1].body(), Body::Wrap { recipient, .. } if *recipient == lab.recipients[x_at]),
+        "CONTROL: A's batch wraps X first"
+    );
+    save_records(x, &encode_records(&batch[..2])).unwrap();
+
+    let before = ids(x);
+    let admin = admin_open(x).expect("X is an admin");
+    assert!(
+        admin.doc.entry(&ring, "ring-cred").is_some(),
+        "CONTROL: X reads the ring"
+    );
+    // The text without the ring's section, its header included: the section is gone whole, so
+    // its entries are the tombstone loop's, not a plan's.
+    let text = admin.doc.render();
+    let mut kept = Vec::new();
+    let mut in_ring = false;
+    for line in text.as_str().expect("utf-8").lines() {
+        if line.trim_start().starts_with('[') {
+            in_ring = line.trim() == ring.header();
+        }
+        if !in_ring {
+            kept.push(line);
+        }
+    }
+    let doc = Document::parse(&format!("{}\n", kept.join("\n"))).expect("the text parses");
+    assert!(
+        doc.lockers().iter().all(|plan| plan.audience != ring),
+        "CONTROL: the ring's section is gone"
+    );
+    admin_publish(x, &admin, &doc).expect("X drops the ring");
+    let signed = signed_since(x, &before);
+    let tombstoned: BTreeSet<RecordId> = signed
+        .iter()
+        .filter_map(|record| match record.body() {
+            Body::Delete {
+                audience, epoch, ..
+            } if *audience == list => Some(*epoch),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tombstoned,
+        BTreeSet::from([*batch[0].id()]),
+        "the tombstones go under A's epoch"
+    );
+    assert!(
+        !signed.iter().any(
+            |record| matches!(record.body(), Body::Epoch { audience, .. } if *audience == list)
+        ),
+        "X mints no ring epoch that leaves A out"
+    );
+    lab.macs.server.stop();
+}
+
 /// The first key, of secrets of `0x5a` bytes led by a counter, whose recipient sorts above
 /// `bound`. The lab Macs' keys are random, so no fixed set of keys lies above every draw of them
 /// (the 255 single-byte secrets once tried missed about one fixture in 450); the counter runs on

@@ -20,6 +20,7 @@ use aterm_gui_timing::now_ms;
 
 pub mod fleet_mail;
 pub mod handler_tally;
+pub mod report;
 
 /// What the fabric needs of a session.
 pub trait FabricSession: Send + Sync {
@@ -30,6 +31,8 @@ pub trait FabricSession: Send + Sync {
     fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool;
     /// Tell the presence band this session's mail or hold moved.
     fn fabric_changed(&self);
+    /// Tell whoever judges this session by its hold that the hold moved.
+    fn hold_moved(&self) {}
     fn holder_token(&self) -> Option<String>;
     /// Stable private storage for this session's direct fleet mail; absent in inert contexts.
     fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
@@ -68,6 +71,9 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     }
     fn fabric_changed(&self) {
         (**self).fabric_changed();
+    }
+    fn hold_moved(&self) {
+        (**self).hold_moved();
     }
     fn holder_token(&self) -> Option<String> {
         (**self).holder_token()
@@ -1518,15 +1524,36 @@ pub struct TopicEntry {
     pub since: String,
 }
 
+/// The newest broadcast this session posted on a topic channel (`post to=say[:<topic>]`), as
+/// [`SessionFabric::last_topic_post`] reads it: what a worker's row shows as its step when it is
+/// newer than the words on its screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicPost {
+    /// The topic it went out on (`say` for a bare `to=say`, as the bridge names it).
+    pub topic: String,
+    /// Its text, at most [`TOPIC_POST_KEPT`] bytes of it, cut at a character's end.
+    pub text: String,
+    /// When `post` queued it, on the wall clock ([`aterm_gui_timing::wall_ms`]), which an agent's
+    /// transcript rows are stamped on.
+    pub at_ms: u64,
+}
+
+/// The most bytes of a topic post [`SessionFabric::last_topic_post`] keeps: an inline post's
+/// whole text, and the head of a longer one.
+pub const TOPIC_POST_KEPT: usize = POST_INLINE_MAX;
+
 /// The per-session fabric state, hung on aterm-gui's `SessionCtx` ([`FabricSession`]).
 #[derive(Default)]
 pub struct SessionFabric {
     #[cfg(unix)]
     mesh: fleet_mail::MeshPolicy,
     inbox: Mutex<Inbox>,
-    changed: Condvar,
+    changed: aterm_control::park::Changed<Inbox>,
     direct_epoch: AtomicU64,
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
+    /// [`Self::last_topic_post`]. Not carried by a seamless update: the successor's rows read the
+    /// screen until the session posts on a topic again.
+    last_topic: Mutex<Option<TopicPost>>,
     hold_serial: std::sync::atomic::AtomicU64,
     person_refusals: AtomicU64,
     #[cfg(any(test, debug_assertions))]
@@ -1612,25 +1639,21 @@ impl SessionFabric {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(until);
         }
-        aterm_control::park::park_guarded(
-            &self.changed,
-            guard,
-            until,
-            aterm_control::park::Lane::SERVED,
-        )
+        self.changed
+            .park(guard, until, aterm_control::park::Lane::SERVED)
     }
 
     /// Wake every waiter parked on this session's condvar without changing anything.
     #[cfg(any(test, debug_assertions))]
     pub fn wake_waiters_for_test(&self) {
-        let _inbox = self.lock();
-        self.changed.notify_all();
+        self.changed.ring(self.lock());
     }
 
     /// The session ended: its program exited or its tab closed.
     pub fn close(&self) {
-        self.lock().closed = true;
-        self.changed.notify_all();
+        let mut inbox = self.lock();
+        inbox.closed = true;
+        self.changed.ring(inbox);
     }
 
     /// Whether [`Self::close`] has run.
@@ -1708,6 +1731,27 @@ impl SessionFabric {
             .iter()
             .map(|(t, e)| (t.clone(), e.clone()))
             .collect()
+    }
+
+    /// The newest post this session queued on a topic channel ([`TopicPost`]), if any.
+    pub fn last_topic_post(&self) -> Option<TopicPost> {
+        self.last_topic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Note `text`, queued on `topic` just now, as [`Self::last_topic_post`].
+    fn note_topic_post(&self, topic: &str, text: &str) {
+        let mut end = text.len().min(TOPIC_POST_KEPT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        *self.last_topic.lock().unwrap_or_else(|p| p.into_inner()) = Some(TopicPost {
+            topic: topic.to_owned(),
+            text: text[..end].to_owned(),
+            at_ms: aterm_gui_timing::wall_ms(),
+        });
     }
 
     /// Whether this session holds `topic` in its opt-in set.
@@ -1890,10 +1934,7 @@ impl SessionFabric {
                     .msg_id_ceiling
                     .is_some_and(|ceiling| inbox.last_msg_id >= ceiling))
         {
-            let (guard, timeout) = self
-                .changed
-                .wait_timeout(inbox, every)
-                .unwrap_or_else(|p| p.into_inner());
+            let (guard, timeout) = self.changed.wait_timeout(inbox, every);
             inbox = guard;
             if timeout.timed_out() && inbox.hold_fenced {
                 waited = waited.saturating_add(every);
@@ -1924,11 +1965,7 @@ impl SessionFabric {
                 return None;
             }
             note_fence_block(self, Some(wait));
-            inbox = self
-                .changed
-                .wait_timeout(inbox, left)
-                .unwrap_or_else(|p| p.into_inner())
-                .0;
+            inbox = self.changed.wait_timeout(inbox, left).0;
         }
         Some(inbox)
     }
@@ -2265,8 +2302,7 @@ impl SessionFabric {
         }
         drop(tl);
         inbox.trim_retired_posts();
-        drop(inbox);
-        self.changed.notify_all();
+        self.changed.ring(inbox);
     }
 
     /// The attempt that fenced this session stood down.
@@ -2275,8 +2311,7 @@ impl SessionFabric {
         let mut inbox = self.lock();
         inbox.hold_fenced = false;
         inbox.retirements_fenced = false;
-        drop(inbox);
-        self.changed.notify_all();
+        self.changed.ring(inbox);
     }
 
     /// Put back the holds another process carried ([`parse_holds`] already made them holds).
@@ -2306,8 +2341,7 @@ impl SessionFabric {
             .unwrap_or_else(|p| p.into_inner())
             .record_fact("hold", fact);
         self.hold_serial.fetch_add(1, Ordering::AcqRel);
-        drop(inbox);
-        self.changed.notify_all();
+        self.changed.ring(inbox);
     }
 
     /// The mail half of the presence facts (aterm-gui's `App::sense`).
@@ -2612,8 +2646,7 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
             }
         }
         inbox.bus_log = Some(clock.ident);
-        drop(inbox);
-        ctx.fabric().changed.notify_all();
+        ctx.fabric().changed.ring(inbox);
     }
     publish()
 }
@@ -3423,8 +3456,7 @@ fn note_given_up(ctx: &dyn FabricSession, gap: GivenUp, scope: GapScope<'_>) -> 
         }
     };
     let owed = ctx.record_fact("inbox-gap", fact);
-    drop(inbox);
-    ctx.fabric().changed.notify_all();
+    ctx.fabric().changed.ring(inbox);
     ctx.fabric_changed();
     owed
 }
@@ -3677,8 +3709,7 @@ fn cmd_link_log(
             changed = true;
         }
         inbox.bus_log = Some(ident);
-        drop(inbox);
-        ctx.fabric().changed.notify_all();
+        ctx.fabric().changed.ring(inbox);
     }
     LINK.node_gaps
         .lock()
@@ -3714,9 +3745,8 @@ fn wake_parked(store: &Store) {
     };
     for ctx in &parked {
         let guard = ctx.fabric().lock();
-        ctx.fabric().changed.notify_all();
         ctx.fabric_changed();
-        drop(guard);
+        ctx.fabric().changed.ring(guard);
     }
 }
 
@@ -3882,8 +3912,7 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
     };
     let _ = ctx.record_fact("hold-advisory", fact);
     inbox.advisory = Some((lost, generation.0));
-    drop(inbox);
-    ctx.fabric().changed.notify_all();
+    ctx.fabric().changed.ring(inbox);
     ctx.fabric_changed();
     true
 }
@@ -4244,10 +4273,7 @@ fn apply_hold_as(
         inbox = match deadline {
             None => {
                 note_fence_block(ctx.fabric(), None);
-                ctx.fabric()
-                    .changed
-                    .wait(inbox)
-                    .unwrap_or_else(|p| p.into_inner())
+                ctx.fabric().changed.wait(inbox)
             }
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4255,11 +4281,7 @@ fn apply_hold_as(
                     return Applied::Fenced;
                 }
                 note_fence_block(ctx.fabric(), fence_wait);
-                ctx.fabric()
-                    .changed
-                    .wait_timeout(inbox, left)
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0
+                ctx.fabric().changed.wait_timeout(inbox, left).0
             }
         };
     }
@@ -4331,35 +4353,35 @@ fn apply_hold_as(
     }
     let held = inbox.holds.is_held();
     let changed = inbox.holds != before;
-    if changed && issuer == HoldIssuer::Person && matches!(act, HoldAct::Set(_)) {
+    if !changed {
+        drop(inbox);
+        return Applied::Unchanged { held };
+    }
+    if issuer == HoldIssuer::Person && matches!(act, HoldAct::Set(_)) {
         ctx.fabric().person_refusals.store(0, Ordering::Relaxed);
     }
-    let mut owed = false;
-    if changed {
-        let lifted = act.origin().unwrap_or("local");
-        ctx.fabric().hold_serial.fetch_add(1, Ordering::AcqRel);
-        let (origin, reason, hold_origin) = inbox.holds.event_fields(lifted);
-        let fact = FabricFact::Hold {
-            held,
-            bridge: issuer == HoldIssuer::Bridge,
-            origin: &origin,
-            hold_origin: &hold_origin,
-            reason: reason.as_deref(),
-            carried,
-        };
-        owed = ctx.record_fact("hold", fact);
-    }
-    drop(inbox);
-    if owed {
-        wake();
-    }
-    if changed {
-        ctx.fabric().changed.notify_all();
-        ctx.fabric_changed();
-        Applied::Changed { held }
-    } else {
-        Applied::Unchanged { held }
-    }
+    let lifted = act.origin().unwrap_or("local");
+    ctx.fabric().hold_serial.fetch_add(1, Ordering::AcqRel);
+    let (origin, reason, hold_origin) = inbox.holds.event_fields(lifted);
+    let fact = FabricFact::Hold {
+        held,
+        bridge: issuer == HoldIssuer::Bridge,
+        origin: &origin,
+        hold_origin: &hold_origin,
+        reason: reason.as_deref(),
+        carried,
+    };
+    let owed = ctx.record_fact("hold", fact);
+    ctx.fabric()
+        .changed
+        .ring_after(&ctx.fabric().inbox, inbox, || {
+            if owed {
+                wake();
+            }
+        });
+    ctx.fabric_changed();
+    ctx.hold_moved();
+    Applied::Changed { held }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -4984,9 +5006,8 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
             inbox.fetches.push_back((off, slot));
         }
     }
-    drop(inbox);
     if answer_ready {
-        ctx.fabric().changed.notify_all();
+        ctx.fabric().changed.ring(inbox);
         ctx.fabric_changed();
     }
     "OK\n".to_string()
@@ -5000,8 +5021,7 @@ fn refuse_fetched(ctx: &dyn FabricSession, off: u64, reply: &str) -> String {
         .find(|(o, s)| *o == off && matches!(s, FetchSlot::Pending | FetchSlot::Partial(_)));
     if let Some((_, slot)) = waiting {
         *slot = FetchSlot::Failed("malformed".to_string());
-        drop(inbox);
-        ctx.fabric().changed.notify_all();
+        ctx.fabric().changed.ring(inbox);
         ctx.fabric_changed();
     }
     reply.to_string()
@@ -5216,11 +5236,13 @@ fn retire_post(
         owed = ctx.record_fact("post-landed", fact);
     }
     inbox.trim_retired_posts();
-    drop(inbox);
-    if owed {
-        wake();
-    }
-    ctx.fabric().changed.notify_all();
+    ctx.fabric()
+        .changed
+        .ring_after(&ctx.fabric().inbox, inbox, || {
+            if owed {
+                wake();
+            }
+        });
     ctx.fabric_changed();
     Ok(())
 }
@@ -5580,8 +5602,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
     }
     let carried_was = was.is_some_and(|w| inbox.carried_marks.remove(&w));
     if inbox.carried_marks.remove(&off) | carried_was {
-        drop(inbox);
-        ctx.fabric().changed.notify_all();
+        ctx.fabric().changed.ring(inbox);
         ctx.fabric_changed();
         return format!("OK {id}\n");
     }
@@ -5592,8 +5613,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         inbox: id,
     };
     let owed = ctx.record_fact("inbox", fact);
-    drop(inbox);
-    ctx.fabric().changed.notify_all();
+    ctx.fabric().changed.ring(inbox);
     ctx.fabric_changed();
     if owed {
         wake();
@@ -5685,11 +5705,10 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             let added = ctx.fabric().topic_add_recording(t, &since, &|kind, fact| {
                 let _ = ctx.record_fact(kind, fact);
             });
-            drop(unfenced);
             let Ok(added) = added else {
                 return format!("ERR topics full (max {MAX_TOPICS}): drop one first\n");
             };
-            ctx.fabric().changed.notify_all();
+            ctx.fabric().changed.ring(unfenced);
             format!("OK {t} since={since} added={}\n", u8::from(added))
         }
         Some("drop") => {
@@ -5718,8 +5737,7 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
                 }
                 unfenced.topic_given_up.remove(t);
             }
-            drop(unfenced);
-            ctx.fabric().changed.notify_all();
+            ctx.fabric().changed.ring(unfenced);
             format!("OK {t} dropped={}\n", u8::from(dropped))
         }
         Some(_) => TOPIC_USAGE.to_string(),
@@ -6142,8 +6160,7 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
             inbox.fetches.remove(i);
             return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
         }
-        inbox = aterm_control::park::park_guarded(
-            &ctx.fabric().changed,
+        inbox = ctx.fabric().changed.park(
             inbox,
             park_until(deadline),
             aterm_control::park::Lane::SERVED,
@@ -6239,11 +6256,14 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
         moved: bus_passed || (decided.is_some() && row.fleet.is_none()),
     };
     let _ = ctx.record_fact("inbox-seen", fact);
-    drop(inbox);
     // As `inbox`'s listing does: a mark the mailbox refuses leaves the message for the next
-    // start to offer again.
-    let _ = fleet_mail::mark_listed(ctx, &listed_fleet);
-    ctx.fabric().changed.notify_all();
+    // start to offer again. A waiter the ring wakes before the mark is made may read the mailbox
+    // unmarked; one that parks again then is woken once the mark is made.
+    ctx.fabric()
+        .changed
+        .ring_after(&ctx.fabric().inbox, inbox, || {
+            let _ = fleet_mail::mark_listed(ctx, &listed_fleet);
+        });
     ctx.fabric_changed();
     format!("OK seen={seen}\n")
 }
@@ -6472,6 +6492,10 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     inbox.next_post_id += 1;
     inbox.outbox_moves += 1;
     let id = inbox.next_post_id;
+    if to == "say" || to.starts_with("say:") {
+        ctx.fabric()
+            .note_topic_post(to.strip_prefix("say:").unwrap_or("say"), &body);
+    }
     inbox.posts.push_back(PostRow {
         id,
         to: pct_encode(&to),
@@ -6499,8 +6523,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         idem: key.as_deref(),
     };
     let _ = ctx.record_fact("post", fact);
-    drop(inbox);
-    ctx.fabric().changed.notify_all();
+    ctx.fabric().changed.ring(inbox);
     ctx.fabric_changed();
     handler_tally::note_since(handler_tally::Row::Post, began);
 
@@ -6560,8 +6583,7 @@ fn wait_landing(
         if std::time::Instant::now() >= deadline {
             return Err(format!("ERR timeout id={id}\n"));
         }
-        guard = aterm_control::park::park_guarded(
-            &ctx.fabric().changed,
+        guard = ctx.fabric().changed.park(
             guard,
             park_until(deadline),
             aterm_control::park::Lane::SERVED,
@@ -6624,8 +6646,7 @@ fn wait_receipt_on_log(
         if std::time::Instant::now() >= deadline {
             return format!("ERR timeout id={id} off={off}\n");
         }
-        guard = aterm_control::park::park_guarded(
-            &ctx.fabric().changed,
+        guard = ctx.fabric().changed.park(
             guard,
             park_until(deadline),
             aterm_control::park::Lane::SERVED,
@@ -7267,6 +7288,40 @@ mod topic_tests {
             parse_topics(&hostile),
             vec![("build.failed".to_string(), entry("head"))],
         );
+    }
+
+    #[test]
+    fn a_post_on_a_topic_is_the_sessions_last_topic_post_and_an_addressed_one_is_not() {
+        let h = crate::test_support::test_handle(1);
+        let ctx = &*h.ctx;
+        assert!(ctx.fabric.last_topic_post().is_none());
+        let post = |rest: &str| super::cmd_post(ctx, rest, None);
+        assert_eq!(post("to=say:build kind=note -- crate 3 of 9"), "OK 1\n");
+        let first = ctx.fabric.last_topic_post().expect("a topic post");
+        assert_eq!(
+            (first.topic.as_str(), first.text.as_str()),
+            ("build", "crate 3 of 9")
+        );
+        // Negative control: mail to a session is no channel post, and leaves the last one.
+        assert_eq!(post("to=@s-peer kind=report -- to the manager"), "OK 2\n");
+        assert_eq!(ctx.fabric.last_topic_post().as_ref(), Some(&first));
+        assert_eq!(post("to=say kind=note -- everyone"), "OK 3\n");
+        let bare = ctx.fabric.last_topic_post().expect("a topic post");
+        assert_eq!(
+            (bare.topic.as_str(), bare.text.as_str()),
+            ("say", "everyone")
+        );
+        assert!(bare.at_ms >= first.at_ms);
+        // A long body keeps its head, cut where a character ends (each `é` is two bytes, after
+        // one `a`, so the cap falls inside one).
+        let long = format!("a{}", "é".repeat(super::TOPIC_POST_KEPT));
+        assert_eq!(
+            super::cmd_post(ctx, "to=say:big kind=note", Some(long.clone().into_bytes())),
+            "OK 4\n"
+        );
+        let kept = ctx.fabric.last_topic_post().expect("a topic post").text;
+        assert_eq!(kept.len(), super::TOPIC_POST_KEPT - 1);
+        assert!(long.starts_with(&kept));
     }
 }
 

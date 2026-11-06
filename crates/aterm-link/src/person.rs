@@ -21,6 +21,34 @@ use crate::transport::{self, Closer, Conn};
 /// The kinds a person may `post`.
 pub const PERSON_KINDS: [&str; 5] = ["ask", "answer", "task", "report", "note"];
 
+/// The body token on a post a bridge hands to a person from a session on another Mac (§11 C3d,
+/// the bridge's `hand_to_person`): `<seq>:<producer>` ([`wire_stamp`]), the offset the post has
+/// on that Mac's bus and the producer whose push brought it, so a person's answer to it carries
+/// the offset as its `re=` there where the producer is that Mac's ([`wire_re`]).
+pub const WIRE_RE_TOKEN: &str = "wre";
+
+/// The value of [`WIRE_RE_TOKEN`]: `seq`, then `producer` in 16 hex digits.
+#[must_use]
+pub(crate) fn wire_stamp(seq: u64, producer: u64) -> String {
+    format!("{seq}:{producer:016x}")
+}
+
+/// The offset and producer a [`wire_stamp`] names, `None` for any other value.
+fn stamped(value: &str) -> Option<(u64, u64)> {
+    let (seq, producer) = value.split_once(':')?;
+    let producer = (producer.len() == 16)
+        .then(|| u64::from_str_radix(producer, 16).ok())
+        .flatten()?;
+    Some((crate::parse_uint::<u64>(seq)?, producer))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// NEGATIVE CONTROL: [`wire_re`] takes a read refused below the lanes' oldest for no post,
+    /// as it would without the told read.
+    pub(crate) static UNTOLD_WIRE_RE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What a person verb was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
@@ -270,6 +298,10 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
             eprintln!("aterm fabric {verb}: {e}");
             ExitCode::FAILURE
         }
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Unmapped>()) => {
+            eprintln!("aterm fabric {verb}: {e}");
+            ExitCode::from(2)
+        }
         Err(e) => {
             if astream_broker::broker_refusal(&e)
                 .is_some_and(astream_broker::BrokerRefusal::is_permanent)
@@ -297,6 +329,9 @@ struct Sealing {
     key: crate::person_key::PersonKey,
     cert: crate::person_key::Cert,
     member: String,
+    /// The node service's hand-off it was routed by: this Mac's node, the nodes its seat held
+    /// before, and where each rotated node's seat is now.
+    handoff: crate::federate::Handoff,
 }
 
 /// With the mesh on (§11 C3c), how a person's post to `@<sid>@<node>` at `now_ms` is written:
@@ -402,7 +437,12 @@ fn sealing_for(
             refusal.describe()
         )));
     }
-    Ok(Some(Sealing { key, cert, member }))
+    Ok(Some(Sealing {
+        key,
+        cert,
+        member,
+        handoff,
+    }))
 }
 
 /// An inbox whose mail stdout refused (the reader went away, a full disk): nothing is marked
@@ -685,21 +725,136 @@ fn post(
     text: &str,
     sealing: Option<&Sealing>,
 ) -> io::Result<()> {
+    let wire = match (sealing, re) {
+        // A node this Mac's seat held before names this Mac's own session, where an offset here
+        // names the post as its session does.
+        (Some(sealing), Some(re)) if sealing.member != sealing.handoff.me => {
+            let (mut conn, _closer) = connect(cfg, cmd)?;
+            let to = (sid, sealing.member.as_str());
+            let wire = wire_re(&mut conn, (&cfg.fleet, person), &sealing.handoff, to, re)?;
+            let Some(wire) = wire else {
+                return Err(io::Error::other(Unmapped {
+                    re,
+                    sid: sid.to_owned(),
+                    node: node.to_owned(),
+                }));
+            };
+            Some(wire)
+        }
+        _ => re,
+    };
     let node = sealing.map_or(node, |sealing| sealing.member.as_str());
     let subject = crate::subject::post_lane(&cfg.fleet, node, sid, person, kind);
     let mut body = Body::new(crate::now_ms());
-    body.re = re;
+    body.re = wire;
     body.text = text.to_string();
     if let Some(sealing) = sealing {
         let address = crate::person_key::post_address(&cfg.fleet, sid, person, kind);
         sealing.key.seal(&sealing.cert, &address, &mut body);
     }
     let off = publish(cfg, cmd, person, &subject, &body.encode())?;
-    println!(
-        "OK off={off} to=@{sid}@{node} kind={kind}{} from={person}",
-        re.map_or_else(String::new, |r| format!(" re={r}"))
-    );
+    let named = match (re, wire) {
+        (Some(re), Some(wire)) if wire != re => format!(" re={re} (@{wire} on {node})"),
+        (Some(re), _) => format!(" re={re}"),
+        (None, _) => String::new(),
+    };
+    println!("OK off={off} to=@{sid}@{node} kind={kind}{named} from={person}");
     Ok(())
+}
+
+/// A person's post to another Mac (a member other than this Mac's node) whose `re=` names
+/// nothing there ([`wire_re`]): nothing is posted, and the person is told why (exit 2).
+#[derive(Debug)]
+struct Unmapped {
+    re: u64,
+    sid: String,
+    node: String,
+}
+
+impl std::fmt::Display for Unmapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (re, sid, node) = (self.re, safe(&self.sid, 64), safe(&self.node, 64));
+        write!(
+            f,
+            "re={re} names no post of {sid}'s on {node} whose offset there this Mac knows (an \
+             offset on this Mac names nothing on {node}): nothing was posted (`aterm fabric \
+             inbox` shows the re= that names each post; without re= the post names none)"
+        )
+    }
+}
+
+impl std::error::Error for Unmapped {}
+
+/// The `re=` a person's post to `@<sid>@<node>` on another Mac carries (§11 C3d), `member`
+/// being the member that post goes to (`handoff`'s current of `node`, another than this Mac's):
+/// an offset on this Mac's bus means nothing on another Mac's, so `re` must be a post this Mac's
+/// bridge handed the person from that session, and the post carries the offset that post has
+/// there, which the bridge stamped on it ([`WIRE_RE_TOKEN`]), as a session's answer to it names
+/// it. The asking session's wait is on that offset. The post at `re` is read on the person's
+/// lanes here, those of this Mac's node and of the nodes its seat held before (`handoff`), which
+/// the person's ring reads and only this Mac's bridge and node service write; it is from that
+/// session when its `from=` is `<sid>@<n>` with `handoff`'s current of `n` the member, and its
+/// stamp's producer is that member's or a node's whose seat the member holds now (the push of a
+/// Mac that rotated its key brings what it wrote before under its new node), judged here by the
+/// hand-off the post is routed by: the bridge reads none to stamp a copy no move put on its
+/// lane. A read refused below the lanes' oldest is read again told, as the bridge
+/// reads one ([`crate::bridge::told_read_at`]). `None` where `re` is no such post, it carries no
+/// offset there, or retention gave it up.
+///
+/// # Errors
+/// The broker cannot be read.
+pub(crate) fn wire_re(
+    conn: &mut Conn,
+    (fleet, person): (&str, &str),
+    handoff: &crate::federate::Handoff,
+    (sid, member): (&str, &str),
+    re: u64,
+) -> io::Result<Option<u64>> {
+    let filter = crate::subject::person_mail_filter(fleet, person);
+    let rows = match conn.fetch(re, &filter, 1) {
+        Ok((rows, _)) => rows,
+        Err(e) if transport::retained_past(&e, re).is_some() => {
+            #[cfg(test)]
+            let told = !UNTOLD_WIRE_RE.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let told = true;
+            if told {
+                crate::bridge::told_read_at(conn, re, &filter)?.unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    let Some((_, subject, raw)) = rows.into_iter().find(|(off, _, _)| *off == re) else {
+        return Ok(None);
+    };
+    let lane = format!("/f/{fleet}/in/p/{person}/");
+    let written_here = subject
+        .strip_prefix(&lane)
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(node, _)| node == handoff.me || handoff.retired(&handoff.me).contains(node));
+    let (body, _) = Body::decode(&raw);
+    let from_there = body
+        .from
+        .as_deref()
+        .and_then(|from| from.split_once('@'))
+        .is_some_and(|(s, n)| s == sid && handoff.current(n) == Some(member));
+    let seats = handoff.retired(member);
+    let brought_by_there = |producer: u64| {
+        std::iter::once(member)
+            .chain(seats.iter().map(String::as_str))
+            .any(|node| astream_cap::producer_id_of(node) == producer)
+    };
+    let seq = body
+        .unknown
+        .get(WIRE_RE_TOKEN)
+        .and_then(|value| stamped(value))
+        .filter(|(seq, producer)| {
+            *seq < astream_broker::ACK_SEQ_BASE && brought_by_there(*producer)
+        })
+        .map(|(seq, _)| seq);
+    Ok(seq.filter(|_| written_here && from_there))
 }
 
 fn inbox(
@@ -837,7 +992,7 @@ pub(crate) fn inbox_delivery_line(
 ) -> String {
     let (b, _) = Body::decode(raw);
     let (re, verdict, dl) = (b.re, b.verdict.clone(), b.dl);
-    let t = crate::fabric::traffic_of_body(fleet, off, subject, b);
+    let t = crate::fabric::traffic_of_body(fleet, off, subject, b, now_ms);
     let mut line = format!(
         "@{off}  {}  {}  from={} trust={}",
         crate::fabric::clock_at(t.t_ms, now_ms, header_offset, local_at),
@@ -2199,6 +2354,188 @@ mod tests {
         let rows = held();
         assert_eq!(rows.len(), 4, "with the mesh off the post is written");
         assert!(!Body::decode(&rows[3].2).0.unknown.contains_key(CERT_TOKEN));
+    }
+
+    /// **A PERSON'S ANSWER TO ANOTHER MAC NAMES THE POST IT ANSWERS AS THAT MAC NUMBERS IT, OR IS
+    /// REFUSED** (§11 C3d): `re=` names a post this Mac's bridge handed the person, on the
+    /// person's lane of this Mac's node or of a node its seat held before, from the session the
+    /// answer goes to (`<sid>@<n>`, `n` that session's member or a node that member's seat held),
+    /// brought by that member's producer or one of a node its seat held, and the answer carries
+    /// the offset that post has on the asker's Mac, which the bridge stamped on it
+    /// ([`WIRE_RE_TOKEN`]). An `re=` that names another session's post, a post of that session
+    /// id on another Mac, one with no stamp, a stamp out of range, of another format or under
+    /// another Mac's producer, a post on another node's lane, or no post at all, is refused
+    /// (exit 2) and nothing is written: an offset on this Mac names nothing on another.
+    /// NEGATIVE CONTROLS: to this Mac's own session, named by its node or by a node its seat held
+    /// before, and with the mesh off, `re=` is kept as given.
+    #[cfg(unix)]
+    #[test]
+    fn a_persons_answer_to_another_mac_names_the_post_it_answers_as_that_mac_numbers_it_or_is_refused(
+    ) {
+        use crate::federate::{node_of, Handoff, MeshPaths};
+        let (dir, _server, mut cfg, mut cmd) = guarded_person("h-andrew", false);
+        let keys = dir.path().join("keys");
+        aterm_uds::private_file::ensure_private_dir(&keys).unwrap();
+        let seed = [5u8; 32];
+        let text = format!("{}\n", aterm_codec::hex::encode_lower(&seed));
+        aterm_uds::private_file::write_private(
+            &keys,
+            crate::federate::NODE_KEY_FILE,
+            text.as_bytes(),
+        )
+        .unwrap();
+        let here = node_of(&astream_aead::signature::public_key(&seed));
+        let there = node_of(&astream_aead::signature::public_key(&[6u8; 32]));
+        let (retired, old_here) = ("n-00000000000000ee", "n-00000000000000dd");
+        let stranger = "n-00000000000000ff";
+        Handoff {
+            me: here.clone(),
+            members: [here.clone(), there.clone()].into(),
+            moved: [
+                (retired.to_owned(), there.clone()),
+                (old_here.to_owned(), here.clone()),
+            ]
+            .into(),
+            gone: std::collections::BTreeSet::new(),
+        }
+        .write(&keys)
+        .unwrap();
+        assert!(crate::person_key::vouch(&keys, &seed, crate::now_ms()).is_ok());
+        let socket = dir.path().join("bus.sock");
+        // What this Mac's bridge hands the person: a copy on the person's lane of `node`.
+        let mut seq = 0;
+        let mut handed = |node: &str, from: &str, stamp: Option<String>| {
+            let mut writer = astream_broker::Client::connect(&socket).unwrap();
+            let grant = format!("rw,p={node}:/f/f/in/p/h-andrew/{node}/ask");
+            let cap = astream_cap::mint(&[0x51; 32], &grant).unwrap();
+            writer.attach(&cap.filter, &cap.tag).unwrap();
+            let mut body = Body::new(crate::now_ms());
+            body.from = Some(from.to_owned());
+            body.text = "ship it?".to_owned();
+            if let Some(stamp) = stamp {
+                body.unknown.insert(WIRE_RE_TOKEN.to_owned(), stamp);
+            }
+            seq += 1;
+            let subject = format!("/f/f/in/p/h-andrew/{node}/ask");
+            let producer = astream_cap::producer_id_of(node);
+            writer
+                .publish(producer, seq, &subject, &body.encode())
+                .unwrap()
+                .0
+        };
+        let by = |seq: u64, node: &str| Some(wire_stamp(seq, astream_cap::producer_id_of(node)));
+        let from_a = format!("s-a@{there}");
+        let current = handed(&here, &from_a, by(7, &there));
+        let via_retired = handed(&here, &format!("s-a@{retired}"), by(9, retired));
+        let pushed_after_rotation = handed(&here, &format!("s-a@{retired}"), by(10, &there));
+        let before_rotation = handed(old_here, &from_a, by(11, &there));
+        let another_session = handed(&here, &format!("s-other@{there}"), by(13, &there));
+        let same_sid_here = handed(&here, &format!("s-a@{here}"), by(17, &there));
+        let same_sid_stranger = handed(&here, &format!("s-a@{stranger}"), by(19, &there));
+        let same_sid_old_here = handed(&here, &format!("s-a@{old_here}"), by(21, &there));
+        let unstamped = handed(&here, &from_a, None);
+        let out_of_range = handed(&here, &from_a, by(astream_broker::ACK_SEQ_BASE, &there));
+        let bare_seq = handed(&here, &from_a, Some("23".to_owned()));
+        let another_producer = handed(&here, &from_a, by(25, stranger));
+        let another_lane = handed(stranger, &from_a, by(15, &there));
+        // A session of this Mac asked before its key rotated: the bridge wrote it unstamped, from
+        // the bare session, on the person's lane of the node it was then.
+        let local_before_rotation = handed(old_here, "s-a", None);
+
+        let mut reader = astream_broker::Client::connect(&socket).unwrap();
+        let cap = astream_cap::mint(&[0x51; 32], "ro:/f/f/in/>").unwrap();
+        reader.attach(&cap.filter, &cap.tag).unwrap();
+        let mut answers = |node: &str| -> Vec<Option<u64>> {
+            let lane = format!("/f/f/in/{node}/s-a/h-andrew/answer");
+            let (rows, _) = reader.fetch(0, &lane, 64).unwrap();
+            rows.iter()
+                .map(|(_, _, raw)| Body::decode(raw).0.re)
+                .collect()
+        };
+        let answer = |node: &str, re: u64| Act::Post {
+            sid: "s-a".to_string(),
+            node: node.to_string(),
+            kind: "answer".to_string(),
+            re: Some(re),
+            text: "yes".to_string(),
+        };
+        let mut posted = |cfg: &Config, act: Act| {
+            cmd.act = act;
+            main("post", &cmd, cfg)
+        };
+        cfg.mesh = Some(MeshPaths {
+            keys: keys.clone(),
+            root: keys.clone(),
+        });
+        for (node, re) in [
+            (there.as_str(), current),
+            (there.as_str(), via_retired),
+            (retired, via_retired),
+            (there.as_str(), pushed_after_rotation),
+            (there.as_str(), before_rotation),
+        ] {
+            assert_eq!(
+                posted(&cfg, answer(node, re)),
+                ExitCode::SUCCESS,
+                "re={re} to s-a@{node}"
+            );
+        }
+        assert_eq!(
+            answers(&there),
+            [Some(7), Some(9), Some(9), Some(10), Some(11)],
+            "each names the post as the asker's Mac numbers it"
+        );
+        for (why, re) in [
+            ("another session's post", another_session),
+            ("that session id's post on this Mac", same_sid_here),
+            (
+                "that session id's post on a node that is no member",
+                same_sid_stranger,
+            ),
+            (
+                "that session id's post on a node this Mac held",
+                same_sid_old_here,
+            ),
+            ("an unstamped post", unstamped),
+            ("a stamp out of range", out_of_range),
+            ("a stamp of another format", bare_seq),
+            ("a stamp under another Mac's producer", another_producer),
+            ("a post on another node's lane", another_lane),
+            ("no post", local_before_rotation + 1000),
+        ] {
+            assert_eq!(
+                posted(&cfg, answer(&there, re)),
+                ExitCode::from(2),
+                "{why} is refused"
+            );
+        }
+        assert_eq!(answers(&there).len(), 5, "a refused answer writes nothing");
+        assert_eq!(
+            posted(&cfg, answer(&here, unstamped)),
+            ExitCode::SUCCESS,
+            "this Mac's own session"
+        );
+        assert_eq!(
+            posted(&cfg, answer(old_here, local_before_rotation)),
+            ExitCode::SUCCESS,
+            "this Mac's own session, named by a node its seat held before"
+        );
+        assert_eq!(
+            answers(&here),
+            [Some(unstamped), Some(local_before_rotation)],
+            "keeps re= as given"
+        );
+        cfg.mesh = None;
+        assert_eq!(
+            posted(&cfg, answer(&there, another_session)),
+            ExitCode::SUCCESS,
+            "the mesh off"
+        );
+        assert_eq!(
+            answers(&there).last(),
+            Some(&Some(another_session)),
+            "with the mesh off, re= is kept as given"
+        );
     }
 
     #[test]

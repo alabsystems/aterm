@@ -98,8 +98,8 @@ impl EpochBy {
 }
 
 /// The repaint nudge's one attempt on an epoch (`crate::app_nudge`). It alone decides who repaired
-/// a healed epoch ([`Epoch::healer`]): `by=nudge` is the attempt's own heal, never a repaint after
-/// the attempt ended without one.
+/// a healed epoch ([`Epoch::healer`]) on the alternate screen: `by=nudge` is the attempt's own heal,
+/// never a repaint after the attempt ended without one, nor the program leaving that screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Attempt {
     /// No repair was attempted.
@@ -468,7 +468,11 @@ impl EpochBook {
         epoch.class = class;
         if !debt.owed() {
             let owed = epoch.had_debt;
-            let healer = epoch.healer();
+            let healer = if probe.main_screen {
+                EpochBy::App
+            } else {
+                epoch.healer()
+            };
             let healed = epoch.healed_by(probe.full_clears, probe.screen_replaced);
             let since = now_ms.saturating_sub(epoch.last_resize_ms);
             let closed = self.current.take();

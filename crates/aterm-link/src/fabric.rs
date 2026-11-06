@@ -1951,7 +1951,10 @@ pub struct Traffic {
     /// The publisher's wall clock (`t=`), ms — informational, `0` when absent.
     pub t_ms: u64,
     /// Who sent it: the cap-forced `<src>` segment, or `<sid>@<node>` when a node attests which
-    /// of its sessions spoke (the bridge's own rule).
+    /// of its sessions spoke (the bridge's own rule); `<person>@<node>` for a person's post the
+    /// Mac `<node>` carried, once its seal verifies at the reader's clock
+    /// ([`crate::person_key::carried_by`], the bridge's own check); and on a person's lane, the
+    /// `<sid>@<node>` this Mac's bridge names a session on another Mac by ([`render_from`]).
     pub from: String,
     /// Who it is for: `<sid>@<node>`, `fleet`, `all`, or `-` for a node's own face.
     pub to: String,
@@ -1959,35 +1962,52 @@ pub struct Traffic {
     pub kind: String,
     /// The body's length in bytes ([`Traffic::text`]'s, as the record holds it).
     pub len: usize,
-    /// The receiver's trust label, computed from the address alone ([`crate::render::trust_of`]).
+    /// The receiver's trust label ([`crate::render::trust_of`]) of the sender's principal: the
+    /// lane's writer, the cap-forced segment of its address, save for a carried person's post
+    /// whose seal verifies, which is the person's (`human`). A claim of a person that does not
+    /// verify leaves the writer, the Mac whose lane brought it, accountable.
     pub trust: &'static str,
     /// The body ([`traffic_of`]): the decoded `text=` when the record's first line carries one,
     /// else that whole first line — only `tail --bodies` ever prints it.
     pub text: String,
 }
 
-fn render_from(src: &str, body_from: Option<&str>) -> String {
+/// The sender of an `in` record the writer `src` wrote, its body naming `body_from`: a node's
+/// session, `<sid>@<src>`, when a node names a bare session (`s-`); on a person's lane
+/// (`person_lane`, `/f/<F>/in/p/<person>/<node>/<kind>`) written by a node, a `<sid>@<node>` as
+/// it is, the session on another Mac whose answer or receipt this Mac's bridge handed the person
+/// (§11 C3d): only this Mac's own bridge writes `in/p/*/<this node>/*`, since no peer's ring
+/// reaches a person's lane; else `src`.
+fn render_from(person_lane: bool, src: &str, body_from: Option<&str>) -> String {
+    let principal = crate::subject::is_principal;
+    let session = |sid: &str| sid.starts_with("s-") && principal(sid);
+    let by_node = src.starts_with("n-");
     match body_from {
-        Some(sid)
-            if src.starts_with("n-")
-                && sid.starts_with("s-")
-                && crate::subject::is_principal(sid) =>
+        Some(sid) if by_node && session(sid) => format!("{sid}@{src}"),
+        Some(named)
+            if person_lane
+                && by_node
+                && named.split_once('@').is_some_and(|(sid, node)| {
+                    session(sid) && node.starts_with("n-") && principal(node)
+                }) =>
         {
-            format!("{sid}@{src}")
+            named.to_string()
         }
         _ => src.to_string(),
     }
 }
 
-/// Classify one record. Its body ([`Traffic::text`]) and `len` follow [`first_line_body`].
+/// Classify one record, as a reader whose clock reads `now_ms` sees it (a carried person's
+/// certificate is judged in force or lapsed at it). Its body ([`Traffic::text`]) and `len` follow
+/// [`first_line_body`].
 #[must_use]
-pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
+pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8], now_ms: u64) -> Traffic {
     if raw.starts_with(b"v=2 ") {
-        if let Some(t) = mirrored_traffic(fleet, off, subject, raw) {
+        if let Some(t) = mirrored_traffic(fleet, off, subject, raw, now_ms) {
             return t;
         }
     }
-    let mut t = traffic_of_body(fleet, off, subject, Body::decode(raw).0);
+    let mut t = traffic_of_body(fleet, off, subject, Body::decode(raw).0, now_ms);
     if let Some((text, len)) = first_line_body(raw) {
         t.text = text;
         t.len = len;
@@ -1995,10 +2015,16 @@ pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
     t
 }
 
-fn mirrored_traffic(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Option<Traffic> {
+fn mirrored_traffic(
+    fleet: &str,
+    off: u64,
+    subject: &str,
+    raw: &[u8],
+    now_ms: u64,
+) -> Option<Traffic> {
     let text = std::str::from_utf8(raw).ok()?;
     let b = aterm_slog::decode_bus(text).ok()?;
-    let mut t = traffic_of_body(fleet, off, subject, Body::default());
+    let mut t = traffic_of_body(fleet, off, subject, Body::default(), now_ms);
     if t.kind != "ev" {
         return None;
     }
@@ -2030,8 +2056,14 @@ fn first_line_body(raw: &[u8]) -> Option<(String, usize)> {
     Some((String::from_utf8_lossy(head).into_owned(), head.len()))
 }
 
-/// [`traffic_of`] over a body already decoded.
-pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) -> Traffic {
+/// [`traffic_of`] over a body already decoded, at the reader's clock `now_ms`.
+pub(crate) fn traffic_of_body(
+    fleet: &str,
+    off: u64,
+    subject: &str,
+    body: Body,
+    now_ms: u64,
+) -> Traffic {
     let relayed = body.via.is_some();
     let segs: Vec<&str> = subject.split('/').collect();
     let seg = |i: usize| safe(segs.get(i).copied().unwrap_or("-"), 128);
@@ -2041,12 +2073,10 @@ pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) 
         ""
     };
     let (from, to, kind, trust) = match (face, segs.len()) {
-        ("in", 8) => (
-            safe(&render_from(segs[6], body.from.as_deref()), 128),
-            format!("{}@{}", seg(5), seg(4)),
-            seg(7),
-            trust_of(segs[6], relayed),
-        ),
+        ("in", 8) => {
+            let (from, trust) = in_sender(fleet, &segs, &body, relayed, now_ms);
+            (from, format!("{}@{}", seg(5), seg(4)), seg(7), trust)
+        }
         ("fleet", 6) => (
             seg(4),
             "fleet".to_string(),
@@ -2096,7 +2126,39 @@ pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) 
     }
 }
 
-/// TRAFFIC: the newest `n` records the broker holds of the fleet (or of `faces`), read TOLD
+/// Who sent the record `body` on the `in` lane `segs` (`/f/<F>/in/<node>/<sid>/<src>/<kind>`,
+/// split at `/`), and its trust label, at the reader's clock `now_ms`. A record on a session's
+/// lane that names a person ([`crate::person_key::BY_TOKEN`]) is the person's,
+/// `<person>@<src>` (`human`), only once its seal verifies as the bridge would check it
+/// ([`crate::person_key::carried_by`]); one whose claim does not is the writer's alone, the Mac
+/// whose lane brought it, its body's `from=` unread, so a claimed name is never shown as the
+/// sender. Any other record is [`render_from`]'s, its trust the writer's.
+fn in_sender(
+    fleet: &str,
+    segs: &[&str],
+    body: &Body,
+    relayed: bool,
+    now_ms: u64,
+) -> (String, &'static str) {
+    let (sid, src, kind) = (segs[5], segs[6], segs[7]);
+    let session = sid.starts_with("s-") && crate::subject::is_principal(sid);
+    let carried = if session {
+        crate::person_key::carried_by(fleet, sid, src, kind, body, now_ms)
+    } else {
+        Ok(None)
+    };
+    match carried {
+        Ok(Some(person)) => (safe(&person, 128), trust_of(&person, relayed)),
+        Ok(None) => (
+            safe(&render_from(segs[4] == "p", src, body.from.as_deref()), 128),
+            trust_of(src, relayed),
+        ),
+        Err(_) => (safe(src, 128), trust_of(src, relayed)),
+    }
+}
+
+/// TRAFFIC: the newest `n` records the broker holds of the fleet (or of `faces`), as a reader at
+/// `now_ms` classifies them ([`traffic_of`]), read TOLD
 /// ([`transport::fetch_told_kept`]): the fleet's root reaches the bulk stream's class and the
 /// held mail and presence below its cut, so its oldest is the cut, and a plain read on at it
 /// would leave out the records retention still holds below it (astream's
@@ -2107,6 +2169,7 @@ fn last_records(
     faces: Option<&[String]>,
     head: u64,
     n: usize,
+    now_ms: u64,
 ) -> io::Result<Vec<Traffic>> {
     let filters: Vec<String> = faces.map_or_else(|| vec![fleet_root(fleet)], <[String]>::to_vec);
     let mut merged: BTreeMap<u64, Traffic> = BTreeMap::new();
@@ -2126,7 +2189,7 @@ fn last_records(
                     if older || merged.contains_key(off) {
                         continue;
                     }
-                    merged.insert(*off, traffic_of(fleet, *off, subject, raw));
+                    merged.insert(*off, traffic_of(fleet, *off, subject, raw, now_ms));
                     if merged.len() > n {
                         merged.pop_first();
                     }
@@ -2214,7 +2277,7 @@ fn overdue_work(
                 transport::fetch_told_kept(conn, next, filter, transport::POST_PAGE)?;
             for (off, subject, raw) in &page {
                 if fed.insert(*off) {
-                    scan.feed(fleet, *off, subject, raw);
+                    scan.feed(fleet, *off, subject, raw, now_ms);
                 }
             }
             if after <= next || after >= now_head {
@@ -2363,7 +2426,7 @@ pub(crate) fn overdue_of(
 ) -> Vec<Overdue> {
     let mut scan = OverdueScan::default();
     for (off, subject, raw) in records {
-        scan.feed(fleet, *off, subject, raw);
+        scan.feed(fleet, *off, subject, raw, now_ms);
     }
     scan.finish_on_lanes(now_ms)
         .into_iter()
@@ -2380,11 +2443,13 @@ struct OverdueScan {
 }
 
 impl OverdueScan {
-    fn feed(&mut self, fleet: &str, off: u64, subject: &str, raw: &[u8]) {
+    /// Take the record at `off`, its sender read at the reader's clock `now_ms`
+    /// ([`traffic_of_body`]).
+    fn feed(&mut self, fleet: &str, off: u64, subject: &str, raw: &[u8], now_ms: u64) {
         let (body, _) = Body::decode(raw);
         let (dl, re) = (body.dl, body.re);
         let lane = verdict_lane(fleet, subject, body.from.as_deref());
-        let t = traffic_of_body(fleet, off, subject, body);
+        let t = traffic_of_body(fleet, off, subject, body, now_ms);
         match t.kind.as_str() {
             k if WORK_KINDS.contains(&k) => {
                 if let Some(dl) = dl {
@@ -3138,6 +3203,7 @@ pub fn gather() -> Result<Report, Off> {
             faces.as_deref(),
             head,
             TRAFFIC_ROWS,
+            now_ms,
         ) {
             Ok(t) => report.traffic = t,
             Err(e) => bus_errors.push(Warning::new(
@@ -5671,7 +5737,7 @@ impl TailFmt {
         now_ms: u64,
         local_at: &dyn Fn(i64) -> Option<i64>,
     ) -> String {
-        let t = traffic_of(fleet, off, subject, raw);
+        let t = traffic_of(fleet, off, subject, raw, now_ms);
         if self.json {
             tail_json(fleet, subject, &t, self.bodies)
         } else {
@@ -6628,7 +6694,7 @@ mod tests {
                 assert_eq!(field("node"), Some("n-a"));
                 assert_eq!(field("sid"), [Some("s-x"), None][i], "{line}");
                 assert_eq!(field("kind"), Some(["note", "presence"][i]));
-                let t = traffic_of("f1", offs[i], subject, body.as_bytes());
+                let t = traffic_of("f1", offs[i], subject, body.as_bytes(), 0);
                 let table = tail_line(&t, 0, 0, true);
                 let printed = table.split_once("  text=").map_or("", |(_, text)| text);
                 assert_eq!(
@@ -7829,6 +7895,7 @@ mod tests {
             4,
             "/f/lab/in/n-a/s-w/n-a/task",
             b"v=1 t=1757000000000 from=s-me text=secret%20plan",
+            0,
         );
         assert_eq!(t.from, "s-me@n-a", "the node attests which session spoke");
         assert_eq!(t.to, "s-w@n-a");
@@ -7842,23 +7909,24 @@ mod tests {
         assert!(tail_line(&t, t.t_ms, 0, true).ends_with("text=secret plan"));
 
         let mirrored = b"v=2 t=1757000000001 ep=1 seq=4 ms=3 op=close node=r2 k=cmd out=fail code=1 src=shell conf=exact";
-        let t = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/ev", mirrored);
+        let t = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/ev", mirrored, 0);
         assert_eq!((t.kind.as_str(), t.trust), ("ev", "shell"));
         assert_eq!(t.len, mirrored.len());
         assert_eq!(t.t_ms, 1_757_000_000_001);
         let line = tail_line(&t, t.t_ms, 0, true);
         assert!(line.contains(" op=close node=r2 k=cmd out=fail "), "{line}");
         assert!(!tail_line(&t, t.t_ms, 0, false).contains("op=close"));
-        let other = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/presence", mirrored);
+        let other = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/presence", mirrored, 0);
         assert_eq!(other.kind, "presence");
 
-        let h = traffic_of("lab", 5, "/f/lab/in/n-a/s-w/h-andrew/ask", b"v=1 t=1");
+        let h = traffic_of("lab", 5, "/f/lab/in/n-a/s-w/h-andrew/ask", b"v=1 t=1", 0);
         assert_eq!((h.from.as_str(), h.trust), ("h-andrew", "human"));
         let r = traffic_of(
             "lab",
             6,
             "/f/lab/in/n-a/s-w/h-andrew/ask",
             b"v=1 t=1 via=n-b",
+            0,
         );
         assert_eq!(r.trust, "relayed");
         let forged = traffic_of(
@@ -7866,6 +7934,7 @@ mod tests {
             7,
             "/f/lab/in/n-a/s-w/s-evil/note",
             b"v=1 from=h-andrew",
+            0,
         );
         assert_eq!(forged.from, "s-evil");
 
@@ -7874,7 +7943,7 @@ mod tests {
         // alone. NEGATIVE CONTROL (scratch): today's decoded-text rule gives `len` 0 and an
         // empty body.
         let row: &[u8] = b"v=1 t=2 state=live attention=QZP7WORD1";
-        let p = traffic_of("lab", 1, "/f/lab/pub/n-a/s-w/presence", row);
+        let p = traffic_of("lab", 1, "/f/lab/pub/n-a/s-w/presence", row, 0);
         assert_eq!(
             (p.from.as_str(), p.to.as_str(), p.kind.as_str(), p.len),
             ("s-w@n-a", "-", "presence", row.len())
@@ -7890,7 +7959,7 @@ mod tests {
         // the face's cut may hold) is keystrokes.
         // NEGATIVE CONTROL (scratch): taking the whole raw body prints them.
         let keys: &[u8] = b"v=1 t=1 gen=1:ab len=9\nQZP7KEYS1";
-        let k = traffic_of("lab", 13, "/f/lab/term/n-a/s-w/in/h-andrew", keys);
+        let k = traffic_of("lab", 13, "/f/lab/term/n-a/s-w/in/h-andrew", keys, 0);
         assert_eq!((k.text.as_str(), k.len), ("v=1 t=1 gen=1:ab len=9", 22));
         for shown in [
             tail_line(&k, 0, 0, true),
@@ -7898,28 +7967,35 @@ mod tests {
         ] {
             assert!(!shown.contains("QZP7KEYS1"), "{shown}");
         }
-        let n = traffic_of("lab", 2, "/f/lab/pub/n-a/node/presence", b"v=1 t=2");
+        let n = traffic_of("lab", 2, "/f/lab/pub/n-a/node/presence", b"v=1 t=2", 0);
         assert_eq!(n.from, "n-a");
         let s = traffic_of(
             "lab",
             150,
             "/f/lab/pub/n-a1b2/s-c3d4/say/build.failed",
             b"v=1 t=1 kind=task from=s-c3d4 text=x",
+            0,
         );
         assert_eq!(
             (s.from.as_str(), s.to.as_str(), s.kind.as_str(), s.trust),
             ("s-c3d4@n-a1b2", "say:build.failed", "task", "agent")
         );
-        let bare = traffic_of("lab", 151, "/f/lab/pub/n-a/s-w/say/say", b"v=1 t=1");
+        let bare = traffic_of("lab", 151, "/f/lab/pub/n-a/s-w/say/say", b"v=1 t=1", 0);
         assert_eq!((bare.to.as_str(), bare.kind.as_str()), ("say:say", "note"));
         assert_eq!(
             (bare.text.as_str(), bare.len),
             ("v=1 t=1", 7),
             "a bare body's own line"
         );
-        let ev = traffic_of("lab", 3, "/f/lab/pub/n-a/s-w/ev", b"v=1 t=2");
+        let ev = traffic_of("lab", 3, "/f/lab/pub/n-a/s-w/ev", b"v=1 t=2", 0);
         assert_eq!(ev.trust, SCREEN);
-        let halt = traffic_of("lab", 8, "/f/lab/fleet/h-andrew/halt", b"v=1 t=2 state=on");
+        let halt = traffic_of(
+            "lab",
+            8,
+            "/f/lab/fleet/h-andrew/halt",
+            b"v=1 t=2 state=on",
+            0,
+        );
         assert_eq!(
             (
                 halt.from.as_str(),
@@ -7929,10 +8005,10 @@ mod tests {
             ),
             ("h-andrew", "fleet", "halt", "human")
         );
-        let odd = traffic_of("lab", 9, "/f/lab/pub/h-andrew/say/note", b"v=1 t=2");
+        let odd = traffic_of("lab", 9, "/f/lab/pub/h-andrew/say/note", b"v=1 t=2", 0);
         assert_eq!((odd.to.as_str(), odd.kind.as_str()), ("-", "note"));
         // The drive face is cut: its record reads as any face nothing serves, by its subject.
-        let key = traffic_of("lab", 10, "/f/lab/term/n-a/s-w/in/h-andrew", b"v=1");
+        let key = traffic_of("lab", 10, "/f/lab/term/n-a/s-w/in/h-andrew", b"v=1", 0);
         assert_eq!(
             (
                 key.from.as_str(),
@@ -7942,14 +8018,257 @@ mod tests {
             ),
             ("-", "/f/lab/term/n-a/s-w/in/h-andrew", "term", SCREEN)
         );
-        let odd = traffic_of("lab", 11, "/f/lab/zzz/q", b"");
+        let odd = traffic_of("lab", 11, "/f/lab/zzz/q", b"", 0);
         assert_eq!((odd.kind.as_str(), odd.trust), ("zzz", SCREEN));
-        let alien = traffic_of("lab", 11, "/f/other/in/n-a/s-w/n-a/note", b"");
+        let alien = traffic_of("lab", 11, "/f/other/in/n-a/s-w/n-a/note", b"", 0);
         assert_eq!((alien.kind.as_str(), alien.trust), ("unknown", SCREEN));
 
-        let hostile = traffic_of("lab", 12, "/f/lab/in/n-a/s-w/n-\u{1b}[2J/note", b"v=1");
+        let hostile = traffic_of("lab", 12, "/f/lab/in/n-a/s-w/n-\u{1b}[2J/note", b"v=1", 0);
         let line = tail_line(&hostile, 0, 0, true);
         assert!(!line.contains('\u{1b}'), "{line:?}");
+    }
+
+    /// When the carried-post tests' certificate was signed, and the post: a reader's clock.
+    const CARRIED_AT: u64 = 1_800_000_000_000;
+
+    /// A post of h-andrew's to session `s-q`, of `kind`, sealed on the Mac whose node seed is
+    /// `[51; 32]` and carried by that Mac's mesh (§11 C3c, `federate::Routes::carry_one`): the
+    /// Mac's node, and the body its lane holds, `by=h-andrew` beside the seal.
+    fn carried_post(kind: &str) -> (String, Body) {
+        use crate::person_key::{post_address, read_cert, vouch, PersonKey, BY_TOKEN};
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        aterm_uds::private_file::ensure_private_dir(dir.path()).expect("a private dir");
+        let seed = [51u8; 32];
+        assert!(vouch(dir.path(), &seed, CARRIED_AT).is_ok());
+        let key = PersonKey::read(dir.path()).expect("reads").expect("made");
+        let cert = read_cert(dir.path()).expect("reads").expect("vouched");
+        let mut body = Body::new(CARRIED_AT);
+        body.dl = Some(60_000);
+        body.text = "QZP9PLAN".to_owned();
+        key.seal(
+            &cert,
+            &post_address("lab", "s-q", "h-andrew", kind),
+            &mut body,
+        );
+        body.unknown
+            .insert(BY_TOKEN.to_owned(), "h-andrew".to_owned());
+        let node = crate::federate::node_of(&astream_aead::signature::public_key(&seed));
+        (node, body)
+    }
+
+    /// **A CARRIED PERSON'S POST READS AS THE PERSON ONLY WHILE ITS SEAL VERIFIES** (§11 C3d): a
+    /// post of h-andrew's that the Mac P carried onto its own lane to session s-q on Q,
+    /// `by=h-andrew` beside the seal, is the person's in every observer view (`traffic_of`, the
+    /// TRAFFIC cells, `tail`, `tail --json`, the deadline scan), `from=h-andrew@<P>
+    /// trust=human`, once its seal verifies, at the reader's clock, under the certificate of the
+    /// node key that names P, as Q's bridge checks it (`person_key::carried_by`).
+    /// NEGATIVE CONTROLS, each the same record less one premise, each refused for its reason and
+    /// shown as the lane's writer and `agent`, never under the name it claims: the same bytes on
+    /// another Mac's lane (not vouched), `by=` naming another person and its text changed (each
+    /// a bad seal), its seal taken off (unsealed), a body `from=s-x` beside a failed claim (the
+    /// Mac still, not `s-x@<P>`), `by=` naming no person (malformed), and a reader whose clock
+    /// is past the certificate's life (lapsed, though nothing in the post changed); one relayed
+    /// (`via=`) reads `relayed`.
+    #[test]
+    fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
+        use crate::person_key::{
+            carried_by, Refusal, BY_TOKEN, CERT_LIFE_MS, CERT_TOKEN, SEAL_TOKEN,
+        };
+        let (p, post) = carried_post("ask");
+        let q = crate::federate::node_of(&[52; 32]);
+        let other = crate::federate::node_of(&[53; 32]);
+        let lane = |writer: &str| format!("/f/lab/in/{q}/s-q/{writer}/ask");
+        // Every view of the record: its classification, its TRAFFIC cells' trust and sender,
+        // its `tail` line's words and its `tail --json` object.
+        let views = |subject: &str, body: &Body, now: u64| {
+            let t = traffic_of("lab", 40, subject, &body.encode(), now);
+            let cells = traffic_cells(&t, now, 0);
+            let line = tail_line(&t, now, 0, false);
+            let json = tail_json("lab", subject, &t, false);
+            (t, (cells[4].clone(), cells[5].clone()), line, json)
+        };
+        let shows =
+            |what: &str, subject: &str, body: &Body, now: u64, (from, trust): (&str, &str)| {
+                let (t, cells, line, json) = views(subject, body, now);
+                assert_eq!((t.from.as_str(), t.trust), (from, trust), "{what}");
+                assert_eq!(t.to, format!("s-q@{q}"), "{what}");
+                assert_eq!(cells, (trust.to_owned(), from.to_owned()), "{what}");
+                let words: Vec<&str> = line.split_whitespace().collect();
+                assert!(
+                    words.contains(&from) && words.contains(&trust),
+                    "{what}: {line}"
+                );
+                for (key, want) in [("from", from), ("trust", trust)] {
+                    assert!(
+                        json.contains(&format!("\"{key}\":\"{want}\"")),
+                        "{what}: {json}"
+                    );
+                }
+                assert!(
+                    !line.contains("QZP9PLAN") && !json.contains("QZP9PLAN"),
+                    "{what}"
+                );
+            };
+        let person = format!("h-andrew@{p}");
+        shows("verified", &lane(&p), &post, CARRIED_AT, (&person, "human"));
+        assert_eq!(
+            carried_by("lab", "s-q", &p, "ask", &post, CARRIED_AT),
+            Ok(Some(person.clone()))
+        );
+        let late = CARRIED_AT + 60_001;
+        let overdue = overdue_of("lab", &[(40, lane(&p), post.encode())], late);
+        assert_eq!(
+            overdue.iter().map(|o| o.from.as_str()).collect::<Vec<_>>(),
+            vec![person.as_str()],
+            "the deadline scan names the person"
+        );
+
+        let with = |change: &dyn Fn(&mut Body)| {
+            let mut body = post.clone();
+            change(&mut body);
+            body
+        };
+        let lapsed_at = CARRIED_AT + CERT_LIFE_MS + 1;
+        let controls: [(&str, &str, Body, u64, Refusal); 7] = [
+            (
+                "another Mac's lane",
+                &other,
+                post.clone(),
+                CARRIED_AT,
+                Refusal::NotVouched,
+            ),
+            (
+                "by= another person",
+                &p,
+                with(&|b| {
+                    b.unknown.insert(BY_TOKEN.to_owned(), "h-bob".to_owned());
+                }),
+                CARRIED_AT,
+                Refusal::BadSeal,
+            ),
+            (
+                "its text changed",
+                &p,
+                with(&|b| b.text.push('!')),
+                CARRIED_AT,
+                Refusal::BadSeal,
+            ),
+            (
+                "its seal taken off",
+                &p,
+                with(&|b| {
+                    b.unknown.remove(CERT_TOKEN);
+                    b.unknown.remove(SEAL_TOKEN);
+                }),
+                CARRIED_AT,
+                Refusal::Unsealed,
+            ),
+            (
+                "from=s-x beside a failed claim",
+                &p,
+                with(&|b| {
+                    b.from = Some("s-x".to_owned());
+                    b.text.push('!');
+                }),
+                CARRIED_AT,
+                Refusal::BadSeal,
+            ),
+            (
+                "by= no person",
+                &p,
+                with(&|b| {
+                    b.unknown.insert(BY_TOKEN.to_owned(), "s-evil".to_owned());
+                }),
+                CARRIED_AT,
+                Refusal::Malformed,
+            ),
+            (
+                "a reader past its certificate's life",
+                &p,
+                post.clone(),
+                lapsed_at,
+                Refusal::Lapsed,
+            ),
+        ];
+        for (what, writer, body, now, refusal) in &controls {
+            assert_eq!(
+                carried_by("lab", "s-q", writer, "ask", body, *now),
+                Err(*refusal),
+                "{what}"
+            );
+            shows(what, &lane(writer), body, *now, (writer, "agent"));
+        }
+        let overdue = overdue_of("lab", &[(40, lane(&p), post.encode())], lapsed_at);
+        assert_eq!(
+            overdue.iter().map(|o| o.from.as_str()).collect::<Vec<_>>(),
+            vec![p.as_str()],
+            "the deadline scan judges the certificate at the reader's clock"
+        );
+        let relayed = with(&|b| b.via = Some(other.clone()));
+        assert_eq!(
+            carried_by("lab", "s-q", &p, "ask", &relayed, CARRIED_AT),
+            Err(Refusal::Relayed)
+        );
+        shows("relayed", &lane(&p), &relayed, CARRIED_AT, (&p, "relayed"));
+    }
+
+    /// **A PERSON'S LANE NAMES A SESSION ON ANOTHER MAC AS ITS BRIDGE WROTE IT** (§11 C3d): only
+    /// this Mac's own bridge writes a person's lane (`/f/<F>/in/p/<person>/<this node>/<kind>`;
+    /// no peer's ring reaches one), and it names a session on another Mac whose answer or
+    /// receipt it hands the person `from=<sid>@<node>`, which TRAFFIC, `tail` and the person's
+    /// inbox line show as it is, the writer's trust beside it.
+    /// NEGATIVE CONTROLS: the same `from` on a session's lane shows the writer node, as before (a
+    /// node attests only a bare session of its own there); on a person's lane whose writer is no
+    /// node it shows the writer; and a `from` that is not a session `@` a node shows the writer.
+    #[test]
+    fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
+        let (p, q) = (
+            crate::federate::node_of(&[51; 32]),
+            crate::federate::node_of(&[52; 32]),
+        );
+        let named = format!("s-q@{q}");
+        let raw = |from: &str| format!("v=1 t=1757000000000 from={from} re=3 text=done");
+        let on_person_lane = format!("/f/lab/in/p/h-andrew/{p}/answer");
+        let t = traffic_of("lab", 41, &on_person_lane, raw(&named).as_bytes(), 0);
+        assert_eq!((t.from.as_str(), t.trust), (named.as_str(), "agent"));
+        let line = tail_line(&t, t.t_ms, 0, false);
+        assert!(line.split_whitespace().any(|w| w == named), "{line}");
+        let inbox = crate::person::inbox_delivery_line(
+            ("lab", "h-andrew.cap"),
+            41,
+            &on_person_lane,
+            raw(&named).as_bytes(),
+            0,
+            Some(0),
+            &|_| Some(0),
+        );
+        assert!(
+            inbox.contains(&format!("  answer  from={named} trust=agent re=3")),
+            "{inbox}"
+        );
+        let bare = traffic_of("lab", 42, &on_person_lane, raw("s-x").as_bytes(), 0);
+        assert_eq!(
+            bare.from,
+            format!("s-x@{p}"),
+            "a bare session is still the writer's"
+        );
+
+        let on_session_lane = format!("/f/lab/in/{p}/s-x/{q}/note");
+        let t = traffic_of("lab", 43, &on_session_lane, raw(&named).as_bytes(), 0);
+        assert_eq!((t.from.as_str(), t.trust), (q.as_str(), "agent"));
+        let by_person = "/f/lab/in/p/h-andrew/h-bob/answer";
+        let t = traffic_of("lab", 44, by_person, raw(&named).as_bytes(), 0);
+        assert_eq!((t.from.as_str(), t.trust), ("h-bob", "human"));
+        for odd in [
+            format!("h-x@{q}"),
+            "s-q@h-x".to_owned(),
+            format!("s-q@{q}@{q}"),
+            format!("s-Q@{q}"),
+            "s-q@".to_owned(),
+        ] {
+            let t = traffic_of("lab", 45, &on_person_lane, raw(&odd).as_bytes(), 0);
+            assert_eq!(t.from, p, "{odd}");
+        }
     }
 
     const CMD: &str = "aterm link serve --fleet lab --broker /tmp/b.sock --state /s";
@@ -10132,7 +10451,7 @@ mod tests {
     #[test]
     fn traffic_shows_a_record_held_below_the_fleets_oldest() {
         let bus = held_ask_bus("al-held-traffic");
-        let traffic = last_records(&mut bus.dial(), "lab", None, bus.head, TRAFFIC_ROWS)
+        let traffic = last_records(&mut bus.dial(), "lab", None, bus.head, TRAFFIC_ROWS, 0)
             .expect("the traffic");
         assert!(
             traffic.iter().any(|t| t.off == bus.ask && t.kind == "ask"),
@@ -10616,6 +10935,7 @@ mod tests {
             7,
             "/f/lab/in/n-a/s-one/h-andrew/task",
             b"v=1 t=6000000 text=the%20secret%20plan",
+            0,
         )];
         r.warnings = warned(&r);
         let text = render_text(&r);
@@ -10696,12 +11016,14 @@ mod tests {
                 1,
                 "/f/f/in/n-1/s-1/h-a/note",
                 format!("v=1 t={pre_ms} text=pre").as_bytes(),
+                now_ms,
             ),
             traffic_of(
                 "f",
                 2,
                 "/f/f/in/n-1/s-1/h-a/note",
                 format!("v=1 t={post_ms} text=post").as_bytes(),
+                now_ms,
             ),
         ];
         let report = render_text_local(&r, &la_at);

@@ -884,10 +884,11 @@ impl Journal {
         let Ok(now) = self.fx.wall_secs() else {
             return;
         };
-        for view in views(records).iter().filter(|v| v.open) {
-            let due = view.intent.at_secs.saturating_add(SETTLE_WINDOW.as_secs());
-            if due < now && !crate::needs::raised(dirs, &stale_key(&view.intent.id)) {
-                let _ = crate::needs::raise(dirs, &self.stale_need(&view.intent, now));
+        for intent in open_intents_filtered(records, |i| {
+            i.at_secs.saturating_add(SETTLE_WINDOW.as_secs()) < now
+        }) {
+            if !crate::needs::raised(dirs, &stale_key(&intent.id)) {
+                let _ = crate::needs::raise(dirs, &self.stale_need(intent, now));
             }
         }
     }
@@ -1098,10 +1099,9 @@ impl IntentStore for Journal {
         if let JournalEnd::Fault { at, why } = &end {
             return Err(self.fault(*at, why));
         }
-        Ok(views(&records)
+        Ok(open_intents_filtered(&records, |_| true)
             .into_iter()
-            .filter(|v| v.open)
-            .map(|v| v.intent)
+            .cloned()
             .collect())
     }
 
@@ -1340,7 +1340,57 @@ const fn settles_closed(settled: &Settled) -> bool {
     )
 }
 
+/// Every open intent matching `keep`, in step order, borrowed from `records` without cloning
+/// closed intents or outcome records.
+fn open_intents_filtered<'a>(
+    records: &'a [(u64, JournalRecord)],
+    keep: impl Fn(&Intent) -> bool,
+) -> Vec<&'a Intent> {
+    let mut tracked: Vec<(&'a Intent, bool, bool)> = Vec::new();
+    let mut index: HashMap<&'a IntentId, usize> = HashMap::new();
+    for (_, record) in records {
+        match record {
+            JournalRecord::Intent(intent) if keep(intent) => {
+                index.insert(&intent.id, tracked.len());
+                tracked.push((intent, false, true));
+            }
+            JournalRecord::Intent(_) => {}
+            JournalRecord::Settled { intent, outcome } => {
+                if let Some((_, settled_seen, open)) =
+                    index.get(intent).and_then(|&i| tracked.get_mut(i))
+                    && !*settled_seen
+                {
+                    *settled_seen = true;
+                    if settles_closed(outcome) {
+                        *open = false;
+                    }
+                }
+            }
+            JournalRecord::Observed {
+                intent,
+                found: Some(_),
+                ..
+            } => {
+                if let Some((_, _, open)) = index.get(intent).and_then(|&i| tracked.get_mut(i)) {
+                    *open = false;
+                }
+            }
+            JournalRecord::Observed { found: None, .. } => {}
+            JournalRecord::Retracted { intent, .. } => {
+                if let Some((_, _, open)) = index.get(intent).and_then(|&i| tracked.get_mut(i)) {
+                    *open = false;
+                }
+            }
+        }
+    }
+    tracked
+        .into_iter()
+        .filter_map(|(intent, _, open)| open.then_some(intent))
+        .collect()
+}
+
 /// Every intent's view, in step order, from one pass over `records` (plan §8, body 7).
+#[cfg(unix)]
 pub(crate) fn views(records: &[(u64, JournalRecord)]) -> Vec<IntentView> {
     views_filtered(records, |_| true)
 }
@@ -1639,20 +1689,20 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
     let fault = |what: String| {
         Error::refused(format!("step {step}: {what}")).with_sub(Sub::JournalFault { at })
     };
-    let value: Value = aterm_json::from_slice(body).map_err(|_| fault("not JSON".into()))?;
-    if value.as_object().is_none() {
+    let mut value: Value = aterm_json::from_slice(body).map_err(|_| fault("not JSON".into()))?;
+    let Some(object) = value.as_object_mut() else {
         return Err(fault("not a JSON object".into()));
-    }
-    let fields = Fields {
-        value: &value,
+    };
+    let mut fields = Fields {
+        object,
         fault: &fault,
     };
     let v = fields.number("v")?;
     if v != 1 {
         return Err(fault(format!("v is {v}")));
     }
-    let kind = fields.string("type")?;
-    match kind {
+    let kind = fields.take_string("type")?;
+    match kind.as_str() {
         "intent" => {
             let id_text = fields.string("id")?;
             let id = IntentId::parse(id_text)
@@ -1669,19 +1719,20 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
                 id,
                 op,
                 slug,
-                identity: fields.string("identity")?.to_string(),
-                fingerprint: fields.string("fingerprint")?.to_string(),
-                key: fields.string("key")?.to_string(),
-                request: fields.string("request")?.to_string(),
-                target_commitish: fields.maybe_string("target_commitish")?,
-                body_digest: fields.maybe_string("body_digest")?,
-                grant: fields.maybe_string("grant")?,
+                identity: fields.take_string("identity")?,
+                fingerprint: fields.take_string("fingerprint")?,
+                key: fields.take_string("key")?,
+                request: fields.take_string("request")?,
+                target_commitish: fields.take_maybe_string("target_commitish")?,
+                body_digest: fields.take_maybe_string("body_digest")?,
+                grant: fields.take_maybe_string("grant")?,
                 at_secs: fields.number("at_secs")?,
             })))
         }
         "settled" => {
             let intent = fields.intent()?;
-            let outcome = match fields.string("outcome")? {
+            let outcome_kind = fields.take_string("outcome")?;
+            let outcome = match outcome_kind.as_str() {
                 "never_sent" => Settled::NeverSent,
                 "refused" => {
                     let status = fields.number("status")?;
@@ -1691,10 +1742,10 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
                 }
                 "created" => Settled::Created {
                     id: fields.number("id")?,
-                    url: fields.string("url")?.to_string(),
+                    url: fields.take_string("url")?,
                 },
                 "unknown" => Settled::Unknown {
-                    why: fields.string("why")?.to_string(),
+                    why: fields.take_string("why")?,
                 },
                 other => return Err(fault(format!("outcome {other:?}"))),
             };
@@ -1716,8 +1767,8 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
 /// A body's fields, each read with its kind checked; a missing or mistyped one is `decode`'s
 /// fault `{key} is missing or not a {kind}`.
 struct Fields<'a, F: Fn(String) -> Error> {
-    /// The body.
-    value: &'a Value,
+    /// The body object.
+    object: &'a mut Map,
     /// `decode`'s fault for this body.
     fault: &'a F,
 }
@@ -1728,26 +1779,34 @@ impl<'a, F: Fn(String) -> Error> Fields<'a, F> {
         (self.fault)(format!("{key} is missing or not a {kind}"))
     }
 
-    /// A string.
-    fn string(&self, key: &str) -> Result<&'a str> {
-        self.value
+    /// A borrowed string.
+    fn string(&self, key: &str) -> Result<&str> {
+        self.object
             .get(key)
             .and_then(Value::as_str)
             .ok_or_else(|| self.mistyped(key, "string"))
     }
 
-    /// A string or `null`.
-    fn maybe_string(&self, key: &str) -> Result<Option<String>> {
-        match self.value.get(key) {
+    /// An owned string removed from the object without cloning.
+    fn take_string(&mut self, key: &str) -> Result<String> {
+        match self.object.remove(key) {
+            Some(Value::String(s)) => Ok(s),
+            _ => Err(self.mistyped(key, "string")),
+        }
+    }
+
+    /// A string or `null`, removed from the object without cloning.
+    fn take_maybe_string(&mut self, key: &str) -> Result<Option<String>> {
+        match self.object.remove(key) {
             Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(Value::String(s)) => Ok(Some(s)),
             _ => Err(self.mistyped(key, "string or null")),
         }
     }
 
     /// A non-negative integer.
     fn number(&self, key: &str) -> Result<u64> {
-        self.value
+        self.object
             .get(key)
             .and_then(Value::as_u64)
             .ok_or_else(|| self.mistyped(key, "number"))
@@ -1755,7 +1814,7 @@ impl<'a, F: Fn(String) -> Error> Fields<'a, F> {
 
     /// A non-negative integer or `null`.
     fn maybe_number(&self, key: &str) -> Result<Option<u64>> {
-        match self.value.get(key) {
+        match self.object.get(key) {
             Some(Value::Null) => Ok(None),
             Some(v) => v
                 .as_u64()

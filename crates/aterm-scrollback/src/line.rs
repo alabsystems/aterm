@@ -545,18 +545,11 @@ impl Line {
                 } else {
                     0
                 };
-                let mut url_mem = 0usize;
-                let mut id_mem = 0usize;
+                let mut payload_mem = 0usize;
                 for s in spans {
-                    url_mem = url_mem.saturating_add(s.url.len());
-                    if let Some(id) = s.id.as_ref() {
-                        id_mem = id_mem.saturating_add(id.len());
-                    }
+                    payload_mem = payload_mem.saturating_add(s.retained_payload_bytes());
                 }
-                boxed
-                    .saturating_add(heap_spans)
-                    .saturating_add(url_mem)
-                    .saturating_add(id_mem)
+                boxed.saturating_add(heap_spans).saturating_add(payload_mem)
             }
             None => 0,
         };

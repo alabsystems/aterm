@@ -97,6 +97,7 @@ fn claude_session(h: &SessionHandle) {
                 prompts: vec![prompt("keep going"), prompt("wire the survey")],
                 said: Some("Running the tests now.".into()),
                 said_end: Some("Running the tests now.".into()),
+                said_at_ms: None,
                 doing: Some("Bash".into()),
             },
             task: None,
@@ -177,6 +178,7 @@ fn the_survey_answers_a_header_and_a_row_per_session() {
         "cmd=",
         "rows=",
         "need_ids=",
+        "step=",
     ] {
         assert!(!row.contains(&format!(" {key}")), "{key} at facts: {row}");
     }
@@ -806,6 +808,7 @@ fn each_level_emits_exactly_its_fields() {
         "cmd",
         "rows",
         "need_ids",
+        "step",
     ];
     let keys = |row: &str| -> Vec<String> {
         row.split(' ')
@@ -1347,6 +1350,7 @@ fn codex_survey() -> CodexSurvey {
                 prompts: vec![prompt("port the parser")],
                 said: Some("Reading the grammar.".into()),
                 said_end: Some("Ported; the tests pass.".into()),
+                said_at_ms: None,
                 doing: Some("exec_command".into()),
             },
             model: Some("gpt-5.5".into()),
@@ -1659,6 +1663,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         walled_until: None,
         last_used: None,
         read_at: None,
+        launch: None,
     };
     let store = crate::session_store::new_store();
     let claude = crate::session_store::test_handle(5);
@@ -1887,6 +1892,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
             walled_until: None,
             last_used: Some(1_793_159_000),
             read_at: None,
+            launch: None,
         }],
         accounts_unread: Vec::new(),
         session_accounts: std::collections::BTreeMap::new(),
@@ -2185,4 +2191,148 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
         !serves_cached(at, &read, soon, Some("n-2")),
         "the control: another node's snapshot is not served"
     );
+}
+
+/// Holds until the wall clock is past `at_ms`, so what moves next moves later than `at_ms`.
+fn past(at_ms: u64) {
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the clock to move", || {
+        (aterm_gui_timing::wall_ms() > at_ms).then_some(())
+    });
+}
+
+/// `h`'s agent (`claude_session`'s) says `words`, its row written at `at_ms` where it says, and
+/// is doing `doing`.
+fn said(h: &SessionHandle, words: &str, at_ms: Option<u64>, doing: Option<&str>) {
+    h.ctx.timeline.lock().unwrap().set_claude_excerpts(
+        4242,
+        Some(ClaudeExcerpts {
+            excerpts: Excerpts {
+                prompts: Vec::new(),
+                said: Some(words.into()),
+                said_end: Some(words.into()),
+                said_at_ms: at_ms.map(|at| i64::try_from(at).unwrap()),
+                doing: doing.map(str::to_owned),
+            },
+            task: None,
+            transcript_len: None,
+        }),
+    );
+}
+
+/// `h` posts `text` on a topic channel; when it was queued.
+fn topic_post(h: &SessionHandle, text: &str) -> u64 {
+    let answer =
+        crate::fabric::cmd_post(&*h.ctx, &format!("to=say:build kind=note -- {text}"), None);
+    assert!(answer.starts_with("OK "), "{answer}");
+    h.ctx.fabric.last_topic_post().expect("a topic post").at_ms
+}
+
+#[test]
+fn a_step_is_the_last_topic_post_where_it_came_after_the_screens_words_and_not_before() {
+    let h = crate::session_store::test_handle(5);
+    claude_session(&h);
+    assert_eq!(
+        last_words(&h, false).as_deref(),
+        Some("Running the tests now.")
+    );
+    let read = h.ctx.timeline.lock().unwrap().words_read();
+    past(read.at(Word::Said));
+    topic_post(&h, "crate 3 of 9");
+    assert_eq!(
+        last_words(&h, false).as_deref(),
+        Some("crate 3 of 9"),
+        "a newer topic post is the step"
+    );
+    // The same words read again (a new prompt beside them is no word) are no move: the post stays
+    // the step.
+    said(&h, "Running the tests now.", None, Some("Bash"));
+    assert_eq!(last_words(&h, false).as_deref(), Some("crate 3 of 9"));
+
+    let posted = h.ctx.fabric.last_topic_post().expect("a topic post").at_ms;
+    past(posted);
+    said(&h, "All green; landing.", None, Some("Bash"));
+    assert_eq!(
+        last_words(&h, false).as_deref(),
+        Some("All green; landing."),
+        "an older topic post is not"
+    );
+}
+
+/// THE TOOL CALL THAT POSTED ENDS, AND THE POST STAYS THE STEP: `doing` moving is no move of the
+/// `said` a step shows. CONTROL: `said` moving after the post is.
+#[test]
+fn a_step_keeps_a_topic_post_when_only_the_tool_in_flight_moves_after_it() {
+    let h = crate::session_store::test_handle(5);
+    claude_session(&h);
+    said(&h, "Building the workspace.", None, Some("Bash"));
+    past(h.ctx.timeline.lock().unwrap().words_read().at(Word::Said));
+    let posted = topic_post(&h, "crate 9 of 9");
+    past(posted);
+    said(&h, "Building the workspace.", None, None);
+    assert!(
+        h.ctx.timeline.lock().unwrap().words_read().at(Word::Doing) > posted,
+        "PRECONDITION: the tool's end was read after the post"
+    );
+    assert_eq!(
+        last_words(&h, false).as_deref(),
+        Some("crate 9 of 9"),
+        "the call's end leaves the post the step"
+    );
+    said(&h, "Built; testing.", None, None);
+    assert_eq!(last_words(&h, false).as_deref(), Some("Built; testing."));
+}
+
+/// WORDS WRITTEN BEFORE A POST BUT READ AFTER IT ARE OLDER THAN IT: the step goes by the time
+/// the transcript row says (`said_at_ms`), not the read. CONTROL: words its row says were written
+/// after the post are the step.
+#[test]
+fn a_step_goes_by_when_the_transcript_wrote_the_words_not_when_aterm_read_them() {
+    let h = crate::session_store::test_handle(5);
+    claude_session(&h);
+    let posted = topic_post(&h, "crate 3 of 9");
+    past(posted);
+    said(
+        &h,
+        "Building the workspace.",
+        Some(posted - 1),
+        Some("Bash"),
+    );
+    assert!(
+        h.ctx.timeline.lock().unwrap().words_read().at(Word::Said) > posted,
+        "PRECONDITION: the words were read after the post"
+    );
+    assert_eq!(last_words(&h, false).as_deref(), Some("crate 3 of 9"));
+    said(
+        &h,
+        "Building the workspace.",
+        Some(posted + 1),
+        Some("Bash"),
+    );
+    assert_eq!(
+        last_words(&h, false).as_deref(),
+        Some("Building the workspace."),
+        "words written after the post"
+    );
+}
+
+#[test]
+fn a_step_of_words_and_a_post_that_tie_is_the_screens() {
+    let post = |at_ms| crate::fabric::TopicPost {
+        topic: "build".into(),
+        text: "crate 3\nof 9".into(),
+        at_ms,
+    };
+    let words = || Some(("Running".to_owned(), 5));
+    assert_eq!(step_of(words(), Some(&post(5))).as_deref(), Some("Running"));
+    assert_eq!(step_of(words(), Some(&post(4))).as_deref(), Some("Running"));
+    assert_eq!(
+        step_of(words(), Some(&post(6))).as_deref(),
+        Some("crate 3 of 9")
+    );
+    assert_eq!(
+        step_of(None, Some(&post(0))).as_deref(),
+        Some("crate 3 of 9")
+    );
+    assert_eq!(step_of(words(), None).as_deref(), Some("Running"));
+    assert_eq!(step_of(None, None), None);
 }

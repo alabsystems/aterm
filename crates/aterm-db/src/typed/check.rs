@@ -134,11 +134,14 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                 };
                 let mut targets = Vec::new();
                 match (column.ty, field) {
-                    (Ty::Set(Ty::Ref(target)), _) => {
-                        for elem in field.members() {
-                            targets.push((*target, elem));
+                    (Ty::Set(Ty::Ref(target)), super::cell::Field::Set(elements)) => {
+                        for (elem, f) in elements {
+                            if f.present() {
+                                targets.push((*target, elem.as_str()));
+                            }
                         }
                     }
+                    (Ty::Set(Ty::Ref(_)), _) => {}
                     (ty, super::cell::Field::Conflict { candidates, .. }) => {
                         for candidate in candidates {
                             refs(&ty, &candidate.value.x, &mut targets);

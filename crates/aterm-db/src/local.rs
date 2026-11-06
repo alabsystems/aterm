@@ -575,11 +575,9 @@ impl Database {
         }
         let opened = crypto::open(&self.credentials.manifest, &self.credentials.key, wire)?;
         let id = opened.header.id;
-        if self.history.wire(&id).is_some() {
+        if self.history.wire(&id).is_some() || !self.history.check_insert(&opened)? {
             return Ok(false);
         }
-        let mut proposed = self.history.clone();
-        proposed.insert(opened)?;
         if self
             .log
             .stats()
@@ -617,7 +615,7 @@ impl Database {
                 ));
             }
         };
-        self.history = proposed;
+        self.history.retain(opened)?;
         self.receipts.insert(id, (received_at, appended));
         Ok(true)
     }

@@ -554,14 +554,23 @@ impl Directory {
             Err(error) if self.is_recovery() || error.is_busy() => Err(error),
             Err(original) => {
                 let recovery = self.recovery();
-                if !matches!(
-                    recovery.observe_store_if_exists(session, self.catalog_scope()),
-                    Ok(Some(_))
-                ) {
-                    return Err(original);
+                match aterm_uds::private_file::check_private_dir(&recovery.root) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(original);
+                    }
+                    Err(_) => return Err(original),
                 }
+                let Ok(Some(catalog)) =
+                    recovery.observe_store_if_exists(session, self.catalog_scope())
+                else {
+                    return Err(original);
+                };
+                let Ok(records) = recovery.discovery_records_from(session, &catalog) else {
+                    return Err(original);
+                };
                 recovery
-                    .observe_primary_with_policy(session, policy)
+                    .project(session, records, policy)
                     .map_err(|_| original)
             }
         }
@@ -683,6 +692,26 @@ impl Directory {
             directory.discovery_records_from(session, &catalog)?,
             &Policy::default(),
         )
+    }
+    pub(crate) fn snapshot_existing_if_exists(
+        &self,
+        session: &Session<'_>,
+    ) -> Result<Option<Snapshot>> {
+        let Some(catalog) = self.observe_table_if_exists(session, self.catalog_scope())? else {
+            return Ok(None);
+        };
+        let directory = if catalog.is_recovery() {
+            self.recovery()
+        } else {
+            self.clone()
+        };
+        directory
+            .project(
+                session,
+                directory.discovery_records_from(session, &catalog)?,
+                &Policy::default(),
+            )
+            .map(Some)
     }
     /// Observe an already enrolled catalog without falling back to enrollment
     /// when its claim or journal is absent or incomplete.
@@ -894,9 +923,8 @@ impl Directory {
                     let Ok(descriptor) = Descriptor::decode(self.trust, record.payload()) else {
                         continue;
                     };
-                    if retained.contains(&descriptor.scope.digest())
-                        && seen.insert(record.header().id)
-                    {
+                    if retained.contains(&descriptor.scope.digest()) {
+                        seen.insert(record.header().id);
                         records.push(record);
                     }
                 }

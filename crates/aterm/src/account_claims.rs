@@ -65,6 +65,9 @@ fn denied_swarm_labels_from_roster(
             }
         }
     }
+    if !roster.members.iter().any(|m| roster.is_member_denied(m)) {
+        return out;
+    }
     let surviving_canon: std::collections::BTreeSet<String> = roster
         .members
         .iter()
@@ -138,11 +141,14 @@ impl Table for Commons {
             .as_ref()
             .map(denied_swarm_labels_from_roster)
             .unwrap_or_default();
+        let mut machine_str = String::with_capacity(32);
         let book = Book::of(
             read.rows
                 .iter()
                 .filter_map(|(machine, body)| {
-                    Row::from_value(&hex::encode_lower(machine), body).ok()
+                    machine_str.clear();
+                    hex::push_lower(&mut machine_str, machine);
+                    Row::from_value(&machine_str, body).ok()
                 })
                 .filter(|row| row.machine == me || !label_is_denied(&row.label, &denied)),
         );

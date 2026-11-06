@@ -181,7 +181,7 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
     if has(Check::Cells) && ctx.cells_pulled {
         work.push_str(" pulled-cells");
     }
-    if ctx.compile_only && (has(Check::Test) || has(Check::Checkers)) {
+    if ctx.compile_only && (has(Check::Test) || has(Check::Checkers) || has(Check::Measure)) {
         work.push_str(" --compile-only");
     }
     if ctx.no_windows
@@ -592,6 +592,7 @@ mod tests {
             order: (0, 4242, 0),
             stalled: Some(span),
             credit: Vec::new(),
+            overrun: None,
         };
         let stuck = atpkg::admit_disk::Error::Stuck {
             stuck: aterm_toolchain::waits::Stuck {

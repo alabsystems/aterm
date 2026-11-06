@@ -1067,6 +1067,8 @@ mod tests {
             rev: 1,
             state,
             from: FROM_CTL.to_owned(),
+            manager_node: None,
+            told: Default::default(),
             why,
             checked: None,
             left: None,

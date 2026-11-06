@@ -1296,6 +1296,35 @@ impl App {
             .any(|terminal| !terminal.finished)
     }
 
+    /// A live installer travels with its PTY when its durable receipt lets the successor
+    /// recover the exact child's prompt ownership without submitting another command.
+    pub(crate) fn developer_tools_install_holds_handoff(&self) -> bool {
+        self.workstation_setup
+            .developer_tools_session
+            .iter()
+            .filter(|terminal| !terminal.finished)
+            .any(|terminal| {
+                let Some(child) = self.pool.get(terminal.session) else {
+                    return true;
+                };
+                child.pid != child.shell_identity.pid
+                    || !terminal.receipt.as_ref().is_some_and(|receipt| {
+                        self.workstation_setup
+                            .developer_tools_mark
+                            .path
+                            .as_deref()
+                            .is_some_and(|mark| {
+                                receipt.transferable(
+                                    mark,
+                                    child.ctx.self_id.as_str(),
+                                    child.pid,
+                                    child.shell_identity.birth,
+                                )
+                            })
+                    })
+            })
+    }
+
     /// The installer terminal `session` landed, as a pressed tab's landing leaves it, with no
     /// recovery receipt: it holds off other prompts until
     /// [`Self::finish_developer_tools_install`].

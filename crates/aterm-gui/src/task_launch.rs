@@ -133,6 +133,10 @@ pub(crate) struct TaskOrder {
     pub(crate) model: Option<String>,
     /// `from=`, the session that starts the worker.
     pub(crate) caller: Option<SessionId>,
+    /// The Mac [`Self::caller`] runs on where the spawn came over a fleet drive: the driver's node
+    /// (`crate::fabric::serving_driver`), which the task record keeps as its manager's
+    /// ([`crate::task_record::TaskRecord::manager_node`]); `None` for a spawn made on this Mac.
+    pub(crate) manager_node: Option<String>,
     /// The `cwd=` named, canonical.
     pub(crate) trusted_cwd: Option<String>,
     /// Whether the task file ends with the [`fact_line`] naming its starter.
@@ -175,6 +179,7 @@ impl TaskOrder {
             agent,
             model,
             caller,
+            manager_node: None,
             trusted_cwd,
             fact_line: true,
             autopilot: WORKER_AUTOPILOT,
@@ -199,6 +204,7 @@ impl TaskOrder {
             agent: aterm_phase::Program::Generic,
             model: None,
             caller,
+            manager_node: None,
             trusted_cwd,
             fact_line: false,
             autopilot: WORKER_AUTOPILOT,
@@ -641,7 +647,8 @@ pub(crate) enum PoolWait {
 /// after each wait of [`POOL_HOLD_LOOK`] at most (and at `until`, by `now`, Unix seconds): the
 /// launch is tried again once `opening` no longer names that instant, as where a row serves now,
 /// the pool or its mode changed, or another row opens first. `wait` waits, and answers false
-/// where the launch is no longer wanted (its session ended).
+/// where the launch is no longer wanted (its session ended, or its task moved on), so no further
+/// try claims a row for it.
 ///
 /// # Errors
 ///
@@ -710,46 +717,46 @@ pub(crate) fn pool_wait_for<'a>(
     let mut mark: Option<PoolHoldMark<'a>> = None;
     let mut noted = None;
     let mut sub = None;
-    move |next| match next {
-        PoolWait::Retry(pause) => {
-            std::thread::sleep(*pause);
-            alive()
-        }
-        PoolWait::Hold { until, why, look } => {
-            if noted != Some(*until) {
-                noted = Some(*until);
-                let until_words =
-                    aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0));
-                aterm_log::info!(
-                    "worker session {}: launch held until {until_words}: {held_because}",
-                    work.local
-                );
-                note_launch(
-                    &work.ctx,
-                    format!("held until {until_words} ({why}): {held_because}"),
-                );
-            }
-            mark.get_or_insert_with(|| PoolHoldMark::of(&work.ctx))
-                .until(*until, held_because);
-            let sub = sub.get_or_insert_with(|| {
-                crate::session_watch::Subscription::single(&work.ctx.watchers)
-            });
-            let now = Instant::now();
-            let end = now
-                .checked_add(*look)
-                .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
-            loop {
-                // A stall the deadline marked ends a hold as it ends the wait for a prompt: a line
-                // typed once the row opens would start a worker nobody is waiting for.
-                if !alive() || task_moved_on(&work.ctx).is_some() {
-                    return false;
+    move |next| {
+        let wait = match next {
+            PoolWait::Retry(pause) => *pause,
+            PoolWait::Hold { until, why, look } => {
+                if noted != Some(*until) {
+                    noted = Some(*until);
+                    let until_words =
+                        aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0));
+                    aterm_log::info!(
+                        "worker session {}: launch held until {until_words}: {held_because}",
+                        work.local
+                    );
+                    note_launch(
+                        &work.ctx,
+                        format!("held until {until_words} ({why}): {held_because}"),
+                    );
                 }
-                let left = end.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return true;
-                }
-                let _ = sub.wait(left);
+                mark.get_or_insert_with(|| PoolHoldMark::of(&work.ctx))
+                    .until(*until, held_because);
+                *look
             }
+        };
+        let sub = sub
+            .get_or_insert_with(|| crate::session_watch::Subscription::single(&work.ctx.watchers));
+        let now = Instant::now();
+        let end = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
+        loop {
+            // A stall the deadline marked ends a wait as it ends the wait for a prompt: another
+            // try could claim a row or install a program, and a line typed once the row opens
+            // would start a worker nobody is waiting for.
+            if !alive() || task_moved_on(&work.ctx).is_some() {
+                return false;
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            let _ = sub.wait(left);
         }
     }
 }
@@ -828,7 +835,8 @@ impl NativeGoogleAdmission {
         agent: aterm_phase::Program,
         starter: aterm_agent::harness::worker::Starter,
         scope: Option<aterm_agent::harness::account_work::Scope>,
-    ) -> Result<(aterm_agent::harness::worker::Starter, Self), String> {
+    ) -> Result<(aterm_agent::harness::worker::Starter, Self), aterm_agent::harness::worker::Refused>
+    {
         #[cfg(unix)]
         if native_google_agent(agent) {
             let parts = PoolSeat::here().ok_or("Native Google pool location is unavailable")?;
@@ -900,7 +908,7 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
-    let (admitted, google) = match admit_prepared_worker(
+    let admission = admit_prepared_worker(
         cli,
         caller,
         aterm_types::dirs::home_dir().as_deref(),
@@ -915,20 +923,23 @@ fn run_worker_launch(work: &Launch) {
             }
             NativeGoogleAdmission::prepare(work.agent, starter, work.account_scope.clone())
         },
-    ) {
-        Ok(prepared) => prepared,
-        Err(refused) => {
-            if account_preparation_cancelled(work) {
-                stall_why(
-                    work,
-                    "held",
-                    "account preparation stopped for shutdown or update",
-                );
-            } else {
-                stall_why(work, refused_why(&refused), refused.why());
-            }
-            return;
-        }
+    );
+    if admission.is_err() && account_preparation_cancelled(work) {
+        stall_why(
+            work,
+            "held",
+            "account preparation stopped for shutdown or update",
+        );
+        return;
+    }
+    let Some((admitted, google)) = take_admission(
+        &work.ctx,
+        work.local,
+        work.agent,
+        admission,
+        crate::harness_host::member_label,
+    ) else {
+        return;
     };
     let admitted = if found == (Found::Parent { lent: false }) {
         admitted.past_the_twin(cli, work.model.as_deref())
@@ -960,11 +971,7 @@ fn run_worker_launch(work: &Launch) {
     let prompt = match await_prompt(work, Duration::ZERO) {
         Ok(prompt) => prompt,
         Err(why) => {
-            if account_preparation_cancelled(work) {
-                stall_why(work, "held", &why);
-            } else {
-                stall(work, &why);
-            }
+            stall_unprompted(work, &why);
             return;
         }
     };
@@ -1062,7 +1069,7 @@ fn run_program_launch(work: &Launch, run: &crate::program_worker::ProgramRun) {
     let prompt = match await_prompt(work, Duration::ZERO) {
         Ok(prompt) => prompt,
         Err(why) => {
-            stall(work, &why);
+            stall_unprompted(work, &why);
             return;
         }
     };
@@ -1135,7 +1142,7 @@ pub(crate) const fn claim_worker_mode(
 
 /// The store a worker's program is read from and installed into ([`admit_worker`]).
 pub(crate) trait ProgramStore {
-    /// Whether `program` has an installed build.
+    /// Whether `program` is here for a worker's line to run ([`runnable_in`]).
     fn present(&self, program: &str) -> bool;
     /// Why atpkg installs no `program` on this machine, where it does not: a person keeps it off
     /// (`[packages] exclude`, a removal, or a no to unattended installs, [`held_in`]), or no
@@ -1175,8 +1182,7 @@ impl AtpkgStore<'_> {
 
 impl ProgramStore for AtpkgStore<'_> {
     fn present(&self, program: &str) -> bool {
-        atpkg::store::resolve_configured()
-            .is_some_and(|layout| atpkg::ops::active_build_of(&layout, program).is_some())
+        atpkg::store::resolve_configured().is_some_and(|layout| runnable_in(&layout, program))
     }
 
     fn held(&self, program: &str) -> Option<String> {
@@ -1189,6 +1195,19 @@ impl ProgramStore for AtpkgStore<'_> {
         let (atpkg, layout) = Self::installer()?;
         install_with(&atpkg, &layout, program, self.0)
     }
+}
+
+/// Whether `layout` holds a `program` a worker's line can run: an active build, or a development
+/// link whose tools still run ([`atpkg::linkmode::live_linked_checkout`]) and include one of that
+/// name, the word the line types. atpkg's install leaves a link as it stands and says so with
+/// success, so a launcher that looked only for a build refused a `codex` that runs (m111,
+/// 2026-11-06).
+pub(crate) fn runnable_in(layout: &atpkg::store::Layout, program: &str) -> bool {
+    use atpkg::linkmode::{linked_tool_names, live_linked_checkout};
+    atpkg::ops::active_build_of(layout, program).is_some()
+        || (live_linked_checkout(layout, program).is_ok_and(|root| root.is_some())
+            && linked_tool_names(layout, program)
+                .is_some_and(|tools| tools.iter().any(|tool| tool == program)))
 }
 
 /// Run `atpkg`'s verified install of `program` on `layout` for the launcher of `ctx`, whose timeline
@@ -1414,18 +1433,23 @@ fn admit_prepared_worker<M, T>(
     store: &dyn ProgramStore,
     prepare: impl FnOnce(
         aterm_agent::harness::worker::Starter,
-    ) -> Result<(aterm_agent::harness::worker::Starter, T), String>,
+    ) -> Result<
+        (aterm_agent::harness::worker::Starter, T),
+        aterm_agent::harness::worker::Refused,
+    >,
 ) -> Result<(aterm_agent::harness::worker::Admitted, T), aterm_agent::harness::worker::Refused> {
     admit_worker(cli, starter, user, note, installing, store)?.prepare(cli, user, prepare)
 }
 
 /// The task record's `why=` for a worker its launcher refused before its line
-/// ([`aterm_agent::harness::worker::Refused`]): `signin` for a sign-in or authentication
-/// preparation failure, and `install` for a program whose install failed.
+/// ([`aterm_agent::harness::worker::Refused`]): `signin` for a login only a person can sign back
+/// in, `install` for a program whose install failed, and `startup` for a preparation that failed
+/// for any other reason, which a later start of its agent heals as any startup stall.
 pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused) -> &'static str {
     match refused {
         aterm_agent::harness::worker::Refused::SignedOut(_) => crate::task_record::WHY_SIGNIN,
         aterm_agent::harness::worker::Refused::Program(_) => crate::task_record::WHY_INSTALL,
+        aterm_agent::harness::worker::Refused::Preparation(_) => "startup",
     }
 }
 
@@ -1439,8 +1463,10 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
 /// the launcher then types nothing when the work ends, and nothing ends atpkg's child
 /// (ATERM-KI-1105-2). Its own work is what the atpkg child it spawned writes ([`install_with`]), so
 /// a sign-in check, which has no such child, has that limit whole, whatever else moves on the
-/// store. The mark lives only in this process, so a seamless update's successor, which has no
-/// launcher, judges the worker as usual.
+/// store. Each mark has a clock of its own
+/// ([`crate::session_timeline::SessionTimeline::worker_install_mark`]), so no install's silence
+/// counts against the sign-in check after it. The mark lives only in this process, so a seamless
+/// update's successor, which has no launcher, judges the worker as usual.
 pub(crate) struct InstallingMark<'a>(&'a SessionCtx);
 
 impl<'a> InstallingMark<'a> {
@@ -1645,7 +1671,7 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
                 match await_prompt(work, PROMPT_SETTLE) {
                     Ok(settled) => prompt = settled,
                     Err(why) => {
-                        stall(work, &why);
+                        stall_unprompted(work, &why);
                         return None;
                     }
                 }
@@ -1880,13 +1906,68 @@ fn agy_rotation_held(
 }
 
 fn stall(work: &Launch, why: &str) {
-    stall_why(work, "shell", why);
+    note_launch(&work.ctx, format!("never typed ({why})"));
+    stall_task_shell(&work.ctx, work.local, why);
 }
 
-/// [`stall`] with the task record's `why=` word `word`.
+/// [`stall`] with the task record's `why=` word `word`, for a launch no shell or person stopped:
+/// it keeps the record's attention, as a closed account epoch asks nothing of anyone.
 fn stall_why(work: &Launch, word: &'static str, why: &str) {
     note_launch(&work.ctx, format!("never typed ({why})"));
     stall_task_why(&work.ctx, work.local, word, why);
+}
+
+/// A launcher's wait for its prompt ([`await_prompt`]) ended with `why`. A shutdown or update that
+/// cancelled its account preparation says `why=held` and blames no shell; anything else ended the
+/// wait from the shell, a person or the task's own record ([`stall`]).
+fn stall_unprompted(work: &Launch, why: &str) {
+    if account_preparation_cancelled(work) {
+        stall_why(work, "held", why);
+    } else {
+        stall(work, why);
+    }
+}
+
+/// What session `local`'s launcher keeps of its admission. Admitted, the reason atpkg keeps its
+/// program off this Mac, if it does, goes on the timeline for a stall to name
+/// ([`crate::harness_host::kept_off_held`]). Refused, its task is `stalled` with [`refused_why`]'s
+/// word, and the refusal's cause and the member `on` reads go in `attention=` under the mark's
+/// lock, so a dispatcher can place the next worker elsewhere. The launch's note and the log keep
+/// the whole words.
+pub(crate) fn take_admission<T>(
+    ctx: &SessionCtx,
+    local: u64,
+    agent: aterm_phase::Program,
+    admission: Result<
+        (aterm_agent::harness::worker::Admitted, T),
+        aterm_agent::harness::worker::Refused,
+    >,
+    on: impl FnOnce() -> Option<String>,
+) -> Option<(aterm_agent::harness::worker::Admitted, T)> {
+    let refused = match admission {
+        Ok(admitted) => {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_worker_kept_off(admitted.0.kept_off_why().map(str::to_owned));
+            return Some(admitted);
+        }
+        Err(refused) => refused,
+    };
+    note_launch(ctx, format!("never typed ({})", refused.why()));
+    aterm_log::warn!(
+        "worker session {local}: {}; nothing was typed",
+        refused.why()
+    );
+    let word = refused_why(&refused);
+    let words = crate::harness_host::StartupHold::Refused {
+        agent,
+        why: refused.short(),
+        word,
+    }
+    .attention_on(on().as_deref());
+    mark_refused(ctx, local, word, &words);
+    None
 }
 
 /// [`stall`] for a launch its launcher gave up on before typing, for a reason no shell or person
@@ -1943,19 +2024,27 @@ pub(crate) fn stall_refused_task(
     why: &str,
 ) {
     aterm_log::warn!("worker session {local}: {why}; nothing was typed");
+    let word = "startup";
     let words = crate::harness_host::StartupHold::Refused {
         agent,
         why: why.to_owned(),
-        on: crate::harness_host::member_label(),
+        word,
     }
-    .attention();
+    .attention_on(crate::harness_host::member_label().as_deref());
+    mark_refused(ctx, local, word, &words);
+}
+
+/// Mark session `local`'s `working` task stalled with the `why=` word `word` and `words` in
+/// `attention=`, both under one lock. A record that moved on already says what became of the task,
+/// and keeps its attention.
+fn mark_refused(ctx: &SessionCtx, local: u64, word: &'static str, words: &str) {
     let mut mark = TaskMark::new(TaskState::Stalled);
-    mark.why = Some("startup");
+    mark.why = Some(word);
     let marked = crate::task_record::mark_session_task_with(
         ctx,
         local,
         Some(&mark),
-        crate::task_record::AttentionEdit::Raise(&words),
+        crate::task_record::AttentionEdit::Raise(words),
         ctx.fabric.fence_wait(),
         |task, _| task.is_some_and(|task| task.state == TaskState::Working),
     );
@@ -1966,10 +2055,15 @@ pub(crate) fn stall_refused_task(
     }
 }
 
-/// [`stall`] of session `local` by its parts, with the task record's `why=` word `word`. Only a `working` record takes the
-/// mark: one that moved on already says what became of the task ([`task_moved_on`]), and a
-/// deadline's stall keeps its attention.
-pub(crate) fn stall_task_why(ctx: &SessionCtx, local: u64, word: &'static str, why: &str) {
+/// [`stall`] of session `local` by its parts: `stalled why=shell`.
+pub(crate) fn stall_task_shell(ctx: &SessionCtx, local: u64, why: &str) {
+    stall_task_why(ctx, local, "shell", why);
+}
+
+/// [`stall`] of session `local` by its parts, with the task record's `why=` word `word`. Only a
+/// `working` record takes the mark: one that moved on already says what became of the task
+/// ([`task_moved_on`]), and a deadline's stall keeps its attention.
+fn stall_task_why(ctx: &SessionCtx, local: u64, word: &'static str, why: &str) {
     aterm_log::warn!("worker session {local}: {why}; nothing was typed");
     let mut mark = TaskMark::new(TaskState::Stalled);
     mark.why = Some(word);
@@ -2235,26 +2329,22 @@ fn claude_pick(
     use aterm_agent::harness::{accounts, accounts_pool};
     let cli = accounts::Cli::Claude;
     let mode = seat.mode_for(cli);
-    if mode == accounts::Mode::Off {
-        return Ok(None);
-    }
     let who = accounts::ProcessLogin::of_env_for(
         cli,
         starter.env.iter().map(|(n, v)| (n.as_str(), v.as_str())),
     );
-    if !who.default_home || !who.stored_login {
+    if !accounts::claude_worker_may_move(mode, &who) {
         return Ok(None);
     }
     let roster = seat.bound_roster(cli)?;
-    if roster.rows.len() < 2 {
+    if !roster.several() || accounts::judged_label(&roster, &who).is_none() {
         return Ok(None);
     }
-    let Some(from) = accounts::judged_label(&roster, &who) else {
-        return Ok(None);
-    };
     let (state, _) = seat.store(cli).load_judged(seat.now, &roster)?;
     let enrolled = accounts::enrolled_for(cli, &roster);
-    let Some(row) = accounts::worker_row(&roster, &state, &enrolled, from, mode, seat.now) else {
+    let Some((from, row)) =
+        accounts::claude_worker_move(&roster, &state, &enrolled, &who, mode, seat.now)
+    else {
         return Ok(None);
     };
     let env = accounts_pool::login_env(cli, row, seat.home).map_err(|why| why.to_string())?;

@@ -476,6 +476,15 @@ impl Scratch {
     }
 }
 
+/// install.sh's wait for a person's zshenv files (`zsh_ask_secs`) lengthened to [`HANG`]: every
+/// zsh these tests ask answers, so on a loaded machine a run waits out only its hang detector.
+fn zsh_ask() -> (String, String) {
+    (
+        "ATERM_INSTALL_ZSH_ASK_SECS".into(),
+        HANG.as_secs().to_string(),
+    )
+}
+
 /// The environment of a whole-script run.
 pub fn hermetic(home: &Home, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
@@ -488,6 +497,7 @@ pub fn hermetic(home: &Home, extra: &[(&str, &str)]) -> Vec<(String, String)> {
             s(&home.home.join("Applications")).into(),
         ),
         ("ATERM_NO_TOOLCHAIN".into(), "1".into()),
+        zsh_ask(),
     ];
     for (key, value) in extra {
         env.retain(|(k, _)| k != key);
@@ -572,11 +582,11 @@ impl Lib {
         Self {
             script: script.to_path_buf(),
             items: Vec::new(),
-            env: vec![("PATH".into(), system_path().into())],
+            env: vec![("PATH".into(), system_path().into()), zsh_ask()],
         }
     }
 
-    /// Set `key` in the batch's environment (PATH included).
+    /// Set `key` in the batch's environment (PATH and `ATERM_INSTALL_ZSH_ASK_SECS` included).
     pub fn env(&mut self, key: &str, value: &str) -> &mut Self {
         self.env.retain(|(k, _)| k != key);
         self.env.push((key.into(), value.into()));

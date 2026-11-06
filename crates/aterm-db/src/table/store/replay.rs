@@ -193,20 +193,21 @@ pub(super) fn restore(
     // and before finalization. Keep signed-envelope and historical validation
     // per record without repeating those filesystem checks for every entry.
     let envelope = Envelope::parse(scope, &wire)?;
-    let header = envelope.header.clone();
-    super::operation_policy(scope, &header, envelope.body.len() - 16)?;
-    let (quarantine, cut) = if aterm_db_core::quarantine_eligible(
+    super::operation_policy(scope, &envelope.header, envelope.body.len() - 16)?;
+    let (header, quarantine, cut) = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,
         batch.discarded_source(&envelope)?,
     ) {
         (
+            envelope.header,
             Some((envelope.roster, envelope.epoch, envelope.authored_ms)),
             None,
         )
     } else {
         let record = batch.open_envelope(envelope)?;
-        (None, super::cutoff::decode(record.payload()))
+        let cut = super::cutoff::decode(record.payload());
+        (record.header, None, cut)
     };
     if header.id != receipt.id {
         return Err(Error::new("replayed receipt differs from ciphertext"));

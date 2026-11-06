@@ -208,6 +208,21 @@ pub fn own_team() -> Result<Option<String>, String> {
     }
 }
 
+/// The signing identifier this process's code is signed with (`com.aterm.aterm` for the app):
+/// `None` for unsigned code, and off macOS.
+/// # Errors
+/// Security.framework could not read this process's signing information.
+pub fn own_identifier() -> Result<Option<String>, String> {
+    #[cfg(target_vendor = "apple")]
+    {
+        sec::own_identifier()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Ok(None)
+    }
+}
+
 /// The identity check in force.
 #[derive(Debug)]
 pub struct Identity {
@@ -528,6 +543,7 @@ mod sec {
         ) -> OSStatus;
         static kSecGuestAttributeAudit: CFTypeRef;
         static kSecCodeInfoTeamIdentifier: CFTypeRef;
+        static kSecCodeInfoIdentifier: CFTypeRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -713,6 +729,22 @@ mod sec {
     /// The team identifier this process's code is signed by, or `None` (ad hoc, or unsigned).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn own_team() -> Result<Option<String>, String> {
+        // SAFETY: reading an immutable framework constant.
+        own_signing_value(unsafe { kSecCodeInfoTeamIdentifier })
+    }
+
+    /// The signing identifier this process's code is signed with (`com.aterm.aterm`), or `None`
+    /// (unsigned).
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn own_identifier() -> Result<Option<String>, String> {
+        // SAFETY: reading an immutable framework constant.
+        own_signing_value(unsafe { kSecCodeInfoIdentifier })
+    }
+
+    /// One string of this process's signing information (`key`, a `kSecCodeInfo…` constant), or
+    /// `None` when the information has none.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn own_signing_value(key: CFTypeRef) -> Result<Option<String>, String> {
         const SIGNING_INFORMATION: u32 = 1 << 1;
         let mut me: CFTypeRef = std::ptr::null();
         // SAFETY: an out-parameter for one new reference.
@@ -725,28 +757,28 @@ mod sec {
             "SecCodeCopySigningInformation",
         )?;
         let info = owned(info, "SecCodeCopySigningInformation")?;
-        // SAFETY: reading an immutable framework constant; `info` is a live dictionary, and the
+        // SAFETY: `key` is an immutable framework constant; `info` is a live dictionary, and the
         // value it answers is borrowed from it (the Get rule), read while `info` lives.
-        let team = unsafe { CFDictionaryGetValue(info.0, kSecCodeInfoTeamIdentifier) };
-        if team.is_null() {
+        let value = unsafe { CFDictionaryGetValue(info.0, key) };
+        if value.is_null() {
             return Ok(None);
         }
         let mut buf = vec![0u8; 256];
-        // SAFETY: `team` is a CFString `info` keeps alive; `buf` is its stated size.
+        // SAFETY: `value` is a CFString `info` keeps alive; `buf` is its stated size.
         let ok = unsafe {
             CFStringGetCString(
-                team,
+                value,
                 buf.as_mut_ptr(),
                 buf.len() as isize,
                 K_CF_STRING_ENCODING_UTF8,
             )
         };
         if ok == 0 {
-            return Err("the signing team identifier is unprintable".to_string());
+            return Err("a signing information string is unprintable".to_string());
         }
         let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-        let team = String::from_utf8_lossy(&buf[..end]).into_owned();
-        Ok((!team.is_empty()).then_some(team))
+        let value = String::from_utf8_lossy(&buf[..end]).into_owned();
+        Ok((!value.is_empty()).then_some(value))
     }
 
     /// The code object of the process `token` names.

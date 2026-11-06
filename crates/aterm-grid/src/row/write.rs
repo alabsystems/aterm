@@ -49,6 +49,8 @@ impl Row {
         end: usize,
         end_half_blanked: bool,
     ) {
+        #[cfg(test)]
+        crate::test_counters::count_row_write();
         let end = end.min(self.cells.len());
         let len = if end_half_blanked && end + 1 == old_len {
             end

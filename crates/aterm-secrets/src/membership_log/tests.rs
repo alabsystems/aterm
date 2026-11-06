@@ -1723,6 +1723,7 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
 #[cfg(unix)]
 mod everyone_key;
 mod fold;
+mod no_leak;
 mod reach;
 mod readers;
 mod record_budgets;

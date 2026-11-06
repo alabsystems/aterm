@@ -179,6 +179,8 @@ pub(crate) struct EngineProbe {
     pub(crate) debt: aterm_core::terminal::RenderDebt,
     /// The grid's `(rows, cols)` now.
     pub(crate) geom: (u16, u16),
+    /// The program is on the main screen: it left the alternate screen it owed debt on.
+    pub(crate) main_screen: bool,
 }
 
 impl EngineProbe {
@@ -192,6 +194,7 @@ impl EngineProbe {
             screen_replaced: term.screen_replaced_count(),
             debt: term.render_debt(),
             geom: (term.rows(), term.cols()),
+            main_screen: !term.modes().alternate_screen,
         }
     }
 }
@@ -1316,6 +1319,7 @@ mod tests {
             screen_replaced: 0,
             debt: aterm_core::terminal::RenderDebt::default(),
             geom: (24, 80),
+            main_screen: false,
         }
     }
 
@@ -3374,6 +3378,37 @@ mod tests {
             lines[0].contains("verdict=healed by=nudge tried=1"),
             "{lines:?}"
         );
+    }
+
+    /// Leaving the alternate screen settles its debt whatever the nudge was holding: the program's
+    /// own act, read the same whichever of the nudge and this judge sees it first.
+    #[test]
+    fn a_program_that_left_the_alternate_screen_during_the_hold_closes_by_app() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?1049h");
+        assert!(!EngineProbe::sample(&term).main_screen);
+        term.process(b"\x1b[?1049l");
+        let sampled = EngineProbe::sample(&term);
+        assert!(sampled.main_screen);
+        assert!(!sampled.debt.owed());
+
+        let mut ledger = ResizeLedger::default();
+        ledger.set_agent(true);
+        split_flap(&mut ledger, 1_000);
+        ledger.evaluate(
+            owing(2, 16, -1, (24, 80)),
+            1_000 + LATE_GROW + RISK_AFTER_MS + 5,
+        );
+        ledger.note_tried(1);
+        let left = EngineProbe {
+            screen_replaced: 1,
+            main_screen: true,
+            ..owing(2, 20, 0, (24, 80))
+        };
+        let out = ledger.evaluate(left, 1_000 + LATE_GROW + RISK_AFTER_MS + 900);
+        let payloads: Vec<String> = out.iter().map(Transition::payload).collect();
+        assert_eq!(payloads, ["healed epoch=1 after_ms=1900 by=app"]);
+        assert!(epoch_lines(&ledger)[0].contains("verdict=healed by=app tried=1"));
     }
 
     #[test]

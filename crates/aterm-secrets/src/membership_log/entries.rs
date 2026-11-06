@@ -79,9 +79,11 @@ pub struct CommonsEpochView {
     pub generation: u64,
     /// Unwrapped 32-byte Commons symmetric network key for `basis`.
     pub key: Zeroizing<[u8; 32]>,
-    /// `basis` is still wrapped to a recipient the log removed: a row sealed under it now would
-    /// reach that Mac, so no writer seals under it until the removal's rotation lands.
-    pub wraps_removed: bool,
+    /// `basis` is due a rotation ([`Log::table_basis_due`]: P1's gate, [`Log::head_due`]): its
+    /// causal past lacks a revoking row's entry or the `Remove`s that row's gate needs, or it is
+    /// still wrapped to a recipient the log removed. A row sealed under it now could reach that
+    /// Mac, so no writer seals under it until the rotation lands.
+    pub due: bool,
 }
 
 /// One keyed epoch (F21 rule 4), as [`Log::keyed_epochs`] reads it from the records alone: an
@@ -1107,8 +1109,17 @@ impl Log {
     /// reseal follows every dependent of the keyed epochs it retires ([`Log::draft`] pins the head
     /// that reaches each, as it pins a `Put`'s epoch).
     ///
+    /// A fresh epoch's own batch seals under it without asking [`Log::head_due`], so the epoch's
+    /// gate must be open in this log by construction (one-mesh proofs P1b, `fresh_batch_open`):
+    /// the draft pins what the gate reads first ([`Log::gate_pins`], before `follow`), and an
+    /// epoch whose drafted past leaves the gate shut ([`Log::gate_opens_after`]) is refused. Only
+    /// past [`MAX_PARENTS`](super::MAX_PARENTS) concurrent heads can a pin be left out
+    /// ([`Log::draft`]): a row whose recipient a live seat shares needs every `Remove` that took
+    /// it, so a seated key's flood of concurrent forked `Remove`s of such a row refuses every
+    /// epoch until it is merged.
+    ///
     /// # Errors
-    /// As [`Log::draft_epoch`].
+    /// As [`Log::draft_epoch`], and where the drafted epoch's gate is shut.
     pub fn draft_epoch_following(
         &self,
         actor: &MemberId,
@@ -1125,6 +1136,18 @@ impl Log {
         let mut epoch_key = Zeroizing::new([0u8; 32]);
         aterm_uds::rand::fill(epoch_key.as_mut())?;
         let commitment = epoch_commitment(self.network(), &audience, generation, &epoch_key);
+        // NEGATIVE CONTROL `epoch-unpinned`: follow the lowest heads alone and ask nothing of
+        // the gate, as before P1b.
+        #[cfg(any(test, debug_assertions))]
+        let unpinned = aterm_types::negative_control::on("epoch-unpinned");
+        #[cfg(not(any(test, debug_assertions)))]
+        let unpinned = false;
+        let gated = if unpinned {
+            Vec::new()
+        } else {
+            self.gate_pins()
+        };
+        let pinned: Vec<RecordId> = gated.iter().chain(follow).copied().collect();
         let draft = self.draft_following(
             actor,
             authored_ms,
@@ -1133,9 +1156,32 @@ impl Log {
                 generation,
                 commitment,
             },
-            follow,
+            &pinned,
         );
+        if !unpinned && !self.gate_opens_after(&draft.parents) {
+            return Err(Error::new(
+                "too many concurrent heads for an epoch whose gate is open: more Removes of one \
+                 shared seat than a record can follow",
+            ));
+        }
         Ok((draft, epoch_key))
+    }
+
+    /// What an epoch follows so that its gate is open in this log ([`Log::gate_opens_after`]):
+    /// for each revoking row ([`Membership::revoking_rows`](eval::Membership::revoking_rows)),
+    /// its entry, and the earliest `Remove` that takes it by itself where no live row binds its
+    /// recipient, else every `Remove` that took it.
+    pub(super) fn gate_pins(&self) -> Vec<RecordId> {
+        let at = |id: &RecordId| self.held.get(id).copied().unwrap_or(usize::MAX);
+        let mut pins = Vec::new();
+        for row in self.membership_ref().revoking_rows() {
+            pins.push(row.entry);
+            match row.alone.iter().min_by_key(|id| at(id)) {
+                Some(&one) if !row.recipient_live => pins.push(one),
+                _ => pins.extend(row.removes.iter().copied()),
+            }
+        }
+        pins
     }
 
     /// Draft a [`Body::Wrap`] encrypting `epoch`'s key to `recipient`.
@@ -1568,11 +1614,7 @@ impl Log {
             return Ok(None);
         };
         let mut unwrapped_basis: Option<Zeroizing<[u8; 32]>> = None;
-        let wraps_removed = self.order.iter().enumerate().skip(1).any(|(i, record)| {
-            effective.counts(i)
-                && matches!(record.body(), Body::Wrap { epoch, recipient, .. }
-                    if *epoch == basis && self.recipient_is_removed(recipient))
-        });
+        let due = self.table_basis_due(&basis);
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
                 continue;
@@ -1605,8 +1647,38 @@ impl Log {
             basis,
             generation,
             key,
-            wraps_removed,
+            due,
         }))
+    }
+
+    /// Whether a table writer waits on the epoch `basis` (a Commons epoch, or the fold's
+    /// `[everyone]` epoch): P1's one rule ([`Log::head_due`]), as the vault's writer asks it, over
+    /// the recipients its counting `Wrap`s here name. The gate reads no `Wrap`: a Mac that lacks
+    /// the `Wrap` to a Mac a `Remove` outside `basis`'s past took out (still arriving, or a heal
+    /// by a Mac that holds no `Remove`) seals nothing under it that Mac could open (one-mesh
+    /// proofs P1b).
+    pub(super) fn table_basis_due(&self, basis: &RecordId) -> bool {
+        let effective = self.effective();
+        let wrapped: BTreeSet<Recipient> = self
+            .order
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(i, record)| match record.body() {
+                Body::Wrap {
+                    epoch, recipient, ..
+                } if effective.counts(i) && epoch == basis => Some(*recipient),
+                _ => None,
+            })
+            .collect();
+        let wraps_removed = wrapped.iter().any(|r| self.recipient_is_removed(r));
+        // NEGATIVE CONTROL `table-held-wrap`: the held `Wrap`s alone, as a table writer read them
+        // before P1b.
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("table-held-wrap") {
+            return wraps_removed;
+        }
+        wraps_removed || self.head_due(basis, Some(&wrapped), &self.removed_recipients())
     }
 
     /// Every counting [`EpochAudience::Commons`] epoch, in record order: the log-era sources a

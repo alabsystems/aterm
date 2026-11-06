@@ -399,9 +399,21 @@ impl<M: Machine> Core<M> {
     }
 
     fn broadcast(&self, reply: &Reply) {
+        if !self.sessions.values().any(|s| s.attached) {
+            return;
+        }
+        let encoded = reply.encode().map_err(|e| e.to_string());
         for (sid, s) in &self.sessions {
-            if s.attached {
-                self.reply(*sid, reply, None);
+            if !s.attached {
+                continue;
+            }
+            let sent = encoded
+                .as_deref()
+                .map_err(Clone::clone)
+                .and_then(|bytes| transport::send(&s.out, bytes, None).map_err(|e| e.to_string()));
+            if let Err(e) = sent {
+                note!("session {sid}: {e}; closing it");
+                let _ = s.out.shutdown(std::net::Shutdown::Both);
             }
         }
     }
@@ -1322,14 +1334,15 @@ impl<M: Machine> Core<M> {
         )
     )]
     fn tick(&mut self, now: Duration) -> Flow {
-        let silent: Vec<u64> = self
-            .dials
-            .iter()
-            .filter(|(_, p)| now.saturating_sub(p.since) >= SPAN)
-            .map(|(d, _)| *d)
-            .collect();
-        for dial in silent {
-            self.dials.remove(&dial);
+        let mut expired = 0usize;
+        self.dials.retain(|_, p| {
+            let keep = now.saturating_sub(p.since) < SPAN;
+            if !keep {
+                expired += 1;
+            }
+            keep
+        });
+        for _ in 0..expired {
             self.refuse(format!("no hello within {} s", SPAN.as_secs()));
         }
         if !self.ever_attached && now >= SPAN {
@@ -1404,7 +1417,9 @@ impl<M: Machine> Core<M> {
         }
         if self.phase == Phase::Booting && now.saturating_sub(self.last_note) >= TICK {
             self.last_note = now;
-            self.broadcast(&Reply::Booting(self.boot_note()));
+            if self.sessions.values().any(|s| s.attached) {
+                self.broadcast(&Reply::Booting(self.boot_note()));
+            }
         }
         Flow::Go
     }

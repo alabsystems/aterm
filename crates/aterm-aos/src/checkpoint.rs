@@ -188,6 +188,14 @@ impl Checkpoint {
         self.state_digest
     }
 
+    pub(crate) fn with_provenance(&self, provenance: Provenance) -> Checkpoint {
+        Checkpoint {
+            provenance,
+            state: self.state.clone(),
+            state_digest: self.state_digest,
+        }
+    }
+
     /// `Digest::of(b"aterm-aos-checkpoint-v1\0", [encoded provenance, state digest])`.
     #[must_use]
     pub fn digest(&self) -> Digest {

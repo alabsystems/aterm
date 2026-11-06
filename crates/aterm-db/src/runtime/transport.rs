@@ -26,7 +26,25 @@ use std::{
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 31, 84);
 const PORT: u16 = aterm_uds::lan::here::COMMONS_PORT;
-const WORKERS: usize = 4;
+/// The most rounds peers that dialled in run here at once.
+const INCOMING: usize = 2;
+/// The most rounds this side dials that run at once ([`dial_room`]); an enrolling endpoint, which
+/// has no listener, runs [`INCOMING`] more.
+const ROUNDS: usize = 2;
+/// How long a discovery dial holds a place among [`ROUNDS`] before its peer authenticates, while
+/// this side has found no peer (CR2). One that has not authenticated by then is parked: it keeps
+/// its socket and may still become a round, and the next dial starts beside it, as happy eyeballs
+/// (RFC 8305) staggers connection attempts. An endpoint whose accept queue is full, or a host that
+/// drops the SYN, then holds its own dial for up to its handshake or connect limit, but the next
+/// dial for no longer than this. `ROUNDS × SPACING`: both places fill before the first parks.
+const STAGGER: Duration = Duration::from_millis(500);
+/// The most dials this side has open at once, parked ones included (CR2): with [`INCOMING`],
+/// what one node's discovery costs the LAN. Seventy Macs that find no peer at once hold at most
+/// 70 × `DIALS` = 420 connections, six per Mac, within each listener's backlog of 128; once a
+/// Mac has found one, it holds at most `ROUNDS + 1`.
+const DIALS: usize = 6;
+/// The least time between two dials this side starts: at most four a second.
+const SPACING: Duration = Duration::from_millis(250);
 /// How often every link sends its beacon, after the first one each sends as it opens.
 const BEACON: Duration = Duration::from_secs(5);
 /// How often the seats' advertised builds and `Bus` speakers are read again.
@@ -77,8 +95,13 @@ struct Worker {
     task: JoinHandle<(Option<SocketAddr>, Repair, bool, RepairRound)>,
     incoming: bool,
     target: Option<SocketAddr>,
-    /// When its round began: one that began after a push's ask counts for it ([`Push`]).
+    /// When its round began, by the transport's clock: one that began after a push's ask counts
+    /// for it ([`Push`]), and a dial holds a place among [`ROUNDS`] for [`STAGGER`] after it
+    /// ([`dial_room`]).
     started: Instant,
+    /// Raised once its round's peer authenticates ([`Repair::hear`]): the dial holds its place
+    /// from then on ([`dial_room`]).
+    heard: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Worker {
     fn start(
@@ -87,9 +110,13 @@ impl Worker {
         target: Option<SocketAddr>,
         scope: Scope,
         repair: Repair,
+        started: Instant,
     ) -> io::Result<Self> {
         let incoming = connection.is_some();
         let began_ms = aterm_time::unix_millis().unwrap_or(0);
+        let heard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut repair = repair;
+        repair.hear(heard.clone());
         let channel = Arc::new(Mutex::new(Channel::default()));
         if let Some(connection) = &connection {
             channel
@@ -123,10 +150,17 @@ impl Worker {
                             let Some(target) = target else {
                                 return Err(crate::Error::new("automatic repair has no target"));
                             };
-                            (
-                                Connection::connect(target, scope, Duration::from_secs(3))?,
-                                Side::Initiator,
-                            )
+                            let connection =
+                                Connection::connect(target, scope, Duration::from_secs(3))
+                                    .inspect_err(|error| {
+                                        // The host there refused it: nothing listens at that
+                                        // port (CR2). A timeout, or no route (this Mac's link
+                                        // went, or that host sleeps), says nothing of it.
+                                        if error.kind() == io::ErrorKind::ConnectionRefused {
+                                            repair.disown();
+                                        }
+                                    })?;
+                            (connection, Side::Initiator)
                         };
                         if !control
                             .lock()
@@ -209,7 +243,8 @@ impl Worker {
             task,
             incoming,
             target,
-            started: Instant::now(),
+            started,
+            heard,
         })
     }
     fn stop(&self) {
@@ -238,6 +273,7 @@ pub(crate) fn test_worker(
         Some(target),
         Scope::Loopback,
         repair,
+        Instant::now(),
     )
     .unwrap();
     let (_, repair, success, report) = worker.task.join().unwrap();
@@ -513,14 +549,21 @@ impl Transport {
     }
     /// A transport with no link yet, whose group is `port` in `scope`.
     fn unopened(endpoint: Option<Endpoint>, scope: Scope, port: u16) -> Result<Self> {
-        let mut token = [0; 32];
-        SystemRandom::new()
-            .fill(&mut token)
-            .map_err(|_| crate::Error::new("discovery randomness unavailable"))?;
+        let (mut token, mut seed) = ([0; 32], [0; 32]);
+        for random in [&mut token, &mut seed] {
+            SystemRandom::new()
+                .fill(random)
+                .map_err(|_| crate::Error::new("discovery randomness unavailable"))?;
+        }
         let now = Instant::now();
         // What it verified before a restart is dialled first ([`Hints::remember`]).
         let memory = endpoint.as_ref().and_then(Memory::of);
-        let mut hints = Hints::new(token);
+        // Its beacons tag its lab, and it dials its lab's first and no other's, in an order of
+        // its own (CR2).
+        let mut hints = match &endpoint {
+            Some(endpoint) => Hints::tagged(endpoint.beacon_key(), token, seed),
+            None => Hints::new(token),
+        };
         if let Some(memory) = &memory
             && let Some(now_ms) = aterm_time::unix_millis()
         {
@@ -840,9 +883,9 @@ impl Transport {
                     self.beacon,
                     now,
                 )?;
-                // Unproved inbound peers cannot occupy the outbound repair budget.
-                if self.workers.len() < WORKERS
-                    && self.workers.iter().filter(|worker| worker.incoming).count() < WORKERS / 2
+                // Unproved inbound peers cannot occupy the outbound repair budget, nor dials the
+                // inbound one.
+                if self.workers.iter().filter(|worker| worker.incoming).count() < INCOMING
                     && let Some(listener) = &link.listener
                     && let Some(endpoint) = &self.endpoint
                 {
@@ -854,6 +897,7 @@ impl Transport {
                                 None,
                                 self.scope,
                                 Repair::default(),
+                                now,
                             )?);
                             after_accept = Some(index + 1);
                         }
@@ -887,59 +931,141 @@ impl Transport {
         if now >= self.beacon {
             self.beacon = now + BEACON;
         }
-        // Pending enrollment has no listener, so every worker may search for
-        // an approver. A serving endpoint keeps capacity for incoming repair.
-        let outgoing_limit = if self
-            .endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.pending())
-        {
-            WORKERS
-        } else {
-            WORKERS / 2
-        };
-        // Silent discovery candidates must not take every outgoing worker
-        // while a completed peer waits for its next ordinary retry. Reserve
-        // one outgoing worker for established endpoints; the others discover.
-        // Before any peer is established, and while enrolling without a
-        // listener, all outgoing capacity remains available for discovery.
-        let discovering = self
-            .workers
-            .iter()
-            .filter(|worker| {
-                !worker.incoming
-                    && worker
-                        .target
-                        .is_none_or(|address| !self.hints.established(address))
-            })
-            .count();
-        let allow_discovery = outgoing_limit == WORKERS
-            || !self.hints.has_established()
-            || discovering < outgoing_limit - 1;
-        if now >= self.dial
-            && let Some(endpoint) = &self.endpoint
+        if let Some(endpoint) = &self.endpoint
             && !self.links.is_empty()
-            && self.workers.len() < WORKERS
-            && self
+        {
+            let dialing: Vec<_> = self
                 .workers
                 .iter()
                 .filter(|worker| !worker.incoming)
-                .count()
-                < outgoing_limit
-            && let Some((address, repair)) = self.hints.next_allowed(now, allow_discovery)
-        {
-            match Worker::start(endpoint.clone(), None, Some(address), self.scope, repair) {
-                Ok(worker) => self.workers.push(worker),
-                Err(error) => {
-                    self.hints
-                        .finish(address, Repair::default(), Outcome::Busy, now);
-                    return Err(error);
+                .map(|worker| Dialing {
+                    started: worker.started,
+                    established: worker
+                        .target
+                        .is_some_and(|address| self.hints.established(address)),
+                    heard: worker.heard.load(std::sync::atomic::Ordering::Acquire),
+                })
+                .collect();
+            if let Some((address, repair)) = next_dial(
+                &mut self.hints,
+                &dialing,
+                endpoint.pending(),
+                &mut self.dial,
+                now,
+            ) {
+                match Worker::start(
+                    endpoint.clone(),
+                    None,
+                    Some(address),
+                    self.scope,
+                    repair,
+                    now,
+                ) {
+                    Ok(worker) => self.workers.push(worker),
+                    Err(error) => {
+                        self.hints
+                            .finish(address, Repair::default(), Outcome::Busy, now);
+                        return Err(error);
+                    }
                 }
             }
-            self.dial = now + Duration::from_millis(250);
         }
         Ok(())
     }
+}
+
+/// An outgoing worker as dial admission reads it ([`dial_room`]).
+#[derive(Clone, Copy, Debug)]
+struct Dialing {
+    /// When it was dialled ([`Worker::started`]).
+    started: Instant,
+    /// Its endpoint completed an authenticated round before ([`Hints::established`]).
+    established: bool,
+    /// Its peer authenticated in this round ([`Worker::heard`]).
+    heard: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of CR2's stagger, on for one test thread: every outgoing worker holds its place
+    /// among [`ROUNDS`] until its round ends, as before CR2, so slow endpoints that took every
+    /// place hold the next dial for their whole connect or handshake limit.
+    pub(super) static UNSTAGGERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR2's bound, on for one test thread: parked dials are not counted against
+    /// [`DIALS`], so endpoints that never answer open a new dial every [`SPACING`].
+    pub(super) static UNBOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of CR2's first cut, on for one test thread: discovery dials park, and new ones start
+    /// beside them, whether or not this side has found a peer, so a serving node drifts to
+    /// [`DIALS`] open dials in steady state.
+    pub(super) static PARKS_ALWAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this side may start a dial at `now` beside its outgoing workers `dialing`, and if it
+/// may, whether it may go to an endpoint no round established yet (discovery).
+///
+/// A dial holds a place among [`ROUNDS`] while its endpoint is established (a round with a known
+/// peer) or its peer has authenticated (`heard`), and for [`STAGGER`] after it starts. One that
+/// has done neither by then is parked: it keeps its socket and may still become a round, and the
+/// next dial starts beside it. At most [`DIALS`] are open at once, parked ones included.
+///
+/// Until this side finds a peer (none established, no dial heard), discovery dials go on beside
+/// parked ones. Once it has found one, a serving endpoint keeps a place for its peers' rounds and
+/// runs one discovery dial at a time, parked or not, as before CR2: it holds at most `ROUNDS + 1`
+/// dials, and the dials its search left parked only drain, never keeping an established peer's
+/// round out while fewer than [`DIALS`] are open. An enrolling endpoint (`pending`) has no
+/// listener, so it runs [`INCOMING`] more rounds and reserves none.
+fn dial_room(
+    dialing: &[Dialing],
+    pending: bool,
+    has_established: bool,
+    now: Instant,
+) -> Option<bool> {
+    #[cfg(test)]
+    let (unstaggered, unbounded, parks_always) = (
+        UNSTAGGERED.with(std::cell::Cell::get),
+        UNBOUNDED.with(std::cell::Cell::get),
+        PARKS_ALWAYS.with(std::cell::Cell::get),
+    );
+    #[cfg(not(test))]
+    let (unstaggered, unbounded, parks_always) = (false, false, false);
+    let rounds = if pending { ROUNDS + INCOMING } else { ROUNDS };
+    if dialing.len() >= DIALS && !unbounded {
+        return None;
+    }
+    let young =
+        |dial: &Dialing| unstaggered || now.saturating_duration_since(dial.started) < STAGGER;
+    let placed = dialing
+        .iter()
+        .filter(|dial| dial.established || dial.heard || young(dial))
+        .count();
+    if placed >= rounds {
+        return None;
+    }
+    let found = (has_established || dialing.iter().any(|dial| dial.heard)) && !parks_always;
+    let discovering = dialing
+        .iter()
+        .filter(|dial| !dial.established && !dial.heard)
+        .count();
+    Some(pending || !found || discovering < rounds - 1)
+}
+
+/// The next endpoint to dial at `now`, if [`dial_room`] leaves room beside `dialing` and the last
+/// dial was [`SPACING`] ago (`dial` is when the next may start, moved on by one that does), with
+/// the repair state its last round left ([`Hints::next_allowed`]).
+fn next_dial(
+    hints: &mut Hints,
+    dialing: &[Dialing],
+    pending: bool,
+    dial: &mut Instant,
+    now: Instant,
+) -> Option<(SocketAddr, Repair)> {
+    if now < *dial {
+        return None;
+    }
+    let discovery = dial_room(dialing, pending, hints.has_established(), now)?;
+    let next = hints.next_allowed(now, discovery)?;
+    *dial = now + SPACING;
+    Some(next)
 }
 impl Drop for Transport {
     fn drop(&mut self) {
@@ -947,5 +1073,7 @@ impl Drop for Transport {
     }
 }
 
+#[cfg(test)]
+mod stagger_tests;
 #[cfg(test)]
 mod tests;

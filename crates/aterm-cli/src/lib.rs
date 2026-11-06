@@ -162,6 +162,8 @@ pub enum Verb {
     Conn,
     /// `aterm resource-run` — explicitly attribute one external job to a tab.
     ResourceRun,
+    /// Read authenticated retained custody for the calling process tree.
+    ResourceInspect,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
     /// `aterm agh` — the GitHub client: reads and writes as the routed identity, JSON out, typed exits.
@@ -232,6 +234,7 @@ impl Verb {
         Verb::Ctl,
         Verb::Conn,
         Verb::ResourceRun,
+        Verb::ResourceInspect,
         Verb::Pkg,
         Verb::Agh,
         Verb::Fleet,
@@ -268,6 +271,7 @@ impl Verb {
             Verb::Ctl => "ctl",
             Verb::Conn => "conn",
             Verb::ResourceRun => "resource-run",
+            Verb::ResourceInspect => "resource-inspect",
             Verb::Pkg => "pkg",
             Verb::Agh => "agh",
             Verb::Fleet => "fleet",
@@ -308,6 +312,7 @@ impl Verb {
             Verb::Ctl
             | Verb::Conn
             | Verb::ResourceRun
+            | Verb::ResourceInspect
             | Verb::Pkg
             | Verb::Agh
             | Verb::Fleet
@@ -342,6 +347,7 @@ impl Verb {
             Verb::Ctl => "aterm ctl <args>",
             Verb::Conn => "aterm conn [<cmd>]",
             Verb::ResourceRun => "aterm resource-run <args>",
+            Verb::ResourceInspect => "aterm resource-inspect --json",
             Verb::Pkg => "aterm pkg <args>",
             Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
@@ -387,6 +393,10 @@ impl Verb {
             Verb::Conn => &[
                 "Wire which sessions pull from or push to each",
                 "other (ls | add | set | rm | spawn | show | map).",
+            ],
+            Verb::ResourceInspect => &[
+                "Read the calling process's authenticated retained",
+                "CPU and memory custody as versioned JSON.",
             ],
             Verb::ResourceRun => &[
                 "Run a command with its CPU and memory charged to",

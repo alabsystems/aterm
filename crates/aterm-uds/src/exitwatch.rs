@@ -203,6 +203,19 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn watch(pid: u32, stamp: fn() -> T) -> Option<Self> {
+        Self::watch_then(pid, stamp, || {})
+    }
+
+    /// As [`Self::watch`], notifying only after the exit stamp is readable.
+    /// The notification is an observation, never child-control or reap authority.
+    #[cfg(unix)]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn watch_then(
+        pid: u32,
+        stamp: fn() -> T,
+        ready: impl FnOnce() + Send + 'static,
+    ) -> Option<Self> {
         let target = exit_readable(pid)?;
         let (cancelled, cancel) = std::io::pipe().ok()?;
         let stamped = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -210,8 +223,8 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
         std::thread::Builder::new()
             .name(exit_moment_thread(pid))
             .spawn(move || {
-                if wait_readable(&target, &cancelled) {
-                    let _ = into.set(stamp());
+                if wait_readable(&target, &cancelled) && into.set(stamp()).is_ok() {
+                    ready();
                 }
             })
             .ok()?;
@@ -225,6 +238,17 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     #[cfg(any(not(unix), target_arch = "wasm32"))]
     #[must_use]
     pub fn watch(_pid: u32, _stamp: fn() -> T) -> Option<Self> {
+        None
+    }
+
+    /// See [`Self::watch_then`]: no primitive is wired on this platform.
+    #[cfg(any(not(unix), target_arch = "wasm32"))]
+    #[must_use]
+    pub fn watch_then(
+        _pid: u32,
+        _stamp: fn() -> T,
+        _ready: impl FnOnce() + Send + 'static,
+    ) -> Option<Self> {
         None
     }
 
@@ -507,5 +531,40 @@ mod tests {
         watch
             .exit_status()
             .expect("a status once the queue is readable")
+    }
+}
+
+#[cfg(all(test, unix, not(target_arch = "wasm32")))]
+mod notification_tests {
+    use super::*;
+    #[test]
+    fn notification_observes_the_completed_stamp_before_it_can_return() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let (sent, seen) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let watch = ExitMoment::watch_then(child.id(), std::time::Instant::now, move || {
+            sent.send(()).unwrap();
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let Some(watch) = watch else {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+            panic!("native exit watcher unavailable");
+            #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+            return;
+        };
+        let started = std::time::Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        seen.recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        // Callback is still blocked: moving stamp publication after it is a
+        // deterministic failure, rather than a timing-sensitive race test.
+        assert!(watch.get().is_some_and(|stamp| stamp >= started));
+        release.send(()).unwrap();
     }
 }

@@ -580,9 +580,10 @@ fn a_dry_run_s_toolset_line_follows_the_console_owner() {
     }
 }
 
-/// What atpkg's seed will not install, no line of the plan promises: a decline, or the consent
-/// `--no-toolchain` persists and a later run without the flag keeps. Its rule is the seed's: under
-/// `[packages]`, `auto_install` when it is there, else its retired spelling.
+/// What atpkg's seed will not install, no line of the plan promises: a decline, a `prefix` atpkg
+/// ignores, or the consent `--no-toolchain` persists and a later run without the flag keeps. Its
+/// rule is the seed's: under `[packages]`, `auto_install` when it is there, else its retired
+/// spelling.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_dry_run_promises_no_toolset_atpkg_would_withhold() {
@@ -613,6 +614,42 @@ fn a_dry_run_promises_no_toolset_atpkg_would_withhold() {
         (
             "elsewhere",
             Some("[other]\nauto_install = false\n"),
+            false,
+            false,
+        ),
+        (
+            "prefix-elsewhere",
+            Some("[packages]\nprefix = \"/opt/elsewhere\" # moved\n"),
+            false,
+            true,
+        ),
+        (
+            "prefix-tilde",
+            Some("[packages]\nprefix = '~/elsewhere'\n"),
+            false,
+            true,
+        ),
+        (
+            "prefix-default",
+            Some("[packages]\nprefix = \"~/Library/Application Support/aterm/pkg/\"\n"),
+            false,
+            false,
+        ),
+        (
+            "prefix-dropped",
+            Some("[packages]\nprefix = \"relative/pkg\"\n"),
+            false,
+            false,
+        ),
+        (
+            "prefix-empty",
+            Some("[packages]\nprefix = \"\"\n"),
+            false,
+            false,
+        ),
+        (
+            "prefix-other-table",
+            Some("[other]\nprefix = \"/opt/elsewhere\"\n"),
             false,
             false,
         ),
@@ -1208,6 +1245,75 @@ fn a_zdotdir_names_the_zshrc_to_edit_and_to_sweep() {
             recs[i].err
         );
     }
+}
+
+/// How long `zsh_rc_dir` waits for a person's zshenv files (`zsh_ask_secs`), computed with no
+/// timing: 5 s (`ZSH_ASK_SECS`), which `ATERM_INSTALL_ZSH_ASK_SECS` only lengthens, and never
+/// past `VERIFY_WAIT_SECS`'s 60 s. A shorter count, a leading zero or anything but digits keeps
+/// 5 s; a value is evaluated as arithmetic only once it is digits (an `a[$(…)]` runs nothing),
+/// few enough not to overflow. This suite's own batches wait out the hang detector,
+/// [`HANG`](crate::support::HANG).
+#[test]
+fn zsh_s_ask_budget_only_lengthens_up_to_the_hang_detector() {
+    let scratch = Scratch::new();
+    let ran = scratch.join("arithmetic-ran");
+    // A set name, so arithmetic on it would run the subscript's command under `set -u`.
+    let injected = format!("ZSH_ASK_SECS[$(: >{})]", q(s(&ran)));
+    let mut lib = Lib::new();
+    let suite = lib.call("zsh_ask_secs w; printf %s \"$w\"", &[]);
+    let unset = lib.call(
+        "( unset ATERM_INSTALL_ZSH_ASK_SECS; zsh_ask_secs w; printf %s \"$w\" )",
+        &[],
+    );
+    let mut calls = Vec::new();
+    for (value, want) in [
+        ("", "5"),
+        ("1", "5"),
+        ("4", "5"),
+        ("5", "5"),
+        ("6", "6"),
+        ("59", "59"),
+        ("60", "60"),
+        ("61", "60"),
+        ("100", "60"),
+        ("99999999999999999999999", "60"),
+        // 2^64 + 30, which 64-bit arithmetic would read as 30.
+        ("18446744073709551646", "60"),
+        ("0", "5"),
+        ("08", "5"),
+        ("060", "5"),
+        ("abc", "5"),
+        ("-7", "5"),
+        ("+7", "5"),
+        (" 9", "5"),
+        ("9 ", "5"),
+        ("1e3", "5"),
+        (injected.as_str(), "5"),
+    ] {
+        let call = lib.call(
+            format!(
+                "( ATERM_INSTALL_ZSH_ASK_SECS={}; zsh_ask_secs w; printf %s \"$w\" )",
+                q(value)
+            ),
+            &[],
+        );
+        calls.push((value, want, call));
+    }
+    let records = lib.run(&scratch);
+    assert_eq!(
+        records[suite].out,
+        crate::support::HANG.as_secs().to_string(),
+        "{}",
+        records[suite].err
+    );
+    assert_eq!(records[unset].out, "5", "{}", records[unset].err);
+    let wrong: Vec<_> = calls
+        .iter()
+        .filter(|(_, want, call)| records[*call].out != *want)
+        .map(|(value, want, call)| (value, want, &records[*call].out, &records[*call].err))
+        .collect();
+    assert!(wrong.is_empty(), "(value, want, got, err): {wrong:?}");
+    assert!(!ran.exists(), "an ask budget ran as arithmetic");
 }
 
 /// A `ZDOTDIR` that only `~/.zshenv` sets, unexported, is not in the environment install.sh

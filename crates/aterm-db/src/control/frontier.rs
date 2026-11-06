@@ -485,7 +485,7 @@ fn send_evidence_wires(
 fn receive_evidence(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
-    peer: &mut Metadata,
+    peer_bound: &mut RecordsBound,
     target: &Request,
     answer: Option<&mut Repair>,
     session: &Session,
@@ -501,7 +501,7 @@ fn receive_evidence(
     }
     let bound = read_bound(&header[4..9])?;
     let local = compatible(endpoint, bound)?;
-    peer.bound = bound;
+    *peer_bound = bound;
     let count = u32::from_be_bytes(header[10..14].try_into().map_err(failure)?) as usize;
     let bytes = u64::from_be_bytes(header[14..22].try_into().map_err(failure)?);
     let is_log = header[9] != 0;
@@ -715,7 +715,6 @@ pub(super) fn connected(
         return enroll(endpoint, stream, side, repair, &own, &mut peer, &session);
     }
     let evidence = own_evidence(endpoint, &own.request)?;
-    let peer_request = peer.request.clone();
     let (theirs, mut lease) = match side {
         Side::Initiator => {
             send_evidence(
@@ -729,8 +728,8 @@ pub(super) fn connected(
             let theirs = receive_evidence(
                 endpoint,
                 stream,
-                &mut peer,
-                &peer_request,
+                &mut peer.bound,
+                &peer.request,
                 Some(repair),
                 &session,
                 wire.evidence_bytes(),
@@ -743,8 +742,8 @@ pub(super) fn connected(
             let theirs = receive_evidence(
                 endpoint,
                 stream,
-                &mut peer,
-                &peer_request,
+                &mut peer.bound,
+                &peer.request,
                 None,
                 &session,
                 wire.evidence_bytes(),
@@ -941,10 +940,13 @@ fn decode_frontier_and_set(
     if count > bound.held as usize || wire.len() != 13 + count * 32 {
         return Err(Error::new("Commons frontier exceeds its bound"));
     }
-    let ids: Vec<Digest> = wire[13..].as_chunks::<32>().0.to_vec();
+    let mut ids = Vec::with_capacity(count);
     let mut seen = BTreeSet::new();
-    if !ids.iter().all(|id| seen.insert(*id)) {
-        return Err(Error::new("Commons frontier repeats an id"));
+    for &id in wire[13..].as_chunks::<32>().0 {
+        if !seen.insert(id) {
+            return Err(Error::new("Commons frontier repeats an id"));
+        }
+        ids.push(id);
     }
     peer.bound = bound;
     Ok((ids, seen))
@@ -1237,12 +1239,11 @@ fn enroll(
         {
             return Err(Error::new("pending device custody changed"));
         }
-        let request = peer.request.clone();
         let evidence = receive_evidence(
             endpoint,
             stream,
-            peer,
-            &request,
+            &mut peer.bound,
+            &peer.request,
             Some(repair),
             session,
             session.wire.evidence_bytes(),
@@ -1261,7 +1262,7 @@ fn enroll(
         let grant = receive_evidence(
             endpoint,
             stream,
-            peer,
+            &mut peer.bound,
             &own.request,
             None,
             session,

@@ -848,11 +848,13 @@ app_already_current() { # <elected_tag> <tag_explicit> <bundle_id> <installed_ve
 # /dev/null: the shell twin of aterm_uds::deadline, since this script runs alone
 # through curl | bash and can source nothing. codesign waits on trustd and spctl
 # also on a network lookup; while either does not answer it never returns. Every
-# call is bounded at VERIFY_WAIT_SECS — a hang detector, never a latency budget:
-# the in-app updater measured codesign at 0.09 s on 851 MB and spctl under half a
-# second (crates/aterm-update/src/verify.rs), and a binary asked what it is
-# (first_line_bounded) answers at once after its first exec's wait on the
-# system's code assessment, seconds on a loaded machine. A Ctrl-C, hang-up or
+# call but one is bounded at VERIFY_WAIT_SECS — a hang detector, never a latency
+# budget: the in-app updater measured codesign at 0.09 s on 851 MB and spctl
+# under half a second (crates/aterm-update/src/verify.rs), and a binary asked
+# what it is (first_line_bounded) answers at once after its first exec's wait on
+# the system's code assessment, seconds on a loaded machine. The one is
+# zsh_rc_dir's ask of a person's own zshenv files, a budget (zsh_ask_secs) that a
+# test lengthens to the hang detector. A Ctrl-C, hang-up or
 # TERM to this script's process group (a terminal's Ctrl-C reaches it whole)
 # while CMD runs SIGKILLs CMD's group and ends the run with that signal
 # (die_of), as it would have ended without bounded, never as a status a
@@ -5343,20 +5345,57 @@ toolset_consent_off() { # <cfg>
 		}' "$1" 2>/dev/null
 }
 
+# The `prefix` line of <cfg> when atpkg would ignore it, printed (status 1 and
+# nothing otherwise): under [packages], a quoted absolute or `~/` path that is not
+# atpkg's one default prefix (config.rs `admit_packages`, `prefix_path`). A shipped
+# atpkg then installs nothing nobody named. A form this cannot read counts as
+# consent, and so does what atpkg itself drops: an empty, relative or `~user` value.
+toolset_prefix_ignored() { # <cfg>
+	[[ -f "$1" ]] || return 1
+	local declined
+	declined="$(toolset_decline_path)"
+	ATERM_PKG_PREFIX="${declined%/declined}" awk '
+		function strip(s) { sub(/[ \t]*#.*$/, "", s); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+		function tidy(s) { gsub(/\/+/, "/", s); if (s != "/") sub(/\/$/, "", s); return s }
+		{
+			line = strip($0)
+			if (line ~ /^\[/) { inpk = (line ~ /^\[[ \t]*packages[ \t]*\]$/); next }
+			if (inpk && line ~ /^prefix[ \t]*=/) have = line
+		}
+		END {
+			v = have
+			sub(/^[^=]*=[ \t]*/, "", v)
+			if (v !~ /^".*"$/ && v !~ /^\047.*\047$/) exit 1
+			v = substr(v, 2, length(v) - 2)
+			sub(/^[ \t]+/, "", v)
+			sub(/[ \t]+$/, "", v)
+			if (v == "~") v = ENVIRON["HOME"]
+			else if (v ~ /^~\//) v = ENVIRON["HOME"] substr(v, 2)
+			else if (v !~ /^\//) exit 1
+			if (tidy(v) == tidy(ENVIRON["ATERM_PKG_PREFIX"])) exit 1
+			print have
+		}' "$1" 2>/dev/null
+}
+
+# The line of <cfg> that withholds the toolset, in the order atpkg reads them.
+toolset_config_off() { # <cfg>
+	toolset_prefix_ignored "$1" || toolset_consent_off "$1"
+}
+
 # Why atpkg's seed will install no toolset here, whatever this run asks, in the
 # order its seed reads them (adoption.rs `adoption_with`), or nothing when it will.
 # Every line this script prints about the toolset arriving asks this. A pinned
-# pre-lean DMG's atpkg honours the decline but predates the consent key. Two more
-# withhold it and are not read here, so the plan can still promise too much: a
-# `[packages] prefix` atpkg ignores, and an aterm.toml it cannot parse.
+# pre-lean DMG's atpkg honours the decline but predates the consent key. An
+# aterm.toml atpkg cannot parse withholds it too and is not read here, since a
+# shell script cannot judge TOML, so the plan can still promise too much there.
 toolset_withheld() {
 	local cfg line home="$HOME/.config/aterm/aterm.toml"
 	if [[ -f "$(toolset_decline_path)" ]]; then
 		echo "this machine declined the ALab toolset ($(toolset_decline_path)); \`aterm pkg install --default-set\` puts it back"
 	elif [[ "${CONTAINER_KIND:-}" != dmg ]]; then
 		cfg="$(toolset_consent_path)"
-		if line="$(toolset_consent_off "$cfg")"; then
-			if [[ "$cfg" == "$home" ]] || toolset_consent_off "$home" >/dev/null; then
+		if line="$(toolset_config_off "$cfg")"; then
+			if [[ "$cfg" == "$home" ]] || toolset_config_off "$home" >/dev/null; then
 				echo "$cfg says \`$line\`: $NO_TOOLCHAIN_EFFECT"
 			else
 				echo "$cfg says \`$line\`, but an aterm opened outside this shell reads $home, which does not: that launch can still install it"
@@ -5885,8 +5924,31 @@ zsh_rc_walk() { # <path-output> <kind-output> <path> <confined-home-or-empty> <h
 	printf -v "$zw_kind_out" '%s' "$zw_kind"
 }
 
+# How long zsh_rc_dir gives a person's own zshenv files to answer, in whole
+# seconds of bounded's clock: atpkg/zdotdir.rs's ASK_BUDGET, the login-PATH
+# probe's budget. That startup code may never end, and the folder it names goes
+# only into a hint or the by-hand uninstall list, so a zsh late past it leaves
+# the folder unknown. ATERM_INSTALL_ZSH_ASK_SECS (an install_sh test's seam,
+# the twin of atpkg's ATPKG_ZSH_ASK_WITHIN_MS) lengthens it, never past
+# VERIFY_WAIT_SECS, so a suite whose zsh must answer waits out only its hang
+# detector on a loaded machine; a shorter count, or anything but digits with no
+# leading zero, keeps ZSH_ASK_SECS. It is compared only once it is digits
+# (arithmetic on an a[$(…)] in it would run the command) and by its length first
+# (a longer count could overflow the comparison).
+ZSH_ASK_SECS=5
+zsh_ask_secs() { # <output-variable>
+	local za="${ATERM_INSTALL_ZSH_ASK_SECS:-}"
+	case "$za" in
+	'' | 0* | *[!0-9]*) za="$ZSH_ASK_SECS" ;;
+	esac
+	[[ "${#za}" -le "${#VERIFY_WAIT_SECS}" && "$za" -le "$VERIFY_WAIT_SECS" ]] || za="$VERIFY_WAIT_SECS"
+	[[ "$za" -ge "$ZSH_ASK_SECS" ]] || za="$ZSH_ASK_SECS"
+	printf -v "$1" '%s' "$za"
+}
+
 # The twin of atpkg/zdotdir.rs: inherited environment (confined when HOME is
-# redirected), then HOME without startup files, then zsh's explicit answer.
+# redirected), then HOME without startup files, then zsh's explicit answer
+# (within zsh_ask_secs).
 # Assign a variable: printing through command substitution loses trailing LF.
 # Root never queries startup paths. A text-first walk refuses protected targets
 # before metadata, and a fresh nonce plus byte count binds the binary reply.
@@ -5894,7 +5956,7 @@ zsh_rc_dir() { # <output-variable>
 	printf -v "$1" '%s' ''
 	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0
 	local zrc_roots=() zrc_accounts=() zrc_file zrc_seen=0 zrc_zsh="" zrc_dir="" zrc_confine=""
-	local zrc_tmp zrc_nonce zrc_begin zrc_end zrc_field zrc_count zrc_finish zrc_status=0
+	local zrc_tmp zrc_nonce zrc_begin zrc_end zrc_field zrc_count zrc_finish zrc_status=0 zrc_wait
 	zrc_uid="$(installer_uid)"
 	[[ "$zrc_uid" != 0 ]] || return 0
 	zsh_rc_lexical zrc_named "$HOME" || return 0
@@ -5950,11 +6012,12 @@ zsh_rc_dir() { # <output-variable>
 	zrc_begin="install.sh-zdotdir:$zrc_nonce:begin"
 	zrc_end="install.sh-zdotdir:$zrc_nonce:end"
 	zrc_status=0
+	zsh_ask_secs zrc_wait
 	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
 	probe_temp zrc_tmp aterm-zdotdir || return 0
 	(
 		unset ZDOTDIR
-		cd "$HOME" 2>/dev/null && BOUNDED_ERR=/dev/null bounded 5 "$zrc_zsh" -c \
+		cd "$HOME" 2>/dev/null && BOUNDED_ERR=/dev/null bounded "$zrc_wait" "$zrc_zsh" -c \
 			"builtin setopt nomultibyte; builtin printf '\\0%s\\0%d\\0%s\\0%s\\0' '$zrc_begin' \"\${#\${ZDOTDIR-}}\" \"\${ZDOTDIR-}\" '$zrc_end'"
 	) >"$zrc_tmp" || zrc_status=$?
 	# Change byte counting only after startup has run with its inherited locale.

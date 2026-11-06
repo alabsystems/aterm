@@ -25,6 +25,14 @@
 //! its spec and closes the laws for the World that asks the compiled kernels. [`Table`]'s folds
 //! are the island's folds, step for step and with no early exit; until loops reach Trust's E6
 //! import, the answer sheet the tests recompute holds them to the island (TG12 removes it).
+//!
+//! `revocation_no_leak_island.rs` (P1b) proves, for a World of Macs that sign the records of any
+//! causal DAG under these decisions, that nothing minted or sealed after a seat's removal reaches
+//! the removed seat but after a re-grant (`spec_no_leak`). Its writer's gate is [`Table::gate`]
+//! with each revoking row's own entry in the epoch's past as well, the gate `Log::head_due` asks.
+//! Its `Remove`s are plain ones authorized with nothing void, since whether a quorum accepts a
+//! share is a view's: the Rust gate is at least as strict, its one-`Remove` clause counting a
+//! `Remove` only where it takes the row by itself and is so authorized.
 
 /// One bound seat row: its actor (`MemberId`), its age recipient and its entry record, as dense
 /// ids the caller interns (the decision only compares them). Entry and `Remove` records are
@@ -106,6 +114,11 @@ contract! {
 #[rustfmt::skip]
 #[path = "revocation_island.rs"]
 mod island;
+// P1b, P1's Tier 2 (`spec_no_leak`), over the island above.
+#[cfg(clean_islands)]
+#[rustfmt::skip]
+#[path = "revocation_no_leak_island.rs"]
+mod no_leak_island;
 
 /// The island's `anyN`: `||` folded left over `0..n`, every index asked, no early exit.
 pub(crate) fn any_n(n: usize, mut p: impl FnMut(usize) -> bool) -> bool {
@@ -236,10 +249,15 @@ impl<'a, B: Fn(usize, usize) -> bool> Table<'a, B> {
         current(self.bound_live(r), self.revoked(r))
     }
 
-    /// Whether epoch record `e` keeps every revoked recipient out: for each row whose recipient
-    /// stays revoked, every `Remove` that took it lies in `e`'s causal past, or one does and no
-    /// row that is not out binds the recipient. A writer seals only under an epoch whose gate is
-    /// open, and an epoch whose gate is shut is due a rotation.
+    /// Whether epoch record `e` has every revoked recipient's `Remove`s: for each row whose
+    /// recipient stays revoked, every `Remove` that took it lies in `e`'s causal past, or one does
+    /// and no row that is not out binds the recipient. The writer's gate (`Log::head_due`) also
+    /// asks for each such row's entry in `e`'s past (the no-leak island's `gateFix`): a Mac that
+    /// holds `e` but not the row would read the recipient as current and wrap `e` to it. Unlike
+    /// this fold, the writer's one-`Remove` clause counts only a `Remove` that takes the row by
+    /// itself and is authorized with nothing void: not a quorum's share in the row's entry's past,
+    /// nor an Undo share a removed Mac signed, whose quorum another Mac's view of `e` need not
+    /// accept.
     pub fn gate(&self, e: usize) -> bool {
         all_n(self.rows.len(), |i| {
             gate_row(

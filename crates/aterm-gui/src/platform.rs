@@ -5,14 +5,13 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
 use aterm_window::event_loop::EventLoopProxy;
 use aterm_window::window::Window;
 
 use crate::app_config::WindowTheme;
-use crate::notify::NotifyMsg;
+use crate::notify::Notifier;
 use crate::{Wake, WindowId, menu, toolbar};
 
 /// One complete toolbar tab-strip model, borrowed for a single [`AppRt::set_toolbar_tabs`] push.
@@ -100,14 +99,14 @@ pub(crate) trait AppRt {
         1.0
     }
 
-    /// Spawn the process-wide notification delivery thread and return the bounded `SyncSender` each tab clones into its engine callbacks. macOS, Windows and Linux deliver.
+    /// Spawn the process-wide notification delivery thread and return the bounded [`Notifier`] each tab clones into its engine callbacks. macOS, Windows and Linux deliver.
     fn send_notification_init(
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
         center: crate::notice_center::NoticeCenter,
-    ) -> SyncSender<NotifyMsg>;
+    ) -> Notifier;
 
     /// Build + install the native application menu bar, returning the retained action target the caller keeps alive.
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle>;
@@ -560,7 +559,7 @@ impl AppRt for AppRtMacOS {
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
         center: crate::notice_center::NoticeCenter,
-    ) -> SyncSender<NotifyMsg> {
+    ) -> Notifier {
         crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
@@ -1720,7 +1719,7 @@ impl AppRt for AppRtLinux {
         silent: Arc<AtomicBool>,
         own_alerts: Arc<AtomicBool>,
         center: crate::notice_center::NoticeCenter,
-    ) -> SyncSender<NotifyMsg> {
+    ) -> Notifier {
         crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 

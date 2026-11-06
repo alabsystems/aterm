@@ -242,7 +242,6 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
         std::borrow::Cow::Borrowed(raw_text)
     };
     let now = aterm_time::unix_secs().ok_or("System clock is unavailable")?;
-    let date = mail_date(now)?;
     let mut identifier = [0u8; 16];
     aterm_uds::rand::fill(&mut identifier).map_err(|_| "Could not generate message identity")?;
     let domain = draft.from.split_once('@').ok_or("Invalid sender")?.1;
@@ -250,7 +249,9 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
     let mut message =
         String::with_capacity(256 + subject.len() + body_b64_len + (body_b64_len / 76) * 2);
     use std::fmt::Write as _;
-    let _ = write!(message, "Date: {date}\r\nMessage-ID: <");
+    message.push_str("Date: ");
+    write_mail_date(&mut message, now)?;
+    message.push_str("\r\nMessage-ID: <");
     aterm_codec::base64::encode_url_into(&mut message, &identifier).map_err(|e| e.to_string())?;
     let _ = write!(message, "@{domain}>\r\nFrom: {}\r\n", draft.from);
     if !draft.to.is_empty() {
@@ -288,7 +289,7 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
     Ok(message.into_bytes())
 }
 
-fn mail_date(seconds: u64) -> Result<String, String> {
+fn write_mail_date(out: &mut String, seconds: u64) -> Result<(), String> {
     let iso = aterm_types::rfc3339::format_rfc3339(seconds);
     if iso.len() != 20 || !iso.is_ascii() {
         return Err("System clock is outside supported mail dates".into());
@@ -303,14 +304,24 @@ fn mail_date(seconds: u64) -> Result<String, String> {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    Ok(format!(
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
         "{}, {} {} {} {} +0000",
         days[((seconds / 86400 + 4) % 7) as usize],
         &iso[8..10],
         months[month],
         &iso[..4],
         &iso[11..19]
-    ))
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+fn mail_date(seconds: u64) -> Result<String, String> {
+    let mut out = String::with_capacity(31);
+    write_mail_date(&mut out, seconds)?;
+    Ok(out)
 }
 
 #[cfg(test)]

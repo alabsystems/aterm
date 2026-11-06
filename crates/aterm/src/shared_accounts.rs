@@ -131,41 +131,68 @@ fn project_imports(snapshot: &Snapshot) -> Catalog {
                     .flatten()
                     .filter_map(aterm_json::Value::as_u64)
                     .collect();
-                let account = |provider: Option<&aterm_json::Value>| {
-                    let column = provider.and_then(|provider| provider["column"].as_u64());
-                    Account {
-                        key: format!("import:{source}:{record}:{}", column.unwrap_or(0)),
-                        operation: operation.clone(),
-                        label: label.clone(),
-                        provider: provider
-                            .and_then(|provider| provider["provider"].as_str())
-                            .unwrap_or("unspecified")
-                            .into(),
-                        method: None,
-                        email: email.clone(),
-                        realm: None,
-                        secret_reference: false,
-                        required_browser: false,
-                        conflicted,
-                        stopped: cell.stopped,
-                        import: Some(ImportOrigin {
-                            table: table.clone(),
-                            source: source.clone(),
-                            record,
-                            provider_column: column,
-                            presence: provider
-                                .and_then(|provider| provider["presence_marker"].as_bool()),
-                            machine_hint: machine_hint.clone(),
-                            unclassified_columns: unclassified_columns.clone(),
-                        }),
-                        import_link: None,
-                    }
-                };
+                let account_with =
+                    |provider: Option<&aterm_json::Value>,
+                     label: String,
+                     email: Option<String>,
+                     machine_hint: Option<String>,
+                     unclassified_columns: Vec<u64>| {
+                        let column = provider.and_then(|provider| provider["column"].as_u64());
+                        Account {
+                            key: format!("import:{source}:{record}:{}", column.unwrap_or(0)),
+                            operation: operation.clone(),
+                            label,
+                            provider: provider
+                                .and_then(|provider| provider["provider"].as_str())
+                                .unwrap_or("unspecified")
+                                .into(),
+                            method: None,
+                            email,
+                            realm: None,
+                            secret_reference: false,
+                            required_browser: false,
+                            conflicted,
+                            stopped: cell.stopped,
+                            import: Some(ImportOrigin {
+                                table: table.clone(),
+                                source: source.clone(),
+                                record,
+                                provider_column: column,
+                                presence: provider
+                                    .and_then(|provider| provider["presence_marker"].as_bool()),
+                                machine_hint,
+                                unclassified_columns,
+                            }),
+                            import_link: None,
+                        }
+                    };
                 match row["providers"].as_array() {
                     Some(providers) if !providers.is_empty() => {
-                        rows.extend(providers.iter().map(|provider| account(Some(provider))))
+                        let last = providers.len() - 1;
+                        for provider in &providers[..last] {
+                            rows.push(account_with(
+                                Some(provider),
+                                label.clone(),
+                                email.clone(),
+                                machine_hint.clone(),
+                                unclassified_columns.clone(),
+                            ));
+                        }
+                        rows.push(account_with(
+                            Some(&providers[last]),
+                            label,
+                            email,
+                            machine_hint,
+                            unclassified_columns,
+                        ));
                     }
-                    _ => rows.push(account(None)),
+                    _ => rows.push(account_with(
+                        None,
+                        label,
+                        email,
+                        machine_hint,
+                        unclassified_columns,
+                    )),
                 }
             }
         }

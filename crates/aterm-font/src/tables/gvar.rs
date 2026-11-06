@@ -1599,7 +1599,20 @@ impl<'a> Table<'a> {
         glyph_id: GlyphId,
         builder: &mut dyn OutlineSink,
     ) -> Option<Rect> {
-        self.outline_with(glyf_table, coordinates, glyph_id, builder, None)
+        let mut work = crate::work::OutlineWork::default();
+        self.outline_with(glyf_table, coordinates, glyph_id, builder, None, &mut work)
+    }
+
+    /// [`Table::outline`] under `work`.
+    pub(crate) fn outline_within(
+        &self,
+        glyf_table: glyf::Table,
+        coordinates: &[NormalizedCoordinate],
+        glyph_id: GlyphId,
+        builder: &mut dyn OutlineSink,
+        work: &mut crate::work::OutlineWork,
+    ) -> Option<Rect> {
+        self.outline_with(glyf_table, coordinates, glyph_id, builder, None, work)
     }
 
     /// [`Table::outline`], also sending each stored point to `tap`.
@@ -1611,7 +1624,15 @@ impl<'a> Table<'a> {
         builder: &mut dyn OutlineSink,
         tap: &mut dyn PointSink,
     ) -> Option<Rect> {
-        self.outline_with(glyf_table, coordinates, glyph_id, builder, Some(tap))
+        let mut work = crate::work::OutlineWork::default();
+        self.outline_with(
+            glyf_table,
+            coordinates,
+            glyph_id,
+            builder,
+            Some(tap),
+            &mut work,
+        )
     }
 
     fn outline_with<'s>(
@@ -1621,10 +1642,10 @@ impl<'a> Table<'a> {
         glyph_id: GlyphId,
         builder: &'s mut dyn OutlineSink,
         tap: Option<&'s mut dyn PointSink>,
+        work: &mut crate::work::OutlineWork,
     ) -> Option<Rect> {
         let mut b = glyf::Builder::tapped(Transform::default(), RectF::new(), builder, tap);
         let glyph_data = glyf_table.get(glyph_id)?;
-        let mut work = crate::work::OutlineWork::default();
         let _ = outline_var_impl(
             glyf_table,
             self,
@@ -1633,7 +1654,7 @@ impl<'a> Table<'a> {
             coordinates,
             0,
             &mut b,
-            &mut work,
+            work,
         );
         if work.exhausted() {
             return None;

@@ -98,8 +98,13 @@ const fn source_coord(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> Optio
     }
 }
 
+/// Copy the extras of `cell`, the source cell at `src_index`, to `(dest_row, dest_col)`. A ring
+/// slot counts only where the cell's bits claim it (COMPLEX, an RGB colour mode), as the
+/// render, the scroll into history and DECCRA read it: a writer that overwrites a cell leaves
+/// its slots behind.
 fn remap_copied_extra(
     extras_ctx: &mut ExtrasCopyCtx<'_>,
+    cell: crate::Cell,
     src_index: usize,
     dest_row: u16,
     dest_col: u16,
@@ -112,13 +117,19 @@ fn remap_copied_extra(
     };
 
     let stored = old_extras.get(coord);
-    let complex = if stored.and_then(CellExtra::complex_char).is_none() {
+    let complex = if cell.is_complex() && stored.and_then(CellExtra::complex_char).is_none() {
         old_extras.complex_codepoint_for(coord.row, coord.col)
     } else {
         None
     };
-    let fg = old_extras.fg_rgb_for(coord.row, coord.col);
-    let bg = old_extras.bg_rgb_for(coord.row, coord.col);
+    let fg = cell
+        .fg_needs_overflow()
+        .then(|| old_extras.fg_rgb_for(coord.row, coord.col))
+        .flatten();
+    let bg = cell
+        .bg_needs_overflow()
+        .then(|| old_extras.bg_rgb_for(coord.row, coord.col))
+        .flatten();
 
     if stored.is_some() || complex.is_some() || fg.is_some() || bg.is_some() {
         let mut extra = stored.cloned().unwrap_or_default();
@@ -183,7 +194,7 @@ pub(super) fn copy_cells_to_row(
             let dest_col = j;
             let src = cell_offset + src_index;
             new_row.set(dest_col, *cell);
-            remap_copied_extra(extras_ctx, src, dest_row, dest_col);
+            remap_copied_extra(extras_ctx, *cell, src, dest_row, dest_col);
             j += 1;
             if src < content_len && !(cell.is_empty() && is_image_blank(extras_ctx, src)) {
                 content_end = j;
@@ -337,6 +348,11 @@ mod tests {
                 old_extras: Some(&old),
                 new_extras: &mut remapped,
             },
+            Cell::from_raw_parts(
+                0,
+                crate::PackedColors::DEFAULT.with_rgb_fg().with_rgb_bg(),
+                CellFlags::COMPLEX,
+            ),
             1,
             1,
             3,
@@ -352,6 +368,56 @@ mod tests {
         assert_eq!(copied.underline_color(), Some([7, 8, 9]));
         assert_ne!(old.get(coord).unwrap().fg_rgb(), copied.fg_rgb());
         assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
+    }
+
+    /// A cell written over ring slots keeps none of them through the copy unless its bits
+    /// claim them: an indexed or default colour, or a BMP glyph, takes no slot's value.
+    #[test]
+    fn copied_extra_takes_only_the_ring_slots_the_cell_claims() {
+        let mut old = CellExtras::new();
+        old.set_complex_char_ring(0, 1, '👩', 2, 8);
+        old.set_rgb_ring_range(0, 1, 2, Some([1, 2, 3]), Some([4, 5, 6]), 2, 8);
+        let indexed = crate::PackedColors::DEFAULT.set_fg_indexed(1);
+        let cases = [
+            ("plain", Cell::new('A'), None),
+            (
+                "fg only",
+                Cell::from_raw_parts(u16::from(b'A'), indexed.with_rgb_fg(), CellFlags::empty()),
+                Some((Some([1, 2, 3]), None, false)),
+            ),
+            (
+                "bg only",
+                Cell::from_raw_parts(u16::from(b'A'), indexed.with_rgb_bg(), CellFlags::empty()),
+                Some((None, Some([4, 5, 6]), false)),
+            ),
+            (
+                "complex only",
+                Cell::from_raw_parts(0, indexed, CellFlags::COMPLEX),
+                Some((None, None, true)),
+            ),
+        ];
+        for (name, cell, want) in cases {
+            let mut remapped = CellExtras::new();
+            remap_copied_extra(
+                &mut ExtrasCopyCtx {
+                    source: ExtrasSource::Row(0),
+                    old_extras: Some(&old),
+                    new_extras: &mut remapped,
+                },
+                cell,
+                1,
+                1,
+                3,
+            );
+            let got = remapped.get(CellCoord::new(1, 3)).map(|extra| {
+                (
+                    extra.fg_rgb(),
+                    extra.bg_rgb(),
+                    extra.complex_char().is_some(),
+                )
+            });
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]

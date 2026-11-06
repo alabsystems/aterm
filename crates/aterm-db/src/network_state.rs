@@ -104,9 +104,9 @@ impl Publication {
             });
         if has_current_claim && !current {
             state.visibility = Visibility::Unavailable;
-            state.detail = format!(
-                "Current observation expired or its clock is unavailable; retained history remains. {}",
-                state.detail
+            state.detail.insert_str(
+                0,
+                "Current observation expired or its clock is unavailable; retained history remains. ",
             );
         }
         if state.visibility == Visibility::Active {

@@ -14,11 +14,12 @@
 //! (to a member admitted after its epoch) opens that epoch's table operations and none of the
 //! vault entries the `[everyone]` epoch seals.
 //!
-//! Which epoch a writer seals under (M6): the newest it holds that wraps no removed recipient;
-//! among concurrent newest epochs that qualify, the lowest id, as the vault does for twins. When
-//! every newest epoch it holds still wraps a removed Mac, the lowest such one is its view with
-//! [`CommonsEpochView::wraps_removed`] set, and the writer waits (M4,
-//! `aterm_mesh_core::capacity::writer_waits`) until the removal's rotation arrives. Concurrent
+//! Which epoch a writer seals under (M6): the newest it holds that is not due a rotation (P1's
+//! one rule, [`Log::head_due`]: its gate is open and it wraps no removed recipient); among
+//! concurrent newest epochs that qualify, the lowest id, as the vault does for twins. When every
+//! newest epoch it holds is due, the lowest one is its view with [`CommonsEpochView::due`] set,
+//! and the writer waits (M4, `aterm_mesh_core::capacity::writer_waits`) until the rotation
+//! arrives. Concurrent
 //! heads withhold nothing: both are member-signed log records.
 
 use super::{Body, EpochAudience, Log, RecordId, entries::CommonsEpochView};
@@ -110,21 +111,6 @@ impl Log {
         Ok(None)
     }
 
-    /// Whether a counting `Wrap` of `epoch` is addressed to a recipient the log removed: a row
-    /// sealed under it now would reach that Mac (PF1's `wraps_removed` kernel per recipient).
-    fn fold_wraps_removed(&self, epoch: &RecordId) -> bool {
-        let effective = self.effective();
-        self.order.iter().enumerate().skip(1).any(|(i, record)| {
-            effective.counts(i)
-                && matches!(record.body(), Body::Wrap { epoch: wrapped, recipient, .. }
-                if wrapped == epoch
-                    && aterm_mesh_core::revocation::wraps_removed(
-                        self.recipient_is_removed(recipient),
-                        true,
-                    ))
-        })
-    }
-
     /// The fold's view for `identity`: the `[everyone]` epoch a table writer seals under (the
     /// module's rule), its generation and its derived network key. `None` where `identity` is no
     /// current `[everyone]` seat or holds no newest `[everyone]` epoch's key.
@@ -143,20 +129,20 @@ impl Log {
                 continue;
             };
             if let Some(key) = self.open_own_wrap(identity, &epoch, generation, &commitment)? {
-                held.push((epoch, generation, key, self.fold_wraps_removed(&epoch)));
+                held.push((epoch, generation, key, self.table_basis_due(&epoch)));
             }
         }
-        let chosen = match held.iter().position(|(_, _, _, removed)| !removed) {
+        let chosen = match held.iter().position(|(_, _, _, due)| !due) {
             Some(at) => held.swap_remove(at),
             None if !held.is_empty() => held.swap_remove(0),
             None => return Ok(None),
         };
-        let (basis, generation, key, wraps_removed) = chosen;
+        let (basis, generation, key, due) = chosen;
         Ok(Some(CommonsEpochView {
             basis,
             generation,
             key: fold_network_key(self.network(), &basis, &key),
-            wraps_removed,
+            due,
         }))
     }
 

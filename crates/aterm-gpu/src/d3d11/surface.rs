@@ -31,6 +31,11 @@
 //! A present takes the device's context (the runtime flushes it), and a
 //! removal code from `Present` or `ResizeBuffers` latches the device lost like
 //! any checked call; the injected-loss drill answers the present's `enter`.
+//! A drop clears what the context binds and flushes it: a frame that never
+//! presented leaves buffer 0 bound, and a released chain lives on until the
+//! context lets it go, its window refusing another chain meanwhile.
+
+use std::mem::ManuallyDrop;
 
 use aterm_win32::Win32::Foundation::{
     CloseHandle, DXGI_STATUS_OCCLUDED, HANDLE, HWND, WAIT_OBJECT_0,
@@ -73,8 +78,9 @@ struct DcompTree {
 /// One window's swap chain on the arm's device.
 pub(crate) struct D3dWindowSurface {
     dev: D3dDevice,
-    /// The `IDXGISwapChain3`.
-    swap: Com,
+    /// The `IDXGISwapChain3`, released by `drop` before it forces the
+    /// chain's destruction.
+    swap: ManuallyDrop<Com>,
     /// The frame-latency waitable, closed on drop.
     waitable: HANDLE,
     /// A composition chain's tree, held for the surface's life.
@@ -220,7 +226,7 @@ impl D3dWindowSurface {
         }
         let mut surface = Self {
             dev: dev.clone(),
-            swap,
+            swap: ManuallyDrop::new(swap),
             waitable,
             _tree: None,
             kind,
@@ -448,10 +454,13 @@ impl D3dWindowSurface {
             return Ok(());
         }
         // Every reference to the buffers, the views included, must be gone.
+        // The context's binding of buffer 0, which a frame that never
+        // presented leaves, does not stop it (SPECS.md §5.19).
         self.back = None;
         let cur = self.dev.enter()?;
-        // SAFETY: `swap` is an IDXGISwapChain3 whose buffers nothing holds; the
-        // count and format are kept (0, UNKNOWN), and so are the flags.
+        // SAFETY: `swap` is an IDXGISwapChain3 whose buffers the surface no
+        // longer holds; the count and format are kept (0, UNKNOWN), and so are
+        // the flags.
         let hr = unsafe {
             (self
                 .swap
@@ -500,10 +509,23 @@ impl D3dWindowSurface {
 }
 
 impl Drop for D3dWindowSurface {
+    /// Release the chain and force its destruction, so its window can take
+    /// another at once (an HDR switch's remake, the 8-bit chain made after a
+    /// refused f16 one): a window takes one flip-model chain at a time, and
+    /// D3D11 defers a released chain's destruction while its context still
+    /// refers to it, keeping it whole while a view of its buffer 0 is bound
+    /// (`Current::clear_state_and_flush`).
     fn drop(&mut self) {
         self.back = None;
+        self._tree = None;
+        // SAFETY: released once, here; nothing reads `swap` after.
+        unsafe { ManuallyDrop::drop(&mut self.swap) };
         // SAFETY: the waitable is the chain's, closed once here.
         unsafe { CloseHandle(self.waitable) };
+        // A lost device's chain dies with it.
+        if let Ok(cur) = self.dev.enter() {
+            cur.clear_state_and_flush();
+        }
     }
 }
 
@@ -611,8 +633,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Clear buffer 0 to `rgba`, read it back, and return its texels.
-    fn clear_and_read(surf: &mut D3dWindowSurface, rgba: [f64; 4]) -> Vec<u8> {
+    /// Clear buffer 0 to `rgba` in a pass, which leaves it bound to the
+    /// context as the render target, as a frame's blit pass does.
+    pub(crate) fn clear(surf: &mut D3dWindowSurface, rgba: [f64; 4]) {
         let dev = surf.dev.clone();
         let uniform = dev
             .buffer(D3dBufferRole::Uniform, 16)
@@ -638,6 +661,14 @@ pub(crate) mod tests {
                 .expect("a pass over buffer 0");
         }
         frame.submit().expect("the clear submits");
+    }
+
+    /// Clear buffer 0 to `rgba`, read it back, and return its texels.
+    fn clear_and_read(surf: &mut D3dWindowSurface, rgba: [f64; 4]) -> Vec<u8> {
+        clear(surf, rgba);
+        let dev = surf.dev.clone();
+        let (w, h) = surf.size();
+        let back = surf.back_buffer().expect("buffer 0");
         dev.read_rgba8(back, w, h, w as usize * 4)
             .expect("buffer 0 reads back")
     }
@@ -693,6 +724,50 @@ pub(crate) mod tests {
         );
         assert!(!uniform(&blue, [255, 0, 51, 255]), "and not the first one");
         assert_eq!(surf.present(1), Ok(D3dPresented::Shown));
+        win.pump();
+    }
+
+    /// An HDR switch's remake on one window: an f16 chain whose frame drew
+    /// into buffer 0 and never presented (so the context still binds it) is
+    /// dropped, and an 8-bit chain is made on its window at once; then that
+    /// chain presents, is dropped, and an f16 one takes the window again.
+    /// Each new chain draws and presents. A window takes one flip-model
+    /// chain at a time, and D3D11 defers a released chain's destruction while
+    /// its context refers to it: without the drop's forced destruction,
+    /// `CreateSwapChainForHwnd` is refused while the old chain lives on.
+    #[test]
+    fn a_dropped_chain_leaves_its_window_to_the_next_one() {
+        desktop_or_could_not_run();
+        let dev = crate::d3d11::test_device();
+        let win = Window::new(0);
+        let make = |format, what: &str| {
+            // SAFETY: as above.
+            unsafe {
+                D3dWindowSurface::create(&dev, win.0, D3dSwapKind::Hwnd, (128, 64), format, 1)
+            }
+            .unwrap_or_else(|e| panic!("{what}: {e}"))
+        };
+        let mut f16 = make(TexelFormat::Rgba16Float, "the first f16 chain");
+        assert!(f16.wait_for_frame(60_000), "the f16 chain's frame");
+        clear(&mut f16, [0.5, 0.25, 1.0, 1.0]);
+        drop(f16);
+        let mut sdr = make(
+            TexelFormat::Rgba8Unorm,
+            "an 8-bit chain on the window an f16 chain drew on and never presented",
+        );
+        assert!(sdr.wait_for_frame(60_000), "the 8-bit chain's frame");
+        let red = clear_and_read(&mut sdr, [1.0, 0.0, 0.2, 1.0]);
+        assert!(uniform(&red, [255, 0, 51, 255]), "the 8-bit chain draws");
+        assert_eq!(sdr.present(0), Ok(D3dPresented::Shown));
+        win.pump();
+        drop(sdr);
+        let mut f16 = make(
+            TexelFormat::Rgba16Float,
+            "an f16 chain on the window the 8-bit chain presented on",
+        );
+        assert!(f16.wait_for_frame(60_000), "the second f16 chain's frame");
+        clear(&mut f16, [0.5, 0.25, 1.0, 1.0]);
+        assert_eq!(f16.present(0), Ok(D3dPresented::Shown));
         win.pump();
     }
 

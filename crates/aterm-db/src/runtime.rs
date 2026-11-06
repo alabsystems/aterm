@@ -415,9 +415,14 @@ impl Refusals {
         let base = TICK * 2;
         match status {
             Some(Status::Refused(refusal)) => {
-                let cause = Some((refusal.step, refusal.error.clone()));
-                refusal.standing = self.cause == cause;
-                self.cause = cause;
+                let standing = self
+                    .cause
+                    .as_ref()
+                    .is_some_and(|(step, err)| *step == refusal.step && err == &refusal.error);
+                refusal.standing = standing;
+                if !standing {
+                    self.cause = Some((refusal.step, refusal.error.clone()));
+                }
             }
             Some(Status::Retrying(_)) => return POLL,
             other => {

@@ -2436,12 +2436,15 @@ pub fn serve_with_handshake<H, E>(
         running,
         handshake_within,
         (hand_over, on_event),
-        Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+        (
+            Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+            Arc::default(),
+        ),
     );
 }
 
 /// [`serve_with_handshake`] seating its connections in `slots`, which the caller keeps to read
-/// who holds them.
+/// who holds them, and holding them in `live`, whose clock runs their lifetimes.
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn serve_with_handshake_on<H, E>(
     listener: &TcpListener,
@@ -2449,7 +2452,7 @@ pub(crate) fn serve_with_handshake_on<H, E>(
     running: &AtomicBool,
     handshake_within: Duration,
     (hand_over, on_event): (H, E),
-    slots: Arc<Slots>,
+    (slots, live): (Arc<Slots>, Arc<LiveConnections>),
 ) where
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
@@ -2468,7 +2471,7 @@ pub(crate) fn serve_with_handshake_on<H, E>(
         Locality::Fleet,
         handshake_within,
         (hand_over, on_event),
-        slots,
+        (slots, live),
     );
 }
 
@@ -2599,11 +2602,15 @@ fn serve_inner<H, E>(
         locality,
         handshake_within,
         (hand_over, on_event),
-        Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+        (
+            Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)),
+            Arc::default(),
+        ),
     );
 }
 
-/// [`serve_inner`] seating its connections in `slots`.
+/// [`serve_inner`] seating its connections in `slots` and holding them in `live`, whose clock
+/// runs their lifetimes.
 #[allow(clippy::too_many_arguments)]
 fn serve_seated<H, E>(
     listener: ListenerSocket<'_>,
@@ -2613,7 +2620,7 @@ fn serve_seated<H, E>(
     locality: Locality,
     handshake_within: Duration,
     (hand_over, on_event): (H, E),
-    slots: Arc<Slots>,
+    (slots, live): (Arc<Slots>, Arc<LiveConnections>),
 ) where
     H: Fn(Served, FleetOp) -> io::Result<()> + Send + Sync + Clone + 'static,
     E: Fn(FleetEvent) + Send + Sync + Clone + 'static,
@@ -2626,7 +2633,6 @@ fn serve_seated<H, E>(
         )));
         return;
     }
-    let live = Arc::new(LiveConnections::default());
     let mut next_id: u64 = 0;
     let mut stopped = None;
     while running.load(Ordering::Acquire) {
@@ -2814,9 +2820,20 @@ fn serve_seated<H, E>(
     }
 }
 
-#[derive(Default)]
-struct LiveConnections {
+/// The connections a listener holds from their accept on: [`LiveConnections::cut_overdue`] cuts
+/// each one a proof stamped ([`LiveTenure::proved`]) once the lifetime has passed on its clock,
+/// and [`LiveConnections::cut_all`] cuts every one.
+pub(crate) struct LiveConnections {
     fleet_live: Mutex<Vec<Live>>,
+    /// The clock a proof's stamp ([`LiveTenure::proved`]) and the lifetime's cut
+    /// ([`LiveConnections::cut_overdue`]) both read.
+    now: Box<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl Default for LiveConnections {
+    fn default() -> Self {
+        Self::on_clock(Instant::now)
+    }
 }
 
 struct Live {
@@ -2841,6 +2858,14 @@ impl Live {
 }
 
 impl LiveConnections {
+    /// Connections whose proofs are stamped, and whose lifetimes are cut, on `now`.
+    fn on_clock(now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self {
+            fleet_live: Mutex::default(),
+            now: Box::new(now),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Live>> {
         self.fleet_live
             .lock()
@@ -2863,7 +2888,7 @@ impl LiveConnections {
     }
 
     fn cut_overdue(&self, lifetime: Duration) {
-        let now = Instant::now();
+        let now = (self.now)();
         self.lock().retain(|live| {
             let overdue = live
                 .proved
@@ -2907,7 +2932,7 @@ impl LiveTenure {
     }
 
     fn proved(&self, drive: bool, most: usize) -> bool {
-        let now = Instant::now();
+        let now = (self.live.now)();
         let mut held = self.live.lock();
         let Some(source) = held
             .iter()
@@ -4899,6 +4924,80 @@ mod tests {
         ));
     }
 
+    /// A listener clock that stands still until its test moves it ([`Still::pass`]): the
+    /// [`LiveConnections`] it makes ([`Still::live`]) stamp each proof and cut each lifetime on
+    /// it, so no scheduling delay of the listener's threads ever spends a connection's lifetime.
+    #[derive(Clone)]
+    struct Still {
+        base: Instant,
+        past: Arc<Mutex<Duration>>,
+    }
+
+    impl Still {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                past: Arc::default(),
+            }
+        }
+
+        fn pass(&self, by: Duration) {
+            *self.past.lock().unwrap() += by;
+        }
+
+        fn live(&self) -> Arc<LiveConnections> {
+            let Self { base, past } = self.clone();
+            Arc::new(LiveConnections::on_clock(move || {
+                base + *past.lock().unwrap()
+            }))
+        }
+    }
+
+    /// The lifetime runs on the listener's clock from the proof's stamp: a connection held an
+    /// hour before it proved is not overdue, one a millisecond short of its lifetime is held, and
+    /// one at its lifetime is cut, its peer reading the end. As the listener does, `live` holds a
+    /// duplicate of the accepted socket while the accepted descriptor stays open through the
+    /// peer's read, so only the cut's hang-up, not the dropped entry, can end the line.
+    #[test]
+    fn a_proof_starts_its_lifetime_on_the_listeners_clock() {
+        let lifetime = SERVED_WITHIN;
+        let (accepted, mut peer) = over_loopback(
+            move |tcp| {
+                let clock = Still::new();
+                let live = clock.live();
+                let held = || live.lock().len();
+                let line = aterm_uds::kept_out(|| tcp.try_clone()).unwrap();
+                let tenure = live.hold(1, tcp.peer_addr().unwrap().ip(), line);
+                clock.pass(Duration::from_secs(3600));
+                assert!(
+                    tenure.proved(false, 1),
+                    "the only connection proves within its share"
+                );
+                live.cut_overdue(lifetime);
+                assert_eq!(
+                    held(),
+                    1,
+                    "its lifetime starts at the proof, not the accept"
+                );
+                clock.pass(lifetime - Duration::from_millis(1));
+                live.cut_overdue(lifetime);
+                assert_eq!(held(), 1, "a millisecond short of its lifetime it is held");
+                clock.pass(Duration::from_millis(1));
+                live.cut_overdue(lifetime);
+                assert_eq!(held(), 0, "at its lifetime it is cut");
+                drop(tenure);
+                tcp
+            },
+            |tcp| tcp,
+        );
+        let end = peer.read(&mut [0]);
+        assert!(
+            matches!(end, Ok(0)),
+            "the cut connection's peer reads its end while the listener's descriptor is open: {end:?}"
+        );
+        drop(accepted);
+    }
+
     #[test]
     fn the_cut_frees_the_slot_of_a_peer_that_sent_its_fin_and_reads_nothing() {
         the_cut_frees_the_slot_of(|local, answering| {
@@ -4923,9 +5022,10 @@ mod tests {
         });
     }
 
-    /// One slot, a short lifetime and a member that sends its FIN and reads nothing: `relaying`
-    /// runs the relay (its first argument) beside the local end that answers it. The connection
-    /// closes at its lifetime and the next dial is served.
+    /// One slot, a lifetime that passes only on the test's [`Still`] clock, and a member that
+    /// sends its FIN and reads nothing: `relaying` runs the relay (its first argument) beside the
+    /// local end that answers it. The connection closes once its lifetime has passed and the next
+    /// dial is served.
     fn the_cut_frees_the_slot_of(
         relaying: impl Fn(Box<dyn FnOnce() -> io::Result<()>>, CtlStream) -> io::Result<()>
         + Send
@@ -4946,23 +5046,28 @@ mod tests {
             serves: &[FleetOp::Survey],
             slots: 1,
             per_source: 1,
-            lifetime: Duration::from_millis(200),
+            lifetime: SERVED_WITHIN,
         };
+        let clock = Still::new();
         let serving = {
             let running = Arc::clone(&running);
+            let live = clock.live();
             std::thread::spawn(move || {
-                serve_with_handshake(
+                serve_with_handshake_on(
                     &listener,
                     &listening,
                     &running,
                     HANG,
-                    move |served: Served, _op| {
-                        let (local, answering) = CtlStream::pair()?;
-                        relaying(Box::new(move || served.relay_answers(local)), answering)
-                    },
-                    move |event| {
-                        let _ = events.lock().unwrap().send(event);
-                    },
+                    (
+                        move |served: Served, _op| {
+                            let (local, answering) = CtlStream::pair()?;
+                            relaying(Box::new(move || served.relay_answers(local)), answering)
+                        },
+                        move |event| {
+                            let _ = events.lock().unwrap().send(event);
+                        },
+                    ),
+                    (Arc::new(Slots::new(1, PREAUTH_GRACE)), live),
                 );
             })
         };
@@ -4977,9 +5082,13 @@ mod tests {
 
         let tcp = TcpStream::connect(addr).unwrap();
         let (silent, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).unwrap();
+        // Admitted is told once the listener's handshake is over: a lifetime that passed before
+        // it would cut the handshake, not the relay.
         assert!(matches!(next("Admitted"), FleetEvent::Admitted { .. }));
         silent.tcp().shutdown(std::net::Shutdown::Write).unwrap();
+        clock.pass(SERVED_WITHIN);
         assert!(matches!(next("Closed"), FleetEvent::Closed { .. }));
+        // Proved where the clock now stands still, the next dial is never overdue.
         let tcp = TcpStream::connect(addr).unwrap();
         let again = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG);
         assert!(
@@ -4999,11 +5108,13 @@ mod tests {
         at_capacity: std::sync::atomic::AtomicUsize,
         displaced: std::sync::atomic::AtomicUsize,
         refused_v6: Mutex<Vec<String>>,
+        admitted: std::sync::atomic::AtomicUsize,
+        closed: std::sync::atomic::AtomicUsize,
     }
 
     struct Serving {
         heard: Arc<Heard>,
-        /// The listener's slots where [`Serving::start`] made them, read to see
+        /// The listener's slots where [`Serving::start_on`] made them, read to see
         /// who holds them ([`Serving::seats`]).
         slots: Option<Arc<Slots>>,
         running: Arc<AtomicBool>,
@@ -5012,6 +5123,15 @@ mod tests {
 
     impl Serving {
         fn start(listener: TcpListener, listening: Listening) -> Self {
+            Self::start_on(listener, listening, Arc::default())
+        }
+
+        /// [`Serving::start`] holding its connections in `live`, whose clock runs their lifetimes.
+        fn start_on(
+            listener: TcpListener,
+            listening: Listening,
+            live: Arc<LiveConnections>,
+        ) -> Self {
             let heard = Arc::new(Heard::default());
             let slots = Arc::new(Slots::new(listening.slots, PREAUTH_GRACE));
             let running = Arc::new(AtomicBool::new(true));
@@ -5019,8 +5139,8 @@ mod tests {
                 let (heard, running) = (Arc::clone(&heard), Arc::clone(&running));
                 let slots = Arc::clone(&slots);
                 move || {
-                    let on_event = move |event| {
-                        if let FleetEvent::Refused { peer, reason } = event {
+                    let on_event = move |event| match event {
+                        FleetEvent::Refused { peer, reason } => {
                             heard.refused.lock().unwrap().push(reason.clone());
                             if reason == AT_CAPACITY {
                                 heard.at_capacity.fetch_add(1, Ordering::SeqCst);
@@ -5032,6 +5152,13 @@ mod tests {
                                 heard.refused_v6.lock().unwrap().push(reason);
                             }
                         }
+                        FleetEvent::Admitted { .. } => {
+                            heard.admitted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        FleetEvent::Closed { .. } => {
+                            heard.closed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        FleetEvent::Stopped(_) => {}
                     };
                     serve_with_handshake_on(
                         &listener,
@@ -5039,7 +5166,7 @@ mod tests {
                         &running,
                         HANG,
                         (echo, on_event),
-                        slots,
+                        (slots, live),
                     );
                 }
             });
@@ -5057,7 +5184,7 @@ mod tests {
         fn seats(&self) -> &Slots {
             self.slots
                 .as_deref()
-                .expect("a listener Serving::start started")
+                .expect("a listener Serving::start_on started")
         }
     }
 
@@ -5603,13 +5730,22 @@ mod tests {
     fn a_proved_connection_is_cut_at_its_lifetime() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let _served = Serving::start(listener, listening(1, Duration::from_millis(300)));
+        let clock = Still::new();
+        let served = Serving::start_on(listener, listening(1, SERVED_WITHIN), clock.live());
         let dial = || {
             let tcp = TcpStream::connect(addr).map_err(FleetError::Io)?;
             client_handshake(tcp, &secret(7), FleetOp::Survey, HANG)
         };
 
         let (mut silent, _) = dial().unwrap();
+        // Admitted is told once the listener's handshake is over: a lifetime that passed before
+        // it would cut the handshake, not the connection it serves.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the listener admits the dial",
+            || (served.heard.admitted.load(Ordering::SeqCst) == 1).then_some(()),
+        );
+        clock.pass(SERVED_WITHIN);
         silent
             .stream()
             .get_ref()
@@ -5625,14 +5761,14 @@ mod tests {
                 )),
             "the silent connection is cut: {rest:?}"
         );
-        let started = std::time::Instant::now();
-        while let Err(e) = dial() {
-            assert!(
-                started.elapsed() < HANG,
-                "the cut connection never gave its slot back: {e}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // Closed is told once the cut connection's answer let its slot go.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the cut connection gives its slot back",
+            || (served.heard.closed.load(Ordering::SeqCst) == 1).then_some(()),
+        );
+        // Proved where the clock now stands still, the next dial is never overdue.
+        dial().expect("the next dial is served once the cut gave its slot back");
     }
 
     #[cfg(target_os = "macos")]

@@ -148,6 +148,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         Some(addr),
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     let connection = accept_ready(&listener);
@@ -157,6 +158,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         None,
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     let (_, repair, success, round) = client.task.join().unwrap();
@@ -197,6 +199,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         None,
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     let transport = Transport {
@@ -284,6 +287,7 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
             Some(address),
             Scope::Loopback,
             repair,
+            Instant::now(),
         )
         .unwrap();
         let server = Worker::start(
@@ -292,6 +296,7 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
             None,
             Scope::Loopback,
             Repair::default(),
+            Instant::now(),
         )
         .unwrap();
         assert!(server.task.join().unwrap().2);
@@ -353,14 +358,22 @@ fn round_at(
     repair: Repair,
 ) -> (Worker, Worker) {
     let address = listener.local_addr().unwrap();
-    let dialled =
-        Worker::start(client.clone(), None, Some(address), Scope::Loopback, repair).unwrap();
+    let dialled = Worker::start(
+        client.clone(),
+        None,
+        Some(address),
+        Scope::Loopback,
+        repair,
+        Instant::now(),
+    )
+    .unwrap();
     let served = Worker::start(
         server.clone(),
         Some(accept_ready(listener)),
         None,
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     (dialled, served)
@@ -408,6 +421,7 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
                 Some(address),
                 Scope::Loopback,
                 repair,
+                Instant::now(),
             )
             .unwrap();
             a.finish(dialled, now);
@@ -439,6 +453,7 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
             Some(address),
             Scope::Loopback,
             repair,
+            Instant::now(),
         )
         .unwrap();
         a.finish(dialled, now);
@@ -487,6 +502,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
                 Some(address),
                 Scope::Loopback,
                 repair,
+                Instant::now(),
             )
             .unwrap();
             let server = Worker::start(
@@ -495,6 +511,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
                 None,
                 Scope::Loopback,
                 Repair::default(),
+                Instant::now(),
             )
             .unwrap();
             let (_, repair, success, round) = client.task.join().unwrap();
@@ -524,6 +541,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
             Some(address),
             Scope::Loopback,
             repair,
+            Instant::now(),
         )
         .unwrap();
         let (_, repair, success, round) = client.task.join().unwrap();
@@ -543,6 +561,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
         Some(address),
         Scope::Loopback,
         repair,
+        Instant::now(),
     )
     .unwrap();
     let server = Worker::start(
@@ -551,6 +570,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
         None,
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     assert!(client.task.join().unwrap().2);
@@ -636,6 +656,7 @@ fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
                 Some(listener.local_addr().unwrap()),
                 Scope::Loopback,
                 Repair::default(),
+                Instant::now(),
             )
             .unwrap(),
         );
@@ -711,6 +732,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             Some(address),
             Scope::Loopback,
             repair,
+            Instant::now(),
         )
         .unwrap();
         let server = Worker::start(
@@ -719,6 +741,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             None,
             Scope::Loopback,
             Repair::default(),
+            Instant::now(),
         )
         .unwrap();
         let (_, repair, success, report) = client.task.join().unwrap();
@@ -759,6 +782,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
             Some(listeners[0].local_addr().unwrap()),
             Scope::Loopback,
             Repair::default(),
+            Instant::now(),
         )
         .unwrap(),
     );
@@ -792,6 +816,7 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
         None,
         Scope::Loopback,
         Repair::default(),
+        Instant::now(),
     )
     .unwrap();
     assert!(server.task.join().unwrap().2);
@@ -810,13 +835,16 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
 fn pending_enrollment_uses_all_workers_without_a_listener() {
     let lab = crate::control::enrollment::tests::Lab::new(true);
     let endpoint = Arc::new(lab.pending());
-    let stalled: Vec<_> = (0..WORKERS)
+    let rounds = ROUNDS + INCOMING;
+    let stalled: Vec<_> = (0..rounds)
         .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
     let mut transport = loopback(endpoint.clone(), 0, [81; 32]);
     assert!(transport.links.iter().all(|link| link.listener.is_none()));
     let mut held = Vec::new();
-    for listener in &stalled[..WORKERS / 2] {
+    // Two dials a moment ago, within their stagger: they hold the two places a serving node has.
+    let now = Instant::now() + Duration::from_secs(1);
+    for listener in &stalled[..ROUNDS] {
         transport.workers.push(
             Worker::start(
                 endpoint.clone(),
@@ -824,13 +852,13 @@ fn pending_enrollment_uses_all_workers_without_a_listener() {
                 Some(listener.local_addr().unwrap()),
                 Scope::Loopback,
                 Repair::default(),
+                now,
             )
             .unwrap(),
         );
         held.push(accept_ready(listener));
     }
-    let now = Instant::now() + Duration::from_secs(1);
-    for (index, listener) in stalled[WORKERS / 2..].iter().enumerate() {
+    for (index, listener) in stalled[ROUNDS..].iter().enumerate() {
         let address = listener.local_addr().unwrap();
         transport.hints.observe(
             &Hints::new([index as u8 + 82; 32]).wire(address.port()),
@@ -838,21 +866,113 @@ fn pending_enrollment_uses_all_workers_without_a_listener() {
             now,
         );
     }
-    for tick in 0..WORKERS / 2 {
+    // Still within the first two dials' stagger, the enrollee dials its other two.
+    for tick in 0..INCOMING as u32 {
         transport
-            .tick(now + Duration::from_secs(tick as u64))
+            .tick(now + Duration::from_millis(100) + SPACING * tick)
             .unwrap();
     }
+    assert!(Duration::from_millis(100) + SPACING * (INCOMING as u32 - 1) < STAGGER);
     assert_eq!(
         transport.workers.len(),
-        WORKERS,
+        rounds,
         "a pending device has no incoming traffic to reserve workers for"
     );
-    for listener in &stalled[WORKERS / 2..] {
+    for listener in &stalled[ROUNDS..] {
         held.push(accept_ready(listener));
     }
-    assert_eq!(held.len(), WORKERS);
+    assert_eq!(held.len(), rounds);
     transport.stop();
+}
+
+/// CR2: two endpoints that accept the connection and never answer it (a peer whose accept queue
+/// is full) take both places a serving node's rounds have, ahead of a real peer. Once the first
+/// has staggered, the peer is dialled beside them, and its round completes. The ticks run on an
+/// injected clock and the dial is checked as the tick returns; only the sockets run in real time.
+///
+/// NEGATIVE CONTROL (run here, [`super::UNSTAGGERED`]): while both stalled dials hold their places
+/// the peer is not dialled.
+#[test]
+fn a_peer_is_dialled_and_repairs_beside_two_stalled_dials() {
+    for unstaggered in [true, false] {
+        let lab = Lab::new();
+        let mut listeners: Vec<_> = (0..3)
+            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+            .collect();
+        listeners.sort_by_key(|listener| listener.local_addr().unwrap());
+        let peer = listeners.pop().unwrap();
+        let address = peer.local_addr().unwrap();
+        let mut transport = loopback(lab.endpoints[0].clone(), 0, [61; 32]);
+        let start = Instant::now();
+        // One loopback address beacons at most two endpoints, so the first stalled dial is
+        // already open, and the second stalled endpoint and the peer are heard.
+        let mut held = Vec::new();
+        transport.workers.push(
+            Worker::start(
+                lab.endpoints[0].clone(),
+                None,
+                Some(listeners[0].local_addr().unwrap()),
+                Scope::Loopback,
+                Repair::default(),
+                start,
+            )
+            .unwrap(),
+        );
+        held.push(accept_ready(&listeners[0]));
+        for (index, listener) in [&listeners[1], &peer].into_iter().enumerate() {
+            let at = listener.local_addr().unwrap();
+            transport.hints.observe(
+                &Hints::new([index as u8 + 62; 32]).wire(at.port()),
+                at,
+                start,
+            );
+        }
+        super::UNSTAGGERED.with(|cell| cell.set(unstaggered));
+        transport.tick(start + Duration::from_millis(300)).unwrap();
+        assert_eq!(
+            transport.workers.len(),
+            2,
+            "the second stalled endpoint is dialled"
+        );
+        held.push(accept_ready(&listeners[1]));
+        let staggered = start + STAGGER + Duration::from_millis(100);
+        transport.tick(staggered).unwrap();
+        super::UNSTAGGERED.with(|cell| cell.set(false));
+        let dialled = transport
+            .workers
+            .iter()
+            .any(|worker| worker.target == Some(address));
+        if unstaggered {
+            assert!(!dialled, "MUTANT: two stalled dials hold the peer's dial");
+            transport.stop();
+            continue;
+        }
+        assert!(dialled, "the peer waits behind two stalled dials");
+        // Beside both: each holds its own dial until its handshake limit, which the peer's round
+        // need not wait for.
+        assert_eq!(transport.workers.len(), 3);
+        let server = Worker::start(
+            lab.endpoints[1].clone(),
+            Some(accept_ready(&peer)),
+            None,
+            Scope::Loopback,
+            Repair::default(),
+            staggered,
+        )
+        .unwrap();
+        assert!(
+            server.task.join().unwrap().2,
+            "the peer's side of the round"
+        );
+        let until = Instant::now() + Duration::from_secs(60);
+        while !transport.hints.established(address) {
+            assert!(Instant::now() < until, "the peer's round did not complete");
+            transport.tick(staggered).unwrap();
+            aterm_uds::deadline::poll_yield();
+        }
+        transport.stop();
+        drop(held);
+    }
 }
 
 #[test]
@@ -1703,6 +1823,64 @@ fn a_peer_that_refuses_its_connections_is_dialed_later_each_time() {
     );
 }
 
+/// What a dial says of its endpoint, over real sockets (CR2): a refused connection, or a listener
+/// that proves another lab's discriminator, says no peer of this lab is there
+/// ([`Repair::disowned`]); a listener that accepts and hangs up says nothing of the kind. Only a
+/// peer that authenticates raises the dial's flag ([`Worker::heard`]).
+#[test]
+fn a_dial_disowns_its_endpoint_only_on_evidence() {
+    let lab = Lab::new();
+    let other = Lab::new();
+    assert_ne!(
+        lab.endpoints[0].beacon_key(),
+        other.endpoints[1].beacon_key(),
+        "two labs"
+    );
+    let dial = |target: SocketAddr| {
+        Worker::start(
+            lab.endpoints[0].clone(),
+            None,
+            Some(target),
+            Scope::Loopback,
+            Repair::default(),
+            Instant::now(),
+        )
+        .unwrap()
+    };
+    let ended = |worker: Worker| {
+        let heard = worker.heard.clone();
+        let (_, repair, _, _) = worker.task.join().unwrap();
+        (
+            repair.disowned(),
+            heard.load(std::sync::atomic::Ordering::Acquire),
+        )
+    };
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    assert_eq!(ended(dial(dead)), (true, false), "a refused port");
+
+    let hangs_up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let worker = dial(hangs_up.local_addr().unwrap());
+    drop(hangs_up.accept().unwrap());
+    assert_eq!(
+        ended(worker),
+        (false, false),
+        "a connection closed unproved"
+    );
+
+    for (server, disowned, heard) in [
+        (&other.endpoints[1], true, false),
+        (&lab.endpoints[1], false, true),
+    ] {
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let (dialled, served) = round_at(&lab.endpoints[0], server, &listener, Repair::default());
+        assert_eq!(ended(dialled), (disowned, heard), "disowned, heard");
+        drop(served.task.join().unwrap());
+    }
+}
+
 #[test]
 fn panicked_worker_releases_the_hint_slot_for_retry() {
     let lab = Lab::new();
@@ -1720,6 +1898,7 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
         target: Some(address),
         task: thread::spawn(|| panic!("intentional worker failure")),
         started: now,
+        heard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let until = now + Duration::from_secs(60);
     while !transport.workers.is_empty() {

@@ -50,6 +50,25 @@ fn run(code: Option<i32>, seen: SeedMarkers, said: &str) -> PassRun {
     }
 }
 
+/// A long stderr keeps its end, where atpkg says what failed. NEGATIVE CONTROL: keeping its first
+/// 2000 characters drops the failure.
+#[test]
+fn a_long_stderr_keeps_the_failure_atpkg_closes_it_with() {
+    let progress = "atpkg: fetching a part of a long install\n".repeat(100);
+    let said = format!("{progress}atpkg: install claude failed: the disk is full\n");
+    let why = run(Some(1), SeedMarkers::default(), &said).why();
+    assert_eq!(why.chars().count(), 2000);
+    assert!(
+        why.ends_with("atpkg: install claude failed: the disk is full"),
+        "{why}"
+    );
+    assert_eq!(
+        run(Some(1), SeedMarkers::default(), " a\n\n b \n").why(),
+        "a | b",
+        "CONTROL: a short one is whole"
+    );
+}
+
 /// `carry_wait_row` clears the progress bar once after a pass runs or dies, and keeps it open on `PassVerdict::Busy`.
 #[test]
 fn a_waited_pass_that_ran_retires_its_row_and_busy_carries_it() {

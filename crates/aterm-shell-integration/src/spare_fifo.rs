@@ -51,81 +51,59 @@ pub struct HoldEnds {
     pub shell: std::fs::File,
 }
 
-/// The ends of the hold for the spare whose FIFO is at `path`: on Darwin the FIFO itself, opened
-/// read-write for the host (`O_NONBLOCK`) and read-only for the shell (blocking; the open does not
-/// wait, since the host's end is a writer already), checked to be the one FIFO. Elsewhere an anonymous pipe made
-/// close-on-exec atomically (`pipe2`), its write end alone non-blocking, and `path` is left as the
-/// mark it is: fish reads its end through `/dev/fd/10`, which Linux opens
-/// again, and opening a named FIFO again waits for a writer, so a fish whose host is gone would
-/// wait there for ever, while opening a pipe again never waits. Darwin has no `pipe2`, and its
-/// `/dev/fd` hands back the same open file, so the FIFO serves there.
+/// The ends of a spare's hold: an anonymous pipe, each end close-on-exec, its write end alone
+/// non-blocking. The spare's FIFO stays the mark it is and is never opened for the hold. A named
+/// FIFO cannot serve: fish reads its end through `/dev/fd/10`, which Linux opens again, and
+/// opening a named FIFO again waits for a writer, so a fish whose host is gone would wait there
+/// for ever; and on Darwin a FIFO `read` that starts as its last writer closes can miss the
+/// end-of-file and block for ever with no writer left (a zsh hold whose host closed its end just
+/// after the shell printed `parked`, held at its first `read -u 10`; a C reproducer, measured
+/// 2026-11-06, hung 11 times in about 36,000 tries on a FIFO and never in 12,000 on a pipe).
+///
+/// The pipe is made under [`aterm_uds::kept_out`], so no spawn that takes
+/// [`aterm_uds::spawn_lock`] (each through `spawnfd`, `pspawn` or `aterm-pty`) copies it before
+/// both ends are close-on-exec (Darwin has no `pipe2`: std marks the ends after `pipe`). A fork
+/// that bypasses the lock (a bare `std::process::Command`, a framework's own spawn) can still copy
+/// the write end in that window and carry it past its exec, and the shell's hold then lasts until
+/// that child exits. The write end, never handed to a child, is asked to be close-on-fork. The
+/// read end is not: the spawn hands it to the shell, and std's `Command` refuses to pass a
+/// close-on-fork descriptor.
 ///
 /// # Errors
-/// Either open's or `pipe2`'s; `fcntl`'s when the write end cannot be made non-blocking; and on
-/// Darwin `InvalidData` when the two opens are not the one FIFO.
-pub fn hold_ends(path: &Path) -> std::io::Result<HoldEnds> {
-    #[cfg(target_vendor = "apple")]
-    {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
-        let host = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)?;
-        let shell = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(path)?;
-        let (a, b) = (host.metadata()?, shell.metadata()?);
-        let one_fifo = a.file_type().is_fifo()
-            && b.file_type().is_fifo()
-            && (a.dev(), a.ino()) == (b.dev(), b.ino());
-        if !one_fifo || !close_on_exec(host.as_raw_fd()) || !close_on_exec(shell.as_raw_fd()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "{}: the hold's two ends are not one close-on-exec FIFO",
-                    path.display()
-                ),
-            ));
-        }
-        Ok(HoldEnds { host, shell })
+/// `pipe`'s, or marking its ends close-on-exec; `fcntl`'s when the write end cannot be marked
+/// close-on-fork or made non-blocking.
+pub fn hold_ends() -> std::io::Result<HoldEnds> {
+    use std::os::fd::{AsRawFd as _, OwnedFd};
+    let HoldPipe { shell, host } =
+        aterm_uds::kept_out(|| std::io::pipe().map(|(shell, host)| HoldPipe { shell, host }))?;
+    let host = OwnedFd::from(host);
+    let fd = host.as_raw_fd();
+    // SAFETY: `F_GETFL` and `F_SETFL` read and set the status flags of `fd`, open and owned
+    // here; they touch no memory. The flag is on the write end's own open file description.
+    let made = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !made {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-        let _ = path;
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is a live two-int buffer `pipe2` fills.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `pipe2` just made both descriptors, and nothing else owns either.
-        let (shell, host) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        let fd = host.as_raw_fd();
-        // SAFETY: `F_GETFL` and `F_SETFL` read and set the status flags of `fd`, open and owned
-        // here; they touch no memory. The flag is on the write end's own open file description.
-        let made = unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
-        };
-        if !made {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(HoldEnds {
-            host: host.into(),
-            shell: shell.into(),
-        })
-    }
+    Ok(HoldEnds {
+        host: host.into(),
+        shell: OwnedFd::from(shell).into(),
+    })
 }
 
-/// Whether `fd` is close-on-exec.
-#[cfg(target_vendor = "apple")]
-fn close_on_exec(fd: libc::c_int) -> bool {
-    // SAFETY: `F_GETFD` reads the descriptor flags of `fd`, open here; it touches no memory.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    flags >= 0 && flags & libc::FD_CLOEXEC != 0
+/// The pipe [`hold_ends`] makes, as [`aterm_uds::kept_out`] creates it.
+struct HoldPipe {
+    shell: std::io::PipeReader,
+    host: std::io::PipeWriter,
+}
+
+/// Only the write end is kept out of children: the read end is handed to the shell.
+impl aterm_uds::spawn_lock::Descriptors for HoldPipe {
+    fn mark(&self) -> std::io::Result<()> {
+        aterm_uds::keep_out_of_children(&self.host)
+    }
 }
 
 /// Release every FIFO in `dir` whose owner has ended or whose pid now has a different birth,
@@ -162,8 +140,8 @@ fn sweep_dead_with(
 
 /// The line a release leaves in a FIFO once both its names are gone. No hold knows it: an older
 /// build's hold, which opens the FIFO's path at each read, loops, fails to open the name it holds
-/// on, and exits; this build's, which reads its descriptor (on Darwin the FIFO itself), loops and
-/// reads end-of-file once the wake closes.
+/// on, and exits; this build's reads its pipe ([`hold_ends`]), never the FIFO, and reads
+/// end-of-file once its host's end closes.
 const END: &[u8] = b"end\n";
 
 fn write_end(wake: &std::fs::File) -> std::io::Result<()> {

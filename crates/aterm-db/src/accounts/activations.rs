@@ -130,7 +130,7 @@ impl Activations {
                 return Err(Error::new("account has no current decision"));
             };
             let record = history.records[head].clone();
-            intents::current(&history, &record)?;
+            intents::current_with_statuses(&history, &statuses, &record)?;
             let members = prepared_members(session, &history, &statuses, &record)?;
             let configuration = Configuration::capture_in_session(
                 session,
@@ -146,7 +146,7 @@ impl Activations {
             if statuses.get(&account) != Some(&State::Ready(record.id())) {
                 return Err(Error::new("account changed during member observation"));
             }
-            intents::current(&history, &record)?;
+            intents::current_with_statuses(&history, &statuses, &record)?;
             if prepared_members(session, &history, &statuses, &record)? != members {
                 return Err(Error::new("prepared members changed during observation"));
             }
@@ -195,15 +195,18 @@ impl Activations {
     pub fn local_preparations(&self) -> Result<Vec<(Digest, Digest)>> {
         let named = self.observe_store_if_declared(|session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
-            Ok(!addressed(&history, session.actor()).is_empty())
+            let statuses = history.statuses();
+            Ok(addressed_iter(&history, &statuses, session.actor())
+                .next()
+                .is_some())
         })?;
         if named != Some(true) {
             return Ok(Vec::new());
         }
         self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
-            Ok(addressed(&history, session.actor())
-                .into_iter()
+            let statuses = history.statuses();
+            Ok(addressed_iter(&history, &statuses, session.actor())
                 .filter(|(_, decision)| session.permit_account(&history.records[decision]).is_ok())
                 .collect())
         })
@@ -547,25 +550,25 @@ fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
 
 /// Each account whose unique current decision prepares the device `actor`, with
 /// that decision: the most a permit can admit, since it requires the same device.
-fn addressed(history: &History, actor: Actor) -> Vec<(Digest, Digest)> {
-    let statuses = history.statuses();
-    statuses
-        .iter()
-        .filter_map(|(&account, state)| {
-            let &State::Ready(decision) = state else {
-                return None;
-            };
-            let record = &history.records[&decision];
-            let Action::Prepare(terms) = &record.request().action else {
-                return None;
-            };
-            if terms.device.actor() != actor {
-                return None;
-            }
-            intents::current_with_statuses(history, &statuses, record).ok()?;
-            Some((account, decision))
-        })
-        .collect()
+fn addressed_iter<'a>(
+    history: &'a History,
+    statuses: &'a BTreeMap<Digest, State>,
+    actor: Actor,
+) -> impl Iterator<Item = (Digest, Digest)> + 'a {
+    statuses.iter().filter_map(move |(&account, state)| {
+        let &State::Ready(decision) = state else {
+            return None;
+        };
+        let record = &history.records[&decision];
+        let Action::Prepare(terms) = &record.request().action else {
+            return None;
+        };
+        if terms.device.actor() != actor {
+            return None;
+        }
+        intents::current_with_statuses(history, statuses, record).ok()?;
+        Some((account, decision))
+    })
 }
 
 fn next_generation(history: &History, parents: &[Digest]) -> Result<u64> {

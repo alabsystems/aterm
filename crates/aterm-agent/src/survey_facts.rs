@@ -33,15 +33,21 @@ pub struct SurveyAccountFact {
     pub usage_5h_pct: Option<u32>,
     /// Active 7-day weekly utilization percent, when observed and still running.
     pub usage_7d_pct: Option<u32>,
-    /// Unix timestamp (seconds) when the weekly window resets, when known.
+    /// Unix timestamp (seconds) when the weekly window resets, when known. Where its read named no
+    /// reset, the latest it can: a week from that read.
     pub week_reset: Option<i64>,
     /// Unix timestamp (seconds) until which a standing wall blocks this account, when walled.
     pub walled_until: Option<i64>,
     /// Unix timestamp (seconds) when a session here last ran on this account.
     pub last_used: Option<i64>,
     /// Unix timestamp (seconds) when its usage figures were last read, when known. A row whose
-    /// reading is old says `unseen`, not `usable` ([`crate::harness::cli::survey_accounts`]).
+    /// reading is old, or no newer than its newest wall, says `unseen`, not `usable`
+    /// ([`crate::harness::cli::survey_accounts`]).
     pub read_at: Option<i64>,
+    /// Whether a worker with no starter of its kind would start on it here (`launch=1|0`,
+    /// [`crate::harness::accounts_pool::unstarted_launch_row`]). `None` from an aterm older than
+    /// the field, which says nothing of it (no `launch=`, or `launch=-`).
+    pub launch: Option<bool>,
 }
 
 /// One subscriber last-heard record from a vault server running on this machine (§7.2, C16).
@@ -338,7 +344,7 @@ impl SwarmSurveyFacts {
         for acc in &self.accounts {
             lines.push(format!(
                 "account pool={} id={} condition={} enrolled={} pct5={} pct7={} \
-                 week_reset={} walled_until={} last_used={} read_at={}",
+                 week_reset={} walled_until={} last_used={} read_at={} launch={}",
                 aterm_codec::pct::encode(&acc.pool),
                 aterm_codec::pct::encode(&aterm_ctl::masked_label(&acc.id)),
                 aterm_codec::pct::encode(&acc.condition),
@@ -349,6 +355,8 @@ impl SwarmSurveyFacts {
                 opt_i64_token(acc.walled_until),
                 opt_i64_token(acc.last_used),
                 opt_i64_token(acc.read_at),
+                acc.launch
+                    .map_or("-", |launch| if launch { "1" } else { "0" }),
             ));
         }
         for repo in repos {
@@ -666,6 +674,11 @@ fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, 
         read_at: required_raw(fields, "read_at")
             .ok()
             .map_or(Ok(None), |raw| parse_opt_i64(raw, "read_at"))?,
+        // A member older than the field sends none.
+        launch: field_raw(fields, "launch")
+            .filter(|raw| *raw != "-")
+            .map(|raw| parse_bool01(raw, "launch"))
+            .transpose()?,
     })
 }
 
@@ -866,6 +879,7 @@ fn account_facts_of(
             week_reset: row.week_reset,
             last_used: row.used_at,
             read_at: row.read_at,
+            launch: Some(row.launch),
         }));
         sessions.extend(
             read.sessions
@@ -1013,6 +1027,7 @@ mod tests {
                     walled_until: None,
                     last_used: Some(1_793_159_900),
                     read_at: None,
+                    launch: Some(true),
                 },
                 SurveyAccountFact {
                     pool: "codex".to_owned(),
@@ -1025,6 +1040,7 @@ mod tests {
                     walled_until: Some(1_793_170_000),
                     last_used: Some(1_793_158_000),
                     read_at: None,
+                    launch: Some(false),
                 },
                 SurveyAccountFact {
                     pool: "claude".to_owned(),
@@ -1037,6 +1053,7 @@ mod tests {
                     walled_until: None,
                     last_used: None,
                     read_at: None,
+                    launch: None,
                 },
             ],
             accounts_unread: vec!["grok".to_owned(), "kimi".to_owned()],
@@ -1375,10 +1392,13 @@ mod tests {
             condition,
             five_hour_pct: Some(10),
             five_hour_reset: Some(1_793_140_000),
+            five_hour_reset_named: true,
             seven_day_pct: Some(42),
             week_reset: Some(1_793_500_000),
+            week_reset_named: true,
             used_at: Some(1_793_130_000),
             read_at: Some(1_793_130_000),
+            launch: false,
             pk: None,
             plan: None,
             plan_tier: None,
@@ -1537,6 +1557,68 @@ mod tests {
         assert_eq!(line("-").unwrap().read_at, None);
         assert_eq!(line("").unwrap().read_at, None, "an older member");
         assert!(line("soon").is_err(), "CONTROL: a bad figure is no figure");
+    }
+
+    /// Which row a launch there would start on crosses the wire as one field, on every row of a
+    /// pool, and an older member, which sends no such field, still parses as saying nothing.
+    #[test]
+    fn an_account_rows_launch_crosses_the_wire_and_an_older_member_sends_none() {
+        use crate::harness::accounts::{Class, Condition};
+        use crate::harness::cli::SurveyAccount;
+        let line = |launch: &str| {
+            let mut fields: Vec<(String, String)> = [
+                ("pool", "codex"),
+                ("id", "main"),
+                ("condition", "usable"),
+                ("enrolled", "1"),
+                ("pct5", "-"),
+                ("pct7", "1"),
+                ("week_reset", "-"),
+                ("walled_until", "-"),
+                ("last_used", "-"),
+                ("read_at", "-"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            if !launch.is_empty() {
+                fields.push(("launch".to_owned(), launch.to_owned()));
+            }
+            parse_account_line(&fields)
+        };
+        assert_eq!(line("1").unwrap().launch, Some(true));
+        assert_eq!(line("0").unwrap().launch, Some(false));
+        assert_eq!(line("-").unwrap().launch, None);
+        assert_eq!(line("").unwrap().launch, None, "an older member");
+        assert!(line("maybe").is_err(), "CONTROL: a bad word is no word");
+
+        let row = |label: &str, launch: bool| SurveyAccount {
+            label: label.to_owned(),
+            class: Class::Preferred,
+            enrolled: true,
+            condition: Condition::Usable,
+            five_hour_pct: None,
+            five_hour_reset: None,
+            five_hour_reset_named: false,
+            seven_day_pct: None,
+            week_reset: None,
+            week_reset_named: false,
+            used_at: None,
+            read_at: None,
+            launch,
+            pk: None,
+            plan: None,
+            plan_tier: None,
+        };
+        let (rows, _, _, _) = account_facts_of([(
+            Cli::Codex,
+            Ok(SurveyPool {
+                rows: vec![row("main", true), row("work", false)],
+                ..SurveyPool::default()
+            }),
+        )]);
+        let launches: Vec<_> = rows.iter().map(|row| row.launch).collect();
+        assert_eq!(launches, [Some(true), Some(false)]);
     }
 
     #[cfg(unix)]

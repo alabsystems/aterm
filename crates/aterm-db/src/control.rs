@@ -309,6 +309,48 @@ fn hold_key(local: &BTreeSet<Digest>, remote: &BTreeSet<Digest>) -> Digest {
     hash.finalize()
 }
 
+/// The digest every round's TLS discriminator is made of: the label and the lab's three trust
+/// pins (network, authority, genesis). It is PUBLIC, not an admission secret: two endpoints whose
+/// digests differ never complete a round.
+pub(crate) fn discriminator(trust: &Trust) -> [u8; 32] {
+    let mut domain = Sha256::new();
+    domain.update(b"aterm/commons/control-transport/1\0");
+    domain.update(trust.network);
+    domain.update(trust.authority);
+    domain.update(trust.genesis);
+    domain.finalize()
+}
+
+/// The key a node's discovery beacons tag its lab with (`crate::runtime::discovery`, CR2): a
+/// digest of its [`discriminator`] under its own label, so two nodes' keys are equal exactly when
+/// their discriminators are. Unequal keys mean no round between them gets past TLS; equal ones
+/// mean only that one may.
+pub(crate) fn beacon_key(trust: &Trust) -> [u8; 32] {
+    let mut key = Sha256::new();
+    key.update(b"aterm/commons/beacon-lab/1\0");
+    key.update(discriminator(trust));
+    key.finalize()
+}
+
+/// A flag a round raises when its peer authenticates ([`Repair::hear`]). Cloning a [`Repair`]
+/// leaves the clone without it, so only the round it was armed for raises it.
+#[derive(Default)]
+struct Heard(Option<Arc<std::sync::atomic::AtomicBool>>);
+impl Clone for Heard {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+impl std::fmt::Debug for Heard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Heard(armed)"
+        } else {
+            "Heard"
+        })
+    }
+}
+
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
@@ -320,6 +362,10 @@ pub struct Repair {
     /// This side dialed, sent its hello over an established channel, and the peer closed or went
     /// quiet before sending its own ([`Self::unanswered`]).
     unanswered: bool,
+    /// What this round learned says no peer of this lab is at its endpoint ([`Self::disowned`]).
+    disowned: bool,
+    /// Raised when this round's peer authenticates ([`Self::hear`]).
+    heard: Heard,
     cursor: Option<Digest>,
     membership_hint: MembershipHint,
     data: crate::replica::Repair,
@@ -359,7 +405,39 @@ impl Repair {
         self.phase = Phase::Connecting;
         self.authenticated = None;
         self.unanswered = false;
+        self.disowned = false;
         self.clear_application();
+    }
+    /// What this round learned says no peer of this lab is at the endpoint it dialled: its host
+    /// refused the connection ([`Self::disown`]), or its listener proved another discriminator,
+    /// another lab's. A round that stalled, found no route, went unanswered or was refused after
+    /// TLS says neither: a peer of this lab that is busy, asleep or not ready looks the same
+    /// (CR2).
+    pub(crate) const fn disowned(&self) -> bool {
+        self.disowned
+    }
+    /// The host this round dialled refused its connection: nothing listens at that port
+    /// ([`Self::disowned`]).
+    pub(crate) fn disown(&mut self) {
+        self.disowned = true;
+    }
+    /// A round's state once `actor` authenticated in it, under zero pins (tests).
+    #[cfg(test)]
+    pub(crate) fn heard_from(actor: Actor) -> Self {
+        let mut repair = Self::default();
+        let pins = Trust {
+            network: [0; 16],
+            authority: [0; 32],
+            genesis: [0; 32],
+        };
+        repair.prepare(pins, actor);
+        repair
+    }
+    /// Raise `flag` when this round's peer authenticates ([`Self::prepare`]): the dial scheduler
+    /// reads it while a round this side dialled runs (CR2). An enrolling round prepares, and so
+    /// raises it, only once its enrollment completes. A clone of this repair carries no flag.
+    pub(crate) fn hear(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.heard = Heard(Some(flag));
     }
     /// This round's initiator requested authority evidence and the peer closed or
     /// went quiet before sending it. A responder answers only once it has admitted the
@@ -465,6 +543,9 @@ impl Repair {
     }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
         self.authenticated = Some(Instant::now());
+        if let Some(flag) = &self.heard.0 {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         if self.peer != Some((trust, actor)) {
             self.cursor = None;
             self.membership_hint = MembershipHint::default();
@@ -604,9 +685,9 @@ thread_local! {
 }
 
 impl Endpoint {
-    /// Local signed fleet advertisements, bound to current seats by this endpoint's log.
-    /// Neither an IP address nor a self-signed unknown node can select a seat's build.
-    #[cfg(not(test))]
+    /// Signed fleet descriptors whose keys this endpoint's historical witness binds to seats,
+    /// paired with locally observed contact IPs. The signature covers the descriptor, not the
+    /// IP or observation time; the witness need not contain the full current roster.
     pub(crate) fn advertised_versions(
         &self,
         state: &Path,
@@ -1069,6 +1150,12 @@ impl Endpoint {
         self.pending
     }
 
+    /// The key this endpoint's discovery beacons name its lab by, enrolling or not
+    /// ([`beacon_key`], CR2).
+    pub(crate) fn beacon_key(&self) -> [u8; 32] {
+        beacon_key(&self.trust)
+    }
+
     /// `witness` is a signed ACN3 node containing this request's exact Bind fact.
     /// A genesis witness must equal the independent pin. Other signed witnesses
     /// establish historical approval only, even before their ancestry arrives.
@@ -1233,12 +1320,7 @@ impl Endpoint {
         // This PUBLIC discriminator separates networks/protocols. It is not an
         // admission secret. Authority witness + exporter-bound identity below
         // are mandatory before any inventory or control repair is exposed.
-        let mut domain = Sha256::new();
-        domain.update(b"aterm/commons/control-transport/1\0");
-        domain.update(self.trust.network);
-        domain.update(self.trust.authority);
-        domain.update(self.trust.genesis);
-        let discriminator = FleetSecret::new(&domain.finalize())
+        let discriminator = FleetSecret::new(&discriminator(&self.trust))
             .map_err(|_| Error::new("invalid Commons protocol discriminator"))?;
         #[cfg(test)]
         let negotiate_recovery = !self.legacy && !self.legacy_repair;
@@ -1272,7 +1354,11 @@ impl Endpoint {
                         Duration::from_secs(30),
                     )
                 }
-                .map_err(|_| Error::new("Commons control TLS handshake failed"))?;
+                .map_err(|error| {
+                    // Its listener proved another discriminator: no peer of this lab is there.
+                    repair.disowned = matches!(error, fleet::FleetError::ListenerWrongSecret);
+                    Error::new("Commons control TLS handshake failed")
+                })?;
                 locality
                     .recheck()
                     .inspect_err(|_| repair.phase = Phase::Route)?;
@@ -2926,5 +3012,7 @@ pub(crate) fn read_u32(stream: &mut impl Read) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+#[cfg(test)]
+mod advertised_tests;
 #[cfg(test)]
 mod tests;

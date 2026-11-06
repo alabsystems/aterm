@@ -17,6 +17,15 @@ use crate::{DIRECTORY_NAME, MAX_RECORD_BYTES, MAX_SLOTS, Owner, Record, SlotStat
 /// Native per-account capacity directory, independent of a scratch `HOME`.
 /// The account database is the one authority for the Unix home directory.
 pub fn capacity_dir() -> io::Result<PathBuf> {
+    let home = account_home()?;
+    Ok(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/aterm/capacity")
+    } else {
+        home.join(".cache/aterm/capacity")
+    })
+}
+
+pub(crate) fn account_home() -> io::Result<PathBuf> {
     // SAFETY: getuid has no arguments and only reads this process's real uid.
     let uid = unsafe { libc::getuid() };
     let mut bytes = vec![0u8; 4096];
@@ -56,11 +65,7 @@ pub fn capacity_dir() -> io::Result<PathBuf> {
         if !home.is_absolute() {
             return Err(invalid("account home is not absolute"));
         }
-        return Ok(if cfg!(target_os = "macos") {
-            home.join("Library/Caches/aterm/capacity")
-        } else {
-            home.join(".cache/aterm/capacity")
-        });
+        return Ok(home);
     }
 }
 
@@ -108,6 +113,15 @@ impl Pool {
     pub fn open_in(capacity: &Path, slots: NonZeroU32) -> io::Result<Self> {
         if !capacity.is_absolute() || slots.get() > MAX_SLOTS {
             return Err(invalid("invalid CPU pool path or slot count"));
+        }
+        // Existing published pools need no write access to their capacity parent.
+        // In particular a retired legacy memory ledger can keep that parent
+        // read-only while its independently private CPU child remains writable.
+        if let Some(pool) = Self::open_existing(capacity)? {
+            if pool.slots() != slots {
+                return Err(invalid("CPU pool capacity differs"));
+            }
+            return Ok(pool);
         }
         if !capacity.exists() {
             DirBuilder::new().recursive(true).mode(0o700).create(capacity)?;
@@ -221,9 +235,180 @@ impl Pool {
         self.0.slots
     }
 
-    /// Acquire one available unit lease without waiting. `None` means every
-    /// slot was held during the scan. It is not a permanent reservation.
+    #[cfg(feature = "jobserver")]
+    pub(crate) fn contains(&self, lease: &Lease) -> io::Result<bool> {
+        self.validate_path()?;
+        Ok(self.0.identities.get(lease.slot as usize) == Some(&Identity::of(&lease.file)?))
+    }
+
+    /// Reuse a trusted producer's inherited CPU slot under serialized admission.
+    ///
+    /// The target must be observed exclusively held inside the same manifest
+    /// transaction as adoption. If its previous holder closes during handoff,
+    /// locking the same slot is a checked replacement, not an exact OFD proof.
+    /// No participating grant can interleave, and held occupancy cannot exceed
+    /// the entry snapshot. Slot metadata is diagnostic, never authorization.
+    /// Busy admission returns WouldBlock; retain the original descriptor and
+    /// use try_adopt_inherited for a nonblocking controller retry.
+    pub fn adopt_inherited(&self, file: File) -> io::Result<Lease> {
+        self.try_adopt_inherited(&file, |_| self.slots().get())?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    /// Nonblocking inherited continuation. None means busy or policy veto and
+    /// leaves the caller's descriptor available for the same checked retry.
+    /// Activated external backing requires ExternalDebt's corresponding route.
+    /// The callback is a bounded cached GLOBAL native ceiling, not local -j.
+    pub fn try_adopt_inherited(
+        &self,
+        file: &File,
+        policy: impl FnOnce(u32) -> u32,
+    ) -> io::Result<Option<Lease>> {
+        self.validate_path()?;
+        let Some(_transaction) = self.admission_lock()? else { return Ok(None) };
+        if crate::external_debt::activation_present(self)? {
+            return Err(invalid("activated CPU pool requires checked external-debt inheritance"));
+        }
+        let held =
+            self.snapshot()?.iter().filter(|slot| matches!(slot, SlotState::Held { .. })).count()
+                as u32;
+        if held > policy(held).min(self.slots().get()) {
+            return Ok(None);
+        };
+        self.adopt_in_transaction(file).map(Some)
+    }
+
+    /// Startup-only bounded retry, outside a custodian's event loop. It keeps
+    /// the original descriptor alive while unrelated admission transactions finish.
+    pub fn adopt_inherited_until(
+        &self,
+        file: &File,
+        deadline: std::time::Instant,
+    ) -> io::Result<Lease> {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            if let Some(lease) = self.try_adopt_inherited(file, |_| self.slots().get())? {
+                return Ok(lease);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    // Caller retains the native manifest transaction and validated occupancy.
+    pub(crate) fn adopt_in_transaction(&self, file: &File) -> io::Result<Lease> {
+        self.adopt_in_transaction_with(file, || {})
+    }
+    pub(crate) fn adopt_in_transaction_with(
+        &self,
+        file: &File,
+        after_probe: impl FnOnce(),
+    ) -> io::Result<Lease> {
+        self.validate_path()?;
+        let mut file = file.try_clone()?;
+        check_private(&file, false)?;
+        // SAFETY: this is the newly owned descriptor. Only query its access mode.
+        let access = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if access < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if access & libc::O_ACCMODE != libc::O_RDWR {
+            return Err(invalid("inherited CPU descriptor is not read/write"));
+        }
+        let identity = Identity::of(&file)?;
+        let slot = self
+            .0
+            .identities
+            .iter()
+            .position(|&known| known == identity)
+            .ok_or_else(|| invalid("inherited CPU descriptor is not a sealed slot"))?
+            as u32;
+        let probe = Probe(self.open_slot(slot, false)?);
+        match probe.0.try_lock_shared() {
+            Ok(()) => return Err(invalid("inherited CPU slot is not held")),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        after_probe();
+        file.try_lock()
+            .map_err(|_| invalid("inherited CPU slot is held by a different open description"))?;
+        // A duplicated descriptor shares the writer's current offset.
+        file.seek(SeekFrom::Start(0))?;
+        let record = Record::parse(&bounded_text(&mut file)?)?;
+        if record.slot != slot {
+            return Err(invalid("inherited CPU slot record does not match its identity"));
+        }
+        // SAFETY: file owns this live descriptor. Descriptor flags are local
+        // to this copy; this does not change the parent's open description.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the same live, owned descriptor and flags validated above.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Lease { slot, owner: record.owner, file })
+    }
+
+    /// Acquire one available unit lease without waiting. `None` means capacity
+    /// or the admission lock was busy. It is not a permanent reservation.
     pub fn try_acquire(&self, owner: Owner) -> io::Result<Option<Lease>> {
+        self.try_acquire_with_limit(owner, self.slots().get())
+    }
+
+    /// Apply a caller's conservative observed limit before acquiring work.
+    ///
+    /// The limit counts every held lease, including leases above a newly
+    /// reduced limit. A reduction therefore pauses new admission until enough
+    /// workers finish; it never moves or unlocks another worker's descriptor.
+    /// This is intended for a host observation, not a build's `-j` ceiling.
+    /// Participating callers serialize the count and acquisition on the sealed
+    /// manifest inode. A busy admission lock returns `None`, without waiting.
+    /// This does not publish policy: callers with a larger limit, including
+    /// older clients, may still use other physical slots. It is not a global
+    /// memory limit or authority to change the pool's physical capacity.
+    /// A zero limit pauses all new work, for example during critical pressure.
+    pub fn try_acquire_with_limit(&self, owner: Owner, limit: u32) -> io::Result<Option<Lease>> {
+        self.try_acquire_observed(owner, |_| limit)
+    }
+
+    /// Observe a conservative ceiling inside the shared admission transaction.
+    /// The callback receives the held count and must be bounded, nonblocking,
+    /// and must not acquire another lease from this pool. In particular it can
+    /// inspect cached pressure before the atomic worker acquisition. Once an
+    /// external-debt domain exists this raw route refuses; use ExternalDebt's
+    /// checked shared transaction instead, including for partial activation.
+    pub fn try_acquire_observed(
+        &self,
+        owner: Owner,
+        observe: impl FnOnce(u32) -> u32,
+    ) -> io::Result<Option<Lease>> {
+        self.validate_path()?;
+        if owner.pid == 0 {
+            return Err(invalid("CPU owner pid is zero"));
+        }
+        let admission = self.admission_lock()?;
+        let Some(_admission) = admission else { return Ok(None) };
+        if crate::external_debt::activation_present(self)? {
+            return Err(invalid("activated CPU pool requires checked external-debt admission"));
+        }
+        let held =
+            self.snapshot()?.iter().filter(|slot| matches!(slot, SlotState::Held { .. })).count();
+        let limit = observe(held as u32);
+        if held >= limit.min(self.slots().get()) as usize {
+            return Ok(None);
+        }
+        self.try_acquire_in_transaction(owner)
+    }
+
+    // The v3 debt adapter and observed admission above already hold the sealed
+    // manifest transaction. Re-entering that lock would refuse every grant.
+    pub(crate) fn try_acquire_in_transaction(&self, owner: Owner) -> io::Result<Option<Lease>> {
         self.validate_path()?;
         if owner.pid == 0 {
             return Err(invalid("CPU owner pid is zero"));
@@ -247,6 +432,19 @@ impl Pool {
             }
         }
         Ok(None)
+    }
+
+    fn admission_lock(&self) -> io::Result<Option<Probe>> {
+        let file = open_at(&self.0.directory, "pool", libc::O_RDONLY, false)?;
+        check_private(&file, false)?;
+        if Identity::of(&file)? != self.0.config {
+            return Err(invalid("CPU admission manifest identity changed"));
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Probe(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
     }
 
     /// Read current slot states without modifying records or waiting on a
@@ -330,6 +528,20 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// Update diagnostic attribution while retaining the same kernel lease.
+    /// This grants no capacity and does not change the original ownership
+    /// value returned by `owner`; readers tolerate an in-progress record.
+    pub fn report_owner(&self, owner: Owner) -> io::Result<()> {
+        if owner.pid == 0 {
+            return Err(invalid("CPU owner pid is zero"));
+        }
+        let mut file = self.file.try_clone()?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(Record { slot: self.slot, owner }.encode().as_bytes())?;
+        file.flush()
+    }
+
     /// Slot held by this lease.
     #[must_use]
     pub fn slot(&self) -> u32 {

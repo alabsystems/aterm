@@ -19,6 +19,8 @@ pub(crate) struct Snapshot {
     /// The restored agents' hold is holding the automatic lane
     /// (`HostHandle::restored_pending`).
     restored_hold: bool,
+    /// The accepted apply is waiting for its account-work epoch to retire.
+    account_work_hold: bool,
     applying: bool,
     retry_scheduled: bool,
 }
@@ -49,6 +51,7 @@ impl Snapshot {
                 .harness
                 .as_ref()
                 .is_some_and(|host| host.restored_pending(now)),
+            account_work_hold: app.account_drain_pending(),
             applying: updater.phase == UpdaterPhase::Applying,
             retry_scheduled: updater
                 .staged
@@ -70,10 +73,13 @@ impl Snapshot {
         }
     }
 
-    /// What holds the automatic lane past its ladder (`apply_held=` on the wire).
+    /// What holds this apply (`apply_held=` on the wire), for the same staged artifact.
     pub(crate) fn apply_held(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
-        (matches!(self.apply_posture(status), "automatic" | "automatic-idle") && self.restored_hold)
-            .then_some("restored-agents")
+        match self.apply_posture(status) {
+            "applying" if self.account_work_hold => Some("account-work"),
+            "automatic" | "automatic-idle" if self.restored_hold => Some("restored-agents"),
+            _ => None,
+        }
     }
 
     /// The ledger and the GUI can observe different generations.
@@ -329,6 +335,7 @@ mod tests {
             posture: Some(ApplyPosture::Automatic),
             phase: Some(ApplyPhase::PreferOutputGap),
             restored_hold: false,
+            account_work_hold: false,
             applying: false,
             retry_scheduled: false,
         };
@@ -391,6 +398,7 @@ mod tests {
             posture: Some(ApplyPosture::Automatic),
             phase: Some(ApplyPhase::Land),
             restored_hold: true,
+            account_work_hold: false,
             applying: false,
             retry_scheduled: true,
         };
@@ -405,6 +413,48 @@ mod tests {
             None,
             "a lane that will not apply by itself is held by nothing"
         );
+    }
+
+    #[test]
+    fn an_accepted_apply_names_account_work_only_until_its_exact_drain_finishes() {
+        use crate::app_account_work::Continuation;
+        use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+
+        let mut status = status();
+        let mut app = App::headless_for_test();
+        let attempt = ApplyAttemptTicket::for_test(
+            status.staged_build.unwrap(),
+            status.staged_commit.as_deref().unwrap(),
+            status.staged_dmg_sha256.as_deref().unwrap(),
+        );
+        attempt.make_current_apply_for_test(&mut app.native_updater_service);
+        assert_eq!(Snapshot::capture(&app).apply_held(&status), None);
+        #[cfg(unix)]
+        let next_attempt = app.next_update_handoff_id;
+        let continuation = || Continuation::Handoff {
+            mode: ApplyMode::Immediate,
+            attempt: Some(attempt.clone()),
+            same_image: None,
+            #[cfg(unix)]
+            next_attempt,
+        };
+        let work = app.account_work.enter().unwrap();
+        assert!(!app.accounts_drained_before(continuation()));
+        let waiting = Snapshot::capture(&app);
+        assert_eq!(waiting.apply_posture(&status), "applying");
+        assert_eq!(waiting.apply_held(&status), Some("account-work"));
+        status.staged_dmg_sha256 = Some("c".repeat(64));
+        assert_eq!(
+            waiting.apply_held(&status),
+            None,
+            "another artifact has no matching hold"
+        );
+        status.staged_dmg_sha256 = Some("b".repeat(64));
+        drop(work);
+        assert!(app.accounts_drained_before(continuation()));
+        let ready = Snapshot::capture(&app);
+        assert_eq!(ready.apply_posture(&status), "applying");
+        assert_eq!(ready.apply_held(&status), None);
     }
 
     fn installed_activation(build: u64) -> StagedUpdate {
@@ -441,6 +491,7 @@ mod tests {
             posture: None,
             phase: None,
             restored_hold: false,
+            account_work_hold: false,
             applying: false,
             retry_scheduled: false,
         };

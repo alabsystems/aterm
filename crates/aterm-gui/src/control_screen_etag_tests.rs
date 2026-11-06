@@ -587,7 +587,9 @@ fn the_published_frame_equals_a_fresh_read_over_the_walk() {
                 frame_hits += 1;
                 frame
             }
-            Styled::Miss(snap) => look.publish_styled(key, &snap),
+            Styled::Miss(snap) => look
+                .publish_styled_within(key, &snap)
+                .expect("the walk's frames fit the cap"),
         };
         drop(look);
         if last_text

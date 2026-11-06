@@ -91,13 +91,12 @@ impl EncryptedBody {
         body.extend_from_slice(&[0xd3, 0x14]);
         let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &body);
         body.extend_from_slice(digest.as_ref());
-        let cfb = aes::encrypt_cfb(session.as_ref(), &[0u8; 16], &body)?;
-        let enc_len = (1 + cfb.len()) as u32;
-        let mut data = Vec::with_capacity(6 + 1 + cfb.len());
+        let enc_len = (1 + body.len()) as u32;
+        let mut data = Vec::with_capacity(6 + 1 + body.len());
         data.extend_from_slice(&[0xc0 | 18, 255]);
         data.extend_from_slice(&enc_len.to_be_bytes());
         data.push(1);
-        data.extend_from_slice(&cfb);
+        aes::encrypt_cfb_into(session.as_ref(), &[0u8; 16], &body, &mut data)?;
         Ok(Self { session, data })
     }
     pub fn key_packet(&self, recipient: &Recipient) -> Result<Vec<u8>, String> {
@@ -130,14 +129,17 @@ impl EncryptedBody {
             .fold(0u16, |a, b| a.wrapping_add(u16::from(*b)));
         plain[33..35].copy_from_slice(&sum.to_be_bytes());
         let wrapped = aes::wrap(&derived[..klen], plain.as_ref())?;
-        let mut packet = Vec::with_capacity(14 + 32 + wrapped.len());
+        let body_len = 14 + 32 + wrapped.len();
+        let mut packet = Vec::with_capacity(6 + body_len);
+        packet.extend_from_slice(&[0xc0 | 1, 255]);
+        packet.extend_from_slice(&(body_len as u32).to_be_bytes());
         packet.push(3);
         packet.extend_from_slice(&recipient.id);
         packet.extend_from_slice(&[18, 1, 7, 64]);
         packet.extend_from_slice(&public);
         packet.push(wrapped.len() as u8);
         packet.extend_from_slice(&wrapped);
-        Ok(frame(1, &packet))
+        Ok(packet)
     }
     pub fn armored(&self, recipient: &Recipient) -> Result<String, String> {
         let key_packet = self.key_packet(recipient)?;
@@ -174,14 +176,6 @@ impl EncryptedBody {
         aterm_codec::base64::encode(self.session.as_ref())
             .map_err(|_| "Could not encode session key".into())
     }
-}
-
-fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(6 + body.len());
-    bytes.extend_from_slice(&[0xc0 | tag, 255]);
-    bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(body);
-    bytes
 }
 
 #[cfg(test)]

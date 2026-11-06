@@ -414,13 +414,19 @@ pub fn fit(
     wrap: impl Fn(&[Value]) -> Value,
 ) -> crate::Result<usize> {
     let size = |n: usize| aterm_json::to_vec(&wrap(&entries[..n])).map_or(usize::MAX, |b| b.len());
-    if size(0) > cap {
-        return Err(crate::Error::new("an empty row passes its cap"));
+    if entries.is_empty() {
+        if size(0) > cap {
+            return Err(crate::Error::new("an empty row passes its cap"));
+        }
+        return Ok(0);
     }
-    let (mut fits, mut fails) = (0, entries.len() + 1);
     if size(entries.len()) <= cap {
         return Ok(entries.len());
     }
+    if size(0) > cap {
+        return Err(crate::Error::new("an empty row passes its cap"));
+    }
+    let (mut fits, mut fails) = (0, entries.len());
     // Encoded size grows with the prefix, so the boundary is found by bisection.
     while fails - fits > 1 {
         let mid = fits + (fails - fits) / 2;
@@ -486,6 +492,24 @@ pub(crate) mod commons {
                 period,
                 revert: matches!(command, Command::Revert { .. }),
                 changes: command.changes()?.to_vec(),
+            })
+        }
+
+        /// [`Self::from_eligible`] moving `changes` out of `command`.
+        pub(crate) fn from_eligible_owned(
+            period: u64,
+            operation: Operation,
+            command: Command,
+        ) -> Option<Self> {
+            let revert = matches!(command, Command::Revert { .. });
+            Some(Self {
+                id: operation.header.id,
+                actor: operation.header.actor,
+                sequence: operation.header.sequence,
+                roster: operation.roster,
+                period,
+                revert,
+                changes: command.into_changes()?,
             })
         }
     }

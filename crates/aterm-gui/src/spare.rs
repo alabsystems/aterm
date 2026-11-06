@@ -267,7 +267,7 @@ impl SpareFifo {
         if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        match aterm_core::shell_integration::spare_fifo::hold_ends(&path) {
+        match aterm_core::shell_integration::spare_fifo::hold_ends() {
             Ok(ends) => Ok(Self {
                 path,
                 link: None,

@@ -29,7 +29,9 @@ pub mod clt_mark;
 pub mod clt_shim;
 
 pub mod fleet_name;
+mod hyperlink;
 pub mod identity;
+pub use hyperlink::HyperlinkData;
 pub mod lab_window_guard;
 pub mod machine_name;
 pub mod needs;
@@ -62,6 +64,9 @@ pub mod control_request;
 pub mod control_socket;
 pub mod control_verbs;
 pub mod fabric_grammar;
+pub mod resource_admission;
+pub mod resource_inspection;
+pub mod resource_subgroup;
 
 pub mod fabric_command;
 pub mod fs_restricted;

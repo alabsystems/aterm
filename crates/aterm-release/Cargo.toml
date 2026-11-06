@@ -113,6 +113,9 @@ aterm-secrets = { workspace = true }
 # Early release observations reuse the authenticated control client, never a shell.
 aterm-agent = { workspace = true }
 aterm-ctl = { path = "../aterm-ctl" }
+# Operator GitHub transport shares agh's vault routing, isolated exact-object Git
+# runner and durable write journal; no release-specific credential store.
+agh = { workspace = true }
 
 # `ship site` uploads each file of the site as one gzip member around the PNG encoder's
 # deterministic DEFLATE (no clock, name or host in a member), so its SHA-256 names the

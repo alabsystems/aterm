@@ -781,8 +781,7 @@ impl Registry {
                         ));
                     }
                     let view = View::read(to.table, &session, &log);
-                    let carried =
-                        carried_origins(log.eligible().into_iter().map(|(_, command)| command));
+                    let carried = carried_origins(log.eligible_iter().map(|(_, command)| command));
                     // What is carried already is each record that authenticates, wherever
                     // it was written: a cell some other writer put at a record's key first
                     // must not keep that record from being carried.

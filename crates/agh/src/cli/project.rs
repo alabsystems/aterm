@@ -328,25 +328,25 @@ pub fn project(value: &Value, fields: &[FieldPath]) -> Value {
 }
 
 /// The value at `path`: `Each` maps over an array, and a missing point is null.
-pub(crate) fn value_at(value: &Value, path: &FieldPath) -> Value {
+pub(crate) fn value_at<'a>(value: &'a Value, path: &FieldPath) -> std::borrow::Cow<'a, Value> {
     value_at_steps(value, &path.steps)
 }
 
-fn value_at_steps(value: &Value, steps: &[Step]) -> Value {
+fn value_at_steps<'a>(value: &'a Value, steps: &[Step]) -> std::borrow::Cow<'a, Value> {
     match steps.split_first() {
-        None => value.clone(),
+        None => std::borrow::Cow::Borrowed(value),
         Some((Step::Key(key), rest)) => match value.get(key) {
             Some(inner) => value_at_steps(inner, rest),
-            None => Value::Null,
+            None => std::borrow::Cow::Borrowed(&Value::Null),
         },
         Some((Step::Each, rest)) => match value {
-            Value::Array(items) => Value::Array(
+            Value::Array(items) => std::borrow::Cow::Owned(Value::Array(
                 items
                     .iter()
-                    .map(|item| value_at_steps(item, rest))
+                    .map(|item| value_at_steps(item, rest).into_owned())
                     .collect(),
-            ),
-            _ => Value::Null,
+            )),
+            _ => std::borrow::Cow::Borrowed(&Value::Null),
         },
     }
 }

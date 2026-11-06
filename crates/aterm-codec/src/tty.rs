@@ -86,6 +86,60 @@ pub fn one_line(text: &str, cap: usize) -> String {
     out
 }
 
+/// Write one human-readable line, escaping [`is_active`] characters in every
+/// formatted piece, including embedded newlines and tabs. Ordinary characters
+/// and backslashes are kept, without truncation. Append one newline on success.
+/// This does not flush `out`.
+///
+/// # Errors
+/// Returns the first output error, or an error if a formatter fails.
+pub fn write_line(
+    out: &mut dyn std::io::Write,
+    args: std::fmt::Arguments<'_>,
+) -> std::io::Result<()> {
+    let mut line = LineWriter { out, error: None };
+    let formatted = std::fmt::write(&mut line, args);
+    if let Some(error) = line.error {
+        return Err(error);
+    }
+    formatted.map_err(|_| std::io::Error::other("formatting failed"))?;
+    line.out.write_all(b"\n")
+}
+
+struct LineWriter<'a> {
+    out: &'a mut dyn std::io::Write,
+    error: Option<std::io::Error>,
+}
+
+impl std::fmt::Write for LineWriter<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if self.error.is_some() {
+            return Err(std::fmt::Error);
+        }
+        let text: std::borrow::Cow<'_, str> = if text.chars().any(is_active) {
+            let mut escaped = String::with_capacity(text.len());
+            for c in text.chars() {
+                if is_active(c) {
+                    push_escape(&mut escaped, c);
+                } else {
+                    escaped.push(c);
+                }
+            }
+            std::borrow::Cow::Owned(escaped)
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        self.out.write_all(text.as_bytes()).map_err(|error| {
+            self.error = Some(error);
+            std::fmt::Error
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "tty_line_tests.rs"]
+mod line_tests;
+
 /// The characters a terminal body escapes: [`is_active`] but for the line
 /// break and the tab, which a body keeps.
 #[inline]

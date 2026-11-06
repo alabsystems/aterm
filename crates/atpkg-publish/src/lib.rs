@@ -9,6 +9,7 @@ pub mod artifact;
 pub mod canary;
 pub mod channel;
 pub mod cli;
+mod compiler_context;
 pub mod ctx;
 pub mod error;
 pub mod git;
@@ -20,6 +21,7 @@ pub mod identity;
 pub mod lane;
 pub mod pins;
 pub mod programs;
+pub mod project_toolchain;
 pub mod quad;
 /// Test fixtures: never in a release build, which the lane's snapshot is.
 #[cfg(any(test, debug_assertions))]

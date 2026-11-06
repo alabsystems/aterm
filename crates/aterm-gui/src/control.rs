@@ -35,11 +35,9 @@ pub(crate) use control_query::screen_stamp;
 pub(crate) use control_query::search_full_history;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use control_query::serve_ask_walk;
-#[cfg(test)]
-pub(crate) use control_query::styled_frame_payload;
 pub(crate) use control_query::{
     ScreenGen, StyledFrameSnapshot, gather_styled_frame, line_size_name, row_line_size, screen_gen,
-    screen_text, serialize_styled_frame, trimmed_len, visible_row,
+    screen_text, serialize_styled_frame_within, styled_frame_floor, trimmed_len, visible_row,
 };
 pub(crate) use control_query::{SpawnMark, mark_ctl_spawned};
 #[cfg(test)]
@@ -47,6 +45,8 @@ pub(crate) use control_query::{cmd_screen_styled_json, cmd_text_json_looked, tex
 pub(crate) use control_query::{
     search_full_history_direction, search_full_history_point, set_search_max_lines,
 };
+#[cfg(test)]
+pub(crate) use control_query::{serialize_styled_frame, styled_frame_payload};
 
 #[path = "control_end.rs"]
 pub(crate) mod control_end;
@@ -7676,6 +7676,31 @@ fn serve_request_line(
     // no ID or history/since anchor can escape while an old journal is offerable.
     if let Some(refusal) = recovery_count_refusal(recovery_count_admission) {
         out.extend_from_slice(refusal.as_bytes());
+        return Some(ServeDisposition::Close);
+    }
+    // A drive promotion or forwarding route must never enter the local
+    // owner-token/SCM_RIGHTS transport. Consume it before either path.
+    let head = request.head();
+    if head.verb == "resource-admission-v3" {
+        let reply = {
+            #[cfg(unix)]
+            {
+                crate::control_resource_admission::serve(
+                    stream,
+                    head.rest,
+                    scope,
+                    head.selector.is_some(),
+                    store,
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                "ERR resource-admission-v3 unsupported on this platform\n".to_string()
+            }
+        };
+        if !reply.is_empty() {
+            out.push_owned(reply.into_bytes());
+        }
         return Some(ServeDisposition::Close);
     }
     let (request, scope, driven) = match drive_admission(request, scope, store) {

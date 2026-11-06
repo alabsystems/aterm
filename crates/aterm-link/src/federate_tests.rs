@@ -333,6 +333,9 @@ pub(crate) struct Mac {
     pub(crate) node: String,
     pub(crate) secret: Vec<u8>,
     pub(crate) broker: Arc<Broker>,
+    /// While set, the node service's mint refuses the person carry's grants: the carry, at its
+    /// next attach, cannot follow ([`routes_noting`]).
+    pub(crate) carry_down: Arc<std::sync::atomic::AtomicBool>,
     dir: Arc<aterm_tempfile::TempDir>,
 }
 
@@ -355,6 +358,7 @@ impl Mac {
             node: node_of(&key),
             secret,
             broker: Arc::new(broker),
+            carry_down: Arc::default(),
             dir: Arc::new(dir),
         }
     }
@@ -368,6 +372,7 @@ impl Mac {
             node: node_of(&key),
             secret: self.secret.clone(),
             broker: Arc::clone(&self.broker),
+            carry_down: Arc::clone(&self.carry_down),
             dir: Arc::clone(&self.dir),
         }
     }
@@ -393,6 +398,7 @@ impl Mac {
             node: node_of(&key),
             secret: self.secret.clone(),
             broker: Arc::clone(&self.broker),
+            carry_down: Arc::clone(&self.carry_down),
             dir: Arc::new(aterm_tempfile::tempdir().expect("scratch")),
         }
     }
@@ -606,8 +612,9 @@ pub(crate) fn routes_as(
     )
 }
 
-/// [`routes_as`], journaling to `note`, this Mac's log seating the nodes `seats` names.
-fn routes_noting(
+/// [`routes_as`], journaling to `note`, this Mac's log seating the nodes `seats` names, its mint
+/// refusing the person carry's grants while [`Mac::carry_down`] is set.
+pub(crate) fn routes_noting(
     from: &Mac,
     (me, key): (&str, [u8; 32]),
     olds: &BTreeSet<String>,
@@ -620,6 +627,7 @@ fn routes_noting(
     let secret = from.secret.clone();
     let net = Arc::clone(net);
     let bridge_state = from.link_state();
+    let carry_down = Arc::clone(&from.carry_down);
     Routes::start(RoutesConfig {
         me: me.clone(),
         key,
@@ -628,7 +636,16 @@ fn routes_noting(
             key,
             to: None,
         }),
-        mint: Arc::new(move |grant| Mac::mint(&secret, grant)),
+        mint: Arc::new(move |grant| {
+            let carrier = format!("p={}:", crate::federate::CARRIER);
+            if carry_down.load(std::sync::atomic::Ordering::SeqCst) && grant.contains(&carrier) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the person carry is down",
+                ));
+            }
+            Mac::mint(&secret, grant)
+        }),
         dest: Arc::new(move |node| {
             net.refuses(node)?;
             let peer = peers
@@ -689,6 +706,7 @@ pub(crate) fn move_once(mac: &Mac, me: &Mac, old: &str, state: &std::path::Path)
         node_order_olds: false,
         unsealed_carry: false,
         ungated_inbox: false,
+        give_back_carried: false,
         state: Mutex::new(State::default()),
         bell: Condvar::new(),
     };
@@ -1302,8 +1320,16 @@ fn a_burst_the_old_node_landed_and_never_committed_lands_once() {
             false,
         );
         routes.set(&rotated_from(&a, &new_node, &b), &BTreeSet::new());
+        // The push reports a burst after it commits A's group for it, so the wait reads both.
+        let lane = Lane::Mail {
+            dst: b.node.clone(),
+        };
         until(&format!("{case}: A's group for B passes the burst"), || {
             a.broker.group_start(&mail_group(&b.node)) > held[1]
+                && routes
+                    .status()
+                    .get(&lane)
+                    .is_some_and(|pushed| pushed.appended + pushed.deduped >= 2)
         });
         let want: Vec<Vec<u8>> = if control {
             vec![
@@ -1317,9 +1343,7 @@ fn a_burst_the_old_node_landed_and_never_committed_lands_once() {
         };
         assert_eq!(b.mail_for(&b.node), want, "{case}");
         let status = routes.status();
-        let pushed = &status[&Lane::Mail {
-            dst: b.node.clone(),
-        }];
+        let pushed = &status[&lane];
         assert_eq!(
             (pushed.appended, pushed.deduped),
             if control { (2, 0) } else { (0, 2) },

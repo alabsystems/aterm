@@ -56,6 +56,21 @@ pub enum Bucket {
     Unplaced(Slot),
 }
 
+impl Bucket {
+    /// How long a window of this kind can run from a reading of it, in seconds: its length, and a
+    /// week ([`LOGIN_REACH_S`]) where it names none or a longer one.
+    fn length_s(self) -> i64 {
+        let minutes = match self {
+            Bucket::FiveHour => 300,
+            Bucket::Day => 1440,
+            Bucket::Week => 10_080,
+            Bucket::Minutes(minutes) => minutes,
+            Bucket::Unplaced(_) => return LOGIN_REACH_S,
+        };
+        i64::try_from(minutes.saturating_mul(60)).map_or(LOGIN_REACH_S, |s| s.min(LOGIN_REACH_S))
+    }
+}
+
 /// One usage window of a limit family.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Window {
@@ -118,6 +133,40 @@ pub struct CodexLimits {
     pub reached_type: Option<Word>,
     /// The account the rollout's thread was made under ([`opening_account`]).
     pub account: Option<AccountKey>,
+}
+
+impl CodexLimits {
+    /// Whether the server refused use: `rate_limit_reached_type` names a limit. `unknown` names
+    /// none, as the endpoint's reading of the same field says
+    /// ([`crate::harness::codex_app_login::usage_from_backend`]).
+    fn refused(&self) -> bool {
+        self.reached_type
+            .as_ref()
+            .is_some_and(|reached| reached.as_str() != "unknown")
+    }
+
+    /// Whether it says anything of `family`: a window of it, or a refusal.
+    fn speaks_of(&self, family: &str) -> bool {
+        self.family.as_str() == family && (!self.windows.is_empty() || self.refused())
+    }
+
+    /// When the refusal it names ends: when the most used window still running at that reading
+    /// ends. The reading fixes this and the clock never moves it, so a five-hour wall ends at its
+    /// reset and does not become the week's. Where every window had ended by then, it is the most
+    /// used one's end, which has passed. It names no end with no window at all, so that is a week
+    /// from the reading ([`LOGIN_REACH_S`]).
+    fn refusal_ends(&self) -> i64 {
+        let share = |a: &&Window, b: &&Window| a.used_percent.total_cmp(&b.used_percent);
+        self.windows
+            .iter()
+            .filter(|w| w.resets_at.is_none_or(|reset| reset > self.at_unix))
+            .max_by(share)
+            .or_else(|| self.windows.iter().max_by(share))
+            .map_or(self.at_unix.saturating_add(LOGIN_REACH_S), |w| {
+                w.resets_at
+                    .unwrap_or_else(|| self.at_unix.saturating_add(w.bucket().length_s()))
+            })
+    }
 }
 
 /// A word of the vendor's file ([`Word`]).
@@ -300,12 +349,21 @@ pub fn rollout_readings(path: &Path, reach: u64) -> Option<Vec<CodexLimits>> {
 pub struct Picked {
     /// Its kind.
     pub bucket: Bucket,
-    /// The largest share read within its anchor.
+    /// The largest share read within its anchor. With no anchor, the newest reading's: nothing says
+    /// two readings that name no reset are of one window.
     pub used_percent: f64,
     /// The anchor: the latest reset among the readings within it (epoch seconds); `None` where none of them named one.
     pub resets_at: Option<i64>,
     /// When that share was read, the earliest of a tie (unix seconds).
     pub as_of: i64,
+}
+
+impl Picked {
+    /// When it ends: its reset, or where none is named, its length from when it was read.
+    fn ends(&self) -> i64 {
+        self.resets_at
+            .unwrap_or_else(|| self.as_of.saturating_add(self.bucket.length_s()))
+    }
 }
 
 /// One family's windows as [`pick`] read them.
@@ -348,12 +406,19 @@ pub fn pick(rollouts: &[Vec<CodexLimits>], family: &str, now_unix: i64) -> Optio
             .filter(|(_, _, w)| w.resets_at.is_none_or(|r| r > now_unix))
             .collect();
         let anchor = live.iter().filter_map(|(_, _, w)| w.resets_at).max();
-        let within = |w: &Window| match (anchor, w.resets_at) {
+        let newest_of_kind = live.iter().map(|(_, at_ms, _)| *at_ms).max();
+        // A reading that names no reset has no anchor to place it, so only the kind's newest speaks:
+        // a later reading below full lifts a full one, and one that names no reset is not lost to
+        // an older one that named a reset.
+        let within = |at_ms: i64, w: &Window| match (anchor, w.resets_at) {
             (Some(a), Some(r)) => r >= a.saturating_sub(ANCHOR_SLACK_S),
-            (Some(_), None) => false,
-            (None, _) => true,
+            (_, None) => Some(at_ms) == newest_of_kind,
+            (None, Some(_)) => true,
         };
-        let held: Seen<'_> = live.into_iter().filter(|(_, _, w)| within(w)).collect();
+        let held: Seen<'_> = live
+            .into_iter()
+            .filter(|(_, at_ms, w)| within(*at_ms, w))
+            .collect();
         let drop = held
             .windows(2)
             .filter(|pair| {
@@ -435,13 +500,51 @@ fn home_readings(home: &Path) -> Vec<Vec<CodexLimits>> {
 /// How far back a rollout can hold a window that still runs: the longest a window lasts, a week.
 const LOGIN_REACH_S: i64 = 7 * 86_400;
 
-/// The usage readings of the six (`NEWEST_READ`) rollouts of `home` written last that opened under
-/// the login `key` ([`opening_account`]), judged before the six are counted, so other sessions'
-/// rollouts in the same home never push a login's own out of view, among those that can still hold
-/// a running window ([`LOGIN_REACH_S`]).
-fn login_readings(home: &Path, key: AccountKey, now_unix: i64) -> Vec<Vec<CodexLimits>> {
+/// How many of a home's rollouts written last a survey looks through for one login's readings
+/// ([`login_readings`]). Each costs its first line ([`META_BYTES`] at most). One that login opened
+/// costs that line again, one tail ([`TAIL_BYTES`]) and any copied prefix a legacy fork holds
+/// ([`CONTEXT_REACH`] at most). Six that hold a reading from `since` on end the look. A rollout that
+/// holds none is paid for and not counted, and it need not be short: it can hold only another
+/// family's readings, or only readings from before `since`. So the worst case reads all 256: 160 MiB
+/// a home where first lines fit one 64 KiB read and none is a legacy fork, and at most about 17 GiB a
+/// home where each is read to the reach for a copied prefix. This many rollouts written after a wall
+/// take that wall out of view. A node's metrics pass surveys every minute, so a look whose rollouts
+/// have not changed reads none of them ([`LOGIN_LOOKS`]).
+const LOGIN_SCAN: usize = 256;
+
+/// A [`login_readings`]: what it was asked, the rollouts it had in reach, and what it found.
+struct LoginLook {
+    since: Option<i64>,
+    listed: Vec<(std::path::PathBuf, std::time::SystemTime, u64)>,
+    rollouts: Vec<Vec<CodexLimits>>,
+}
+
+/// The last look at each home for each login. Its answer is a function of the rollouts in reach and
+/// `since` alone, so it stands until one of those changes. It holds six rollouts' readings and a
+/// listing of [`LOGIN_SCAN`] at most, for each of the few homes and logins a survey reads.
+static LOGIN_LOOKS: std::sync::Mutex<
+    std::collections::BTreeMap<(std::path::PathBuf, AccountKey), LoginLook>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The usage readings, from `since` on, of the six (`NEWEST_READ`) rollouts of `home` written last
+/// that opened under the login `key` ([`opening_account`]) and still hold a reading of the `codex`
+/// family. A rollout with no reading says nothing of a wall, and a session that starts on a wall
+/// writes no figure, so such a rollout is not counted among the six. Six that do hold a reading say
+/// more of the windows than an older one could. So, up to [`LOGIN_SCAN`] rollouts, neither a login's
+/// own rollouts with no reading nor other sessions' in the same home push its wall out of view. The
+/// look reaches back only as far as a rollout can still speak: one last written before `since` holds
+/// no reading from `since` on, since a reading is stamped before it is written, and one last written
+/// over [`LOGIN_REACH_S`] ago holds no running window. A look that finds what the last one had in
+/// reach, unchanged, reads none of it ([`LOGIN_LOOKS`]).
+fn login_readings(
+    home: &Path,
+    key: AccountKey,
+    since: Option<i64>,
+    now_unix: i64,
+) -> Vec<Vec<CodexLimits>> {
     let mut scratch = Vec::with_capacity(64 * 1024);
-    let reach = u64::try_from(now_unix.saturating_sub(LOGIN_REACH_S)).unwrap_or(0);
+    let week_ago = now_unix.saturating_sub(LOGIN_REACH_S);
+    let reach = u64::try_from(since.map_or(week_ago, |since| since.max(week_ago))).unwrap_or(0);
     let opened_under_key = |path: &Path| {
         crate::harness::footer::open_regular(path)
             .and_then(|file| first_line_of(&file))
@@ -449,55 +552,141 @@ fn login_readings(home: &Path, key: AccountKey, now_unix: i64) -> Vec<Vec<CodexL
             .and_then(opening_account)
             == Some(key)
     };
-    rollouts_by_write(home)
-        .iter()
-        .take_while(|(_, written)| {
+    let listed: Vec<_> = crate::harness::codex_rollout::rollouts_by_write_sized(home)
+        .into_iter()
+        .take_while(|(_, written, _)| {
             written
                 .duration_since(std::time::UNIX_EPOCH)
-                .is_ok_and(|since| since.as_secs() >= reach)
+                .is_ok_and(|at| at.as_secs() >= reach)
         })
-        .filter(|(path, _)| opened_under_key(path))
+        .take(LOGIN_SCAN)
+        .collect();
+    let slot = (home.to_path_buf(), key);
+    let looks = || LOGIN_LOOKS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(look) = looks().get(&slot)
+        && look.since == since
+        && look.listed == listed
+    {
+        return look.rollouts.clone();
+    }
+    let rollouts: Vec<Vec<CodexLimits>> = listed
+        .iter()
+        .filter(|(path, _, _)| opened_under_key(path))
+        .filter_map(|(path, _, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
+        .flat_map(|rollout| readings_since(vec![rollout], since))
+        .filter(|rollout| rollout.iter().any(|r| r.speaks_of(CODEX_FAMILY)))
         .take(NEWEST_READ)
-        .filter_map(|(path, _)| rollout_readings_inner(path, CONTEXT_REACH, true, &mut scratch))
-        .collect()
+        .collect();
+    looks().insert(
+        slot,
+        LoginLook {
+            since,
+            listed,
+            rollouts: rollouts.clone(),
+        },
+    );
+    rollouts
 }
 
-/// The usage sample the rollouts of `homes` hold of the login `key`: what is left of its windows at
-/// `now_unix`, where one of its readings is no older than [`FRESH_S`] or one of them reads a window
-/// full with its reset ahead, since a session stopped at a wall writes no later reading. Only a
-/// rollout opened under that login counts ([`login_readings`]), and one that names no login is left
-/// out rather than guessed at, and so is a reading from before `since`, once the row is known to
-/// have had room ([`crate::harness::accounts::Account::room_since`]).
+/// A wall a login's rollouts show ([`login_sample`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginWall {
+    /// When the reading it stands on was written (unix seconds): for a full window the earliest
+    /// reading of its largest share, for a refusal the reading that named it, and of several walls
+    /// the newest of those. Only a later reading can say anything of room.
+    pub at: i64,
+    /// When it ends (unix seconds), which may have passed: the reset a reading named, or where it
+    /// named none, the most its window can run from that reading: its length, a week at most.
+    pub until: i64,
+}
+
+/// What the rollouts of a login hold of it ([`login_sample`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSample {
+    /// What is left of its five-hour window and its week ([`sample_of`]). `at` is its newest
+    /// reading's stamp.
+    pub sample: Sample,
+    /// The wall its readings show, which no [`Sample`] can hold: a window of another length or none
+    /// reads no figure, and a refusal can stand with every window below full.
+    pub wall: Option<LoginWall>,
+}
+
+/// The wall `pick` and the `newest` reading of a login show: a window full, whatever its kind and
+/// whether or not it named a reset, and a refusal. That is wider than
+/// [`crate::harness::codex_app_login::usage_of`], whose full windows are only the five-hour and the
+/// week. A refusal is read from the newest reading alone, so a later reading that names none lifts
+/// it. A pick keeps a full window's reading until its reset where one is named, and until a later
+/// reading of its kind where none is.
+fn login_wall(pick: Option<&Pick>, newest: &CodexLimits) -> Option<LoginWall> {
+    let full = pick
+        .into_iter()
+        .flat_map(|pick| &pick.windows)
+        .filter(|window| window.used_percent >= 100.0)
+        .map(|window| LoginWall {
+            at: window.as_of,
+            until: window.ends(),
+        });
+    let refused = newest.refused().then(|| LoginWall {
+        at: newest.at_unix,
+        until: newest.refusal_ends(),
+    });
+    full.chain(refused).reduce(|a, b| LoginWall {
+        at: a.at.max(b.at),
+        until: a.until.max(b.until),
+    })
+}
+
+/// What the rollouts of `homes` hold of the login `key` at `now_unix`: what is left of its windows,
+/// and the wall its readings show ([`login_wall`]), where one of its readings is no older than
+/// [`FRESH_S`] or that wall still stands, since a session stopped at a wall writes no later reading.
+/// Only a rollout opened under that login counts ([`login_readings`]), and one that names no login
+/// is left out rather than guessed at, and so is a reading from before `since`, once the row is
+/// known to have had room ([`crate::harness::accounts::Account::room_since`]).
+///
+/// A wall that names no reset lifts as a named one does at a launch's read that shows room, which
+/// moves `since`. It also lifts at a later reading that is not full, and it ends once its window
+/// can have run out, a week from its reading at most.
 ///
 /// A ROLLOUT NAMES ONLY THE LOGIN THAT OPENED IT: one resumed under another login keeps its
 /// opening line, and nothing says which login wrote a reading ([`conversation_newest`]). So this
 /// speaks for `key` only in a home no other login writes to, which the caller answers for as things
 /// stand now ([`crate::harness::cli::survey_accounts`]): a login removed from that home within the
-/// week can still have its full reading credited here, which only keeps a row from being picked
-/// until that window resets or a launch reads it. Reads files alone.
+/// week can still have its wall credited here, which only keeps a row from being picked until
+/// that wall ends or a launch reads it. Reads files alone.
 #[must_use]
 pub fn login_sample(
     homes: &[&Path],
     key: AccountKey,
     since: Option<i64>,
     now_unix: i64,
-) -> Option<Sample> {
+) -> Option<LoginSample> {
     let rollouts: Vec<Vec<CodexLimits>> = homes
         .iter()
-        .flat_map(|home| login_readings(home, key, now_unix))
+        .flat_map(|home| login_readings(home, key, since, now_unix))
         .collect();
-    let pick = pick(&readings_since(rollouts, since), CODEX_FAMILY, now_unix)?;
-    let full = pick.windows.iter().any(|window| {
-        window.used_percent >= 100.0 && window.resets_at.is_some_and(|reset| reset > now_unix)
-    });
-    (full || now_unix.saturating_sub(pick.newest) <= FRESH_S).then(|| sample_of(&pick))
+    let newest = rollouts
+        .iter()
+        .flatten()
+        .filter(|r| r.speaks_of(CODEX_FAMILY))
+        .max_by_key(|r| r.at_ms)?;
+    let pick = pick(&rollouts, CODEX_FAMILY, now_unix);
+    let wall = login_wall(pick.as_ref(), newest);
+    let stands = wall.is_some_and(|wall| wall.until > now_unix);
+    (stands || now_unix.saturating_sub(newest.at_unix) <= FRESH_S).then(|| LoginSample {
+        sample: Sample {
+            at: newest.at_unix,
+            ..pick.as_ref().map(sample_of).unwrap_or_default()
+        },
+        wall,
+    })
 }
 
 /// A [`Pick`] as the account pool's usage [`Sample`]: its five-hour window is the session, its
 /// week the week, each share taken up to the next whole percent (so a share is never read as
 /// further from its wall than it is) and each reset and read time as picked. Another window, an
-/// unplaced one and a void one ([`Pick::void`]) give no figure. `at` is the newest reading's
-/// stamp; `by` is left for [`crate::harness::accounts::note_sample`] to stamp.
+/// unplaced one and a void one ([`Pick::void`]) give no figure, which [`login_sample`]'s wall
+/// makes up for where such a window is full. `at` is the newest reading's stamp; `by` is left for
+/// [`crate::harness::accounts::note_sample`] to stamp.
 #[must_use]
 pub fn sample_of(pick: &Pick) -> Sample {
     // Clamped to 0..=100 first, so the cast neither truncates nor wraps.
@@ -590,7 +779,9 @@ pub fn conversation_newest(conv: &Conversation, now_unix: i64) -> Option<Pick> {
 mod tests {
     use super::*;
     use crate::harness::codex_rollout::PAGINATED;
-    use crate::harness::codex_rollout::fixtures::{context, message, meta, meta_as, rate};
+    use crate::harness::codex_rollout::fixtures::{
+        context, message, meta, meta_as, no_reset, rate, refused,
+    };
     use crate::harness::codex_rollout::tail_of;
     use std::time::SystemTime;
 
@@ -978,6 +1169,61 @@ mod tests {
         assert_eq!(p.windows[0].used_percent, 95.0);
     }
 
+    /// NOTHING SAYS TWO READINGS THAT NAME NO RESET ARE OF ONE WINDOW, so only a kind's newest
+    /// speaks: a later one below full lifts a full one, and one that names no reset is not lost to
+    /// an older one that named a reset, whose reset it stands until. A reading that did name a reset
+    /// keeps the anchor's law: a later rollout's lower share leaves the largest where it was.
+    /// NEGATIVE CONTROL: with no anchor the largest share stood, so a full reading stranded the row
+    /// for a week, and a full reading was dropped beside any reading that named a reset.
+    #[test]
+    fn a_window_that_names_no_reset_is_read_from_its_kinds_newest_reading() {
+        let now = T0 / 1000;
+        let reset = now + 3_600;
+        let five = |ms: i64, used: f64, resets: Option<i64>| {
+            let mut read = reading(ms, key(LOGIN_A), &[(Slot::Primary, used, 300, 0)]);
+            read.windows[0].resets_at = resets;
+            read
+        };
+        let of = |rollouts: &[CodexLimits]| {
+            let p = pick(&apart(rollouts), CODEX_FAMILY, now).expect("a pick");
+            (p.windows[0].used_percent, p.windows[0].resets_at)
+        };
+        let (older, newer) = (T0 - 60_000, T0 - 10_000);
+        assert_eq!(
+            of(&[five(older, 100.0, None), five(newer, 20.0, None)]),
+            (20.0, None),
+            "a later reading below full lifts it"
+        );
+        assert_eq!(
+            of(&[five(older, 20.0, None), five(newer, 100.0, None)]),
+            (100.0, None)
+        );
+        assert_eq!(
+            of(&[five(older, 30.0, Some(reset)), five(newer, 100.0, None)]),
+            (100.0, Some(reset)),
+            "it stands until the reset a read named"
+        );
+        assert_eq!(
+            of(&[five(older, 100.0, None), five(newer, 20.0, Some(reset))]),
+            (20.0, Some(reset)),
+            "a later reading below full lifts it, whatever it names"
+        );
+        assert_eq!(
+            of(&[five(older, 100.0, Some(reset)), five(newer, 20.0, None)]),
+            (100.0, Some(reset)),
+            "CONTROL: a full window that named its reset stands across rollouts"
+        );
+        assert_eq!(
+            of(&[
+                five(older, 100.0, None),
+                five(newer - 1_000, 20.0, None),
+                five(newer, 40.0, Some(reset))
+            ]),
+            (40.0, Some(reset)),
+            "a full reading that named none is out of view once a later reading speaks"
+        );
+    }
+
     #[test]
     fn a_legacy_forks_copied_readings_are_none_of_its_own() {
         let dir = aterm_tempfile::Builder::new()
@@ -1292,8 +1538,8 @@ mod tests {
 
         let homes = [home.path()];
         let of = |login, at| login_sample(&homes, key(login).expect("a key"), None, at);
-        assert_eq!(of(LOGIN_A, now).and_then(|s| s.week_pct), Some(100));
-        assert_eq!(of(LOGIN_B, now).and_then(|s| s.week_pct), Some(7));
+        assert_eq!(of(LOGIN_A, now).and_then(|s| s.sample.week_pct), Some(100));
+        assert_eq!(of(LOGIN_B, now).and_then(|s| s.sample.week_pct), Some(7));
         assert_eq!(
             of(("acct-lab-3", "user-lab"), now),
             None,
@@ -1305,7 +1551,7 @@ mod tests {
             "its reading is too old to read"
         );
         assert_eq!(
-            of(LOGIN_A, now + FRESH_S + 61).and_then(|s| s.week_pct),
+            of(LOGIN_A, now + FRESH_S + 61).and_then(|s| s.sample.week_pct),
             Some(100),
             "a wall outlasts the age of the reading that showed it"
         );
@@ -1313,6 +1559,285 @@ mod tests {
             of(LOGIN_A, week + 1),
             None,
             "CONTROL: its window ended, so nothing is left of it"
+        );
+    }
+
+    /// One rollout of the login `LOGIN_A` in a day folder under `day`, holding `lines`, written at
+    /// `written`; `n` tells it from the others.
+    fn lay_rollout(day: &Path, n: usize, written: i64, lines: &[String]) {
+        let thread = format!("01900000-0000-7000-8000-{n:012}");
+        let body = format!(
+            "{}{}",
+            meta_as(
+                T0 - 7_200_000,
+                &thread,
+                &thread,
+                None,
+                Some(PAGINATED),
+                Some(LOGIN_A)
+            ),
+            lines.concat()
+        );
+        let path = day.join(format!("rollout-2026-10-16T08-00-00-{thread}.jsonl"));
+        std::fs::write(&path, body).expect("write rollout");
+        let at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(written).expect("after the epoch"));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(at)
+            .expect("set its write time");
+    }
+
+    /// A home, and the day folder its rollouts go in.
+    fn rollout_home() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
+        let home = aterm_tempfile::Builder::new()
+            .prefix("codex-login-wall-")
+            .tempdir()
+            .expect("temp dir");
+        let day = home.path().join("sessions/2026/10/16");
+        std::fs::create_dir_all(&day).expect("mkdir");
+        (home, day)
+    }
+
+    /// A WALL IS A FULL WINDOW OF ANY KIND, named reset or none, or a refusal with every window below
+    /// full. That is wider than the endpoint's reading ([`crate::harness::codex_app_login::usage_of`]),
+    /// whose full windows are only the five-hour and the week. Each outlasts the age of its reading,
+    /// and one that names no reset ends when its window can have run out, or a week on where nothing
+    /// says how long that is. NEGATIVE CONTROL: only a five-hour or weekly window with its reset ahead
+    /// was read, and `rate_limit_reached_type` by nothing, so each of the others read `usable`.
+    #[test]
+    fn a_logins_wall_is_any_full_window_or_a_refusal() {
+        let now = T0 / 1000;
+        let at_ms = T0 - 60_000;
+        let at = at_ms / 1000;
+        let ahead = now + 3 * 86_400;
+        let read = |lines: &[String], at_now: i64| {
+            let (home, day) = rollout_home();
+            lay_rollout(&day, 0, now, lines);
+            login_sample(&[home.path()], key(LOGIN_A).expect("a key"), None, at_now)
+        };
+        let wall = |lines: &[String]| read(lines, now).and_then(|s| s.wall);
+        for minutes in [300, 1440, 10_080, 90, 0] {
+            let named = rate(at_ms, "codex", Some((100.0, minutes, ahead)), None);
+            assert_eq!(
+                wall(std::slice::from_ref(&named)),
+                Some(LoginWall { at, until: ahead }),
+                "{minutes} minutes, its reset named"
+            );
+            assert_eq!(
+                read(std::slice::from_ref(&named), now + FRESH_S + 61).and_then(|s| s.wall),
+                Some(LoginWall { at, until: ahead }),
+                "{minutes} minutes: a wall outlasts the age of its reading"
+            );
+        }
+        for (minutes, length) in [
+            (300, 5 * 3600),
+            (1440, 86_400),
+            (10_080, 7 * 86_400),
+            (90, 90 * 60),
+            (0, LOGIN_REACH_S),
+            (60 * 24 * 30, LOGIN_REACH_S),
+        ] {
+            let until = at + length;
+            let unnamed = no_reset(&rate(at_ms, "codex", Some((100.0, minutes, 0)), None));
+            assert_eq!(
+                wall(std::slice::from_ref(&unnamed)),
+                Some(LoginWall { at, until }),
+                "{minutes} minutes, no reset named"
+            );
+        }
+        let refusal = |slot| vec![refused(&rate(at_ms, "codex", None, slot))];
+        assert_eq!(
+            wall(&refusal(Some((30.0, 10_080, ahead)))),
+            Some(LoginWall { at, until: ahead }),
+            "refused with its week at 30%"
+        );
+        assert_eq!(
+            wall(&refusal(Some((30.0, 10_080, now - 1)))),
+            Some(LoginWall { at, until: now - 1 }),
+            "refused, its window run out since"
+        );
+        assert_eq!(
+            wall(&[refused(&rate(
+                at_ms,
+                "codex",
+                Some((60.0, 300, now + 60)),
+                Some((30.0, 10_080, ahead))
+            ))]),
+            Some(LoginWall {
+                at,
+                until: now + 60
+            }),
+            "refused: its most used window"
+        );
+        assert_eq!(
+            wall(&refusal(None)),
+            Some(LoginWall {
+                at,
+                until: at + LOGIN_REACH_S
+            }),
+            "refused with no window: a week on"
+        );
+        assert_eq!(
+            wall(&[rate(at_ms, "codex", None, Some((99.0, 10_080, ahead)))]),
+            None,
+            "CONTROL: room, and no refusal"
+        );
+        assert_eq!(
+            wall(&[
+                rate(at_ms, "codex", None, Some((99.0, 10_080, ahead))).replace(
+                    "\"rate_limit_reached_type\":null",
+                    "\"rate_limit_reached_type\":\"unknown\""
+                )
+            ]),
+            None,
+            "CONTROL: the endpoint reads `unknown` as no refusal too"
+        );
+        assert_eq!(
+            wall(&[refused(&rate(
+                at_ms,
+                "codex_bengalfox",
+                None,
+                Some((30.0, 10_080, ahead))
+            ))]),
+            None,
+            "CONTROL: another family's refusal"
+        );
+    }
+
+    /// A REFUSAL'S END IS FIXED BY ITS READING, so the clock does not re-judge which window runs: a
+    /// five-hour wall ends at its reset, and the week's end does not take over. NEGATIVE CONTROL: the
+    /// window that "still runs" was judged at the clock, so at the first reset the wall moved to the
+    /// week's reset, and a row that could run read `limited` for days with no later reading to lift it.
+    #[test]
+    fn a_refusals_end_does_not_move_when_its_first_window_resets() {
+        let now = T0 / 1000;
+        let at_ms = T0 - 60_000;
+        let at = at_ms / 1000;
+        let first = now + 60;
+        let week = now + 4 * 86_400;
+        let read = |line: &String, at_now: i64| {
+            let (home, day) = rollout_home();
+            lay_rollout(&day, 0, now, std::slice::from_ref(line));
+            login_sample(&[home.path()], key(LOGIN_A).expect("a key"), None, at_now)
+        };
+        let wall = |line: &String, at_now: i64| read(line, at_now).and_then(|s| s.wall);
+        let until = |until: i64| Some(LoginWall { at, until });
+        let windows = |five: (f64, i64), weekly: (f64, i64)| {
+            refused(&rate(
+                at_ms,
+                "codex",
+                Some((five.0, 300, five.1)),
+                Some((weekly.0, 10_080, weekly.1)),
+            ))
+        };
+        for used in [100.0, 60.0] {
+            let line = windows((used, first), (30.0, week));
+            assert_eq!(
+                wall(&line, now),
+                until(first),
+                "CONTROL: {used}%, before its reset"
+            );
+            assert_eq!(
+                wall(&line, first + 1),
+                until(first),
+                "{used}%, after its reset: the week's end does not take over"
+            );
+            assert_eq!(
+                read(&line, at + FRESH_S + 1),
+                None,
+                "{used}%: it has ended and its reading is too old to say anything"
+            );
+        }
+        let week_most_used = windows((30.0, first), (60.0, week));
+        for at_now in [now, first + 1] {
+            assert_eq!(
+                wall(&week_most_used, at_now),
+                until(week),
+                "CONTROL: the week was its most used window, so the first reset does not end it"
+            );
+        }
+        assert_eq!(
+            wall(&windows((100.0, at - 5), (30.0, week)), now),
+            until(week),
+            "a window already over at the reading is not the one it names"
+        );
+        assert_eq!(
+            wall(&windows((30.0, at - 5), (60.0, at - 9)), now),
+            until(at - 9),
+            "every window over at the reading: the most used one's end, which has passed"
+        );
+    }
+
+    /// A WALL THAT NAMES NO RESET CANNOT STRAND A ROW. A later reading that is not full lifts it, a
+    /// later one with no refusal lifts a refusal, a launch's read that shows room moves `since`
+    /// past it, and it ends by itself when its window can have run out. Then its reading stays
+    /// beside it as the reason no read shows room, until that reading is too old to say anything.
+    #[test]
+    fn a_wall_that_names_no_reset_lifts() {
+        let now = T0 / 1000;
+        let ahead = now + 3 * 86_400;
+        let at_ms = T0 - 60_000;
+        let at = at_ms / 1000;
+        let later = T0 - 10_000;
+        let full = no_reset(&rate(at_ms, "codex", Some((100.0, 300, 0)), None));
+        let read = |lines: &[String], since: Option<i64>, at_now: i64| {
+            let (home, day) = rollout_home();
+            lay_rollout(&day, 0, now, lines);
+            login_sample(&[home.path()], key(LOGIN_A).expect("a key"), since, at_now)
+        };
+        let walled = |lines: &[String]| read(lines, None, now).and_then(|s| s.wall);
+        assert!(
+            walled(std::slice::from_ref(&full)).is_some(),
+            "CONTROL: it stands"
+        );
+        assert_eq!(
+            walled(&[
+                full.clone(),
+                no_reset(&rate(later, "codex", Some((20.0, 300, 0)), None))
+            ]),
+            None,
+            "a later reading that is not full"
+        );
+        let refusal = refused(&rate(at_ms, "codex", None, Some((30.0, 10_080, ahead))));
+        assert!(
+            walled(std::slice::from_ref(&refusal)).is_some(),
+            "CONTROL: it stands"
+        );
+        assert_eq!(
+            walled(&[
+                refusal.clone(),
+                rate(later, "codex", None, Some((30.0, 10_080, ahead)))
+            ]),
+            None,
+            "a later reading with no refusal"
+        );
+        for lines in [full.clone(), refusal] {
+            assert_eq!(
+                read(&[lines], Some(at + 1), now),
+                None,
+                "a launch's read that showed room"
+            );
+        }
+        let ended = at + 5 * 3600 + 1;
+        let late = read(std::slice::from_ref(&full), None, ended).expect("a read still fresh");
+        assert_eq!(
+            (late.sample.session(ended), late.wall),
+            (
+                None,
+                Some(LoginWall {
+                    at,
+                    until: at + 5 * 3600
+                })
+            ),
+            "its window can have run out, and nothing later shows room"
+        );
+        assert_eq!(
+            read(&[full], None, at + FRESH_S + 1),
+            None,
+            "then its reading is too old to say anything"
         );
     }
 
@@ -1373,7 +1898,7 @@ mod tests {
         let homes = [home.path()];
         let a = key(LOGIN_A).expect("a key");
         assert_eq!(
-            login_sample(&homes, a, None, now).and_then(|s| s.week_pct),
+            login_sample(&homes, a, None, now).and_then(|s| s.sample.week_pct),
             Some(100)
         );
         set_written(&own, now - LOGIN_REACH_S - 1);
@@ -1381,6 +1906,216 @@ mod tests {
             login_sample(&homes, a, None, now),
             None,
             "written too long ago"
+        );
+    }
+
+    /// A ROLLOUT WITH NO READING SAYS NOTHING OF A WALL, so a login's own such rollouts do not count
+    /// among the six: a session that starts on a wall writes no figure, and launches that read
+    /// nothing first make them one after another. Six that hold a reading do push it out, since they
+    /// say more of its windows than it can, and so a reading is counted only while it still speaks
+    /// (`since`). NEGATIVE CONTROL: the six were counted before any was read, so six such launches
+    /// hid the wall and the row read `usable` or `unseen`.
+    #[test]
+    fn a_logins_own_rollouts_with_no_reading_never_push_its_wall_out_of_view() {
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        let at_ms = T0 - 3_600_000;
+        let wall = rate(at_ms, "codex", None, Some((100.0, 10_080, week)));
+        lay_rollout(&day, 0, now - 3_600, std::slice::from_ref(&wall));
+        for n in 1..=NEWEST_READ * 2 {
+            let says_nothing = [
+                context(T0 - 60_000, "gpt-6.1-sol", None),
+                rate(T0 - 60_000, "codex", None, None),
+                rate(T0 - 60_000, "premium", None, None),
+                rate(T0 - 60_000, "codex_bengalfox", Some((3.0, 300, week)), None),
+            ];
+            lay_rollout(&day, n, now - 60, &says_nothing);
+        }
+        let read = |since| login_sample(&homes, a, since, now);
+        assert_eq!(
+            read(None).and_then(|s| s.sample.week_pct),
+            Some(100),
+            "its wall stays in view"
+        );
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        lay_rollout(&day, 0, now - 3_600, std::slice::from_ref(&wall));
+        for n in 1..=NEWEST_READ {
+            let since_then = rate(T0 - 60_000, "codex", None, Some((7.0, 10_080, week)));
+            lay_rollout(&day, n, now - 60, std::slice::from_ref(&since_then));
+        }
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.sample.week_pct),
+            Some(7),
+            "six that hold a reading say more than it can"
+        );
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        let after_since = T0 - 300_000;
+        lay_rollout(
+            &day,
+            0,
+            now - 300,
+            &[rate(
+                after_since,
+                "codex",
+                None,
+                Some((100.0, 10_080, week)),
+            )],
+        );
+        for n in 1..=NEWEST_READ {
+            lay_rollout(&day, n, now - 60, std::slice::from_ref(&wall));
+        }
+        assert_eq!(
+            login_sample(&homes, a, Some(now - 600), now).and_then(|s| s.wall),
+            Some(LoginWall {
+                at: after_since / 1000,
+                until: week
+            }),
+            "readings from before `since` no longer speak, so they are not counted"
+        );
+    }
+
+    /// A LOOK AT ROLLOUTS THAT HAVE NOT CHANGED READS NONE OF THEM, since a node's metrics pass
+    /// surveys every minute with nobody asking and a look can reach [`LOGIN_SCAN`] of them: new bytes
+    /// under the size and write time it last saw stay unread. NEGATIVE CONTROL: with no memory of
+    /// the last look, the second reads 60. CONTROL: another `since`, a later write, or another
+    /// rollout in reach is a look of its own.
+    #[test]
+    fn a_logins_look_reads_nothing_while_its_rollouts_stand_still() {
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        let reading = |pct: f64| rate(T0 - 60_000, "codex", None, Some((pct, 10_080, week)));
+        let week_of = |since: Option<i64>| {
+            login_sample(&homes, a, since, now).and_then(|s| s.sample.week_pct)
+        };
+
+        lay_rollout(&day, 0, now - 60, &[reading(40.0)]);
+        assert_eq!(week_of(None), Some(40));
+        lay_rollout(&day, 0, now - 60, &[reading(60.0)]);
+        assert_eq!(
+            week_of(None),
+            Some(40),
+            "unchanged by its size and write time"
+        );
+        assert_eq!(
+            week_of(Some(now - 600)),
+            Some(60),
+            "CONTROL: another `since` looks again"
+        );
+        lay_rollout(&day, 0, now - 60, &[reading(70.0)]);
+        lay_rollout(&day, 0, now - 59, &[reading(70.0)]);
+        assert_eq!(
+            week_of(Some(now - 600)),
+            Some(70),
+            "CONTROL: a later write looks again"
+        );
+        lay_rollout(&day, 0, now - 59, &[reading(80.0)]);
+        lay_rollout(&day, 1, now - 300, &[reading(10.0)]);
+        assert_eq!(
+            week_of(Some(now - 600)),
+            Some(80),
+            "CONTROL: another rollout in reach looks again"
+        );
+    }
+
+    /// A ROLLOUT LAST WRITTEN BEFORE `since` IS NOT READ: a reading is stamped before it is written,
+    /// so it holds none from `since` on, and a healthy row pays for no older tail. The first rollout
+    /// here holds a stamp no real one can, a reading newer than its last write, so that reading it
+    /// would show. NEGATIVE CONTROL: the look reached back a week whatever `since` said, so up to
+    /// [`LOGIN_SCAN`] older rollouts each paid a first line and a tail, and none could be counted.
+    #[test]
+    fn a_logins_look_reaches_back_only_to_since() {
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let since = now - 600;
+        let week = now + 300_000;
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        let stamped = rate(since * 1000, "codex", None, Some((100.0, 10_080, week)));
+        let shown = Some(LoginWall {
+            at: since,
+            until: week,
+        });
+        let wall = |from: Option<i64>| login_sample(&homes, a, from, now).and_then(|s| s.wall);
+        lay_rollout(&day, 0, since - 1, std::slice::from_ref(&stamped));
+        assert_eq!(
+            login_sample(&homes, a, Some(since), now),
+            None,
+            "last written the second before `since`: its tail is not read"
+        );
+        assert_eq!(wall(None), shown, "CONTROL: with no `since`, it is read");
+        assert_eq!(
+            wall(Some(since - 1)),
+            shown,
+            "CONTROL: last written in the very second of `since`, it is read"
+        );
+        lay_rollout(
+            &day,
+            0,
+            now - LOGIN_REACH_S - 1,
+            std::slice::from_ref(&stamped),
+        );
+        assert_eq!(
+            login_sample(&homes, a, Some(now - 2 * LOGIN_REACH_S), now),
+            None,
+            "a `since` older than a week does not widen the week's reach"
+        );
+
+        let (home, day) = rollout_home();
+        let homes = [home.path()];
+        let at_ms = T0 - 60_000;
+        let older = rate(
+            (since - 120) * 1000,
+            "codex",
+            None,
+            Some((40.0, 10_080, week)),
+        );
+        for n in 1..=NEWEST_READ * 2 {
+            lay_rollout(&day, n, since - 60, std::slice::from_ref(&older));
+        }
+        let full = rate(at_ms, "codex", None, Some((100.0, 10_080, week)));
+        lay_rollout(&day, 0, now - 60, std::slice::from_ref(&full));
+        assert_eq!(
+            login_sample(&homes, a, Some(since), now).and_then(|s| s.wall),
+            Some(LoginWall {
+                at: at_ms / 1000,
+                until: week
+            }),
+            "CONTROL: the wall from `since` on is still found"
+        );
+    }
+
+    /// A SURVEY NEVER READS WITHOUT LIMIT: it looks through [`LOGIN_SCAN`] rollouts written last, of
+    /// any login, and a wall behind that many is out of view.
+    #[test]
+    fn a_login_scan_stops_at_its_bound() {
+        let (home, day) = rollout_home();
+        let now = T0 / 1000;
+        let week = now + 300_000;
+        let homes = [home.path()];
+        let a = key(LOGIN_A).expect("a key");
+        let wall = rate(T0 - 3_600_000, "codex", None, Some((100.0, 10_080, week)));
+        lay_rollout(&day, 0, now - 3_600, std::slice::from_ref(&wall));
+        for n in 1..LOGIN_SCAN {
+            lay_rollout(&day, n, now - 60, &[]);
+        }
+        assert_eq!(
+            login_sample(&homes, a, None, now).and_then(|s| s.sample.week_pct),
+            Some(100),
+            "the last rollout it looks through"
+        );
+        lay_rollout(&day, LOGIN_SCAN, now - 60, &[]);
+        assert_eq!(
+            login_sample(&homes, a, None, now),
+            None,
+            "the first it does not"
         );
     }
 

@@ -181,7 +181,7 @@ pub(super) struct TransientState {
     pub(super) history_image_room: usize,
     /// Edge-triggered BEL flag set by `handle_bell()` (after rate limiting) and drained by `Terminal::drain_bell()`, for polling hosts. A reset keeps it: the bell rang before it.
     pub(super) bell_pending: bool,
-    /// App-event queue of OSC payloads `(code, payload)` the host polls via `Terminal::take_osc_event`: OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks. A reset keeps every event, as `clear` does: they happened before it, and a reset renumbers no row (an A, B or C's `row=` names the row its mark was made on, as after ED 2 and ED 3).
+    /// App-event queue of OSC payloads `(code, payload)` the host polls via `Terminal::take_osc_event`, once it says it does (`Terminal::set_osc_event_polling`): OSC 52 decoded clipboard, OSC 7 cwd, OSC 133 marks. A reset keeps every event, as `clear` does: they happened before it, and a reset renumbers no row (an A, B or C's `row=` names the row its mark was made on, as after ED 2 and ED 3).
     pub(super) osc_events: OscEventQueue,
     /// Where the most recent PTY print run ended: the active-grid cursor `(row, col)` after each print action.
     pub(super) print_anchor: Option<(u16, u16)>,
@@ -378,10 +378,63 @@ impl TransientState {
 }
 
 /// The poll-host app-event queue ([`TransientState::osc_events`]): OSC payloads `(code, payload)` in arrival order, bounded by count and by total payload bytes.
+///
+/// It holds nothing until the host says it polls ([`Self::set_polled`]): a host that never drains
+/// it would otherwise keep it full for the tab's life, and every row splice would walk it. An OSC
+/// 133 `A`, `B` or `C` is kept as numbers ([`OscEvent::Mark`]), so a splice shifts it with integer
+/// arithmetic, and only when one sits at or past the splice ([`Self::shift_marks`]).
 #[derive(Debug, Default)]
 pub(super) struct OscEventQueue {
-    events: VecDeque<(u32, String)>,
+    events: VecDeque<OscEvent>,
+    /// Payload bytes queued, each event counted at its [`OscEvent::len`].
     bytes: usize,
+    /// Whether the host drains the queue ([`Self::set_polled`]); a reset keeps it.
+    polled: bool,
+    /// How many queued events are [`OscEvent::Mark`]s.
+    marks: usize,
+    /// No queued mark's row is past this.
+    mark_row_max: u64,
+}
+
+/// One queued app event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OscEvent {
+    /// A payload as it was queued: OSC 7's cwd, OSC 52's text, OSC 133 `D`'s exit.
+    Text(u32, String),
+    /// An OSC 133 `command` (`A`, `B` or `C`) at absolute `row` and column `col`, read as
+    /// `"<command>;row=<row>;col=<col>"`.
+    Mark { command: char, row: u64, col: u16 },
+}
+
+impl OscEvent {
+    /// The payload's length in bytes, a mark's as it reads.
+    fn len(&self) -> usize {
+        match self {
+            Self::Text(_, payload) => payload.len(),
+            Self::Mark { command, row, col } => {
+                command.len_utf8()
+                    + ";row=".len()
+                    + decimal_len(*row)
+                    + ";col=".len()
+                    + decimal_len(u64::from(*col))
+            }
+        }
+    }
+
+    fn into_pair(self) -> (u32, String) {
+        match self {
+            Self::Text(code, payload) => (code, payload),
+            Self::Mark { command, row, col } => (133, format!("{command};row={row};col={col}")),
+        }
+    }
+}
+
+/// Digits in `n`'s decimal form.
+const fn decimal_len(n: u64) -> usize {
+    match n.checked_ilog10() {
+        Some(log) => log as usize + 1,
+        None => 1,
+    }
 }
 
 impl OscEventQueue {
@@ -390,14 +443,42 @@ impl OscEventQueue {
     /// Most payload bytes held at once, summed over every queued event.
     pub(super) const MAX_BYTES: usize = 1024 * 1024;
 
+    /// Queue events from now on (`true`), or drop every queued one and queue none (`false`).
+    pub(super) fn set_polled(&mut self, polled: bool) {
+        if !polled {
+            self.clear();
+        }
+        self.polled = polled;
+    }
+
+    /// Whether the host drains the queue ([`Self::set_polled`]).
+    #[inline]
+    pub(super) const fn polled(&self) -> bool {
+        self.polled
+    }
+
     /// Append an event, first dropping the oldest ones it would push past a bound.
     pub(super) fn push(&mut self, code: u32, payload: String) {
-        if payload.len() > Self::MAX_BYTES {
+        self.push_event(OscEvent::Text(code, payload));
+    }
+
+    /// Append an OSC 133 `command` (`A`, `B` or `C`) at absolute `row` and column `col`.
+    pub(super) fn push_mark(&mut self, command: char, row: u64, col: u16) {
+        self.push_event(OscEvent::Mark { command, row, col });
+    }
+
+    fn push_event(&mut self, event: OscEvent) {
+        let len = event.len();
+        if !self.polled || len > Self::MAX_BYTES {
             return;
         }
-        self.shed(1, payload.len());
-        self.bytes += payload.len();
-        self.events.push_back((code, payload));
+        self.shed(1, len);
+        if let OscEvent::Mark { row, .. } = event {
+            self.marks += 1;
+            self.mark_row_max = self.mark_row_max.max(row);
+        }
+        self.bytes += len;
+        self.events.push_back(event);
     }
 
     /// Drop the oldest events until `events` more events of `bytes` more
@@ -405,18 +486,28 @@ impl OscEventQueue {
     fn shed(&mut self, events: usize, bytes: usize) {
         while self.events.len() + events > Self::MAX_EVENTS || self.bytes + bytes > Self::MAX_BYTES
         {
-            if self.pop_front().is_none() {
+            if self.pop_event().is_none() {
                 break;
             }
         }
     }
 
+    fn pop_event(&mut self) -> Option<OscEvent> {
+        let event = self.events.pop_front()?;
+        self.bytes -= event.len();
+        if matches!(event, OscEvent::Mark { .. }) {
+            self.marks -= 1;
+            if self.marks == 0 {
+                self.mark_row_max = 0;
+            }
+        }
+        Some(event)
+    }
+
     /// Remove and return the oldest event.
     #[inline]
     pub(super) fn pop_front(&mut self) -> Option<(u32, String)> {
-        let event = self.events.pop_front()?;
-        self.bytes -= event.1.len();
-        Some(event)
+        self.pop_event().map(OscEvent::into_pair)
     }
 
     #[inline]
@@ -424,39 +515,85 @@ impl OscEventQueue {
         self.events.is_empty()
     }
 
-    /// Keep only the events `keep` accepts.
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(u32, &str) -> bool) {
-        let bytes = &mut self.bytes;
-        self.events.retain(|(code, payload)| {
-            let kept = keep(*code, payload);
-            if !kept {
-                *bytes -= payload.len();
-            }
-            kept
-        });
+    /// Drop every queued event; whether the host polls stands.
+    #[inline]
+    fn clear(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
+        self.marks = 0;
+        self.mark_row_max = 0;
     }
 
-    /// Rewrite payloads in place; `rewrite` returns a replacement or `None` to leave the payload as it is.
-    pub(super) fn rewrite(&mut self, mut rewrite: impl FnMut(u32, &str) -> Option<String>) {
-        for (code, payload) in &mut self.events {
-            if let Some(new) = rewrite(*code, payload) {
-                self.bytes = self.bytes - payload.len() + new.len();
-                *payload = new;
+    /// Drop every queued mark, keeping the rest in order.
+    pub(super) fn drop_marks(&mut self) {
+        if self.marks == 0 {
+            return;
+        }
+        let bytes = &mut self.bytes;
+        self.events.retain(|event| {
+            let mark = matches!(event, OscEvent::Mark { .. });
+            if mark {
+                *bytes -= event.len();
+            }
+            !mark
+        });
+        self.marks = 0;
+        self.mark_row_max = 0;
+    }
+
+    /// Move every queued mark at row `at` or past it down by `inserted` rows. Constant work when
+    /// no mark sits there; otherwise one integer step per queued event.
+    pub(super) fn shift_marks(&mut self, at: u64, inserted: u64) {
+        if self.marks == 0 || at > self.mark_row_max {
+            return;
+        }
+        #[cfg(test)]
+        shift_meter::charge(self.events.len());
+        for event in &mut self.events {
+            if let OscEvent::Mark { row, .. } = event
+                && *row >= at
+            {
+                let before = decimal_len(*row);
+                *row = row.saturating_add(inserted);
+                self.bytes = self.bytes - before + decimal_len(*row);
             }
         }
+        self.mark_row_max = self.mark_row_max.saturating_add(inserted);
         self.shed(0, 0);
     }
 
-    /// The queued events, oldest first.
+    /// The queued events as [`Self::pop_front`] would return them, oldest first.
     #[cfg(test)]
-    pub(super) fn iter(&self) -> impl Iterator<Item = &(u32, String)> {
-        self.events.iter()
+    pub(super) fn snapshot(&self) -> Vec<(u32, String)> {
+        self.events
+            .iter()
+            .cloned()
+            .map(OscEvent::into_pair)
+            .collect()
     }
 
     /// Total payload bytes queued.
     #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+/// Deterministic cost meter for [`OscEventQueue::shift_marks`]: the queued events it walked.
+#[cfg(test)]
+pub(super) mod shift_meter {
+    thread_local! {
+        static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `n` events walked.
+    pub(super) fn charge(n: usize) {
+        WALKED.with(|c| c.set(c.get() + n));
+    }
+
+    /// Read and reset, so each measured stretch starts from zero.
+    pub(in crate::terminal) fn take() -> usize {
+        WALKED.with(|c| c.replace(0))
     }
 }
 

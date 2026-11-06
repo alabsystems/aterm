@@ -365,10 +365,20 @@ impl LabView {
             .into_iter()
             .map(|p| p.machine.clone())
             .collect();
-        for placed in self.placements(places) {
-            if placed.account == account && !out.contains(&placed.machine) {
-                out.push(placed.machine);
-            }
+        if self.accounts.contains_key(account) {
+            let mut placed: Vec<&String> = places
+                .rows
+                .iter()
+                .filter(|row| row.account == account)
+                .filter_map(|row| self.bound.get(&row.uuid))
+                .filter(|machine| !out.contains(machine))
+                .collect();
+            placed.sort_by(|a, b| {
+                (label_number(self.machine_label(a)), *a)
+                    .cmp(&(label_number(self.machine_label(b)), *b))
+            });
+            placed.dedup();
+            out.extend(placed.into_iter().cloned());
         }
         out
     }
@@ -376,12 +386,25 @@ impl LabView {
     /// What runs on `machine` (§7): its live preferences by rank, and its live place rows.
     #[cfg(unix)]
     pub fn runs_on(&self, machine: &str, places: &Places) -> (Vec<&Preference>, Vec<Placement>) {
-        let placed = self
-            .placements(places)
-            .into_iter()
-            .filter(|p| p.machine == machine)
+        let preferred: Vec<&Preference> = self.preferred_by(machine).collect();
+        let mut placed: Vec<Placement> = places
+            .rows
+            .iter()
+            .filter(|row| self.bound.get(&row.uuid).is_some_and(|m| m == machine))
+            .filter(|row| {
+                self.accounts.contains_key(&row.account)
+                    && !preferred.iter().any(|p| p.account == row.account)
+            })
+            .map(|row| Placement {
+                machine: machine.to_owned(),
+                account: row.account.clone(),
+                why: row.why,
+                since: row.since,
+            })
             .collect();
-        (self.preferred_by(machine).collect(), placed)
+        placed.sort_by(|a, b| a.account.cmp(&b.account));
+        placed.dedup_by(|a, b| a.account == b.account);
+        (preferred, placed)
     }
 
     /// Where codes for address `pk` arrive (`mail::effective`), with this Mac's `routes`.
@@ -469,25 +492,31 @@ impl LabView {
 
     /// [`Self::alias_targets`] from row `pk`.
     fn alias_targets_of(&self, pk: &str) -> Vec<String> {
-        let mut at = pk.to_owned();
-        let mut seen = BTreeSet::from([at.clone()]);
+        let mut at = pk;
+        let mut seen = BTreeSet::from([pk]);
         let mut out = Vec::new();
         while let Some(next) = self
             .addresses
             .rows
-            .get(&at)
-            .and_then(|row| text(row, "alias_of"))
+            .get(at)
+            .and_then(|row| row.get("alias_of"))
+            .and_then(Value::as_str)
         {
-            let Some(row) = self.addresses.rows.get(&next).filter(|row| row.live()) else {
+            let Some((next_key, row)) = self
+                .addresses
+                .rows
+                .get_key_value(next)
+                .filter(|(_, row)| row.live())
+            else {
                 break;
             };
-            if !seen.insert(next.clone()) {
+            if !seen.insert(next_key.as_str()) {
                 break;
             }
             if let Some(addr) = text(row, "addr") {
                 out.push(addr);
             }
-            at = next;
+            at = next_key.as_str();
         }
         out
     }

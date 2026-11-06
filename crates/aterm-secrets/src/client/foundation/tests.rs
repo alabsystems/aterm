@@ -880,3 +880,217 @@ fn an_approver_that_shares_no_root_on_an_open_approval_holds_the_founding() {
     enroll(&lab, &m2).unwrap();
     PLAYED.with(|played| *played.borrow_mut() = None);
 }
+
+thread_local! {
+    /// A test's hook, run once by the next [`finish`] on this thread between its sync and its
+    /// read-back: this Mac's subscriber, which the founding's publication woke, taking the vault's
+    /// state lock to apply what it heard.
+    static SYNCED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run by [`finish`] between its sync and its read-back: the hook [`SYNCED`] holds, once.
+pub(super) fn synced() {
+    if let Some(synced) = SYNCED.with(|hook| hook.borrow_mut().take()) {
+        synced();
+    }
+}
+
+/// A founding's read-back meets this Mac's subscriber, which the publication woke, holding the
+/// vault's state lock for a moment: it waits that out and reads the root the founding published,
+/// where a read at once finds the state busy and the founding fails with its root published.
+/// The subscriber takes the lock inside the founding's own `finish`, between its sync and its
+/// read-back ([`SYNCED`]), and lets it go on the read's own first blocked try, so no scheduling
+/// races the wait; a lock still held at the deadline says the vault is busy.
+/// NEGATIVE CONTROL: a read-back that reads once (`Bootstrap::cached`, `Bootstrap::observe`) or by
+/// a deadline already passed fails the founding while the lock is held.
+#[test]
+fn the_read_back_waits_out_the_subscriber_its_publication_woke() {
+    let lab = lab_open("read-back");
+    let subscriber = std::rc::Rc::new(std::cell::RefCell::new(None::<StateLock>));
+    let (paths, applying) = (lab.paths.clone(), std::rc::Rc::clone(&subscriber));
+    SYNCED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            *applying.borrow_mut() = Some(StateLock::take(&paths).unwrap());
+        }));
+    });
+    let waited = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (count, applied) = (std::rc::Rc::clone(&waited), std::rc::Rc::clone(&subscriber));
+    let founded = crate::commons::bootstrap::tests::while_held(
+        move || {
+            count.set(count.get() + 1);
+            drop(applied.borrow_mut().take());
+        },
+        || admin_commons_found_by_default(&lab.paths),
+    );
+    assert!(
+        SYNCED.with(|hook| hook.borrow().is_none()),
+        "CONTROL: the subscriber took the lock in the founding's finish"
+    );
+    assert_eq!(
+        waited.get(),
+        1,
+        "the read-back found the state lock held once"
+    );
+    let founded = founded.unwrap();
+    assert!(founded.published);
+
+    let held = StateLock::take(&lab.paths).unwrap();
+    let Err(busy) = installed(&lab.paths, Instant::now()) else {
+        panic!("a state lock held at the deadline reads busy");
+    };
+    assert_eq!(busy.kind(), crate::ErrorKind::VaultBusy, "{busy}");
+    assert!(
+        busy.to_string().contains("not visible after sync"),
+        "{busy}"
+    );
+    drop(held);
+    let read = installed(&lab.paths, Instant::now()).unwrap();
+    assert_eq!(read.trust().genesis, founded.genesis);
+}
+
+/// A founding by default meets another founding on this Mac (a person's `commons init`) only
+/// through the founding lock: while that holds it, the pass prepares and publishes nothing and
+/// says what runs; once it is let go the pass founds.
+/// NEGATIVE CONTROL: a founding by default that takes no lock publishes while it is held.
+#[test]
+fn a_held_founding_lock_puts_the_founding_by_default_off() {
+    let lab = lab_open("default-locked");
+    let before = published(&lab);
+    let held = FoundationLock::held_waiting(&lab.paths).unwrap();
+    let error = admin_commons_found_by_default(&lab.paths).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("another founding of this vault's Commons runs on this Mac now"),
+        "{error}"
+    );
+    assert_eq!(published(&lab), before, "nothing was published");
+    assert!(
+        !lab.paths.dir.join(PREPARED).exists(),
+        "nothing was prepared"
+    );
+    drop(held);
+    assert!(
+        admin_commons_found_by_default(&lab.paths)
+            .unwrap()
+            .published
+    );
+}
+
+/// A person's `commons init` waits out another founding on this Mac (a window's pass) that holds
+/// the founding lock, then founds. The holder lets it go on the waiter's own first blocked try
+/// (`aterm_uds::file_lock::with_lock_wait_observer`), so no scheduling races the wait.
+/// NEGATIVE CONTROL: a `commons init` that takes no lock founds without waiting on it.
+#[test]
+fn commons_init_waits_out_another_founding_on_this_mac() {
+    let lab = lab_open("init-waits");
+    let mut window = Some(FoundationLock::held_if_free(&lab.paths).unwrap().unwrap());
+    assert!(
+        FoundationLock::held_if_free(&lab.paths).unwrap().is_none(),
+        "CONTROL: a second take finds it held"
+    );
+    let waited = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = std::rc::Rc::clone(&waited);
+    let founded = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| {
+            count.set(count.get() + 1);
+            drop(window.take());
+        },
+        || admin_commons_init(&lab.paths),
+    )
+    .unwrap();
+    assert_eq!(
+        waited.get(),
+        1,
+        "commons init found the founding lock held once"
+    );
+    assert!(founded.published);
+}
+
+/// Run `call` on `lab` with `race` published in the moment between `call`'s read of the vault
+/// and its publication's draft: that publication finds this thread's draft turn taken
+/// (`log_entries::TURN_WAITS`), the turn is let go, and `race` publishes first, so `call`'s
+/// publication is not newer than the one the vault holds (a server's 409).
+fn raced<T>(lab: &Lab, race: impl FnOnce(&Paths) + 'static, call: impl FnOnce(&Paths) -> T) -> T {
+    let turn = log_entries::draft_turn(&lab.paths, None).unwrap();
+    let paths = lab.paths.clone();
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let raced = std::rc::Rc::clone(&ran);
+    log_entries::TURN_WAITS.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            drop(turn);
+            race(&paths);
+            raced.set(true);
+        }));
+    });
+    let out = call(&lab.paths);
+    assert!(
+        ran.get(),
+        "CONTROL: the race ran in the founding's publication"
+    );
+    out
+}
+
+/// A founding whose publication met another that landed first (a server's 409, which stored
+/// nothing of it) reopens the vault once. Where that other publication carried the same root (a
+/// founding from the attempt this Mac kept), it is finished there with nothing more published,
+/// by default and at `commons init`; where it carried none (an approver's publish), the
+/// founding says another publish landed first, and the next founds from the kept attempt.
+/// NEGATIVE CONTROL: dropping the reopen leaves the vault's bare refusal, which says no publish
+/// landed first.
+#[test]
+fn a_publication_another_landed_first_finishes_the_root_that_landed() {
+    let lab = lab_open("landed-first-none");
+    let error = raced(
+        &lab,
+        |paths| {
+            let admin = admin_open(paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry(&Audience::Everyone, "raced", b"an approver's publish")
+                .unwrap();
+            admin_publish(paths, &admin, &doc).unwrap();
+        },
+        admin_commons_found_by_default,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::NotStored, "{error}");
+    assert!(
+        error.to_string().contains("another publish landed first"),
+        "{error}"
+    );
+    assert!(no_control(&lab.paths));
+    let kept = prepared(&lab.paths)
+        .unwrap()
+        .expect("the attempt stays kept");
+    let founded = admin_commons_found_by_default(&lab.paths).unwrap();
+    assert!(founded.published);
+    assert_eq!(founded.genesis, kept.trust().genesis);
+
+    for init in [false, true] {
+        let lab = lab_open(if init {
+            "landed-first-init"
+        } else {
+            "landed-first-default"
+        });
+        let call: fn(&Paths) -> crate::Result<CommonsInit> = if init {
+            admin_commons_init
+        } else {
+            admin_commons_found_by_default
+        };
+        let done = raced(&lab, found_without_decisions, call).unwrap();
+        assert!(
+            !done.published,
+            "init={init}: the root that landed is finished"
+        );
+        assert_eq!(
+            published_descriptor(&lab.paths),
+            prepared(&lab.paths).unwrap().unwrap().bytes(),
+            "init={init}: the kept attempt is the root that landed"
+        );
+        assert_eq!(
+            done.genesis,
+            prepared(&lab.paths).unwrap().unwrap().trust().genesis
+        );
+    }
+}

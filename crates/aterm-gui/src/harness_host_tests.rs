@@ -34066,6 +34066,15 @@ impl StartupWorld {
     }
 }
 
+/// [`startup_mark_with`] on a Mac whose label is not known, so a test's words hold on any Mac.
+fn startup_mark_nameless(
+    store: &Store,
+    sid: &str,
+    mark: &StartupMark<'_>,
+) -> Option<(u64, crate::task_record::MarkedWith)> {
+    startup_mark_named(store, sid, mark, || None)
+}
+
 fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) -> Startup {
     let held = matches!(
         state,
@@ -34080,6 +34089,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
         held,
         standing: None,
         installing: false,
+        install_mark: 0,
         install_work: None,
         unheld: None,
     }
@@ -34110,6 +34120,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
         held: Some(read),
         standing: None,
         installing: false,
+        install_mark: 0,
         install_work: None,
         unheld: None,
     }
@@ -34372,6 +34383,175 @@ fn supervision_back_on_gives_a_worker_a_whole_deadline() {
     );
 }
 
+/// A HOLD THAT KEEPS CODEX-ALAB FROM CLAIMING IS NO FAULT OF THE WORKER'S. No deadline falls while
+/// it stands, however long. When it lifts the worker has a whole deadline, so no stall lands in the
+/// look after the lift, and then it falls as ever, so the hold leaves no worker unjudged.
+#[test]
+fn a_held_codex_worker_is_not_judged_and_a_lift_gives_it_a_whole_deadline() {
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let none = OffSessions::default();
+    let t0 = Instant::now() + Duration::from_secs(3 * 3600);
+    let bare = StartupHold::NoComposer {
+        agent: Program::Codex,
+    };
+    let worker = |seen| startup("s-a", StartupState::Working, t0, seen);
+    let mut books = Startups::default();
+    w.set(vec![worker(StartupSeen::Holds(bare.clone()))]);
+    assert_eq!(
+        look_at_startups(&mut books, t0, true, &none, &hooks),
+        Some(t0 + STARTUP_DEADLINE)
+    );
+
+    w.set(vec![worker(StartupSeen::CannotClaim)]);
+    let held = t0 + 10 * STARTUP_DEADLINE;
+    for at in [t0 + Duration::from_secs(1), t0 + STARTUP_DEADLINE, held] {
+        assert_eq!(
+            look_at_startups(&mut books, at, true, &none, &hooks),
+            Some(at + STARTUP_UNREAD_LOOK)
+        );
+    }
+    assert!(w.marks().is_empty(), "no deadline falls under a hold");
+
+    w.set(vec![worker(StartupSeen::Holds(bare.clone()))]);
+    let lifted = held + STARTUP_UNREAD_LOOK;
+    assert_eq!(
+        look_at_startups(&mut books, lifted, true, &none, &hooks),
+        Some(held + STARTUP_DEADLINE)
+    );
+    assert!(w.marks().is_empty(), "no stall in the look after the lift");
+    look_at_startups(
+        &mut books,
+        held + STARTUP_DEADLINE - Duration::from_secs(1),
+        true,
+        &none,
+        &hooks,
+    );
+    assert!(w.marks().is_empty(), "the deadline is whole");
+    look_at_startups(&mut books, held + STARTUP_DEADLINE, true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [stalled("s-a", bare)],
+        "the lift leaves it judged"
+    );
+}
+
+/// A HOLD'S MOVE WAKES THE HOST, as an Autopilot's does: a look runs right after the hold moves, so
+/// a hold standing at that look is seen and a worker it kept from claiming is not stalled for it.
+/// CONTROL: a hold that moved nothing rings nothing.
+#[test]
+fn a_holds_move_wakes_the_host() {
+    let h = crate::session_store::test_handle(3);
+    let hold = crate::fabric::Hold {
+        reason: "-".to_string(),
+        origin: "fleet".to_string(),
+    };
+    let rings = rings_here();
+    assert!(crate::fabric::apply_hold_for_test(
+        &h.ctx,
+        Some(hold.clone())
+    ));
+    assert_eq!(rings_here(), rings + 1, "a hold set");
+    assert!(!crate::fabric::apply_hold_for_test(&h.ctx, Some(hold)));
+    assert_eq!(rings_here(), rings + 1, "CONTROL: nothing moved");
+    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
+    assert_eq!(rings_here(), rings + 2, "a hold lifted");
+}
+
+/// WHAT A HOLD DOES TO A WORKER'S READ, kind by kind. A hold stops neither a shell nor a screen, so
+/// a shell in front, an install and a Claude Code worker's screen read as they do unheld, and only
+/// a codex program, whose claim is the one proof of its start, is not judged.
+#[test]
+fn the_store_judges_a_held_worker_by_what_a_hold_can_stop() {
+    use crate::task_record::{TaskMark, TaskState};
+    use aterm_phase::prompt::fixtures as f;
+    let store = crate::session_store::new_store();
+    let worker = |local_id, agent| {
+        let h = crate::session_store::test_handle(local_id);
+        {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            tl.mark_task(&TaskMark::new(TaskState::Working), false, Instant::now(), 0);
+            tl.set_task_worker(agent, None);
+        }
+        assert!(crate::fabric::apply_hold_for_test(
+            &h.ctx,
+            Some(crate::fabric::Hold {
+                reason: "-".to_string(),
+                origin: "fleet".to_string(),
+            })
+        ));
+        store.write().unwrap().register(h.clone());
+        h
+    };
+    let codex = worker(3, Program::Codex);
+    let claude = worker(4, Program::Claude);
+    let seen = |h: &crate::session_store::SessionHandle| {
+        startups_of(&store, &std::collections::HashSet::new())
+            .into_iter()
+            .find(|w| w.sid == h.sid.as_str())
+            .expect("listed")
+            .seen
+    };
+    let running = |h: &crate::session_store::SessionHandle, group, program: &str| {
+        let mut tl = h.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(group);
+        tl.set_program(group, Some(program.into()));
+    };
+    let no_prompt =
+        |read: StartupSeen| matches!(read, StartupSeen::Holds(StartupHold::NoPrompt { .. }));
+
+    for h in [&codex, &claude] {
+        assert!(
+            no_prompt(seen(h)),
+            "a shell that drew nothing: {:?}",
+            seen(h)
+        );
+        running(h, 77, "sleep");
+        assert!(no_prompt(seen(h)), "an rc file's child: {:?}", seen(h));
+        h.ctx.timeline.lock().unwrap().set_worker_installing(true);
+        assert!(
+            matches!(seen(h), StartupSeen::Holds(StartupHold::Installing { .. })),
+            "an install: {:?}",
+            seen(h)
+        );
+        h.ctx.timeline.lock().unwrap().set_worker_installing(false);
+        running(h, 78, "zsh");
+        h.term
+            .lock()
+            .unwrap()
+            .process(b"$ \x1b]133;A\x07\x1b]133;B\x07");
+        assert!(
+            matches!(seen(h), StartupSeen::Holds(StartupHold::NoAgent { .. })),
+            "a shell at its prompt: {:?}",
+            seen(h)
+        );
+    }
+
+    running(&codex, 79, "codex");
+    assert_eq!(seen(&codex), StartupSeen::CannotClaim, "no claim to be had");
+    running(&claude, 79, "claude");
+    let composer = f::composer("  ? for shortcuts").join("\r\n");
+    claude
+        .term
+        .lock()
+        .unwrap()
+        .process(format!("\x1b[H\x1b[2J{composer}").as_bytes());
+    assert_eq!(
+        seen(&claude),
+        StartupSeen::Started,
+        "CONTROL: a hold stops no screen"
+    );
+
+    assert!(crate::fabric::apply_hold_for_test(&codex.ctx, None));
+    assert_eq!(
+        seen(&codex),
+        StartupSeen::Holds(StartupHold::NoComposer {
+            agent: Program::Codex
+        }),
+        "lifted, it is judged again"
+    );
+}
+
 #[test]
 fn the_startup_deadline_marks_no_off_worker() {
     let w = Arc::new(StartupWorld::default());
@@ -34506,7 +34686,6 @@ fn the_startup_deadline_waits_out_a_launchers_install() {
 fn installing_hold() -> StartupHold {
     StartupHold::Installing {
         agent: Program::Codex,
-        on: Some("m22".to_string()),
     }
 }
 
@@ -34677,7 +34856,7 @@ fn a_hung_install_stalls_the_limit_after_its_work_last_moved() {
     look_at_startups(&mut books, limit, true, &none, &hooks);
     assert_eq!(w.marks(), [stalled("s-a", installing_hold())]);
     assert_eq!(
-        installing_hold().attention(),
+        installing_hold().attention_on(Some("m22")),
         "the worker never started: no Codex started on m22: its install or sign-in check has made \
          no progress for 45 minutes (its task is marked stalled why=startup)"
     );
@@ -34737,6 +34916,63 @@ fn a_store_lock_wait_with_nothing_to_show_is_no_stall() {
         w.marks(),
         [stalled("s-a", installing_hold())],
         "CONTROL: nothing to show for the whole limit"
+    );
+}
+
+/// A SIGN-IN CHECK HAS ITS LIMIT WHOLE, even where no look saw the install before it end, or read
+/// any work of it. Both read `installing` with nothing to show, so only the mark tells them apart.
+/// CONTROL: one mark that long falls at its own limit.
+#[test]
+fn an_installs_silence_never_counts_against_the_mark_after_it() {
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let none = OffSessions::default();
+    let t0 = Instant::now() + Duration::from_secs(3 * 3600);
+    let lock_wait = t0 + Duration::from_secs(29 * 60);
+    let worker = |mark: u64| Startup {
+        installing: true,
+        install_mark: mark,
+        ..startup(
+            "s-a",
+            StartupState::Working,
+            t0,
+            StartupSeen::Holds(installing_hold()),
+        )
+    };
+
+    let mut books = Startups::default();
+    w.set(vec![worker(1)]);
+    look_at_startups(&mut books, t0, true, &none, &hooks);
+    look_at_startups(&mut books, lock_wait, true, &none, &hooks);
+    w.set(vec![worker(2)]);
+    let check = lock_wait + HELD_RELOOK;
+    assert_eq!(
+        look_at_startups(&mut books, check, true, &none, &hooks),
+        Some(check + HELD_RELOOK)
+    );
+    look_at_startups(&mut books, t0 + INSTALL_QUIET_LIMIT, true, &none, &hooks);
+    look_at_startups(
+        &mut books,
+        check + INSTALL_QUIET_LIMIT - Duration::from_secs(1),
+        true,
+        &none,
+        &hooks,
+    );
+    assert!(w.marks().is_empty(), "the check's limit is whole");
+    look_at_startups(&mut books, check + INSTALL_QUIET_LIMIT, true, &none, &hooks);
+    assert_eq!(w.marks(), [stalled("s-a", installing_hold())]);
+
+    let w = Arc::new(StartupWorld::default());
+    let hooks = w.hooks();
+    let mut books = Startups::default();
+    w.set(vec![worker(1)]);
+    look_at_startups(&mut books, t0, true, &none, &hooks);
+    look_at_startups(&mut books, lock_wait, true, &none, &hooks);
+    look_at_startups(&mut books, t0 + INSTALL_QUIET_LIMIT, true, &none, &hooks);
+    assert_eq!(
+        w.marks(),
+        [stalled("s-a", installing_hold())],
+        "CONTROL: one mark, one limit"
     );
 }
 
@@ -34819,7 +35055,6 @@ fn a_hung_install_counts_only_its_own_quiet() {
 #[test]
 fn install_held_takes_only_a_shell_in_front_for_the_install() {
     let agent = Program::Claude;
-    let on = || Some("m22".to_string());
     let no_agent = StartupSeen::Holds(StartupHold::NoAgent {
         agent,
         program: Some("zsh".to_string()),
@@ -34829,13 +35064,12 @@ fn install_held_takes_only_a_shell_in_front_for_the_install() {
         program: Some("zsh".to_string()),
         drew: false,
         idle: true,
-        on: None,
     });
-    let held = StartupSeen::Holds(StartupHold::Installing { agent, on: on() });
-    assert_eq!(install_held(no_agent.clone(), true, on()), held);
-    assert_eq!(install_held(no_prompt.clone(), true, on()), held);
-    assert_eq!(install_held(no_agent.clone(), false, None), no_agent);
-    assert_eq!(install_held(no_prompt.clone(), false, None), no_prompt);
+    let held = StartupSeen::Holds(StartupHold::Installing { agent });
+    assert_eq!(install_held(no_agent.clone(), true), held);
+    assert_eq!(install_held(no_prompt.clone(), true), held);
+    assert_eq!(install_held(no_agent.clone(), false), no_agent);
+    assert_eq!(install_held(no_prompt.clone(), false), no_prompt);
     for seen in [
         StartupSeen::Started,
         StartupSeen::Unread,
@@ -34851,11 +35085,15 @@ fn install_held_takes_only_a_shell_in_front_for_the_install() {
         StartupSeen::Holds(StartupHold::Refused {
             agent,
             why: "no".to_string(),
-            on: on(),
+            word: "startup",
+        }),
+        StartupSeen::Holds(StartupHold::KeptOff {
+            agent,
+            why: "no".to_string(),
         }),
         StartupSeen::Holds(launch_held()),
     ] {
-        assert_eq!(install_held(seen.clone(), true, on()), seen);
+        assert_eq!(install_held(seen.clone(), true), seen);
     }
 
     let w = Arc::new(StartupWorld::default());
@@ -34921,6 +35159,7 @@ fn the_store_hands_the_startup_deadline_an_install_as_what_holds_the_worker() {
     let read = seen();
     assert!(read.installing);
     assert!(is_installing(&read), "short of a prompt: {:?}", read.seen);
+    let first_mark = read.install_mark;
 
     h.term
         .lock()
@@ -34928,6 +35167,10 @@ fn the_store_hands_the_startup_deadline_an_install_as_what_holds_the_worker() {
         .process(b"$ \x1b]133;A\x07\x1b]133;B\x07");
     let read = seen();
     assert!(is_installing(&read), "at a prompt: {:?}", read.seen);
+    assert_eq!(
+        read.install_mark, first_mark,
+        "one mark, however often read"
+    );
 
     installing(false);
     let read = seen();
@@ -34938,6 +35181,7 @@ fn the_store_hands_the_startup_deadline_an_install_as_what_holds_the_worker() {
     );
 
     installing(true);
+    assert_ne!(seen().install_mark, first_mark, "the next mark is another");
     let composer = f::composer("  ? for shortcuts").join("\r\n");
     h.term
         .lock()
@@ -35120,7 +35364,6 @@ fn launch_held() -> StartupHold {
         agent: Program::Codex,
         until: 1_794_170_393,
         because: "no account of its pool can take it now",
-        on: Some("m22".to_string()),
     }
 }
 
@@ -35149,7 +35392,7 @@ fn a_held_launch_stalls_at_the_startup_deadline_naming_what_holds_it() {
     look_at_startups(&mut books, t0 + STARTUP_DEADLINE, true, &none, &hooks);
     assert_eq!(w.marks(), [stalled("s-a", launch_held())]);
     assert_eq!(
-        launch_held().attention(),
+        launch_held().attention_on(Some("m22")),
         "the worker never started: no Codex started on m22: no account of its pool can take it \
          now (the first opens 2026-11-08T20:39:53Z) (its task is marked stalled why=startup)"
     );
@@ -35195,7 +35438,6 @@ fn a_hold_that_ended_leaves_its_typed_line_a_whole_deadline() {
 /// (m115). A shell at a prompt keeps the words it had, and only "no agent" is ever reworded.
 #[test]
 fn a_shell_with_no_prompt_is_named_apart_from_a_launch_that_failed() {
-    let on = || Some("m115".to_string());
     let shell = |prompt, drew, idle| Some(ShellStart { prompt, drew, idle });
     let no_prompt = |drew, idle| {
         StartupSeen::Holds(StartupHold::NoPrompt {
@@ -35203,34 +35445,29 @@ fn a_shell_with_no_prompt_is_named_apart_from_a_launch_that_failed() {
             program: Some("zsh".to_string()),
             drew,
             idle,
-            on: on(),
         })
     };
     let seen = || StartupSeen::Holds(no_agent());
     assert_eq!(
-        shell_held(seen(), shell(false, false, true), on()),
+        shell_held(seen(), shell(false, false, true)),
         no_prompt(false, true)
     );
     assert_eq!(
-        shell_held(seen(), shell(false, false, false), on()),
+        shell_held(seen(), shell(false, false, false)),
         no_prompt(false, false)
     );
     assert_eq!(
-        shell_held(seen(), shell(false, true, true), on()),
+        shell_held(seen(), shell(false, true, true)),
         no_prompt(true, true)
     );
     assert_eq!(
-        shell_held(seen(), shell(true, false, true), on()),
+        shell_held(seen(), shell(true, false, true)),
         seen(),
         "at a prompt"
     );
+    assert_eq!(shell_held(seen(), None), seen(), "CONTROL: nothing read");
     assert_eq!(
-        shell_held(seen(), None, on()),
-        seen(),
-        "CONTROL: nothing read"
-    );
-    assert_eq!(
-        shell_held(StartupSeen::Started, shell(false, false, true), on()),
+        shell_held(StartupSeen::Started, shell(false, false, true)),
         StartupSeen::Started
     );
     let trust = || {
@@ -35238,13 +35475,10 @@ fn a_shell_with_no_prompt_is_named_apart_from_a_launch_that_failed() {
             agent: Program::Claude,
         })
     };
-    assert_eq!(
-        shell_held(trust(), shell(false, false, true), on()),
-        trust()
-    );
+    assert_eq!(shell_held(trust(), shell(false, false, true)), trust());
 
     let words = |seen| match seen {
-        StartupSeen::Holds(hold) => hold.attention(),
+        StartupSeen::Holds(hold) => hold.attention_on(Some("m115")),
         other => panic!("{other:?}"),
     };
     assert_eq!(
@@ -35277,31 +35511,43 @@ fn a_stalls_longest_words_fit_an_attention_entry() {
         Program::Generic,
     ] {
         let holds = [
+            StartupHold::Trust { agent },
+            StartupHold::Box {
+                agent,
+                title: wide.clone(),
+            },
+            StartupHold::NoComposer { agent },
+            StartupHold::NoAgent {
+                agent,
+                program: Some(wide.clone()),
+            },
+            StartupHold::KeptOff {
+                agent,
+                why: wide.repeat(4),
+            },
             StartupHold::LaunchHeld {
                 agent,
                 until: i64::MAX,
                 because: "no account of its pool can take it now",
-                on: Some(wide.clone()),
             },
-            StartupHold::Installing {
-                agent,
-                on: Some(wide.clone()),
-            },
+            StartupHold::Installing { agent },
             StartupHold::NoPrompt {
                 agent,
                 program: Some(wide.clone()),
                 drew: false,
                 idle: true,
-                on: Some(wide.clone()),
             },
             StartupHold::Refused {
                 agent,
                 why: wide.repeat(4),
-                on: Some(wide.clone()),
+                word: crate::task_record::WHY_INSTALL,
+            },
+            StartupHold::Asked {
+                text: wide.repeat(4),
             },
         ];
         for hold in holds {
-            let words = hold.attention();
+            let words = hold.attention_on(Some(&wide));
             assert!(words.len() <= cap, "{} bytes: {words}", words.len());
             assert!(words.starts_with(STARTUP_HEAD), "{words}");
         }
@@ -35316,9 +35562,9 @@ fn a_refused_launch_names_its_cause_and_member_and_no_address() {
     let words = StartupHold::Refused {
         agent: Program::Codex,
         why: "the default login names other@example.test: `aterm ai login codex` signs".to_owned(),
-        on: Some("m22".to_owned()),
+        word: "startup",
     }
-    .attention();
+    .attention_on(Some("m22"));
     assert!(words.contains("on m22:"), "{words}");
     assert!(
         words.contains("the default login names another account:"),
@@ -35329,6 +35575,296 @@ fn a_refused_launch_names_its_cause_and_member_and_no_address() {
         words.ends_with("(its task is marked stalled why=startup)"),
         "{words}"
     );
+}
+
+/// A REFUSAL THAT RUNS LONG KEEPS ITS FIRST CLAUSE WHOLE, the cause and what mends it, so its bound
+/// never cuts the command a person needs. NEGATIVE CONTROL: before, the bound cut every refusal's
+/// head, whose first words were its explanation. CONTROL: one that fits is whole, and a clause too
+/// long for the room is still bounded.
+#[test]
+fn a_long_refusal_keeps_what_mends_it_within_its_bound() {
+    let mends = "only `main` runs this Codex, signed out: `aterm ai login codex`";
+    let words = |why: String| {
+        StartupHold::Refused {
+            agent: Program::Codex,
+            why,
+            word: "startup",
+        }
+        .attention_on(Some("m22"))
+    };
+    let said = words(format!(
+        "{mends}; {}",
+        "the explanation runs on ".repeat(20)
+    ));
+    assert_eq!(
+        said,
+        format!(
+            "{STARTUP_HEAD}no Codex started on m22: {mends} (its task is marked stalled \
+             why=startup)"
+        )
+    );
+    let fits = "short; and whole";
+    assert!(words(fits.to_owned()).contains(fits), "CONTROL: it fits");
+    let cut = words("x".repeat(400));
+    assert!(cut.contains('…'), "{cut}");
+    assert!(cut.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
+}
+
+/// A LONG LABEL LEAVES THE COMMAND WHOLE IN THE STALL ITSELF, on the real words of a refused pin
+/// and of a row that alone runs this Codex. NEGATIVE CONTROL: before, the clause ran past the
+/// attention's room and its command lost its end. CONTROL: the label's start still names the row.
+#[test]
+fn a_long_label_leaves_the_refusals_command_whole_in_its_stall() {
+    use aterm_agent::harness::codex_alab::{
+        AuthPathUnread, DefaultRow, only_default, only_default_pinned, unpin_fix,
+    };
+    let why = AuthPathUnread::Older(std::path::PathBuf::from("/opt/codex-alab/bin/codex"));
+    let label = "a-row-label-longer-than-any-room";
+    let words = |why: String| {
+        StartupHold::Refused {
+            agent: Program::Codex,
+            why,
+            word: "startup",
+        }
+        .attention_on(Some("m22"))
+    };
+    let pinned = words(only_default_pinned(&why, label, &DefaultRow::Unlisted));
+    assert!(
+        pinned.contains(&format!("`{}`", unpin_fix())),
+        "the pin's end: {pinned}"
+    );
+    assert!(pinned.contains("`a-row-label-"), "CONTROL: {pinned}");
+    let serves = words(only_default(
+        &why,
+        None,
+        &DefaultRow::Serves(label.to_owned()),
+    ));
+    assert!(
+        serves.contains("`aterm harness accounts --cli codex` lists it"),
+        "the listing: {serves}"
+    );
+    assert!(serves.contains("`a-row-label-"), "CONTROL: {serves}");
+}
+
+/// A FAILED INSTALL'S STALL NAMES WHAT COULD NOT BE REACHED, from atpkg's real stderr lines for an
+/// index it could not reach (`crates/atpkg/src/cli.rs`). NEGATIVE CONTROL: before, it held only
+/// atpkg's re-run line, itself cut.
+#[test]
+fn a_failed_installs_stall_names_what_could_not_be_reached() {
+    let refused = aterm_agent::harness::worker::Refused::Program(
+        "atpkg's install of claude failed: atpkg: install claude failed: could not reach the \
+         toolchain index: network down | atpkg:   when the connection is back, re-run: aterm pkg \
+         install claude"
+            .to_owned(),
+    );
+    let words = StartupHold::Refused {
+        agent: Program::Claude,
+        why: refused.short(),
+        word: "install",
+    }
+    .attention_on(Some("m22"));
+    assert_eq!(
+        words,
+        format!(
+            "{STARTUP_HEAD}no Claude Code started on m22: install failed: could not reach the \
+             toolchain index: network down (its task is marked stalled why=install)"
+        )
+    );
+}
+
+/// EVERY STALL NAMES ITS MEMBER where its label is known, so a dispatcher can keep that program off
+/// that member whichever hold stopped it. NEGATIVE CONTROL: before, only three of them did.
+/// CONTROL: with no label, none is named.
+#[test]
+fn every_hold_names_its_member() {
+    let agent = Program::Codex;
+    let zsh = || Some("zsh".to_owned());
+    for hold in [
+        StartupHold::Trust { agent },
+        StartupHold::Box {
+            agent,
+            title: "Log in".to_owned(),
+        },
+        StartupHold::NoComposer { agent },
+        StartupHold::NoComposer {
+            agent: Program::Claude,
+        },
+        StartupHold::NoAgent {
+            agent,
+            program: zsh(),
+        },
+        StartupHold::NoAgent {
+            agent,
+            program: None,
+        },
+        StartupHold::KeptOff {
+            agent,
+            why: "no".to_owned(),
+        },
+        installing_hold(),
+        launch_held(),
+        StartupHold::NoPrompt {
+            agent,
+            program: zsh(),
+            drew: false,
+            idle: true,
+        },
+        StartupHold::Refused {
+            agent,
+            why: "no".to_owned(),
+            word: "startup",
+        },
+        StartupHold::Asked {
+            text: "sign in".to_owned(),
+        },
+    ] {
+        let words = hold.attention_on(Some("m22"));
+        assert!(words.contains("on m22"), "{words}");
+        assert!(words.starts_with(STARTUP_HEAD), "{words}");
+        assert!(!hold.attention_on(None).contains("m22"), "CONTROL: {words}");
+    }
+}
+
+/// The deadline's mark reads this Mac's label and raises its stall naming it, whichever hold it
+/// stalls on, Trust's included, which held no label of its own.
+#[test]
+fn a_deadlines_stall_names_the_member_it_was_marked_on() {
+    use crate::task_record::{TaskMark, TaskState};
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(3);
+    h.ctx.timeline.lock().unwrap().mark_task(
+        &TaskMark::new(TaskState::Working),
+        false,
+        Instant::now(),
+        0,
+    );
+    store.write().unwrap().register(h.clone());
+    let hold = StartupHold::Trust {
+        agent: Program::Claude,
+    };
+    startup_mark_named(
+        &store,
+        h.sid.as_str(),
+        &StartupMark::Stalled { hold: &hold },
+        || Some("m22".to_owned()),
+    )
+    .expect("marked");
+    let standing = h
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .attention_owners
+        .get(ATTENTION_OWNER)
+        .map(str::to_string);
+    assert_eq!(
+        standing.as_deref(),
+        Some(
+            "the worker never started: on m22, Claude Code's folder-trust dialog stands on its \
+             screen (its task is marked stalled why=startup)"
+        )
+    );
+}
+
+/// A PROGRAM ATPKG KEEPS OFF THIS MAC NAMES WHY in its stall: the line typed could run only a copy
+/// of the shell's own, and the reason is what a dispatcher mends or places around. NEGATIVE
+/// CONTROL: before, it read "`zsh` holds the tab", the reason only in the launch's note. CONTROL:
+/// with no such reason it reads as before, and a copy of the shell's own that did start reads as
+/// itself.
+#[test]
+fn a_program_atpkg_keeps_off_names_why_in_its_stall() {
+    use crate::task_record::{TaskMark, TaskState};
+    let why = "`[packages] exclude` in aterm.toml names it";
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(3);
+    h.ctx.timeline.lock().unwrap().mark_task(
+        &TaskMark::new(TaskState::Working),
+        false,
+        Instant::now(),
+        0,
+    );
+    store.write().unwrap().register(h.clone());
+    h.term
+        .lock()
+        .unwrap()
+        .process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    let seen = || {
+        startups_of(&store, &std::collections::HashSet::new())
+            .into_iter()
+            .find(|w| w.sid == h.sid.as_str())
+            .expect("listed")
+            .seen
+    };
+    assert!(
+        matches!(seen(), StartupSeen::Holds(StartupHold::NoAgent { .. })),
+        "CONTROL: no reason known: {:?}",
+        seen()
+    );
+    h.ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .set_worker_kept_off(Some(why.to_owned()));
+    let StartupSeen::Holds(hold) = seen() else {
+        panic!("{:?}", seen());
+    };
+    assert_eq!(
+        hold,
+        StartupHold::KeptOff {
+            agent: Program::Claude,
+            why: why.to_owned(),
+        }
+    );
+    assert_eq!(
+        hold.attention_on(Some("m22")),
+        "the worker never started: no Claude Code started on m22: atpkg keeps it off: \
+         `[packages] exclude` in aterm.toml names it (its task is marked stalled why=startup)"
+    );
+    assert_eq!(
+        kept_off_held(StartupSeen::Started, Some(why.to_owned())),
+        StartupSeen::Started,
+        "CONTROL: a copy of the shell's own started"
+    );
+}
+
+/// ANOTHER PROGRAM HOLDING THE TAB IS NO KEPT-OFF PROGRAM: a dispatcher is told what holds the tab,
+/// not sent to mend a package policy. NEGATIVE CONTROL: before, every `NoAgent` read as kept off,
+/// whatever its program. CONTROL: a shell in front, a login shell's name or no program published
+/// reads as kept off.
+#[test]
+fn a_program_holding_the_tab_is_not_read_as_kept_off() {
+    let why = "`[packages] exclude` in aterm.toml names it";
+    let agent = Program::Claude;
+    let no_agent = |program: Option<&str>| {
+        StartupSeen::Holds(StartupHold::NoAgent {
+            agent,
+            program: program.map(str::to_owned),
+        })
+    };
+    let kept_off = StartupSeen::Holds(StartupHold::KeptOff {
+        agent,
+        why: why.to_owned(),
+    });
+    for program in ["docker", "make", "vim"] {
+        let held = kept_off_held(no_agent(Some(program)), Some(why.to_owned()));
+        assert_eq!(held, no_agent(Some(program)));
+        let StartupSeen::Holds(hold) = held else {
+            panic!("{held:?}");
+        };
+        let words = hold.attention_on(Some("m22"));
+        assert!(
+            words.contains(&format!("`{program}` holds the tab")),
+            "{words}"
+        );
+        assert!(!words.contains("atpkg keeps it off"), "{words}");
+    }
+    for program in [Some("zsh"), Some("-zsh"), None] {
+        assert_eq!(
+            kept_off_held(no_agent(program), Some(why.to_owned())),
+            kept_off,
+            "CONTROL: {program:?}"
+        );
+    }
 }
 
 /// A label found is kept, and none is never kept: a read can find none because another process
@@ -36470,7 +37006,7 @@ fn the_startup_marks_land_only_on_the_record_the_look_read() {
             .map(str::to_string)
     };
     let mark = |m: &StartupMark<'_>| {
-        startup_mark_with(&store, &sid, m).map(|(local, marked)| {
+        startup_mark_nameless(&store, &sid, m).map(|(local, marked)| {
             assert_eq!(local, h.local_id);
             marked
         })
@@ -36588,7 +37124,7 @@ fn the_held_marks_are_one_edge_and_land_only_on_the_record_the_look_read() {
             .get(ATTENTION_OWNER)
             .map(str::to_string)
     };
-    let mark = |m: &StartupMark<'_>| startup_mark_with(&store, &sid, m);
+    let mark = |m: &StartupMark<'_>| startup_mark_nameless(&store, &sid, m);
     let read = held_at("unknown", Progress::default());
     let held = StartupMark::Held {
         read: &read,
@@ -36786,8 +37322,79 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
     );
 }
 
+/// A LAUNCHER'S OWN STALL KEEPS THE WORDS IT RAISED: `why=install` and `why=signin` carry their
+/// cause in a startup stall's words, and the next look takes neither for a stall that is over.
+/// NEGATIVE CONTROL: with no arm for them, a look reads the deadline's attention on a record no
+/// deadline stalled, and takes the cause down. CONTROL: once the record moves on they come down.
+#[test]
+fn a_launchers_install_or_sign_in_stall_keeps_its_attention() {
+    use crate::session_timeline::{MetaEdit, write_attention_owned};
+    use crate::task_record::{TaskMark, TaskState};
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(3);
+    store.write().unwrap().register(h.clone());
+    let sid = h.sid.as_str().to_string();
+    let standing = || {
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(ATTENTION_OWNER)
+            .map(str::to_string)
+    };
+    let read = || {
+        startups_of(&store, &std::collections::HashSet::new())
+            .into_iter()
+            .find(|w| w.sid == sid)
+            .expect("listed")
+            .state
+    };
+    let mark = |state: TaskState, why: Option<&'static str>| {
+        let mut mark = TaskMark::new(state);
+        mark.why = why;
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .mark_task(&mark, false, Instant::now(), 0);
+    };
+    for why in [
+        crate::task_record::WHY_INSTALL,
+        crate::task_record::WHY_SIGNIN,
+    ] {
+        let words = StartupHold::Refused {
+            agent: Program::Codex,
+            why: "the cause".to_owned(),
+            word: why,
+        }
+        .attention_on(Some("m22"));
+        mark(TaskState::Stalled, Some(why));
+        write_attention_owned(
+            &h.ctx,
+            ATTENTION_OWNER,
+            MetaEdit::Set(&words),
+            aterm_slog::Actor::Harness,
+        )
+        .expect("written");
+        assert_eq!(read(), StartupState::Other, "{why}");
+        assert!(
+            startup_mark_nameless(&store, &sid, &StartupMark::Over).is_none(),
+            "{why}"
+        );
+        assert_eq!(standing().as_deref(), Some(words.as_str()), "{why}");
+
+        mark(TaskState::Done, Some("marker"));
+        assert_eq!(read(), StartupState::StallOver, "CONTROL: {why}");
+        let (_, over) = startup_mark_nameless(&store, &sid, &StartupMark::Over).expect("over");
+        assert!(over.attention_moved, "CONTROL: {why}");
+        assert_eq!(standing(), None, "CONTROL: {why}");
+    }
+}
+
 /// A screen that reads as started starts no codex worker no claim carries, and under a halt or
-/// Autopilot off a codex worker's screen is not judged at all.
+/// Autopilot off a program in front of a codex worker is not judged at all. A shell in front is:
+/// no halt keeps a shell from its prompt, so it stands as any worker's does.
 #[test]
 fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     let trust = StartupSeen::Holds(StartupHold::Trust {
@@ -36812,10 +37419,37 @@ fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     assert_eq!(
         (
             unclaimed(trust.clone(), Some(Program::Codex), false, None),
+            unclaimed(StartupSeen::Started, Some(Program::Codex), false, None),
             unclaimed(StartupSeen::Started, Some(Program::Claude), false, None),
         ),
-        (StartupSeen::Unread, StartupSeen::Started),
+        (
+            StartupSeen::CannotClaim,
+            StartupSeen::CannotClaim,
+            StartupSeen::Started
+        ),
         "a halt or Autopilot off: no codex start judged, every other worker's as read"
+    );
+    let no_agent = |program: Option<&str>| {
+        StartupSeen::Holds(StartupHold::NoAgent {
+            agent: Program::Codex,
+            program: program.map(str::to_string),
+        })
+    };
+    for shell in [
+        no_agent(Some("zsh")),
+        no_agent(Some("-fish")),
+        no_agent(None),
+    ] {
+        assert_eq!(
+            unclaimed(shell.clone(), Some(Program::Codex), false, None),
+            shell,
+            "a shell in front is judged, held or not"
+        );
+    }
+    assert_eq!(
+        unclaimed(no_agent(Some("node")), Some(Program::Codex), false, None),
+        StartupSeen::CannotClaim,
+        "a program the line may have started is no shell"
     );
 }
 
@@ -36839,6 +37473,23 @@ fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
     assert!(restates(Some(&quote), &bare), "codex-alab's words went");
     assert!(restates(Some(&bare.attention()), &asked), "they came");
     assert!(!restates(Some(&quote), &asked), "CONTROL: the quote holds");
+    let named = asked.attention_on(Some("m22"));
+    assert!(
+        !restates(Some(&named), &asked),
+        "a quote raised naming its member holds"
+    );
+    assert!(restates(Some(&named), &bare), "its words went");
+    let long = StartupHold::Asked {
+        text: "login: ".repeat(60),
+    };
+    assert!(
+        !restates(Some(&long.attention_on(Some("m22"))), &long),
+        "a quote cut for the member's room holds"
+    );
+    let moved = StartupHold::Asked {
+        text: "trust: not trusted yet".to_string(),
+    };
+    assert!(restates(Some(&named), &moved), "its quote moved");
     assert!(
         !restates(Some(&trust.attention()), &bare),
         "CONTROL: a stall that never quoted codex-alab keeps its words"
@@ -36902,7 +37553,7 @@ fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
     };
     let restated = StartupMark::Restated { hold: &bare };
     set(TaskState::Stalled, Some("startup"), &quote);
-    let (_, marked) = startup_mark_with(&store, &sid, &restated).expect("restated");
+    let (_, marked) = startup_mark_nameless(&store, &sid, &restated).expect("restated");
     assert!(marked.attention_moved);
     assert_eq!(standing(), Some(bare.attention()));
     let record = marked.record.expect("the record");
@@ -36916,7 +37567,7 @@ fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
         (TaskState::Stalled, Some("startup"), "a person's own words"),
     ] {
         set(state, why, entry);
-        assert!(startup_mark_with(&store, &sid, &restated).is_none());
+        assert!(startup_mark_nameless(&store, &sid, &restated).is_none());
         assert_eq!(standing().as_deref(), Some(entry), "CONTROL: left alone");
     }
 }
@@ -36980,7 +37631,7 @@ fn a_codex_alab_startup_screen_is_named_by_its_own_attention() {
                 Some(asked)
             ),
         ),
-        (shell, StartupSeen::Unread, StartupSeen::Started),
+        (shell, StartupSeen::CannotClaim, StartupSeen::Started),
         "CONTROLS: codex-alab gone, codex-alab may not claim, another worker"
     );
     let long = format!("{asked} {}", "and more ".repeat(30));
@@ -37045,7 +37696,7 @@ fn a_codex_alab_startup_screen_is_named_by_its_own_attention() {
         panic!("a hold");
     };
     assert_eq!(StartupSeen::Holds(hold.clone()), named);
-    let (_, marked) = startup_mark_with(
+    let (_, marked) = startup_mark_nameless(
         &store,
         worker.sid.as_str(),
         &StartupMark::Stalled { hold: &hold },
@@ -37152,7 +37803,7 @@ fn a_codex_worker_its_proven_claim_carries_is_started_and_never_held() {
         .set("autopilot", Some("off".into()));
     assert_eq!(
         read().1,
-        StartupSeen::Unread,
+        StartupSeen::CannotClaim,
         "Autopilot off: codex-alab may not claim, so nothing is judged"
     );
     worker
@@ -38267,27 +38918,48 @@ fn an_unnamed_conversations_upgrade_wait_climbs_its_ladder() {
             step: Arc::new(|_, _, _| "wait:failed".to_string()),
             ..Acts::inert()
         };
-        hooks.pause = Arc::new(|d| d);
+        // Each pause the host asks for, as asked. A rung is read off its ask, never off the clock: a
+        // look measured from before the call also carries however long the call ran.
+        let asked: Arc<Mutex<Vec<Duration>>> = Arc::default();
+        let seen = Arc::clone(&asked);
+        hooks.pause = Arc::new(move |pause| {
+            seen.lock().unwrap().push(pause);
+            pause
+        });
         let idle = idle_of(hooks, Program::Claude, session);
-        let mut looks = Vec::new();
+        let mut rungs = Vec::new();
         for _ in 0..4 {
+            asked.lock().unwrap().clear();
             let before = Instant::now();
             let step = idle.at_idle().expect("the upgrade's wait is a step");
+            let after = Instant::now();
             assert_eq!(step.line, "upgrade step=wait:failed", "named={named}");
             let look = idle.wants_at().expect("a look after a wait");
-            looks.push(look.saturating_duration_since(before).as_secs());
+            let rung = *asked
+                .lock()
+                .unwrap()
+                .last()
+                .expect("the look's pause was asked");
+            // The look is its rung on from an instant inside the call, however long the call ran.
+            assert!(
+                before + rung <= look && look <= after + rung,
+                "named={named}: the look kept is {:?} on from the call's start, not the last rung \
+                 asked ({rung:?}) on from an instant inside it",
+                look.saturating_duration_since(before)
+            );
+            rungs.push(rung);
             *idle.look_at.lock().unwrap() = None;
         }
         assert_eq!(
-            looks[0],
-            upgrade_drive::first_look().as_secs(),
+            rungs[0],
+            upgrade_drive::first_look(),
             "named={named}: the first rung is the settle's"
         );
         assert!(
-            looks.windows(2).all(|w| w[0] < w[1]),
-            "named={named}: the wait climbs its ladder: {looks:?}"
+            rungs.windows(2).all(|w| w[0] < w[1]),
+            "named={named}: the wait climbs its ladder: {rungs:?}"
         );
-        ladders.push(looks);
+        ladders.push(rungs);
     }
     assert_eq!(ladders[0], ladders[1], "CONTROL: as a named conversation's");
 }
@@ -43183,13 +43855,15 @@ fn a_deadlines_task_line_names_its_mark_never_its_attention() {
             read: &read,
             held_for: Duration::from_secs(125),
         };
-        startup_mark_with(&store, &sid, &held).expect("held");
+        startup_mark_nameless(&store, &sid, &held).expect("held");
         raised.push(standing());
-        startup_mark_with(&store, &sid, &StartupMark::Moved).expect("moved");
+        startup_mark_nameless(&store, &sid, &StartupMark::Moved).expect("moved");
         set(TaskState::Working, None);
-        startup_mark_with(&store, &sid, &StartupMark::Stalled { hold: &asked }).expect("stalled");
+        startup_mark_nameless(&store, &sid, &StartupMark::Stalled { hold: &asked })
+            .expect("stalled");
         raised.push(standing());
-        startup_mark_with(&store, &sid, &StartupMark::Restated { hold: &again }).expect("restated");
+        startup_mark_nameless(&store, &sid, &StartupMark::Restated { hold: &again })
+            .expect("restated");
         raised.push(standing());
     });
     for (said, plant) in raised.iter().zip(["QZP7WORD7", "QZP7WORD8", "QZP7WORD8"]) {

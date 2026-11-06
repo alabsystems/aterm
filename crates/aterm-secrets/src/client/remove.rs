@@ -1078,41 +1078,57 @@ fn draft_removal(
             }
         }
     }
+    let denies = log_entries::Denies::read(paths, &log, &opened, None)?;
     let authored_ms = aterm_time::unix_millis().unwrap_or(0);
     let mut minted = Vec::new();
-    let rotated = device.with_seed(|writer_seed| -> crate::Result<Vec<String>> {
-        for (seat_actor, seat_cutoff) in seats_to_remove {
-            let remove = log
-                .draft(
-                    &actor,
+    let rotated = device.with_seed(
+        |writer_seed| -> crate::Result<Result<Vec<String>, Vec<EpochAudience>>> {
+            for (seat_actor, seat_cutoff) in seats_to_remove {
+                let remove = log
+                    .draft(
+                        &actor,
+                        authored_ms,
+                        Body::Remove {
+                            member: seat_actor,
+                            cutoff: seat_cutoff,
+                        },
+                    )
+                    .sign(writer_seed, incarnation)?;
+                let _ = log.insert(remove.clone())?;
+                minted.push(remove);
+            }
+            // The guard (one-mesh proofs P2): a removal that leaves a newest `[everyone]` or Commons
+            // epoch with no current holder, which this Mac cannot re-key, is refused. A stolen Mac is
+            // removed whatever it strands: keeping it in is worse, and `commons restore` re-keys.
+            let stranded = log_entries::stranded_audiences(&log, &opened);
+            if !stolen && !stranded.is_empty() {
+                return Ok(Err(stranded));
+            }
+            log_entries::rotate_after_removal(
+                &mut log,
+                &opened,
+                &AuthorCtx {
+                    actor: &actor,
+                    writer_seed,
+                    incarnation,
                     authored_ms,
-                    Body::Remove {
-                        member: seat_actor,
-                        cutoff: seat_cutoff,
-                    },
-                )
-                .sign(writer_seed, incarnation)?;
-            let _ = log.insert(remove.clone())?;
-            minted.push(remove);
-        }
-        log_entries::rotate_after_removal(
-            &mut log,
-            &opened,
-            &AuthorCtx {
-                actor: &actor,
-                writer_seed,
-                incarnation,
-                authored_ms,
-            },
-            &BTreeSet::new(),
-            &Rotation {
-                everyone: Some(&everyone),
-                hosts: true,
-                fold,
-            },
-            &mut minted,
-        )
-    })?;
+                },
+                &BTreeSet::new(),
+                &Rotation {
+                    everyone: Some(&everyone),
+                    hosts: true,
+                    fold,
+                },
+                &denies,
+                &mut minted,
+            )
+            .map(Ok)
+        },
+    )?;
+    let rotated = match rotated {
+        Ok(rotated) => rotated,
+        Err(stranded) => return refuse(Error::new(strands_refusal(&label, &stranded))),
+    };
     Ok((
         minted,
         Ok(MemberRemoval {
@@ -1125,6 +1141,24 @@ fn draft_removal(
             envelope_notes: Vec::new(),
         }),
     ))
+}
+
+/// The refusal of a removal that would strand `stranded` (`remove_member`'s guard).
+fn strands_refusal(label: &str, stranded: &[EpochAudience]) -> String {
+    let names: Vec<&str> = stranded
+        .iter()
+        .map(|audience| match audience {
+            EpochAudience::Everyone => "[everyone]",
+            EpochAudience::Commons => "Commons",
+            EpochAudience::Hosts(_) => "a host list",
+        })
+        .collect();
+    format!(
+        "removing {label} would leave the vault's newest {} key with no current Mac holding it, \
+         and this Mac does not hold it to re-key it: remove {label} from a Mac that holds the \
+         newest keys, or let the vault pass heal this Mac in first",
+        names.join(" and ")
+    )
 }
 
 /// How a removal's own batch re-keys an audience the removed Mac may be in ([`RemovalFill`]).
@@ -2894,6 +2928,7 @@ fn tend_ready_epochs_by(
         let Some(opened) = log.open_audience_entries(identity)? else {
             return Ok((Vec::new(), false));
         };
+        let denies = log_entries::Denies::read(paths, &log, &opened, None)?;
         // Read before the first epoch this pass mints, as `opened` was.
         let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
         let still = within_automatic_stop(&log, &opened, &flight, &active, still);
@@ -2917,6 +2952,7 @@ fn tend_ready_epochs_by(
                 &flight,
                 &author,
                 &active,
+                &denies,
                 &mut minted,
                 &still,
             )?;
@@ -2926,6 +2962,7 @@ fn tend_ready_epochs_by(
                 &flight,
                 &author,
                 &BTreeSet::new(),
+                &denies,
                 &mut minted,
                 Some(&still),
             )

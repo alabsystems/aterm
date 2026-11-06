@@ -503,24 +503,31 @@ impl<S: Schema> EventLog<S> {
 
     /// The log's bytes, ending in its seal ([`LogFault::TooLarge`]).
     pub fn encode(&self, schema: &S) -> Result<Vec<u8>, LogFault> {
-        let mut out = Vec::with_capacity(self.inputs.len().saturating_add(2).saturating_mul(64));
+        Self::encode_inputs(schema, &self.header, self.broken.is_some(), &self.inputs)
+    }
+
+    /// Encodes `header` and `inputs` into a sealed log without cloning `inputs` into an [`EventLog`].
+    pub fn encode_inputs(
+        schema: &S,
+        header: &LogHeader,
+        broken: bool,
+        inputs: &[S::Input],
+    ) -> Result<Vec<u8>, LogFault> {
+        let mut out = Vec::with_capacity(inputs.len().saturating_add(2).saturating_mul(64));
         let mut body = Enc::with_capacity(320);
         body.u8(RECORD_VERSION);
         body.u8(KIND_HEADER);
         body.raw(&LOG_MAGIC);
-        body.identity(&self.header.identity);
-        body.u64(self.header.log_epoch);
-        body.u64(self.header.first_cursor);
-        body.digest(&self.header.ancestor);
-        body.bool(self.broken.is_some());
+        body.identity(&header.identity);
+        body.u64(header.log_epoch);
+        body.u64(header.first_cursor);
+        body.digest(&header.ancestor);
+        body.bool(broken);
         put_record(&mut out, 0, body.as_bytes())?;
-        let mut seal_hasher = Self::trace_hasher(
-            schema,
-            &self.header,
-            self.header.first_cursor,
-            self.end_cursor(),
-        );
-        for (k, i) in self.inputs.iter().enumerate() {
+        let n = len_u64(inputs.len());
+        let end_cursor = header.first_cursor.saturating_add(n);
+        let mut seal_hasher = Self::trace_hasher(schema, header, header.first_cursor, end_cursor);
+        for (k, i) in inputs.iter().enumerate() {
             let step = len_u64(k).saturating_add(1);
             body.clear();
             body.u8(RECORD_VERSION);
@@ -529,7 +536,6 @@ impl<S: Schema> EventLog<S> {
             seal_hasher.part(&body.as_bytes()[2..]);
             put_record(&mut out, step, body.as_bytes())?;
         }
-        let n = len_u64(self.inputs.len());
         body.clear();
         body.u8(RECORD_VERSION);
         body.u8(KIND_SEAL);

@@ -245,7 +245,7 @@ fn validate(key: &str, value: &Value) -> Result<()> {
         column(&row["email_column"])?;
         if !row["email"].is_null() {
             let email = field(row, "email")?;
-            crate::contacts::validate("email-addresses", &json!({"address":email}))?;
+            crate::contacts::validate_email_address(email)?;
         }
         if !row["machine_column"].is_null() {
             column(&row["machine_column"])?;

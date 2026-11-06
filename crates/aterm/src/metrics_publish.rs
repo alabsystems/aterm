@@ -766,8 +766,8 @@ impl Shown {
                             .insert(key, (record.revision(), record.summary().clone()));
                     }
                 }
-                Ok(row) => {
-                    if let Some(timeless) = timeless(&row) {
+                Ok(mut row) => {
+                    if let Some(timeless) = timeless(&mut row) {
                         shown.rows.insert(parsed, timeless);
                     }
                 }
@@ -847,17 +847,25 @@ impl Shown {
 }
 
 /// `row`'s encoding with its `at` cleared: what change detection compares.
-fn timeless(row: &Row) -> Option<Vec<u8>> {
-    let mut row = row.clone();
-    match &mut row {
-        Row::Quota(r) => r.at = 0,
-        Row::Agy(r) => r.at = 0,
-        Row::Place(r) => r.at = 0,
-        Row::Needs(r) => r.at = 0,
-        Row::Unread(r) => r.at = 0,
+fn timeless(row: &mut Row) -> Option<Vec<u8>> {
+    let at = match row {
+        Row::Quota(r) => std::mem::replace(&mut r.at, 0),
+        Row::Agy(r) => std::mem::replace(&mut r.at, 0),
+        Row::Place(r) => std::mem::replace(&mut r.at, 0),
+        Row::Needs(r) => std::mem::replace(&mut r.at, 0),
+        Row::Unread(r) => std::mem::replace(&mut r.at, 0),
         Row::Window(_) => return None,
+    };
+    let encoded = row.encode();
+    match row {
+        Row::Quota(r) => r.at = at,
+        Row::Agy(r) => r.at = at,
+        Row::Place(r) => r.at = at,
+        Row::Needs(r) => r.at = at,
+        Row::Unread(r) => r.at = at,
+        Row::Window(_) => {}
     }
-    Some(row.encode())
+    Some(encoded)
 }
 
 /// Whether a row that is not on the log reads as `row`: an empty needs or unread row says what
@@ -1034,15 +1042,18 @@ impl Publisher {
         #[cfg(not(any(test, debug_assertions)))]
         let every = false;
         let mut named = BTreeSet::new();
-        for (subject, row) in &rows {
-            let Some(timeless) = timeless(row) else {
+        for (subject, row) in &mut rows {
+            if matches!(row, Row::Window(_)) {
                 continue;
-            };
+            }
             // One row a subject, the first: a second (two account rows on one key) would publish
             // over it on every pass.
             if !named.insert(*subject) {
                 continue;
             }
+            let Some(timeless) = timeless(row) else {
+                continue;
+            };
             let same = match shown.rows.get(subject) {
                 Some(was) => *was == timeless,
                 None => absent_reads_as(row),
@@ -1230,8 +1241,14 @@ fn quota_row(cli: Cli, account: &SurveyAccount, book: &BookFacts, now: u64) -> O
         enrolled: account.enrolled,
         pct5: pct(account.five_hour_pct),
         pct7: pct(account.seven_day_pct),
-        five_hour_reset: secs(account.five_hour_reset),
-        week_reset: secs(account.week_reset),
+        // A bound no read named is no reset: `merge::usage` takes a window's identity from this
+        // field, and holds a figure with none to its one-window rule.
+        five_hour_reset: secs(
+            account
+                .five_hour_reset
+                .filter(|_| account.five_hour_reset_named),
+        ),
+        week_reset: secs(account.week_reset.filter(|_| account.week_reset_named)),
         walled_until: match account.condition {
             Condition::Limited { until } => secs(Some(until)),
             _ => None,
@@ -1257,7 +1274,15 @@ fn plan_word(account: &SurveyAccount) -> Option<Word> {
     account
         .plan_tier
         .as_deref()
-        .and_then(|tier| Word::new(&format!("{word}-{tier}")))
+        .and_then(|tier| {
+            let mut joined = [0u8; 32];
+            let need = word.len().checked_add(1)?.checked_add(tier.len())?;
+            let slice = joined.get_mut(..need)?;
+            slice[..word.len()].copy_from_slice(word.as_bytes());
+            slice[word.len()] = b'-';
+            slice[word.len() + 1..].copy_from_slice(tier.as_bytes());
+            Word::new(std::str::from_utf8(slice).ok()?)
+        })
         .or_else(|| Word::new(word))
 }
 

@@ -112,9 +112,7 @@ impl Grid {
         let Some(first) = (0..rows).find(|&r| self.row(r).is_some()) else {
             return;
         };
-        self.storage
-            .extras
-            .clear_rows_retaining_capacity(first..rows);
+        let retained_images = self.storage.extras.prepare_rows_for_restore(first..rows);
         for r in first..rows {
             match visible.get(r as usize) {
                 Some(line) => self.fill_row_from_line_cleared(r, line, cols),
@@ -124,6 +122,9 @@ impl Grid {
                     }
                 }
             }
+        }
+        if retained_images {
+            self.storage.extras.finish_rows_restore();
         }
         self.storage.extras.maybe_shrink();
     }

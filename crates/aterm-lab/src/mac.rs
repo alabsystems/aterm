@@ -2,10 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! Disposable macOS guest VM lane via `tart` ([`IMAGE`], [`ROW`]): `dmg` (the disk-image
-//! acceptance), `nux` (the first-run measurements, [`crate::mac_nux`]) and `clean`.
+//! acceptance), `nux` (the first-run measurements, [`crate::mac_nux`]), `runtime`
+//! (release-product measurements, [`crate::mac_runtime`]) and `clean`.
 //!
 //! A run clones the prepared base of its image ([`base_name`]: the image with SIP turned on,
-//! made once by the first run that needs it and kept stopped), boots it with no window and
+//! made once by the first run that needs it and kept stopped), boots it headless except for
+//! runtime's requested display, and
 //! drives it only through `tart exec`, never a connection to the guest's address. tart is
 //! Homebrew's, `$LAB_TART`, or [`TART_VERSION`] fetched into `~/Library/Caches/aterm/mac-lane`
 //! ([`fetch_tart`]).
@@ -134,9 +136,14 @@ pub fn cmd_mac(args: &[String]) -> Res {
     match args.first().map(String::as_str) {
         Some("dmg") => cmd_dmg(&args[1..]),
         Some("nux") => crate::mac_nux::cmd_nux(&args[1..]),
+        Some("runtime") => crate::mac_runtime::run(&args[1..]),
         Some("clean") => cmd_clean(&args[1..]),
         None | Some("help" | "-h" | "--help") => {
-            print!("{USAGE}{}{CLEAN_USAGE}", crate::mac_nux::USAGE);
+            print!(
+                "{USAGE}{}{}{CLEAN_USAGE}",
+                crate::mac_nux::USAGE,
+                crate::mac_runtime::USAGE
+            );
             Ok(0)
         }
         Some(other) => Err(Fail::usage(format!(
@@ -521,6 +528,9 @@ pub(crate) struct Vm {
     keep: bool,
     /// Renamed to a prepared base ([`Vm::promote`]): neither deleted nor kept here.
     promoted: bool,
+    slot: Option<crate::mac_slots::Slot>,
+    display_slot: Option<crate::mac_slots::Slot>,
+    pub(crate) graphics: bool,
 }
 
 impl Vm {
@@ -550,13 +560,22 @@ impl Vm {
             run: None,
             keep,
             promoted: false,
+            slot: None,
+            display_slot: None,
+            graphics: false,
         })
     }
 
-    /// Boot it with no window, the share read-only, and wait for the guest agent ([`ATTEMPT`] at a
+    /// Boot it with the selected display, the share read-only, and wait for the guest agent ([`ATTEMPT`] at a
     /// time).
     pub(crate) fn boot(&mut self) -> Result<(), Fail> {
         use std::os::unix::fs::OpenOptionsExt as _;
+        let display_slot = if self.graphics {
+            Some(crate::mac_slots::Slot::display()?)
+        } else {
+            None
+        };
+        let slot = crate::mac_slots::Slot::take()?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -574,8 +593,19 @@ impl Vm {
             })
             .map_err(|e| format!("{}: {e}", self.log.display()))?;
         let err = log.try_clone().map_err(|e| format!("tart run log: {e}"))?;
-        let child = aterm_uds::spawnfd::command(&self.tart)
-            .args(["run", "--no-graphics", "--no-audio", "--no-clipboard"])
+        let mut command = aterm_uds::spawnfd::command(&self.tart);
+        let mut guards = vec![slot.inherited()?];
+        if let Some(display) = &display_slot {
+            guards.push(display.inherited()?);
+        }
+        command
+            .inherit_guards(guards)
+            .map_err(|e| format!("mac guest slot inheritance: {e}"))?;
+        command.args(["run", "--no-audio", "--no-clipboard"]);
+        if !self.graphics {
+            command.arg("--no-graphics");
+        }
+        let child = command
             .arg(format!("--dir=lane:{}:ro", self.share.display()))
             .arg(&self.name)
             .setsid(true)
@@ -585,6 +615,8 @@ impl Vm {
             .spawn()
             .map_err(|e| not_run(format!("tart run: {e}")))?;
         self.run = Some(child);
+        self.slot = Some(slot);
+        self.display_slot = display_slot;
         let start = Instant::now();
         while start.elapsed() < BOOT {
             stop::check()?;
@@ -632,14 +664,20 @@ impl Vm {
 
     pub(crate) fn stop(&mut self) {
         if let Some(mut child) = self.run.take() {
-            let _ = aterm_uds::spawnfd::command(&self.tart)
-                .args(["stop", &self.name])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = child.wait();
+            let _ = aterm_uds::deadline::output_until(
+                aterm_uds::spawnfd::command(&self.tart)
+                    .args(["stop", &self.name])
+                    .stdin(Stdio::null()),
+                Instant::now() + STEP,
+            );
+            reap_within(&mut child, STEP);
         }
+        self.slot = None;
+        self.display_slot = None;
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.run.as_ref().map(Child::id)
     }
 
     /// Stop it and rename it `base`. `false` when the rename did not take (a concurrent lane's

@@ -527,11 +527,7 @@ fn converge<'a>(
     }
     // `aterm pkg doctor`'s own policy, judged before the rows join doctor's: only a row that
     // fails that surface is unresolved here; its other warnings count as notes.
-    let pkg_judged: Vec<ItemReport> = packages.iter().map(as_pkg_doctor_judges).collect();
     let pkg_failing = packages.iter().any(ItemReport::fails_surface);
-    for row in &mut packages {
-        row.essential = false;
-    }
 
     // The develop rows, read once the store is free again and the packages are read (a
     // checkout's `--check` may build its verifier first): each item probed, none applied,
@@ -577,16 +573,25 @@ fn converge<'a>(
             ));
         }
     }
-    let judged: Vec<ItemReport> = fact_rows
-        .iter()
-        .chain(&repair_rows)
-        .chain(&docs_rows)
-        .chain(&develop_rows)
-        .chain(&pkg_judged)
-        .chain(&refused)
-        .cloned()
-        .collect();
-    let readiness = Readiness::of(&judged, tokens);
+    let row_count = fact_rows.len()
+        + repair_rows.len()
+        + docs_rows.len()
+        + develop_rows.len()
+        + packages.len()
+        + refused.len();
+    let readiness = doctor_readiness(
+        fact_rows
+            .iter()
+            .chain(&repair_rows)
+            .chain(&docs_rows)
+            .chain(&develop_rows),
+        &packages,
+        &refused,
+        tokens,
+    );
+    for row in &mut packages {
+        row.essential = false;
+    }
     let code = u8::from(!readiness.all_green);
     aterm_log::info!(
         "aterm doctor{}: {} rows, exit {code}; {laps}",
@@ -595,7 +600,7 @@ fn converge<'a>(
         } else {
             ""
         },
-        judged.len()
+        row_count
     );
     if args.json {
         let rows: Vec<ItemReport> = fact_rows
@@ -711,19 +716,62 @@ fn left_to_the_pass(row: &mut ItemReport) {
     }
 }
 
-/// A packages row as readiness counts it: as `aterm pkg doctor` judges it, so a row that does
-/// not fail that surface ([`ItemReport::fails_surface`], judged while the row still says whether
-/// it is essential) counts as a note, not unresolved. The JSON's row stays as it read.
-fn as_pkg_doctor_judges(row: &ItemReport) -> ItemReport {
-    let mut judged = row.clone();
+/// Readiness over doctor's rows, with `packages` judged by `aterm pkg doctor`'s surface policy
+/// ([`pkg_judged_outcome`]) without cloning rows into temporary vectors.
+fn doctor_readiness<'a>(
+    rows: impl IntoIterator<Item = &'a ItemReport>,
+    packages: &'a [ItemReport],
+    refused: &'a [ItemReport],
+    scope: &[String],
+) -> Readiness {
+    let mut readiness = Readiness {
+        all_green: false,
+        scope: scope.to_vec(),
+        satisfied: 0,
+        not_applicable: 0,
+        pending_activation: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    let mut any = false;
+    let entries = rows
+        .into_iter()
+        .map(|row| (row, row.outcome))
+        .chain(packages.iter().map(|row| (row, pkg_judged_outcome(row))))
+        .chain(refused.iter().map(|row| (row, row.outcome)));
+    for (row, outcome) in entries {
+        any = true;
+        match outcome {
+            Outcome::Changed if matches!(row.effect, Effect::Login | Effect::Restart) => {
+                readiness.pending_activation.push(row.id.clone());
+            }
+            Outcome::Ok | Outcome::Changed => readiness.satisfied += 1,
+            Outcome::NotApplicable => readiness.not_applicable += 1,
+            Outcome::Planned
+            | Outcome::Person
+            | Outcome::Blocked
+            | Outcome::Deferred
+            | Outcome::Unknown
+            | Outcome::Failed => readiness.unresolved.push(row.id.clone()),
+        }
+    }
+    readiness.all_green =
+        any && readiness.unresolved.is_empty() && readiness.pending_activation.is_empty();
+    readiness
+}
+
+/// A packages row's outcome as readiness counts it: as `aterm pkg doctor` judges it, so a row
+/// that does not fail that surface ([`ItemReport::fails_surface`], judged while the row still
+/// says whether it is essential) counts as a note, not unresolved. The JSON's row stays as it read.
+fn pkg_judged_outcome(row: &ItemReport) -> Outcome {
     let settled = matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     );
     if !settled && !row.fails_surface() {
-        judged.outcome = Outcome::NotApplicable;
+        Outcome::NotApplicable
+    } else {
+        row.outcome
     }
-    judged
 }
 
 /// The rows bare doctor shows besides its facts' (which [`cli::render_brief`] reads itself):
@@ -917,43 +965,48 @@ fn toolset_reads(
 ) -> aterm_machines::init_toolset::Found {
     use aterm_machines::init_toolset::Found;
     use atpkg::Adoption;
+    use std::borrow::Cow;
     let Some(row) = row else {
         return Found::Unread("`aterm pkg doctor` reads no toolset row".to_owned());
     };
     let said = row
         .explain
         .as_ref()
-        .map(|explain| explain.why.clone())
-        .or_else(|| row.why.clone())
-        .or_else(|| row.from.clone())
-        .unwrap_or_else(|| row.title.clone());
+        .map(|explain| explain.why.as_str())
+        .or(row.why.as_deref())
+        .or(row.from.as_deref())
+        .unwrap_or(&row.title);
     match row.outcome {
-        Outcome::Ok => return Found::Complete(row.to.clone().unwrap_or(said)),
-        Outcome::Unknown => return Found::Unread(said),
+        Outcome::Ok => return Found::Complete(row.to.clone().unwrap_or_else(|| said.to_owned())),
+        Outcome::Unknown => return Found::Unread(said.to_owned()),
         _ => {}
     }
-    let off = match adoption {
-        Adoption::Consented if row.outcome == Outcome::NotApplicable => return Found::Off(said),
+    let off: Cow<'static, str> = match adoption {
+        Adoption::Consented if row.outcome == Outcome::NotApplicable => {
+            return Found::Off(said.to_owned());
+        }
         // A window's launch lane stands by while the switch is off, and so does init.
-        Adoption::Consented if !enabled => "Automatic updates are off ([packages].enabled = \
-                                            false in aterm.toml, or the retired auto_update = \
-                                            false), so init installs no toolset; Settings \u{25b8} \
-                                            Packages turns them on, or `aterm pkg install \
-                                            --default-set` installs it"
-            .to_owned(),
-        Adoption::Consented => return Found::Missing(said),
+        Adoption::Consented if !enabled => Cow::Borrowed(
+            "Automatic updates are off ([packages].enabled = \
+             false in aterm.toml, or the retired auto_update = \
+             false), so init installs no toolset; Settings \u{25b8} \
+             Packages turns them on, or `aterm pkg install \
+             --default-set` installs it",
+        ),
+        Adoption::Consented => return Found::Missing(said.to_owned()),
         // The row says the decline, and how to lift it.
-        Adoption::Declined => return Found::Off(said),
-        Adoption::AutoInstallOff => "[packages].auto_install = false in aterm.toml (or a \
-                                     [packages] table too broken to read), so init installs no \
-                                     toolset; `aterm pkg install --default-set` installs it"
-            .to_owned(),
-        Adoption::IgnoredPrefix => ignored_prefix.map_or_else(
-            || "aterm.toml names a [packages] prefix this build ignores".to_owned(),
-            atpkg::config::ignored_prefix_note,
+        Adoption::Declined => return Found::Off(said.to_owned()),
+        Adoption::AutoInstallOff => Cow::Borrowed(
+            "[packages].auto_install = false in aterm.toml (or a \
+             [packages] table too broken to read), so init installs no \
+             toolset; `aterm pkg install --default-set` installs it",
+        ),
+        Adoption::IgnoredPrefix => ignored_prefix.map_or(
+            Cow::Borrowed("aterm.toml names a [packages] prefix this build ignores"),
+            |p| Cow::Owned(atpkg::config::ignored_prefix_note(p)),
         ),
         Adoption::ManagerDisabled => {
-            "this aterm pins no root key, so atpkg installs nothing".to_owned()
+            Cow::Borrowed("this aterm pins no root key, so atpkg installs nothing")
         }
     };
     Found::Off(format!("{off}: {said}"))
@@ -1341,10 +1394,14 @@ fn ai_accounts_due(env: &aterm_agent::harness::cli::Env) -> Option<String> {
     let (config, home) = (env.config.as_deref()?, env.home.as_deref()?);
     let due = aterm_agent::harness::accounts_sync::cli_pools_due(config, &env.state, home, env.now);
     (!due.is_empty()).then(|| {
-        due.iter()
-            .map(|cli| cli.id())
-            .collect::<Vec<_>>()
-            .join(", ")
+        let mut out = String::new();
+        for (i, cli) in due.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(cli.id());
+        }
+        out
     })
 }
 
@@ -1850,24 +1907,34 @@ fn docs_section(rows: &[ItemReport]) -> Option<Section> {
 /// by its id, saying what it read and, where something is to do, the act that does it.
 /// `None` when no develop row was read.
 fn develop_section(rows: &[ItemReport]) -> Option<Section> {
+    use std::fmt::Write as _;
     if rows.is_empty() {
         return None;
     }
     let mut warn = false;
-    let mut lines = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut fact = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            fact.push('\n');
+        }
         let why = row.why.as_deref().unwrap_or("not read");
-        let said = match row.outcome {
-            Outcome::Ok | Outcome::Changed => row.to.clone().unwrap_or_else(|| "ok".to_owned()),
-            Outcome::NotApplicable => format!("not applicable: {why}"),
+        let _ = write!(fact, "{}: ", row.id);
+        match row.outcome {
+            Outcome::Ok | Outcome::Changed => {
+                fact.push_str(row.to.as_deref().unwrap_or("ok"));
+            }
+            Outcome::NotApplicable => {
+                let _ = write!(fact, "not applicable: {why}");
+            }
             Outcome::Planned => {
                 warn = true;
-                format!(
+                let _ = write!(
+                    fact,
                     "{} → {}{}",
                     row.from.as_deref().unwrap_or("not as wanted"),
                     row.to.as_deref().unwrap_or("as wanted"),
                     remedy(row)
-                )
+                );
             }
             Outcome::Person
             | Outcome::Blocked
@@ -1875,15 +1942,14 @@ fn develop_section(rows: &[ItemReport]) -> Option<Section> {
             | Outcome::Unknown
             | Outcome::Failed => {
                 warn = true;
-                format!("{why}{}", remedy(row))
+                let _ = write!(fact, "{why}{}", remedy(row));
             }
-        };
-        lines.push(format!("{}: {said}", row.id));
+        }
     }
     Some(Section {
         label: "develop:",
         mark: if warn { Mark::Warn } else { Mark::Ok },
-        fact: lines.join("\n"),
+        fact,
     })
 }
 

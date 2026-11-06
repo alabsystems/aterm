@@ -341,7 +341,10 @@ fn id(word: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
-fn valid_node(node: &str) -> bool {
+/// Whether `node` is a fleet node's id as a proved drive names it: 32 lowercase hex digits, or
+/// `n-` and 16 of them (the mesh's form).
+#[must_use]
+pub fn valid_node(node: &str) -> bool {
     let (node, len) = node.strip_prefix("n-").map_or((node, 32), |id| (id, 16));
     node.len() == len
         && node
@@ -791,19 +794,59 @@ pub(crate) fn carry(ctx: &dyn FabricSession, post: &Carry<'_>) -> String {
             Err(why) => return refusal(why),
         },
     };
-    let request = format!(
-        "@{} post key={key} kind={} -- {}",
-        post.sid, post.kind, post.text
-    );
-    let answer = match ctx.fleet_drive(post.node, &request) {
-        Ok(answer) => answer,
-        Err(why) => {
-            return refusal(format!(
-                "{} is a pre-R3 Mac, reached by direct fleet mail, and no drive reached it: {why}",
-                post.node
-            ));
-        }
-    };
+    match drive_post(ctx, post.sid, post.node, post.kind, &key, post.text) {
+        Ok(Carried { id, dup }) => format!(
+            "OK fleet=f{id} to=@{}@{} key={key}{}\n",
+            post.sid,
+            post.node,
+            if dup { " dup=1" } else { "" }
+        ),
+        Err(Uncarried::NoDrive(why)) => refusal(format!(
+            "{} is a pre-R3 Mac, reached by direct fleet mail, and no drive reached it: {why}",
+            post.node
+        )),
+        Err(Uncarried::Answered(answer)) => refusal(format!(
+            "{} answered the direct fleet mail: {answer}",
+            post.node
+        )),
+    }
+}
+
+/// A message direct fleet mail took ([`drive_post`]): its id in the mailbox on the other Mac, and
+/// whether that mailbox already held it under the same key (`dup=1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Carried {
+    pub id: u64,
+    pub dup: bool,
+}
+
+/// Why direct fleet mail did not take a message ([`drive_post`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Uncarried {
+    /// No drive reached the Mac, or it hung up before it answered.
+    NoDrive(String),
+    /// The Mac answered with something other than the message's id: its refusal, at most 512
+    /// characters of it.
+    Answered(String),
+}
+
+/// One direct-mail post of `text` (`kind`, one line, under `key`) to session `sid` on `node`: one
+/// fleet drive to that Mac, which posts it into the session's mailbox there as `fleet:<this
+/// node>` ([`post`] under its driver). A message it took for the first time is this session's
+/// [`super::FabricFact::FleetMailOut`]; a duplicate is the one an earlier post carried, already on
+/// the log.
+pub(crate) fn drive_post(
+    ctx: &dyn FabricSession,
+    sid: &str,
+    node: &str,
+    kind: &str,
+    key: &str,
+    text: &str,
+) -> Result<Carried, Uncarried> {
+    let request = format!("@{sid} post key={key} kind={kind} -- {text}");
+    let answer = ctx
+        .fleet_drive(node, &request)
+        .map_err(Uncarried::NoDrive)?;
     let answer = answer.trim_end_matches(['\r', '\n']);
     let mut words = answer.split(' ');
     match (
@@ -813,29 +856,23 @@ pub(crate) fn carry(ctx: &dyn FabricSession, post: &Carry<'_>) -> String {
         words.next(),
     ) {
         (Some("OK"), Some(id), dup @ (None | Some("dup=1")), None) => {
-            let to = format!("@{}@{}", post.sid, post.node);
-            // A duplicate is the message an earlier post carried, already on the log.
             if dup.is_none() {
                 ctx.record_fact(
                     "post",
                     super::FabricFact::FleetMailOut {
                         id,
-                        kind: post.kind,
-                        to: &to,
-                        idem: &key,
+                        kind,
+                        to: &format!("@{sid}@{node}"),
+                        idem: key,
                     },
                 );
             }
-            format!(
-                "OK fleet=f{id} to={to} key={key}{}\n",
-                if dup.is_some() { " dup=1" } else { "" }
-            )
+            Ok(Carried {
+                id,
+                dup: dup.is_some(),
+            })
         }
-        _ => refusal(format!(
-            "{} answered the direct fleet mail: {}",
-            post.node,
-            answer.chars().take(512).collect::<String>()
-        )),
+        _ => Err(Uncarried::Answered(answer.chars().take(512).collect())),
     }
 }
 
@@ -1093,8 +1130,7 @@ fn changed(ctx: &dyn FabricSession) {
     ctx.fabric()
         .direct_epoch
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    ctx.fabric().changed.notify_all();
-    drop(guard);
+    ctx.fabric().changed.ring(guard);
     ctx.fabric_changed();
 }
 
@@ -1726,6 +1762,136 @@ mod tests {
         );
         assert_eq!(off.fabric.lock().posts.len(), 1);
         assert!(off.drives.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_mail() {
+        use crate::report::{To, post as report};
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let there = std::sync::Arc::new(Session {
+            sid: SessionId::new("s-87654321"),
+            ..session(&scratch.path().join("there/s-87654321.toml"))
+        });
+        let served = std::sync::Arc::clone(&there);
+        let node = format!("n-{}", "b".repeat(16));
+        let wanted = node.clone();
+        // This Mac's mesh off, as every aterm's is until R3: the bus is one Mac's alone.
+        let here = Session {
+            drive: Some(Box::new(move |at, request| {
+                assert_eq!(at, wanted, "the drive goes to the manager's Mac");
+                let rest = request
+                    .strip_prefix("@s-87654321 post ")
+                    .ok_or_else(|| format!("not a post to the manager: {request}"))?;
+                Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
+            })),
+            ..session(&scratch.path().join("here/inbox.toml"))
+        };
+        let to = To::There {
+            sid: "s-87654321",
+            node: &node,
+        };
+        let line = "NEEDS YOU: a sign-in | sid=s-12345678 state=working";
+        assert_eq!(
+            report(&here, to, "s-12345678.need.1", line),
+            Ok(format!(
+                "OK fleet=f1 to=@s-87654321@{node} key=s-12345678.need.1"
+            ))
+        );
+        assert_eq!(
+            report(&here, to, "s-12345678.need.1", line),
+            Ok(format!(
+                "OK fleet=f1 to=@s-87654321@{node} key=s-12345678.need.1 dup=1"
+            )),
+            "sent again under its key, it lands once there"
+        );
+        let page = crate::cmd_inbox(&*there, "");
+        assert!(
+            page.contains(&format!("msg f1 from=fleet:{} kind=report", "c".repeat(32)))
+                && page.contains("NEEDS"),
+            "in the manager's inbox on its Mac, from this one: {page}"
+        );
+        assert!(
+            here.fabric.lock().posts.is_empty(),
+            "nothing is queued on this Mac's bus"
+        );
+        assert_eq!(
+            here.facts.lock().unwrap().as_slice(),
+            [format!(
+                "f1 to={} kind=report key=s-12345678.need.1",
+                crate::pct_encode(&format!("@s-87654321@{node}"))
+            )],
+            "the mail carried is one fact on the worker's log"
+        );
+
+        // Negative control: a manager's Mac that refuses the drive's post takes nothing, and the
+        // refusal is the sender's to record.
+        let refused = Session {
+            drive: Some(Box::new(|_, _| {
+                Ok("ERR denied: no drive grant\n".to_owned())
+            })),
+            ..session(&scratch.path().join("refused/inbox.toml"))
+        };
+        assert_eq!(
+            report(&refused, to, "s-12345678.need.1", line),
+            Err(crate::report::Unsent::Answered {
+                node: node.clone(),
+                answer: "ERR denied: no drive grant".to_owned()
+            })
+        );
+        assert!(refused.facts.lock().unwrap().is_empty());
+        assert_eq!(refused.drives.lock().unwrap().len(), 1);
+    }
+
+    /// A REPORT FROM A SESSION LEAVING THE ROSTER GOES BY DIRECT FLEET MAIL EVEN TO A MAC THE MESH
+    /// CARRIES A LIVE SENDER'S TO: the bus drains no outbox of a session that left. CONTROL: the
+    /// same report from a session that stays goes on the bus, undriven.
+    #[test]
+    fn a_leaving_sessions_report_is_driven_to_a_mac_the_mesh_would_carry_it_to() {
+        use crate::report::{To, post as report, post_leaving};
+        crate::with_link_reset(|| {
+            crate::note_bridge_supervised();
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let there = std::sync::Arc::new(Session {
+                sid: SessionId::new("s-87654321"),
+                ..session(&scratch.path().join("there/s-87654321.toml"))
+            });
+            let served = std::sync::Arc::clone(&there);
+            let node = format!("n-{}", "a".repeat(16));
+            let here = Session {
+                heard: vec![node.clone()],
+                drive: Some(Box::new(move |_, request| {
+                    let rest = request
+                        .strip_prefix("@s-87654321 post ")
+                        .ok_or_else(|| format!("not a post to the manager: {request}"))?;
+                    Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
+                })),
+                ..meshed(&scratch.path().join("here/inbox.toml"))
+            };
+            let to = To::There {
+                sid: "s-87654321",
+                node: &node,
+            };
+            let closed = "s-12345678.closed.1";
+            let line = "finished, then its tab closed | sid=s-12345678 state=closed";
+
+            assert_eq!(
+                report(&here, to, closed, line),
+                Ok("OK 1".to_owned()),
+                "a live sender's report rides the mesh"
+            );
+            assert!(here.drives.lock().unwrap().is_empty());
+
+            assert_eq!(
+                post_leaving(&here, to, closed, line),
+                Ok(format!("OK fleet=f1 to=@s-87654321@{node} key={closed}"))
+            );
+            assert_eq!(here.fabric.lock().posts.len(), 1, "nothing more is queued");
+            assert_eq!(here.drives.lock().unwrap().len(), 1);
+            assert!(
+                crate::cmd_inbox(&*there, "").contains("state=closed"),
+                "it is in the manager's mailbox on its Mac"
+            );
+        });
     }
 
     #[test]

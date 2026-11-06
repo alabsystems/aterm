@@ -121,7 +121,10 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn payload_root(layout: &Layout, package: &str, build: u64) -> Option<PathBuf> {
+/// Physical owned payload root, admitting only the store's exact sibling `.noindex` alias.
+/// This is path admission, not signed-content authentication or a lifetime lease.
+#[must_use]
+pub fn payload_root(layout: &Layout, package: &str, build: u64) -> Option<PathBuf> {
     let logical = layout.build_dir(package, build);
     let real_dir = |path: &Path| {
         std::fs::symlink_metadata(path)

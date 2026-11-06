@@ -43,8 +43,8 @@ pub fn sealed_opts(mut opts: OpenOptions) -> OpenOptions {
 /// A broker as the node service hosts `bus.log` (`aterm_mesh::logs::open_bus`,
 /// `docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 C2), so every world runs against it: sealed by
 /// aterm-link's rules unless `opts` names a key (a world's log has no `mint.secret` beside it, so
-/// it stays plaintext as before), its legacy mark judged, retained by aterm's default rules and
-/// limited by its default rate limit.
+/// it stays plaintext as before), its legacy mark judged, retained by the mesh's rules
+/// (`aterm_link::broker_rules::mesh_rules`) and limited by its default rate limit.
 #[must_use]
 pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     let broker = aterm_mesh::logs::open_bus(
@@ -55,7 +55,7 @@ pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     .expect("bus.log opens as the node service opens it");
     assert!(
         broker.retention().is_some(),
-        "the default retention rules are set"
+        "the mesh's retention rules are set"
     );
     broker
 }

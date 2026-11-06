@@ -244,6 +244,18 @@ pub fn now_ms() -> u64 {
     u64::try_from(Instant::now().saturating_duration_since(epoch).as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The wall clock in unix milliseconds (`0` before the epoch): the clock a Claude Code
+/// transcript's and a codex rollout's rows are stamped on, so what aterm stamps itself compares
+/// with them.
+#[must_use]
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

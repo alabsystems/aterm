@@ -281,14 +281,17 @@ pub fn rewrite(image: &mut [u8], stamp: &Stamp) -> Result<(), String> {
     let record = encode(stamp)?;
     let header = HEADER.as_bytes();
     let mut found = Vec::new();
-    for (at, window) in image.windows(header.len()).enumerate() {
-        let is_record = window == header
-            && image
-                .get(at..at + LEN)
-                .and_then(|r| <&[u8; LEN]>::try_from(r).ok())
-                .is_some_and(|r| values(r).is_ok());
-        if is_record {
-            found.push(at);
+    if let Some(limit) = image.len().checked_sub(LEN) {
+        let head = &image[..=limit];
+        let mut cursor = 0;
+        while let Some(rel) = head[cursor..].iter().position(|&b| b == header[0]) {
+            let at = cursor + rel;
+            if image[at..at + LEN].starts_with(header)
+                && <&[u8; LEN]>::try_from(&image[at..at + LEN]).is_ok_and(|r| values(r).is_ok())
+            {
+                found.push(at);
+            }
+            cursor = at + 1;
         }
     }
     match *found.as_slice() {

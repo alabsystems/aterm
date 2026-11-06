@@ -226,7 +226,15 @@ impl Redactor {
     #[inline]
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
-        scan(self.learned(text), true).into_owned()
+        self.apply_cow(text).into_owned()
+    }
+
+    /// Borrowing variant of [`Redactor::apply`]: returns [`std::borrow::Cow::Borrowed`] when no
+    /// learned secret or credential shape matches in `text`.
+    #[inline]
+    #[must_use]
+    pub fn apply_cow<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        scan(self.learned(text), true)
     }
 
     /// Redacts learned values and context-free token prefixes (rule 1) without cross-field rules 2/3.

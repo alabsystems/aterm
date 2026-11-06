@@ -32,6 +32,10 @@ const LOW: &str = "low";
 /// The condition of a row a wall stands on (`Condition::Limited`), until its `walled_until_ms`.
 const LIMITED: &str = "limited";
 
+/// The condition of a row whose login a read found ended (`Condition::SignedOut`): a sign-in there
+/// mends it, not a wait.
+const SIGNED_OUT: &str = "signed-out";
+
 /// One account row of a member's survey, as a pick weighs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -39,12 +43,13 @@ pub(crate) struct Row {
     pub(crate) program: String,
     /// Its label (`id=`).
     pub(crate) label: String,
-    /// Its login is made there (`enrolled=1`).
+    /// Its login counts as made there, as a launch there judges it (`enrolled=1`). A Claude row with
+    /// no directory counts with no look at a login (`ATERM-KI-1105-9`).
     pub(crate) enrolled: bool,
     /// Its condition word (`condition=`).
     pub(crate) condition: String,
-    /// The five-hour window used, in percent; `None` where no window runs (it reset, or was never
-    /// read).
+    /// The five-hour window used, in percent; `None` where no such window runs (it reset or was
+    /// never read), and where the row's window has another length, full or not ([`used`]).
     pub(crate) five_hour: Option<u64>,
     /// The week used, in percent, as [`Self::five_hour`].
     pub(crate) seven_day: Option<u64>,
@@ -57,6 +62,9 @@ pub(crate) struct Row {
     /// When its figures were last read, in Unix seconds on the member's clock (`read_at=`); `None`
     /// where it says `-`, or where its aterm is older than the field and says nothing.
     pub(crate) read_at: Option<u64>,
+    /// Whether a launch on its member would start on it (`launch=1`, and any other word is no);
+    /// `None` where its aterm is older than the field and says nothing.
+    pub(crate) launch: Option<bool>,
 }
 
 impl Row {
@@ -71,6 +79,7 @@ impl Row {
             week_reset_ms: survey::week_reset_ms(fields),
             walled_until_ms: survey::walled_until_ms(fields),
             read_at: fields.number("read_at"),
+            launch: fields.get("launch").map(|word| word == "1"),
         }
     }
 
@@ -90,7 +99,10 @@ impl Row {
     /// How a pick ranks its condition, the harness's own order (`Condition::fresh`): first a row
     /// read lately with room ([`Self::undated`] takes none). Then an `unseen` row, whose missing or
     /// old figures would otherwise rank it as the least used of all: at worst, on a member that
-    /// says `read_at=`, its launch finds a wall, holds and stalls by the startup deadline. A member
+    /// says `read_at=`, its launch finds a wall, holds and stalls by the startup deadline, or on a
+    /// lone row under rotation off, whose launch reads nothing, the worker meets the wall and the
+    /// row's own rollouts show it from then on. A row no read can show a wall on says `launch=0`
+    /// ([`Self::passed_over`]). A member
     /// older than the field has no such deadline, so a worker there can sit `working` at the wall
     /// for days: a pick reads no `read_at=` and `read_at=-` alike, so it takes such a member's
     /// `unseen` row as it does a current one's ([`Self::takes`]). A `low` row goes last, since a
@@ -120,12 +132,22 @@ impl Row {
         self.condition == USABLE && self.read_at.is_none()
     }
 
+    /// Whether its member says a launch there would not start on it: that launch would start on
+    /// another row, on a login no row lists or none can show a wall on, or be refused. `launch=0`
+    /// does not say which, and
+    /// `aterm harness accounts` there does. A member older than the field says nothing, so none of
+    /// its rows is passed over.
+    fn passed_over(&self) -> bool {
+        self.launch == Some(false)
+    }
+
     /// Whether a worker of `program` can run on it now: a row that would ([`Self::would_take`]),
-    /// and not one whose word cannot be dated ([`Self::undated`]). An `unseen` row still takes one
-    /// though it read nothing lately: rows go `unseen` after six hours and only a launch reads one
-    /// again, so refusing them would leave an idle fleet with nowhere to start.
+    /// not one whose word cannot be dated ([`Self::undated`]), and not one a launch there would
+    /// pass over ([`Self::passed_over`]). An `unseen` row still takes one though it read nothing
+    /// lately: rows go `unseen` after six hours and only a launch reads one again, so refusing them
+    /// would leave an idle fleet with nowhere to start.
     fn takes(&self, program: &str, at_ms: Option<u64>) -> bool {
-        self.would_take(program, at_ms) && !self.undated()
+        self.would_take(program, at_ms) && !self.undated() && !self.passed_over()
     }
 
     /// A row of `program`, enrolled, no window of it full ([`Self::spent`]), in a condition that
@@ -254,9 +276,23 @@ pub(crate) enum Judged {
     Met,
     /// It does not.
     Lacks,
-    /// Its facts cannot say: its aterm is too old to say them, it read none yet or none within
-    /// [`REPOS_FRESH_MS`], or the checkout may be among those its read did not reach.
-    Unknown,
+    /// Its facts cannot say, for this reason.
+    Unknown(Unsure),
+}
+
+/// Why a member's facts cannot say whether it meets a [`Need`] ([`Judged::Unknown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unsure {
+    /// It says nothing of the fact: its aterm is too old to, it read no checkouts yet, or its
+    /// reply's rows did not all come.
+    Unsaid,
+    /// Its read of its checkouts says no date, or one not within [`REPOS_FRESH_MS`] of its answer
+    /// on its own clock.
+    Stale,
+    /// Its read lists the checkout with no `HEAD` read.
+    NoHead,
+    /// Its read does not list the checkout, and left clones unlisted or does not say.
+    Cut,
 }
 
 /// The needs `words` name (each `need=<need>[,<need>…]`, [`NEED`]): `repo:<name>` (a checkout of
@@ -339,7 +375,7 @@ impl Member {
         match need {
             Need::Repo(name) => {
                 let Some(repos) = &self.repos else {
-                    return Judged::Unknown;
+                    return Judged::Unknown(Unsure::Unsaid);
                 };
                 // A read its clock puts after its answer is no read it can date: its clock moved.
                 let fresh = repos
@@ -348,7 +384,7 @@ impl Member {
                     .and_then(|(read, at)| at.checked_sub(read))
                     .is_some_and(|age| age <= REPOS_FRESH_MS);
                 if !fresh {
-                    return Judged::Unknown;
+                    return Judged::Unknown(Unsure::Stale);
                 }
                 match repos
                     .rows
@@ -356,28 +392,28 @@ impl Member {
                     .find(|repo| repo.name.eq_ignore_ascii_case(name))
                 {
                     Some(repo) if repo.head.is_some() => Judged::Met,
-                    Some(_) => Judged::Unknown,
-                    None if repos.cut > 0 => Judged::Unknown,
+                    Some(_) => Judged::Unknown(Unsure::NoHead),
+                    None if repos.cut > 0 => Judged::Unknown(Unsure::Cut),
                     None => Judged::Lacks,
                 }
             }
             Need::Free { mb, .. } => match self.free_mb {
                 Some(free) if free >= *mb => Judged::Met,
                 Some(_) => Judged::Lacks,
-                None => Judged::Unknown,
+                None => Judged::Unknown(Unsure::Unsaid),
             },
             Need::Home => {
                 if self.home.is_some() {
                     Judged::Met
                 } else {
-                    Judged::Unknown
+                    Judged::Unknown(Unsure::Unsaid)
                 }
             }
         }
     }
 
     /// How it falls short of `needs`, `None` where it meets them all: a checkout it lacks first,
-    /// then too little free space, then a need its facts cannot say.
+    /// then too little free space, then the first need its facts cannot say.
     fn short_of(&self, needs: &[Need]) -> Option<Short> {
         let judged: Vec<(&Need, Judged)> = needs.iter().map(|n| (n, self.judge(n))).collect();
         let lacks = |repo: bool| {
@@ -389,15 +425,39 @@ impl Member {
             Some(Short::Repo)
         } else if lacks(false) {
             Some(Short::Room)
-        } else if judged.iter().any(|(_, judged)| *judged == Judged::Unknown) {
-            Some(Short::Unknown)
         } else {
-            None
+            judged.iter().find_map(|(_, judged)| match judged {
+                Judged::Unknown(why) => Some(Short::Unknown(*why)),
+                Judged::Met | Judged::Lacks => None,
+            })
         }
     }
 
-    /// Its row that a worker of `program` would best run on: the least used week, then the least
-    /// used five hours ([`used`]), then by label.
+    /// The row of `program` it says a launch there would start on (`launch=1`).
+    fn launch_row(&self, program: &str) -> Option<&Row> {
+        self.accounts
+            .iter()
+            .flatten()
+            .find(|row| row.program == program && row.launch == Some(true))
+    }
+
+    /// Whether a sign-in there is what a launch of `program` lacks: the row it says a launch would
+    /// start on has no login, or where it names none (older than the field, or that launch is
+    /// refused), a row of `program` is signed out.
+    fn signed_out(&self, program: &str) -> bool {
+        match self.launch_row(program) {
+            Some(row) => !row.enrolled || row.condition == SIGNED_OUT,
+            None => self
+                .accounts
+                .iter()
+                .flatten()
+                .any(|row| row.program == program && row.condition == SIGNED_OUT),
+        }
+    }
+
+    /// Its row that a worker of `program` would best run on: of the rows that can take it
+    /// ([`Row::takes`], which is at most the row its survey says a launch there starts on), the
+    /// least used week, then the least used five hours ([`used`]), then by label.
     fn best(&self, program: &str) -> Option<&Row> {
         self.accounts
             .iter()
@@ -427,12 +487,16 @@ enum Short {
     Repo,
     /// It has less free space than a need names.
     Room,
-    /// Its facts cannot say whether it meets them.
-    Unknown,
+    /// Its facts cannot say whether it meets them, for this reason.
+    Unknown(Unsure),
 }
 
-/// A window's use as a pick ranks it: a window with no figure is unused, since its member sends
-/// none once it has reset or where it was never read (a row the harness reads as fresh).
+/// A window's use as a pick ranks it: a window with no figure is unused. A member sends none once
+/// the window has reset, where it was never read (a row the harness reads as fresh), or for a
+/// window of another length. A lone row's full window of any length reads `limited` while its wall
+/// stands, where its records or rollouts show it. On a pool of several, a window only rollouts know
+/// gives no figure and no wall until a launch reads it, so such a row ranks as unused
+/// (`ATERM-KI-1105-1`).
 fn used(pct: Option<u64>) -> u64 {
     pct.unwrap_or(0)
 }
@@ -488,6 +552,14 @@ pub(crate) struct Chosen<'a> {
 pub(crate) struct Counts {
     /// Members that answered.
     pub(crate) answered: usize,
+    /// Of those, the ones this Mac's book names no node for: peers named by hand, whom no drive
+    /// reaches and no grant mends.
+    pub(crate) nodeless: usize,
+    /// Of those with a node, the ones that did not prove the key this Mac binds to it, which no
+    /// grant mends.
+    pub(crate) unproven: usize,
+    /// Of those that proved their node, the ones that do not let this Mac drive them.
+    pub(crate) ungranted: usize,
     /// Of those, the ones that proved their node and let this Mac drive them.
     pub(crate) drivable: usize,
     /// Of those, the ones that lack a checkout the spawn needs.
@@ -495,8 +567,15 @@ pub(crate) struct Counts {
     /// Of those, the ones with less free space than the spawn needs (and every checkout it
     /// needs).
     pub(crate) no_room: usize,
-    /// Of those, the ones whose facts cannot say whether they meet the spawn's needs.
-    pub(crate) unknown: usize,
+    /// Of those, the ones whose facts do not say what the spawn needs ([`Unsure::Unsaid`]).
+    pub(crate) unsaid: usize,
+    /// Of those, the ones whose read of their checkouts cannot be dated as fresh
+    /// ([`Unsure::Stale`]).
+    pub(crate) stale: usize,
+    /// Of those, the ones that list a checkout with no `HEAD` read ([`Unsure::NoHead`]).
+    pub(crate) no_head: usize,
+    /// Of those, the ones whose read may not have reached a checkout ([`Unsure::Cut`]).
+    pub(crate) cut: usize,
     /// Of those that meet its needs, the ones whose aterm says nothing of its accounts.
     pub(crate) silent: usize,
     /// Of those that meet its needs, the ones whose aterm could not read the program's pool
@@ -505,21 +584,34 @@ pub(crate) struct Counts {
     /// Of those that meet its needs, the ones with a row that would take the worker but for an
     /// aterm too old to say when it read that row ([`Row::undated`]).
     pub(crate) undated: usize,
+    /// Of those that meet its needs, the ones a sign-in there would mend ([`Member::signed_out`]).
+    pub(crate) signed_out: usize,
+    /// Of those that meet its needs, the ones with a row that would take the worker but that a
+    /// launch there would not start on ([`Row::passed_over`]).
+    pub(crate) passed_over: usize,
+}
+
+impl Counts {
+    /// The members whose facts cannot say whether they meet the spawn's needs, for any reason.
+    fn unknown(&self) -> usize {
+        self.unsaid + self.stale + self.no_head + self.cut
+    }
 }
 
 /// The member of `members` a worker of `program` goes to: of those that let this Mac drive them,
 /// meet every one of its `needs` by their own facts ([`Member::judge`]; a member whose facts
-/// cannot say is never chosen) and have a row it can run on now, the one whose best row
-/// ([`Member::best`]) ranks first ([`Row::rank`]), then has used the least of its week, then of its
-/// five hours, then the one with the fewest sessions at work, then the
-/// first by host (and node). Never one that does not let this Mac drive it.
+/// cannot say is never chosen) and have a row it can run on now, which on a member that says which
+/// row a launch there starts on is that row alone, the one whose best row ([`Member::best`]) ranks
+/// first ([`Row::rank`]), then has used the least of its week, then of its five hours, then the one
+/// with the fewest sessions at work, then the first by host (and node). Never one that does not let
+/// this Mac drive it.
 /// # Errors
 /// No member qualifies: what the members it read were.
 pub(crate) fn pick<'a>(
     program: &str,
     needs: &[Need],
     members: &'a [Member],
-) -> Result<Chosen<'a>, Counts> {
+) -> Result<Chosen<'a>, Box<Counts>> {
     let able: Vec<(&Member, &Row)> = members
         .iter()
         .filter(|member| member.drivable() && member.short_of(needs).is_none())
@@ -562,23 +654,36 @@ pub(crate) fn pick<'a>(
                 .filter(|m| m.short_of(needs).is_none())
                 .collect();
             let count = |of: &dyn Fn(&Member) -> bool| fit.iter().filter(|m| of(m)).count();
-            Err(Counts {
+            let any_row =
+                |m: &Member, of: &dyn Fn(&Row) -> bool| m.accounts.iter().flatten().any(of);
+            let of_members =
+                |of: &dyn Fn(&Member) -> bool| members.iter().filter(|m| of(m)).count();
+            Err(Box::new(Counts {
                 answered: members.len(),
+                nodeless: of_members(&|m| m.node.is_none()),
+                unproven: of_members(&|m| m.node.is_some() && !m.proven),
+                ungranted: of_members(&|m| m.node.is_some() && m.proven && !m.drive),
                 drivable: drivable.len(),
                 no_repo: short(Short::Repo),
                 no_room: short(Short::Room),
-                unknown: short(Short::Unknown),
+                unsaid: short(Short::Unknown(Unsure::Unsaid)),
+                stale: short(Short::Unknown(Unsure::Stale)),
+                no_head: short(Short::Unknown(Unsure::NoHead)),
+                cut: short(Short::Unknown(Unsure::Cut)),
                 silent: count(&|m| m.accounts.is_none()),
                 unread: count(&|m| {
                     m.accounts.is_some() && m.unread.iter().any(|pool| pool == program)
                 }),
                 undated: count(&|m| {
-                    m.accounts
-                        .iter()
-                        .flatten()
-                        .any(|row| row.would_take(program, m.at_ms) && row.undated())
+                    any_row(m, &|row| row.would_take(program, m.at_ms) && row.undated())
                 }),
-            })
+                signed_out: count(&|m| m.signed_out(program)),
+                passed_over: count(&|m| {
+                    any_row(m, &|row| {
+                        row.would_take(program, m.at_ms) && !row.undated() && row.passed_over()
+                    })
+                }),
+            }))
         }
     }
 }
@@ -651,7 +756,9 @@ pub(crate) fn why(program: &str, needs: &[Need], chosen: &Chosen<'_>) -> String 
 }
 
 /// The refusal of a pick for `program` that chose no member, with how far the `counts` got, the
-/// `alone` reason the read gave for reading no other machine, and the spawn's `needs`.
+/// `alone` reason the read gave for reading no other machine, and the spawn's `needs`. Each clause
+/// says only what those members' facts show, with what mends it or what says more. A survey says
+/// that a launch passes a row over and not why, so that clause names no cause.
 pub(crate) fn none_able(
     program: &str,
     needs: &[Need],
@@ -665,39 +772,21 @@ pub(crate) fn none_able(
             alone.map_or_else(String::new, |why| format!(" ({why})"))
         );
     }
-    let mut asides = Vec::new();
-    if counts.silent > 0 {
-        asides.push(format!(
-            "{} of those run an aterm too old to say its accounts",
-            counts.silent
-        ));
-    }
-    if counts.unread > 0 {
-        asides.push(format!(
-            "{} of those could not read their {program} account records",
-            counts.unread
-        ));
-    }
-    if counts.undated > 0 {
-        asides.push(format!(
-            "{} of those run an aterm too old to say when it read its {program} account: update \
-             it, or name it with `--host <node>`",
-            counts.undated
-        ));
-    }
-    let asides = if asides.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", asides.join("; "))
-    };
     let drive = format!(
-        "--host any: no Mac can take {asked}: {} members answered, {} of them let this Mac drive \
-         them (`aterm fleet allow drive --from <this Mac>` there)",
-        counts.answered, counts.drivable
+        "--host any: no Mac can take {asked}: {} members answered, {} of them can be driven from \
+         this Mac{}",
+        counts.answered,
+        counts.drivable,
+        undriven(counts)
     );
+    if counts.drivable == 0 {
+        return drive;
+    }
+    let accounts = accounts_short(program, counts);
     if needs.is_empty() {
         return format!(
-            "{drive}, and none of those has an enrolled, unwalled {program} account{asides}"
+            "{drive}, and none of those would start it on a {program} account with no known wall \
+             or sign-out{accounts}"
         );
     }
     let said = |of: &dyn Fn(&Need) -> bool| {
@@ -723,12 +812,11 @@ pub(crate) fn none_able(
             said(&|need| matches!(need, Need::Free { .. }))
         ));
     }
-    if counts.unknown > 0 {
+    if counts.unknown() > 0 {
         short.push(format!(
-            "{} cannot say whether they meet its needs (an aterm too old to report its home, \
-             checkouts and disk, or no read of its checkouts within {} min)",
-            counts.unknown,
-            REPOS_FRESH_MS / 60_000
+            "{} cannot say whether they meet its needs ({})",
+            counts.unknown(),
+            unsure(counts)
         ));
     }
     let short = if short.is_empty() {
@@ -738,16 +826,132 @@ pub(crate) fn none_able(
     };
     let fit = counts
         .drivable
-        .saturating_sub(counts.no_repo + counts.no_room + counts.unknown);
+        .saturating_sub(counts.no_repo + counts.no_room + counts.unknown());
     let rest = if fit == 0 {
         ", so none meets them".to_owned()
     } else {
         format!(
-            ", and none of the {fit} that meet them has an enrolled, unwalled {program} \
-             account{asides}"
+            ", and none of the {fit} that meet them would start it on a {program} account with no \
+             known wall or sign-out{accounts}"
         )
     };
     format!("{drive}{short}{rest}")
+}
+
+/// What keeps the members that cannot be driven from being driven, and what mends each, in a
+/// parenthesis; nothing where every member can be.
+fn undriven(counts: &Counts) -> String {
+    let mut why = Vec::new();
+    if counts.ungranted > 0 {
+        why.push(format!(
+            "{} with no grant: `aterm fleet allow drive --from <this Mac>` there",
+            counts.ungranted
+        ));
+    }
+    if counts.unproven > 0 {
+        why.push(format!(
+            "{} with no proof of the node key this Mac's book binds, which no grant mends: `aterm \
+             fleet peers` here reads the issuer's book, else update aterm there or join it again",
+            counts.unproven
+        ));
+    }
+    if counts.nodeless > 0 {
+        why.push(format!(
+            "{} named by hand, with no node a drive can go to: `aterm fleet join` there",
+            counts.nodeless
+        ));
+    }
+    if why.is_empty() {
+        String::new()
+    } else {
+        format!(" (of the others, {})", why.join("; "))
+    }
+}
+
+/// Why the members counted as unsure cannot say, each cause with what mends it.
+fn unsure(counts: &Counts) -> String {
+    let mut why = Vec::new();
+    if counts.unsaid > 0 {
+        why.push(format!(
+            "{} saying nothing of their home, checkouts or disk, from an aterm too old to, no \
+             read of its checkouts yet or a reply cut short: update it, or ask again",
+            counts.unsaid
+        ));
+    }
+    if counts.stale > 0 {
+        why.push(format!(
+            "{} with no read of its checkouts dated within {} min on its clock: ask again, which \
+             starts one",
+            counts.stale,
+            REPOS_FRESH_MS / 60_000
+        ));
+    }
+    if counts.no_head > 0 {
+        why.push(format!(
+            "{} listing the checkout with no HEAD read: mend that checkout there",
+            counts.no_head
+        ));
+    }
+    if counts.cut > 0 {
+        why.push(format!(
+            "{} not listing the checkout, in a read that stopped short of every clone: name that \
+             Mac with `--host <node>`",
+            counts.cut
+        ));
+    }
+    why.join("; ")
+}
+
+/// Why the members that meet a spawn's needs would not start it on an account, each with what mends
+/// it or what says more, in a parenthesis; nothing where nothing but the known walls and sign-outs
+/// the sentence names holds.
+fn accounts_short(program: &str, counts: &Counts) -> String {
+    let report = if program == "claude" {
+        "aterm harness accounts".to_owned()
+    } else {
+        format!("aterm harness accounts --cli {program}")
+    };
+    let mut why = Vec::new();
+    if counts.silent > 0 {
+        why.push(format!(
+            "{} of those say nothing of their accounts, from an aterm too old to or a reply cut \
+             short: update it, or name it with `--host <node>`",
+            counts.silent
+        ));
+    }
+    if counts.unread > 0 {
+        why.push(format!(
+            "{} of those could not read their {program} account records: `{report}` there says why",
+            counts.unread
+        ));
+    }
+    if counts.undated > 0 {
+        why.push(format!(
+            "{} of those run an aterm too old to say when it read its {program} account: update \
+             it, or name it with `--host <node>`",
+            counts.undated
+        ));
+    }
+    if counts.signed_out > 0 {
+        why.push(format!(
+            "{} of those signed out of {program}: `{report}` there names the sign-in",
+            counts.signed_out
+        ));
+    }
+    if counts.passed_over > 0 {
+        why.push(format!(
+            "{} of those holding such an account, where a launch would start on another row, on a \
+             login no row lists or none can show a wall on, or be refused: `{report}` there says \
+             where it would run or why it is refused, and `--host <node>` still starts a worker \
+             there unless that launch is refused",
+            counts.passed_over
+        ));
+    }
+    if why.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", why.join("; "))
+    }
 }
 
 /// What a spawn asked, as a refusal names it: `agent=<program>` and its needs

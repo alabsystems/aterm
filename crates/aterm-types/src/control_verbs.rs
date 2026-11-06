@@ -956,7 +956,7 @@ pub const VERBS: &[VerbSpec] = &[
          failing_applies= persistent= outcome=\"…\"`, plus, where they apply, \
          `stale_check=<rfc3339>` (no check in 4 h) or `check_unrecorded=true`, `checked_at= \
          next_check=`, `checker_stalled=<s>:<phase> checker_respawns= checker_deferred=`, \
-         `apply_phase= apply_held=` (automatic postures), `apply_policy_reason=`, \
+         `apply_phase=` (automatic postures), `apply_held=`, `apply_policy_reason=`, \
          `delivery=deferred|blocked`, `installable=false` (a disk-image, translocated or dev copy \
          never updates), on Linux \
          `linux_installed_build= linux_staged_build= linux_trial=<phase|none> linux_trial_starts= \
@@ -968,7 +968,8 @@ pub const VERBS: &[VerbSpec] = &[
          `disabled`, `unknown`. `apply_phase`: `prefer-idle`, `prefer-output-gap`, `keys-only`, \
          then `land` \
          within a minute of arming; `apply_held=restored-agents` holds the apply (up to 7 min) \
-         while reopened tabs' agents relaunch. `check` (Owner-only) runs one channel check and \
+         while reopened tabs' agents relaunch. `apply_held=account-work` names an accepted \
+         apply waiting for admitted account work to retire. `check` (Owner-only) runs one channel check and \
          answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
          live-session handoff keeps shells) or replaces the executable in place on Linux.",
     )
@@ -3659,12 +3660,15 @@ pub const VERBS: &[VerbSpec] = &[
          later, on this Mac alone: a fleet drive names it at spawn and serves no `meta`); \
          marks `stalled why=shell` if its shell ends or a person uses it before its first \
          prompt, `stalled why=startup` if no agent composer (for `codex`, no proven \
-         claim) within 120 s of `since_ms=` or sooner if its launcher gives up, with what held it in \
-         `attention=` (three name the member too, where its label is known: a launch refused for \
-         a cause no wait ends; a launch held because no account of its pool can take it now, and \
-         when the first opens, which never starts later; and `no shell prompt`, with what the \
-         shell showed: one that drew nothing and used no CPU is stuck at its start, as on a Mac \
-         that needs a restart), or `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
+         claim, and a `codex` program a fabric hold keeps from claiming is not judged until 120 s \
+         after the hold lifts) within 120 s of `since_ms=` or sooner if its launcher gives up, with \
+         what held it in `attention=` (each names the member too, where its label is known, among \
+         them: a launch refused for a cause no wait ends, what mends it first; a launch held \
+         because no account of its pool can take it now, and when the first opens, which never \
+         starts later; an install or sign-in check with no progress for 45 minutes; a program \
+         atpkg keeps off, and why; and `no shell prompt`, with what the shell showed: one that drew \
+         nothing and used no CPU is stuck at its start, as on a Mac that needs a restart), or \
+         `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
          false`, `headless = false`, or `autopilot = \"off\"`), and with `ERR spawn \
          agent=<word>: <why>` for an agent whose turn end no reader sees yet (`grok`, until \
@@ -3672,14 +3676,18 @@ pub const VERBS: &[VerbSpec] = &[
          worker with no usable sign-in file (a pooled `GROK_AUTH_PATH`, else `<GROK_HOME or \
          ~/.grok>/auth.json`, missing, \
          empty or one grok refused) is `stalled why=signin` before anything is installed, and \
-         only a person signs in. An agent whose program atpkg's store holds no build of yet \
+         only a person signs in. An agent whose program \
+         atpkg's store holds no build of yet \
          (every agent is in atpkg's default set; a fresh Mac before its update pass lands it) \
          is then installed by atpkg's verified install, and a failed install is `stalled \
-         why=install`; where `[packages] exclude`, a person's removal or a no to unattended \
+         why=install`, atpkg's last line of the failure in `attention=` (`why=signin` and `why=install` name the \
+         member and the cause there too); where `[packages] exclude`, a person's removal or a no to unattended \
          installs (Keep ALab tools up to date or Install ALab tools off in Settings ▸ \
          Packages, or the toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing \
-         is installed, the launch note says so and the line runs any copy of the shell's own. \
-         The startup deadline waits while it installs, until the install makes no progress for \
+         is installed, the launch note says so and the line runs any copy of the shell's own; \
+         if none starts, its `stalled why=startup` says why. After any install, the launch tries \
+         to renew a signed-out Google login, which reads `why=signin` only if that leaves it \
+         signed out; a renewal that could not run and any other failure read `why=startup`. The startup deadline waits while it installs, until the install makes no progress for \
          45 minutes, and a launcher whose task is no longer `working` types nothing, so a launch \
          that stalled while held or installing never starts later. Program form (Owner-only): \
          `spawn … program=<pct> [arg=<pct>]… [from=<sid>] len=<n>` (`aterm ctl spawn \
@@ -3760,9 +3768,11 @@ pub const VERBS: &[VerbSpec] = &[
          program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
-         (`why=startup|shell|held|signin|install`; it resumes `working why=moved` or `working \
-         why=turn`; a worker a restart brings back is `working why=restored`, or `exited` \
-         where its agent does not come back), or `failed`: \
+         (`why=startup|shell|held|signin|install`; a `why=startup` one resumes plain `working`, \
+         with no `why=`, when its agent starts, a `why=held` one `working why=moved` when it \
+         moves, and the others stay `stalled` until a `task` mark; a worker a restart brings \
+         back is `working why=restored`, or `exited` where its agent does not come back), or \
+         `failed`: \
          the work ended unfinished with its agent still there (`why=could-not-finish`, a Land \
          worker's reply whose first line starts `Could not finish: <why>`; `why=off`, a person \
          turned its Autopilot Off and it stayed Off 3 s, `why=off-ctl`, a manager or a script \
@@ -3987,6 +3997,9 @@ pub const VERBS: &[VerbSpec] = &[
          fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
          id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` (filtered by `mail:kinds=<k,..>`, \
          `mail:from=<class|principal>`, `mail:topic=<t>`) and `GAP <local> mail-dropped=<n>`. \
+         `cells` sends no frame past the 8 MiB reply line cap, saying `GAP <local> \
+         cells-too-large=<bytes> cap=<cap>` once until one fits, and a session serves 16 `cells` \
+         watches (`GAP <local> cells-watches=16` to a further one, which gets no cells). \
          `screen`, `cursor` and `cells` push only whole DEC 2026 frames: a target's unfinished \
          frame puts its content push off (to the frame's 60 s hang detector at most, then as it \
          stands) and holds up no other target or stream. Capped at 1/16 of fd limit (`ERR \
@@ -4465,11 +4478,19 @@ pub const VERBS: &[VerbSpec] = &[
          not be read, whose rows are unknown; `moves_7d=` and `last_move=` are the rotations \
          a session proved on its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say): `account pool=<cli> id=<pct> condition=<word> \
          enrolled=<0|1> pct5=<n|-> pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> \
-         last_used=<unix s|-> read_at=<unix s|->` (on this machine's clock; an id holding an `@` \
-         is sent as `ab…@…`, so no email is; `read_at`: when its figures were last read, from the \
+         last_used=<unix s|-> read_at=<unix s|-> launch=<0|1|->` (on this machine's clock; an id \
+         holding an `@` is sent as `ab…@…`, so no email is; `enrolled`: its login is made here, \
+         as a launch judges it, which for a Claude Code row with no dir is no look at a login; \
+         `read_at`: when its figures were last read, from the \
          records or a Codex row's own rollouts, since a survey asks no provider: a row with a \
-         window read full says `limited`, and one with no reading in six hours says `unseen`, \
-         not `usable`), and one `server_heard vault=<pct> subject=<age1…> at=<unix s>` \
+         window read full, or a refusal in its rollouts, says `limited`, and one with no reading \
+         in six hours, or none since its newest wall, says `unseen`, not `usable`; a `week_reset` \
+         no read named is the latest it can be; `launch=1`: a worker with no starter of its kind \
+         would start on this row here, under the accounts mode, the owner's pin and the Codex \
+         build, which no row of a pool says where that launch is refused, runs on a login no \
+         row lists, or is Codex's on one nothing here can show a wall on, and `-` or no field is \
+         an aterm too old to say), and one \
+         `server_heard vault=<pct> subject=<age1…> at=<unix s>` \
          row per subscriber a vault served here last heard from. A `session` row is `local= \
          sid= state= \
          program=<pct|-> program_kind=<agent|shell|program|-> wait=<memory|-> \
@@ -4485,8 +4506,10 @@ pub const VERBS: &[VerbSpec] = &[
          (`goal=` the agent's active goal, as `status` reads it), `needs=ask` selects the ask \
          excerpt and \
          `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
-         said= cmd= rows= need_ids=` (<= 400 B per excerpt, credentials/fleet codes redacted, fleet \
-         replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, never waited for). \
+         said= cmd= rows= need_ids= step=` (`step=`: a worker's step, its last topic post where \
+         newer than its words, `-` with no task; <= 400 B per excerpt, credentials/fleet codes \
+         redacted, fleet replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, \
+         never waited for). \
          `need_ids=` names each need of an ask as the herald tells them once (at most 33, \
          comma-separated, ids in hex: `<id>` read whole, `<id>/<entry>` read whole beside the \
          entry's cut of it, `/<id>` read from the entry alone; `-` for any other need), so a fleet \

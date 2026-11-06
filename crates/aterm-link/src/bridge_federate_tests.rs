@@ -733,18 +733,22 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             "{}/undeliverable",
             subject::person_lane(FLEET, "h-andrew", &new.node)
         );
+        // The carry counts a refusal after its notice is on the log, so the wait reads both.
+        let refused = if control { 2 } else { 1 };
         until(
             &format!("{case}: the carry took the post to no member"),
             || {
-                new.holds(&notices)
-                    .iter()
-                    .any(|(_, _, body, _)| Body::decode(body).0.re == Some(unmet))
+                routes.carry_status().refused >= refused
+                    && new
+                        .holds(&notices)
+                        .iter()
+                        .any(|(_, _, body, _)| Body::decode(body).0.re == Some(unmet))
             },
         );
         let status = routes.carry_status();
         assert_eq!(
             (status.carried, status.refused),
-            (0, if control { 2 } else { 1 }),
+            (0, refused),
             "{case}: {status:?}"
         );
         if !control {
@@ -998,6 +1002,208 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
             "{case}: the receipt names the ask where it came from"
         );
         drop(routes);
+    }
+}
+
+/// **AN ASK TO A PERSON UNREAD ACROSS TWO ROTATIONS NAMES ITSELF AS ITS SENDER'S MAC DOES** (§11
+/// C3d): B's push brings `s-b`'s ask to `h-andrew` to A's lane back to the person, and A's key
+/// rotates twice before A's bridge reads it. The node service moves it to each new node, and A's
+/// bridge under the second hands it to the person's lane here once, stamped with its offset on B
+/// and B's producer ([`crate::person::WIRE_RE_TOKEN`]), followed back through both moves as a
+/// session's answer names what it answers ([`Bridge::wire_re`]), so the person's answer ends
+/// `s-b`'s wait. The ask brings a stamp of its own, which is not the bridge's: it is dropped.
+/// NEGATIVE CONTROL: [`ONE_HOP`]: the copy is followed back one move alone, to a record the first
+/// move wrote, whose origin names no offset on B: the copy carries no stamp, neither the bridge's
+/// nor the one the ask brought.
+#[test]
+fn an_ask_to_a_person_unread_across_two_rotations_names_itself_as_its_senders_mac_does() {
+    use crate::federate::tests::routes_as;
+    use crate::person::WIRE_RE_TOKEN;
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (ma, mb) = (Mac::new(73), Mac::new(74));
+        let (mid, last) = (ma.rotated(75), ma.rotated(76));
+        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/h-andrew/{}/ask", mb.node);
+        let held = |node: &str| -> Vec<u64> {
+            ma.holds(&lane_of(node))
+                .into_iter()
+                .map(|(off, _, _, _)| off)
+                .collect()
+        };
+        {
+            let mut push = ma.client(
+                mb.key,
+                &[format!(
+                    "rw,p={0}:/f/{FLEET}/in/{1}/*/{0}/*",
+                    mb.node, ma.node
+                )],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-b".to_owned());
+            body.text = "ship it?".to_owned();
+            body.unknown.insert(
+                WIRE_RE_TOKEN.to_owned(),
+                crate::person::wire_stamp(5, pid(&mb.node)),
+            );
+            push.publish(pid(&mb.node), 7, &lane_of(&ma.node), &body.encode())
+                .expect("B's push lands");
+        }
+        let net = Arc::new(Net::default());
+        let handoff = |me: &Mac, olds: &[&Mac]| Handoff {
+            me: me.node.clone(),
+            members: [me.node.clone(), mb.node.clone()].into(),
+            moved: olds
+                .iter()
+                .map(|old| (old.node.clone(), me.node.clone()))
+                .collect(),
+            gone: BTreeSet::new(),
+        };
+        let generation = |me: &Mac, olds: &[&Mac]| {
+            let routes = routes_as(
+                &ma,
+                (&me.node, me.key),
+                &olds.iter().map(|old| old.node.clone()).collect(),
+                vec![Peer::of(&mb)],
+                &net,
+                false,
+            );
+            routes.set(&handoff(me, olds), &BTreeSet::new());
+            routes
+        };
+        let routes = generation(&mid, &[&ma]);
+        until(&format!("{case}: the first move"), || {
+            held(&mid.node).len() == 1
+        });
+        drop(routes);
+        let routes = generation(&last, &[&ma, &mid]);
+        until(&format!("{case}: the second move"), || {
+            held(&last.node).len() == 1
+        });
+        let second = handoff(&last, &[&ma, &mid]);
+        let keys = keys_for(76, Some(&second));
+        crate::federate::write_old_reads(keys.path(), &second, &|grant| {
+            Mac::mint(&ma.secret, grant)
+        })
+        .expect("the node service's reader's ring");
+        let (_lane, mut a, _served) =
+            bridge_on(&last, "s-a", keys.path(), None, crate::fx::Fx::os());
+        a.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+        assert!(
+            a.attach_broker(),
+            "{case}: the bridge attaches to its bus.log"
+        );
+        let person = format!("/f/{FLEET}/in/p/h-andrew/{}/>", last.node);
+        ONE_HOP.with(|on| on.set(control));
+        rounds_until(
+            &format!("{case}: the bridge hands it to the person"),
+            &mut a,
+            || !ma.holds(&person).is_empty(),
+        );
+        ONE_HOP.with(|on| on.set(false));
+        let handed = ma.holds(&person);
+        assert_eq!(handed.len(), 1, "{case}: once");
+        let body = Body::decode(&handed[0].2).0;
+        assert_eq!(
+            body.from.as_deref(),
+            Some(format!("s-b@{}", mb.node).as_str()),
+            "{case}"
+        );
+        assert_eq!(
+            body.unknown.get(WIRE_RE_TOKEN).cloned(),
+            (!control).then(|| crate::person::wire_stamp(7, pid(&mb.node))),
+            "{case}: the ask's offset on B and B's producer, through both moves"
+        );
+        drop(routes);
+    }
+}
+
+/// **AN ASK FROM A MAC THAT ROTATED ITS KEY IS STAMPED BY THE PUSH THAT BROUGHT IT** (§11 C3d):
+/// Q's session asked `h-andrew` under Q's first node, and Q's key rotated before its push
+/// carried the ask, so the push under Q's next node brings it to P's lane back to the person
+/// from the first. P has no hand-off yet; P's bridge hands the ask to the person stamped with its
+/// offset on Q and the producer of the push, with no hand-off read, and the person's answer maps
+/// to that offset once a hand-off says where Q's first node's seat is now, also after a second
+/// rotation of Q's key.
+/// NEGATIVE CONTROL: [`STAMP_BY_SENDER_SEQ`], the stamp by the hand-off the bridge reads
+/// ([`Bridge::sender_seq`]), as before: with none, the copy carries no stamp.
+#[test]
+fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it() {
+    use crate::person::{wire_stamp, WIRE_RE_TOKEN};
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (mp, first) = (Mac::new(83), Mac::new(84));
+        let (second, third) = (first.rotated(85), first.rotated(86));
+        let asked = format!("/f/{FLEET}/in/{}/h-andrew/{}/ask", mp.node, first.node);
+        {
+            let mut push = mp.client(
+                second.key,
+                &[format!(
+                    "rw,p={}:/f/{FLEET}/in/{}/*/{}/*",
+                    second.node, mp.node, first.node
+                )],
+            );
+            let mut body = Body::new(0);
+            body.from = Some("s-q".to_owned());
+            body.text = "ship it?".to_owned();
+            push.publish(pid(&second.node), 7, &asked, &body.encode())
+                .expect("Q's push under its next node lands");
+        }
+        let keys = keys_for(83, None);
+        let (_lane, mut p, _served) = bridge_on(&mp, "s-p", keys.path(), None, crate::fx::Fx::os());
+        assert!(p.attach_broker(), "{case}: the bridge attaches");
+        let person = format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node);
+        STAMP_BY_SENDER_SEQ.with(|on| on.set(control));
+        rounds_until(
+            &format!("{case}: the ask is handed to the person"),
+            &mut p,
+            || !mp.holds(&person).is_empty(),
+        );
+        STAMP_BY_SENDER_SEQ.with(|on| on.set(false));
+        let handed = mp.holds(&person);
+        assert_eq!(handed.len(), 1, "{case}: once");
+        let (copy, _, raw, _) = &handed[0];
+        let body = Body::decode(raw).0;
+        assert_eq!(
+            body.from.as_deref(),
+            Some(format!("s-q@{}", first.node).as_str()),
+            "{case}: from the session under the node it asked from"
+        );
+        assert_eq!(
+            body.unknown.get(WIRE_RE_TOKEN).cloned(),
+            (!control).then(|| wire_stamp(7, pid(&second.node))),
+            "{case}: the ask's offset on Q, and the producer of the push that brought it"
+        );
+        let mut reader = mp.client(mp.key, &[format!("ro:/f/{FLEET}/in/p/h-andrew/>")]);
+        for (now, moved) in [
+            (&second, vec![(first.node.clone(), second.node.clone())]),
+            (
+                &third,
+                vec![
+                    (first.node.clone(), second.node.clone()),
+                    (second.node.clone(), third.node.clone()),
+                ],
+            ),
+        ] {
+            let handoff = Handoff {
+                me: mp.node.clone(),
+                members: [mp.node.clone(), now.node.clone()].into(),
+                moved: moved.into_iter().collect(),
+                gone: BTreeSet::new(),
+            };
+            assert_eq!(
+                crate::person::wire_re(
+                    &mut reader,
+                    (FLEET, "h-andrew"),
+                    &handoff,
+                    ("s-q", &now.node),
+                    *copy,
+                )
+                .expect("the person's lanes read"),
+                (!control).then_some(7),
+                "{case}: the person's answer to s-q on Q, now {}",
+                now.node
+            );
+        }
     }
 }
 
@@ -1976,7 +2182,18 @@ enum Seal<'a> {
 fn person_posts(
     mac: &Mac,
     keys: &std::path::Path,
+    post: (&str, u64, &str, &str),
+    seal: Seal<'_>,
+) -> u64 {
+    person_posts_re(mac, keys, post, None, seal)
+}
+
+/// [`person_posts`], naming `re`.
+fn person_posts_re(
+    mac: &Mac,
+    keys: &std::path::Path,
     (dst, seq, kind, text): (&str, u64, &str, &str),
+    re: Option<u64>,
     seal: Seal<'_>,
 ) -> u64 {
     use crate::person_key::{post_address, read_cert, PersonKey};
@@ -1984,6 +2201,7 @@ fn person_posts(
     let lane = subject::post_lane(FLEET, dst, "s-q", person, kind);
     let mut body = Body::new(crate::now_ms());
     body.text = text.to_owned();
+    body.re = re;
     let sealer = match seal {
         Seal::Own => Some((keys, keys)),
         Seal::Bare => None,
@@ -2013,7 +2231,7 @@ fn person_posts(
 /// **A PERSON'S POST REACHES THE SESSION ON ANOTHER MAC ONCE, AS THE PERSON'S** (§11 C3c): a
 /// person on P posts an ask to `@s-q@<Q>`, sealed by P's person key under the certificate of P's
 /// node key. P's carry verifies the seal and writes the ask on P's own lane to Q, naming the
-/// person, and gives that lane's charge back; P's push carries it to Q's log once; and Q's
+/// person, the lane keeping its row; P's push carries it to Q's log once; and Q's
 /// bridge verifies the seal again, under the certificate's node key, which names P, and hands it
 /// to s-q once, `from=h-andrew@<P> kind=ask trust=human`. A note to a node whose seat rotated to
 /// Q is carried to Q and handed to s-q the same way. Restarted, the carry carries nothing twice. A post with no seal, one sealed by another Mac's person key under P's certificate, one
@@ -2094,13 +2312,18 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
             .client(mp.key, &[format!("ro:{carried_lanes}")])
             .last(&carried_lanes, "", 64)
             .expect("P's last-value index");
-        assert!(
-            charged.is_empty(),
-            "{arm}: the carry gave back each lane it carried on: {:?}",
-            charged
-                .iter()
-                .map(|(_, subject, _)| subject)
-                .collect::<Vec<_>>()
+        let rows: BTreeSet<&str> = charged
+            .iter()
+            .map(|(_, subject, _)| subject.as_str())
+            .collect();
+        let lanes: Vec<String> = ["ask", "note"]
+            .iter()
+            .map(|kind| subject::post_lane(FLEET, &mq.node, "s-q", &mp.node, kind))
+            .collect();
+        assert_eq!(
+            rows,
+            lanes.iter().map(String::as_str).collect(),
+            "{arm}: each lane the carry wrote keeps its row, for a watch that starts again"
         );
         assert!(
             mp.holds(&format!("/f/{FLEET}/in/{stranger}/>")).len() == 1,
@@ -2226,6 +2449,749 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
         assert_eq!(again.carry_status().refused, 0, "{arm}");
         assert!(later > unmet);
         drop(again);
+    }
+}
+
+/// **AN ANSWER AND A RECEIPT TO A PERSON'S POST REACH THE PERSON ON THEIR OWN MAC** (§11 C3d): a
+/// person on P asks `@s-q@<Q>`; P's carry carries it and Q's bridge hands it to s-q as
+/// `from=h-andrew@<P>`. Q's receipt for it, and s-q's answer `to=@h-andrew@<P>`, go on Q's lane
+/// to P under the person's name, naming the carried copy by its offset on P, and Q's push carries
+/// both to P's log. P's bridge hands each to the person's lane on P, where their inbox reads it
+/// as s-q's on Q, once though offered again: `from=s-q@<Q>`, `re=` the offset of the person's own
+/// post, and no token that speaks as a person.
+/// NEGATIVE CONTROLS: with [`NO_WAY_BACK`] on Q, Q has no lane back, as before C3d: the receipt is
+/// journaled `unacked … reason=no-lane`, the answer goes nowhere, and P's log holds nothing from
+/// Q for the person; with [`WIRE_RE_TO_PERSON`] on P, P hands both over naming the carried copy,
+/// an offset on P that is not the person's post.
+#[test]
+fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac() {
+    for arm in ["checked", "no-way-back", "wire-re"] {
+        let (mp, mq) = (Mac::new(61), Mac::new(62));
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        let (kp, kq) = (
+            keys_for(61, Some(&members(&mp, &both))),
+            keys_for(62, Some(&members(&mq, &both))),
+        );
+        assert!(crate::person_key::vouch(kp.path(), &[61; 32], crate::now_ms()).is_ok());
+        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
+        let (_lane_p, mut p, _served_p) = attached(&mp, "s-p", kp.path());
+        let net = Arc::new(Net::default());
+        let from_p = pushes(&mp, &[&mq], &net, &members(&mp, &both));
+        let to_p = pushes(&mq, &[&mp], &net, &members(&mq, &both));
+
+        let post = person_posts(
+            &mp,
+            kp.path(),
+            (&mq.node, 1, "ask", "which branch?"),
+            Seal::Own,
+        );
+        let ask = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        until(&format!("{arm}: the carried ask reaches Q's log"), || {
+            !mq.holds(&ask).is_empty()
+        });
+        let copy = mp.holds(&ask);
+        assert_eq!(copy.len(), 1, "{arm}: P carried the ask once");
+        let carried_at = copy[0].0;
+        assert_ne!(carried_at, post, "{arm}: the copy lies elsewhere on P");
+        let at_q = mq.holds(&ask)[0].0;
+        assert!(
+            offer_live_record(&mut q, at_q),
+            "{arm}: Q's bridge reads it"
+        );
+        let person = format!("h-andrew@{}", mp.node);
+        assert!(
+            lane_q
+                .deliveries()
+                .iter()
+                .any(|line| line.starts_with("deliver s-q ")
+                    && line.contains(&format!(" from={person} kind=ask trust=human"))),
+            "{arm}: s-q was handed the person's ask: {:?}",
+            lane_q.deliveries()
+        );
+
+        NO_WAY_BACK.with(|on| on.set(arm == "no-way-back"));
+        q.send_receipt(&OwedReceipt {
+            sid: "s-q".to_owned(),
+            rid: 1,
+            off: at_q,
+            verdict: "handled".to_owned(),
+            kind: "ask".to_owned(),
+            from: person.clone(),
+            earlier_log: false,
+        })
+        .expect("the receipt goes");
+        let text = "main has it";
+        *lane_q.outbox.lock().unwrap() = Some(format!(
+            "post sid=s-q id=1 to=@{person} kind=answer re={at_q} len={}\n{text}",
+            text.len()
+        ));
+        q.drain_outbox();
+        NO_WAY_BACK.with(|on| on.set(false));
+
+        let back = format!("/f/{FLEET}/in/{}/h-andrew/{}/>", mp.node, mq.node);
+        let handed = format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node);
+        if arm == "no-way-back" {
+            let face = subject::session_face(FLEET, &mq.node, "s-q", "ev");
+            assert!(
+                evs_on(&q, &face)
+                    .iter()
+                    .any(|ev| ev == &format!("unacked re={at_q} verdict=handled reason=no-lane")),
+                "{arm}: Q journals the receipt unsent: {:?}",
+                evs_on(&q, &face)
+            );
+            assert!(mq.holds(&back).is_empty(), "{arm}: Q wrote nothing back");
+            assert!(
+                mp.holds(&handed).is_empty(),
+                "{arm}: the person got nothing"
+            );
+            drop((from_p, to_p));
+            continue;
+        }
+        until(
+            &format!("{arm}: the receipt and the answer reach P's log"),
+            || mp.holds(&back).len() == 2,
+        );
+        let arrived = mp.holds(&back);
+        for (_, _, raw, origin) in &arrived {
+            assert_eq!(
+                Body::decode(raw).0.re,
+                Some(carried_at),
+                "{arm}: Q names the carried copy by its offset on P"
+            );
+            assert_eq!(
+                origin.map(|(producer, _)| producer),
+                Some(pid(&mq.node)),
+                "{arm}: under Q's producer"
+            );
+        }
+        WIRE_RE_TO_PERSON.with(|on| on.set(arm == "wire-re"));
+        let last = arrived.iter().map(|row| row.0).max().expect("two");
+        assert!(
+            offer_live_record(&mut p, last),
+            "{arm}: P's bridge reads them"
+        );
+        // Offered again, as a replay after a lost commit would: written once.
+        for (off, subject, raw, origin) in &arrived {
+            p.deliver_record(*off, subject, raw, *origin);
+        }
+        WIRE_RE_TO_PERSON.with(|on| on.set(false));
+        let inbox = mp.holds(&handed);
+        let kinds: Vec<&str> = inbox
+            .iter()
+            .filter_map(|(_, subject, _, _)| subject.rsplit('/').next())
+            .collect();
+        assert_eq!(kinds, ["ack", "answer"], "{arm}: each handed over once");
+        let names = if arm == "wire-re" { carried_at } else { post };
+        for (_, _, raw, origin) in &inbox {
+            let body = Body::decode(raw).0;
+            assert_eq!(
+                body.from.as_deref(),
+                Some(format!("s-q@{}", mq.node).as_str()),
+                "{arm}"
+            );
+            assert_eq!(body.re, Some(names), "{arm}: names the person's post");
+            assert!(
+                [
+                    crate::person_key::BY_TOKEN,
+                    crate::person_key::CERT_TOKEN,
+                    crate::person_key::SEAL_TOKEN
+                ]
+                .iter()
+                .all(|token| !body.unknown.contains_key(*token)),
+                "{arm}: nothing in it speaks as a person: {:?}",
+                body.unknown
+            );
+            assert_eq!(
+                origin.map(|(producer, _)| producer),
+                Some(pid(&mp.node)),
+                "{arm}: written by P's bridge"
+            );
+        }
+        let ack = Body::decode(&inbox[0].2).0;
+        assert_eq!(ack.verdict.as_deref(), Some("handled"), "{arm}");
+        assert_eq!(Body::decode(&inbox[1].2).0.text, text, "{arm}");
+        let (at, subject, raw, _) = &inbox[1];
+        let line = crate::person::inbox_delivery_line(
+            (FLEET, "cap"),
+            *at,
+            subject,
+            raw,
+            crate::now_ms(),
+            None,
+            &|_| None,
+        );
+        assert!(
+            line.contains(&format!(
+                " answer  from=s-q@{} trust=agent re={names}",
+                mq.node
+            )),
+            "{arm}: the person's inbox reads it as s-q's on Q: {line}"
+        );
+        drop((from_p, to_p));
+    }
+}
+
+/// **A PERSON'S ANSWER ENDS THE WAIT OF THE SESSION ON ANOTHER MAC THAT ASKED** (§11 C3d): s-q on
+/// Q asks `@h-andrew@<P>` with a deadline. Q notes that the ask went to P and arms its deadline;
+/// Q's push carries it to P's log, and P's bridge hands it to the person's lane on P, stamped with
+/// the ask's offset on Q ([`crate::person::WIRE_RE_TOKEN`]). The person answers the copy by its
+/// offset in their inbox, as `aterm fabric post` does ([`crate::person::wire_re`]): the sealed
+/// answer names the ask by its offset on Q, P's carry and push bring it to Q, and Q's bridge hands
+/// it to s-q as the person's answer to that ask, from where the ask went (P, whose lane brought
+/// it), and settles the ask's deadline.
+/// NEGATIVE CONTROLS: with [`UNSTAMPED_COPY`] on P, the copy carries no offset on Q, as before:
+/// the answer names the copy's offset on P, and the ask's deadline on Q stands; with
+/// [`PERSON_REPLY_AS_SENDER`] on Q, Q judges the answer by the sender it names,
+/// `h-andrew@<P>`, which the ask did not go to: it is demoted to a note, and the deadline stands.
+#[test]
+fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
+    use crate::person::WIRE_RE_TOKEN;
+    for arm in ["stamped", "unstamped", "as-sender"] {
+        let stamped = arm != "unstamped";
+        let (mp, mq) = (Mac::new(63), Mac::new(64));
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        let (kp, kq) = (
+            keys_for(63, Some(&members(&mp, &both))),
+            keys_for(64, Some(&members(&mq, &both))),
+        );
+        assert!(crate::person_key::vouch(kp.path(), &[63; 32], crate::now_ms()).is_ok());
+        // Q's log runs ahead of P's, so an offset on P names no record of the ask's on Q.
+        let ev = subject::node_face(FLEET, &mq.node, "ev");
+        let mut writer = mq.client(mq.key, &[format!("rw,p={}:{ev}", mq.node)]);
+        for seq in 0..32 {
+            writer
+                .publish(pid(&mq.node), (1 << 20) + seq, &ev, b"v=1 t=1")
+                .expect("an ev record");
+        }
+        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
+        let (_lane_p, mut p, _served_p) = attached(&mp, "s-p", kp.path());
+        let net = Arc::new(Net::default());
+        let from_p = pushes(&mp, &[&mq], &net, &members(&mp, &both));
+        let to_p = pushes(&mq, &[&mp], &net, &members(&mq, &both));
+
+        let text = "ship it?";
+        *lane_q.outbox.lock().unwrap() = Some(format!(
+            "post sid=s-q id=1 to=@h-andrew@{} kind=ask dl=600000 len={}\n{text}",
+            mp.node,
+            text.len()
+        ));
+        q.drain_outbox();
+        let asked = format!("/f/{FLEET}/in/{}/h-andrew/{}/ask", mp.node, mq.node);
+        let ask = mq.holds(&asked).first().expect("s-q's ask on Q's log").0;
+        assert!(
+            q.deadlines.contains_key(&ask),
+            "{arm}: Q arms the ask's deadline"
+        );
+        until(&format!("{arm}: the ask reaches P's log"), || {
+            !mp.holds(&asked).is_empty()
+        });
+        let at_p = mp.holds(&asked)[0].0;
+        UNSTAMPED_COPY.with(|on| on.set(arm == "unstamped"));
+        assert!(
+            offer_live_record(&mut p, at_p),
+            "{arm}: P's bridge reads it"
+        );
+        UNSTAMPED_COPY.with(|on| on.set(false));
+        let handed = mp.holds(&format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node));
+        assert_eq!(handed.len(), 1, "{arm}: handed to the person once");
+        let (copy, _, raw, _) = &handed[0];
+        let body = Body::decode(raw).0;
+        assert_eq!(
+            body.from.as_deref(),
+            Some(format!("s-q@{}", mq.node).as_str()),
+            "{arm}"
+        );
+        assert_eq!(
+            body.unknown.get(WIRE_RE_TOKEN).cloned(),
+            stamped.then(|| crate::person::wire_stamp(ask, pid(&mq.node))),
+            "{arm}: what the copy says the ask's offset on Q is, and whose push brought it"
+        );
+        assert_ne!(
+            *copy, ask,
+            "{arm}: the copy's offset on P is not the ask's on Q"
+        );
+
+        // The person answers the copy by its offset in their inbox, as `aterm fabric post` does.
+        let handoff = members(&mp, &both);
+        let mut person = mp.client(mp.key, &[format!("ro:/f/{FLEET}/in/p/h-andrew/>")]);
+        let wire = crate::person::wire_re(
+            &mut person,
+            (FLEET, "h-andrew"),
+            &handoff,
+            ("s-q", &mq.node),
+            *copy,
+        )
+        .expect("the person's lane reads");
+        assert_eq!(
+            wire,
+            stamped.then_some(ask),
+            "{arm}: the ask's offset on Q, which the answer names, where the copy says it"
+        );
+        assert_eq!(
+            crate::person::wire_re(
+                &mut person,
+                (FLEET, "h-andrew"),
+                &handoff,
+                ("s-other", &mq.node),
+                *copy,
+            )
+            .expect("reads"),
+            None,
+            "{arm}: the copy is no post of another session's, so it names nothing of one's"
+        );
+        assert_eq!(
+            crate::person::wire_re(
+                &mut person,
+                (FLEET, "h-andrew"),
+                &handoff,
+                ("s-q", &mp.node),
+                *copy,
+            )
+            .expect("reads"),
+            None,
+            "{arm}: the copy is from s-q on Q, so it names nothing of an s-q on P"
+        );
+        // Unstamped, `aterm fabric post` refuses the answer ([`crate::person::wire_re`]); posted
+        // anyway, naming the copy's offset on P, as it was before §11 C3d, it names no ask on Q.
+        let re = wire.unwrap_or(*copy);
+        person_posts_re(
+            &mp,
+            kp.path(),
+            (&mq.node, 2, "answer", "yes"),
+            Some(re),
+            Seal::Own,
+        );
+        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/answer", mq.node, mp.node);
+        until(
+            &format!("{arm}: the person's answer reaches Q's log"),
+            || !mq.holds(&carried).is_empty(),
+        );
+        let at_q = mq.holds(&carried)[0].0;
+        PERSON_REPLY_AS_SENDER.with(|on| on.set(arm == "as-sender"));
+        assert!(
+            offer_live_record(&mut q, at_q),
+            "{arm}: Q's bridge reads it"
+        );
+        PERSON_REPLY_AS_SENDER.with(|on| on.set(false));
+        let deliveries = lane_q.deliveries();
+        let line = deliveries
+            .iter()
+            .find(|line| line.starts_with("deliver s-q ") && line.ends_with(" text=yes"))
+            .unwrap_or_else(|| panic!("{arm}: s-q was handed the answer: {deliveries:?}"));
+        let kind = if arm == "as-sender" { "note" } else { "answer" };
+        assert!(
+            line.contains(&format!(
+                " from=h-andrew@{} kind={kind} trust=human",
+                mp.node
+            )) && line.contains(&format!(" re={re}")),
+            "{arm}: the person's answer, naming {re}: {line}"
+        );
+        assert_eq!(
+            line.contains(" demoted=answer"),
+            arm == "as-sender",
+            "{arm}: whether it reads as a stray reply: {line}"
+        );
+        assert_eq!(
+            q.deadlines.contains_key(&ask),
+            arm != "stamped",
+            "{arm}: whether the ask still waits"
+        );
+        if stamped {
+            // Once retention gave the copy up, it names nothing: the read below the log's oldest
+            // record, which the broker refuses, is read again told, and finds no post at `copy`.
+            mp.broker
+                .set_retention(crate::broker_rules::mesh_rules_scaled(1, 1, 1 << 30))
+                .expect("P's rules");
+            let ev = subject::node_face(FLEET, &mp.node, "ev");
+            mp.client(mp.key, &[format!("rw,p={}:{ev}", mp.node)])
+                .publish(pid(&mp.node), 1 << 21, &ev, b"v=1 t=1")
+                .expect("an ev record");
+            mp.broker
+                .retention_tick_at(mp.broker.now_ms())
+                .expect("a cut on P");
+            let lanes = crate::subject::person_mail_filter(FLEET, "h-andrew");
+            assert!(
+                person
+                    .fetch(*copy, &lanes, 1)
+                    .is_err_and(|e| crate::transport::retained_past(&e, *copy).is_some()),
+                "{arm}: the cut gave the copy up"
+            );
+            assert_eq!(
+                crate::person::wire_re(
+                    &mut person,
+                    (FLEET, "h-andrew"),
+                    &handoff,
+                    ("s-q", &mq.node),
+                    *copy,
+                )
+                .expect("a read below the oldest record is no failure"),
+                None,
+                "{arm}: a copy retention gave up names nothing"
+            );
+        }
+        drop((from_p, to_p));
+    }
+}
+
+/// **A COPY HELD BELOW THE PERSON'S LANES' OLDEST STILL NAMES THE ASK IT COPIES** (§11 C3d): a
+/// cut carries the copy P's bridge handed the person below the base, and the rules set next take
+/// the person's lanes whole from the base alone, so their oldest lies above the copy the broker
+/// still holds. A person's answer to it reads it there as the bridge reads such a record, told
+/// ([`crate::bridge::told_read_at`]), and names the ask by its offset on Q.
+/// NEGATIVE CONTROL: [`crate::person::UNTOLD_WIRE_RE`], the refusal taken for no post: the copy
+/// names nothing, and `aterm fabric post` would refuse the answer.
+#[test]
+fn a_copy_held_below_the_persons_lanes_oldest_still_names_the_ask_it_copies() {
+    use crate::person::{wire_stamp, UNTOLD_WIRE_RE, WIRE_RE_TOKEN};
+    for control in [false, true] {
+        let (mp, mq) = (Mac::new(77), Mac::new(78));
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        mp.broker
+            .set_retention(super::lanes_whole_from_the_base(true))
+            .expect("P's rules");
+        let lane = format!("/f/{FLEET}/in/p/h-andrew/{}/ask", mp.node);
+        let mut bridge = mp.client(mp.key, &[format!("rw,p={}:{lane}", mp.node)]);
+        let mut hand = |seq: u64, text: &str| {
+            let mut body = Body::new(0);
+            body.from = Some(format!("s-q@{}", mq.node));
+            body.text = text.to_owned();
+            body.unknown
+                .insert(WIRE_RE_TOKEN.to_owned(), wire_stamp(seq, pid(&mq.node)));
+            bridge
+                .publish(pid(&mp.node), seq, &lane, &body.encode())
+                .expect("a copy for the person")
+                .0
+        };
+        let copy = hand(7, "held");
+        let later = hand(8, "after");
+        mp.broker
+            .retain_before_carrying_state(later + 1)
+            .expect("a cut that carries the copies");
+        mp.broker
+            .set_retention(super::lanes_whole_from_the_base(false))
+            .expect("P's rules");
+        let lanes = subject::person_mail_filter(FLEET, "h-andrew");
+        assert!(
+            mp.broker
+                .oldest(&astream_wire::Filter::new(lanes.clone()).expect("a filter"))
+                > copy,
+            "PRECONDITION: the person's lanes' oldest lies above the copy the broker holds"
+        );
+        let mut person = mp.client(mp.key, &[format!("ro:{lanes}")]);
+        assert!(
+            person
+                .fetch(copy, &lanes, 1)
+                .is_err_and(|e| crate::transport::retained_past(&e, copy).is_some()),
+            "PRECONDITION: a plain read there is refused"
+        );
+        UNTOLD_WIRE_RE.with(|on| on.set(control));
+        let wire = crate::person::wire_re(
+            &mut person,
+            (FLEET, "h-andrew"),
+            &members(&mp, &both),
+            ("s-q", &mq.node),
+            copy,
+        );
+        UNTOLD_WIRE_RE.with(|on| on.set(false));
+        assert_eq!(
+            wire.expect("the person's lanes read"),
+            (!control).then_some(7),
+            "control={control}: the ask's offset on Q, read told below the oldest"
+        );
+    }
+}
+
+/// **A PERSON'S POST OUTLIVES A CARRY OUTAGE ACROSS A RETENTION CUT** (§11 C3d): a Mac's mesh
+/// `bus.log` holds its mail lanes until the person carry has read them as well as the push
+/// ([`crate::broker_rules::mesh_rules`]). P's carry carries a first post, then goes down while
+/// P's push to Q runs on: a person's ask to `@s-q@<Q>`, then a note of P's own to Q that the push
+/// carries, committing its group past both, lie below a retention cut. The cut keeps the ask;
+/// once the carry is back it carries the ask to Q, and the next cut releases it on P.
+/// NEGATIVE CONTROL: under [`crate::broker_rules::default_rules`], which hold mail for the push
+/// alone, the cut gives the ask up: the carry, back, resumes past it, its journal says retention
+/// gave posts up below it, and Q never gets the ask.
+#[test]
+fn a_persons_post_outlives_a_carry_outage_across_a_retention_cut() {
+    use crate::broker_rules::{mesh_rules_scaled, rules_scaled};
+    use crate::federate::{carry_group, mail_group, tests::routes_noting};
+    use std::sync::atomic::Ordering::SeqCst;
+    for arm in ["mesh", "default-rules"] {
+        let (mp, mq) = (Mac::new(71), Mac::new(72));
+        // The bulk stream holds the cut ([`astream_broker::Retention`]): at one byte, each `ev`
+        // record P writes puts every record before it below the cut, where the mail rule carries
+        // what it still wants and gives up the rest.
+        let rules = if arm == "mesh" {
+            mesh_rules_scaled(1, 1 << 30, 1 << 30)
+        } else {
+            rules_scaled(1, 1 << 30, 1 << 30)
+        };
+        mp.broker.set_retention(rules).expect("P's rules");
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        let kp = keys_for(71, Some(&members(&mp, &both)));
+        assert!(crate::person_key::vouch(kp.path(), &[71; 32], crate::now_ms()).is_ok());
+        let handoff = members(&mp, &both);
+        let net = Arc::new(Net::default());
+        let ev = subject::node_face(FLEET, &mp.node, "ev");
+        // Numbered above P's own note's sequence, which astream would answer as a duplicate.
+        let mut seq = 1 << 20;
+        let mut cut = || {
+            seq += 1;
+            mp.client(mp.key, &[format!("rw,p={}:{ev}", mp.node)])
+                .publish(pid(&mp.node), seq, &ev, b"v=1 t=1")
+                .expect("an ev record");
+            mp.broker
+                .retention_tick_at(mp.broker.now_ms())
+                .expect("a cut on P");
+        };
+        let journal = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let start = || {
+            let journal = Arc::clone(&journal);
+            let routes = routes_noting(
+                &mp,
+                (&mp.node, mp.key),
+                &BTreeSet::new(),
+                (vec![Peer::of(&mq)], &net, false),
+                Arc::new(move |line: &str| journal.lock().unwrap().push(line.to_owned())),
+                Arc::new(|_| true),
+            );
+            routes.set(&handoff, &BTreeSet::new());
+            routes
+        };
+        let routes = start();
+        let first = person_posts(&mp, kp.path(), (&mq.node, 1, "note", "first"), Seal::Own);
+        until(&format!("{arm}: the carry passed the first post"), || {
+            mp.broker.group_start(&carry_group()) > first
+        });
+        drop(routes);
+
+        mp.carry_down.store(true, SeqCst);
+        let routes = start();
+        let ask = person_posts(&mp, kp.path(), (&mq.node, 2, "ask", "kept?"), Seal::Own);
+        let after = mp.post(&mq.node, 1, b"after");
+        until(&format!("{arm}: the push passed P's own note"), || {
+            mp.broker.group_start(&mail_group(&mq.node)) > after
+        });
+        assert_eq!(routes.carry_status().carried, 0, "{arm}: the carry is down");
+        cut();
+        let posts = format!("/f/{FLEET}/in/{}/s-q/h-andrew/ask", mq.node);
+        let kept: Vec<u64> = mp.holds(&posts).iter().map(|row| row.0).collect();
+        assert_eq!(
+            kept,
+            if arm == "mesh" { vec![ask] } else { Vec::new() },
+            "{arm}: what the cut kept of the ask"
+        );
+        drop(routes);
+
+        mp.carry_down.store(false, SeqCst);
+        let routes = start();
+        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        until(
+            &format!("{arm}: the carry, back, passed P's own note"),
+            || mp.broker.group_start(&carry_group()) > after,
+        );
+        if arm == "mesh" {
+            until(&format!("{arm}: the ask reaches Q"), || {
+                !mq.holds(&carried).is_empty()
+            });
+            let got = mq.holds(&carried);
+            assert_eq!(got.len(), 1, "{arm}: once");
+            assert_eq!(Body::decode(&got[0].2).0.text, "kept?", "{arm}");
+            until(&format!("{arm}: the push passed the carried ask"), || {
+                mp.broker.group_start(&mail_group(&mq.node)) > got[0].3.expect("stamped").1
+            });
+            cut();
+            assert!(mp.holds(&posts).is_empty(), "{arm}: released once carried");
+        } else {
+            assert!(mq.holds(&carried).is_empty(), "{arm}: Q never gets the ask");
+            let said = journal.lock().unwrap().clone();
+            assert!(
+                said.iter().any(
+                    |line| line.starts_with("mesh: the person carry resumed at ")
+                        && line.contains("retention gave up the posts below it")
+                ),
+                "{arm}: {said:?}"
+            );
+        }
+        drop(routes);
+    }
+}
+
+/// **A CARRIED POST REACHES ITS MAC THOUGH THE NODE SERVICE RESTARTS BEFORE ITS PUSH RAN** (§11
+/// C3d): with Q cut off, P's carry carries a person's ask to `@s-q@<Q>` onto P's lane to Q, and
+/// P's node service stops before its push to Q carried it. Started again, its watch reads the
+/// lane's row and plans the push (a note of P's own to R, a push it starts after reading every
+/// row, shows the read is done), and once Q is back the ask reaches Q's log, once.
+/// NEGATIVE CONTROL: [`crate::federate::GIVE_BACK_CARRIED`], the carry before C3d giving each lane
+/// back at once: the restarted watch never sees the lane, plans no push to Q, and Q gets nothing.
+#[test]
+fn a_carried_post_reaches_its_mac_though_the_node_service_restarts_before_its_push() {
+    use crate::federate::GIVE_BACK_CARRIED;
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (mp, mq, mr) = (Mac::new(81), Mac::new(82), Mac::new(83));
+        let all = [mp.node.as_str(), mq.node.as_str(), mr.node.as_str()];
+        let kp = keys_for(81, Some(&members(&mp, &all)));
+        assert!(crate::person_key::vouch(kp.path(), &[81; 32], crate::now_ms()).is_ok());
+        let net = Arc::new(Net::default());
+        net.cut(&mq.node);
+        let start = || {
+            GIVE_BACK_CARRIED.with(|on| on.set(control));
+            let routes = routes_of(&mp, vec![Peer::of(&mq), Peer::of(&mr)], &net, false);
+            GIVE_BACK_CARRIED.with(|on| on.set(false));
+            routes.set(&members(&mp, &all), &BTreeSet::new());
+            routes
+        };
+        let routes = start();
+        person_posts(
+            &mp,
+            kp.path(),
+            (&mq.node, 1, "ask", "still there?"),
+            Seal::Own,
+        );
+        until(&format!("{case}: the carry carried the ask"), || {
+            routes.carry_status().carried == 1
+        });
+        drop(routes);
+
+        let routes = start();
+        mp.post(&mr.node, 1, b"to r");
+        until(
+            &format!("{case}: the restarted watch read every row"),
+            || routes.written().contains(&mr.node),
+        );
+        assert_eq!(
+            routes.written().contains(&mq.node),
+            !control,
+            "{case}: whether the watch plans the push to Q"
+        );
+        net.heal(&mq.node);
+        routes.kick();
+        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        if control {
+            until(&format!("{case}: P's note reaches R"), || {
+                !mr.mail_for(&mr.node).is_empty()
+            });
+            assert!(mq.holds(&carried).is_empty(), "{case}: Q gets nothing");
+        } else {
+            until(&format!("{case}: the ask reaches Q"), || {
+                !mq.holds(&carried).is_empty()
+            });
+            assert_eq!(mq.holds(&carried).len(), 1, "{case}: once");
+        }
+        drop(routes);
+    }
+}
+
+/// **A CARRIED LANE'S CHARGE GOES BACK ONCE RETENTION GAVE IT UP** (§11 C3d): the carry gives
+/// no lane back itself (a watch that starts again plans its push from the lane's row), so the mesh
+/// rule forgets ([`crate::broker_rules::mesh_rules`]). P's carry carries a person's ask to
+/// `@s-q@<Q>` and P's push carries it to Q; once both groups passed it, a retention cut gives up
+/// the person's post and the carried copy, and the same tick forgets both lanes: they leave P's
+/// last-value index and the carry's subject budget counts none. A later ask to s-q opens the
+/// carried lane again and reaches Q, once.
+/// NEGATIVE CONTROL: [`crate::broker_rules::mesh_rules_scaled_unforgetting`], the mesh rules
+/// without the forget: the cut gives the records up all the same, yet both lanes keep their rows
+/// and the carry's budget still counts its lane.
+#[test]
+fn a_carried_lanes_charge_goes_back_once_retention_gave_it_up() {
+    use crate::broker_rules::{mesh_rules_scaled, mesh_rules_scaled_unforgetting};
+    use crate::federate::{carry_group, mail_group, CARRIER};
+    for forget in [true, false] {
+        let arm = if forget { "forget" } else { "unforgetting" };
+        let (mp, mq) = (Mac::new(91), Mac::new(92));
+        // At one byte, each `ev` record P writes puts every record before it below the cut, as in
+        // [`a_persons_post_outlives_a_carry_outage_across_a_retention_cut`].
+        let rules = if forget {
+            mesh_rules_scaled(1, 1 << 30, 1 << 30)
+        } else {
+            mesh_rules_scaled_unforgetting(1, 1 << 30, 1 << 30)
+        };
+        mp.broker.set_retention(rules).expect("P's rules");
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        let kp = keys_for(91, Some(&members(&mp, &both)));
+        assert!(crate::person_key::vouch(kp.path(), &[91; 32], crate::now_ms()).is_ok());
+        let net = Arc::new(Net::default());
+        let routes = routes_of(&mp, vec![Peer::of(&mq)], &net, false);
+        routes.set(&members(&mp, &both), &BTreeSet::new());
+        let posts = format!("/f/{FLEET}/in/{}/s-q/h-andrew/ask", mq.node);
+        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        let passed = |at: u64| {
+            mp.broker.group_start(&carry_group()) > at
+                && mp.broker.group_start(&mail_group(&mq.node)) > at
+        };
+
+        person_posts(&mp, kp.path(), (&mq.node, 1, "ask", "first"), Seal::Own);
+        until(&format!("{arm}: the ask reaches Q"), || {
+            !mq.holds(&carried).is_empty()
+        });
+        let at = mp.holds(&carried).first().expect("the carried copy on P").0;
+        until(
+            &format!("{arm}: both groups passed the carried copy"),
+            || passed(at),
+        );
+        let ev = subject::node_face(FLEET, &mp.node, "ev");
+        mp.client(mp.key, &[format!("rw,p={}:{ev}", mp.node)])
+            .publish(pid(&mp.node), 1 << 20, &ev, b"v=1 t=1")
+            .expect("an ev record");
+        let tick = mp
+            .broker
+            .retention_tick_at(mp.broker.now_ms())
+            .expect("a cut on P");
+        assert!(
+            mp.holds(&posts).is_empty() && mp.holds(&carried).is_empty(),
+            "{arm}: the cut gave both records up"
+        );
+        let lanes = format!("/f/{FLEET}/in/{}/>", mq.node);
+        let (rows, _) = mp
+            .client(mp.key, &[format!("ro:{lanes}")])
+            .last(&lanes, "", 64)
+            .expect("P's last-value index");
+        let rows: BTreeSet<&str> = rows
+            .iter()
+            .map(|(_, subject, _)| subject.as_str())
+            .collect();
+        let budget = || {
+            mp.client(mp.key, &[format!("rw,p={CARRIER}:{carried}")])
+                .subject_budget(astream_cap::producer_id_of(CARRIER))
+                .expect("the carry's budget")
+                .expect("a budget")
+                .subjects
+        };
+        // Which tick forgot is not asked: the broker's own tick thread may cut, and forget with
+        // it, before this one. Ticks take turns, each forgetting under its turn what its cut gave
+        // up, so whichever ran had forgotten by the time this one returned.
+        if forget {
+            assert!(rows.is_empty(), "{arm}: both lanes forgotten: {rows:?}");
+            assert_eq!(budget(), 0, "{arm}: the carry's lane given back");
+        } else {
+            assert_eq!(tick.forgotten, 0, "{arm}");
+            assert_eq!(
+                rows,
+                BTreeSet::from([posts.as_str(), carried.as_str()]),
+                "{arm}: both lanes keep their rows"
+            );
+            assert_eq!(budget(), 1, "{arm}: the carry's lane still charged");
+            drop(routes);
+            continue;
+        }
+
+        let again = person_posts(&mp, kp.path(), (&mq.node, 2, "ask", "again"), Seal::Own);
+        until(&format!("{arm}: the later ask reaches Q"), || {
+            mq.holds(&carried).len() == 2
+        });
+        let texts: Vec<String> = mq
+            .holds(&carried)
+            .iter()
+            .map(|row| Body::decode(&row.2).0.text)
+            .collect();
+        assert_eq!(texts, ["first", "again"], "{arm}: each once");
+        assert_eq!(
+            mp.holds(&carried).first().and_then(|row| row.3),
+            Some((astream_cap::producer_id_of(CARRIER), again)),
+            "{arm}: the lane opened again under the carrier"
+        );
+        assert_eq!(budget(), 1, "{arm}: charged again");
+        drop(routes);
     }
 }
 

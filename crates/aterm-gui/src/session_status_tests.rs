@@ -3706,7 +3706,13 @@ fn a_codex_box_needs_you_on_every_reader_and_gives_one_banner() {
             });
             t.set_notification_admission(ctx.box_banner.admission());
             let sink = std::sync::Arc::clone(&passed);
-            t.set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
+            let banner = std::sync::Arc::clone(&ctx.box_banner);
+            t.set_notification_callback(move |body| {
+                banner.deliver(|| {
+                    sink.lock().unwrap().push(body.to_string());
+                    true
+                });
+            });
         }
         let front = |app: &mut crate::App, group: i32| {
             app.pool
@@ -3892,7 +3898,13 @@ impl BoxRig {
             });
             t.set_notification_admission(ctx.box_banner.admission());
             let sink = Arc::clone(&passed);
-            t.set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
+            let banner = Arc::clone(&ctx.box_banner);
+            t.set_notification_callback(move |body| {
+                banner.deliver(|| {
+                    sink.lock().unwrap().push(body.to_string());
+                    true
+                });
+            });
         }
         let mut rig = Self {
             app,

@@ -210,6 +210,144 @@ pub fn parse_statm_resident(text: &str) -> Option<u64> {
     crate::parse_uint(text.split_whitespace().nth(1)?)
 }
 
+/// One PID's conservative memory bytes: macOS's larger physical footprint/resident figure,
+/// or Linux's full resident plus swapped memory. No process-table sweep is performed.
+/// Callers must separately bracket this observation with stable same-UID native identity;
+/// this read alone provides no ownership, lifetime or control authority.
+///
+/// # Errors
+/// The PID is invalid, native usage/status is unavailable, the bounded status read is
+/// incomplete or malformed, arithmetic overflows, or this platform has no reader.
+pub fn pid_memory_bytes(pid: u32) -> std::io::Result<u64> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "memory read requires a valid PID above one",
+            )
+        })?;
+    #[cfg(target_os = "macos")]
+    {
+        let usage = imp::rusage_result(pid).map_err(std::io::Error::from_raw_os_error)?;
+        Ok(usage.ri.ri_phys_footprint.max(usage.ri.ri_resident_size))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut bytes = [0u8; crate::READ_CAP];
+        let (length, truncated) = crate::read_into(
+            std::path::Path::new(&format!("/proc/{pid}/status")),
+            &mut bytes,
+        )
+        .map_err(std::io::Error::from)?;
+        if truncated {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process status exceeds the bounded memory reader",
+            ));
+        }
+        let text = std::str::from_utf8(&bytes[..length]).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process status is not UTF-8",
+            )
+        })?;
+        status_resident_swap_bytes(text)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no native PID memory reader on this platform",
+        ))
+    }
+}
+
+// The sweep's RssAnon-based status_memory intentionally has different semantics: this
+// explicit-PID read includes file-backed resident pages, requires swap coverage and refuses
+// saturation. Keep the stricter field/units/overflow checks beside its maintained reader.
+#[cfg(any(test, target_os = "linux"))]
+fn status_resident_swap_bytes(text: &str) -> std::io::Result<u64> {
+    let malformed = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process status lacks exact resident/swap memory coverage",
+        )
+    };
+    if !text.ends_with('\n') {
+        return Err(malformed());
+    }
+    let mut resident = None;
+    let mut swap = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let slot = match key {
+            "VmRSS" => &mut resident,
+            "VmSwap" => &mut swap,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(malformed());
+        }
+        let mut fields = value.split_whitespace();
+        let bytes = fields
+            .next()
+            .and_then(crate::parse_uint::<u64>)
+            .and_then(|kib| kib.checked_mul(1024))
+            .ok_or_else(malformed)?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err(malformed());
+        }
+        *slot = Some(bytes);
+    }
+    resident
+        .ok_or_else(malformed)?
+        .checked_add(swap.ok_or_else(malformed)?)
+        .ok_or_else(malformed)
+}
+
+#[cfg(test)]
+mod pid_memory_tests {
+    use super::status_resident_swap_bytes;
+
+    #[test]
+    fn pid_memory_status_requires_full_resident_and_swap_not_anon_or_missing_zero() {
+        assert_eq!(
+            status_resident_swap_bytes("RssAnon: 1 kB\nVmRSS: 7 kB\nVmSwap: 3 kB\n").unwrap(),
+            10 * 1024
+        );
+        assert_eq!(
+            status_resident_swap_bytes("VmRSS: 0 kB\nVmSwap: 0 kB\n").unwrap(),
+            0
+        );
+        for text in [
+            "RssAnon: 1 kB\nVmSwap: 0 kB\n",
+            "VmRSS: 7 kB\n",
+            "VmRSS: 7 kB\nVmSwap: 0 kB",
+            "VmRSS: 7 MB\nVmSwap: 0 kB\n",
+            "VmRSS: 7 kB extra\nVmSwap: 0 kB\n",
+            "VmRSS: 7 kB\nVmRSS: 7 kB\nVmSwap: 0 kB\n",
+        ] {
+            assert!(status_resident_swap_bytes(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn pid_memory_status_rejects_field_and_total_overflow() {
+        assert!(
+            status_resident_swap_bytes("VmRSS: 18446744073709551615 kB\nVmSwap: 0 kB\n").is_err()
+        );
+        let almost = u64::MAX / 1024;
+        assert!(
+            status_resident_swap_bytes(&format!("VmRSS: {almost} kB\nVmSwap: 1 kB\n")).is_err()
+        );
+    }
+}
+
 /// A start on the boot clock (`start_ns` since boot, sleep included, as Linux counts a process's start) as unix ms, against the boot clock and the wall clock read together (`boot_now_ns`, `unix_now_ms`). A start after that moment (a process born while the sweep ran) is that moment; `None` before the epoch.
 #[must_use]
 pub fn birth_of_boot_start(start_ns: u64, boot_now_ns: u64, unix_now_ms: i64) -> Option<i64> {
@@ -427,7 +565,7 @@ pub(crate) mod imp {
     /// The flavor this kernel answers, learned at the first read that tells.
     static FLAVOR: Flavor = Flavor::new();
 
-    fn rusage_result(pid: c_int) -> Result<Usage, i32> {
+    pub(super) fn rusage_result(pid: c_int) -> Result<Usage, i32> {
         let mut ri = RusageV6::default();
         let v6 = FLAVOR.read(&mut ri, |flavor, ri| {
             // SAFETY: `ri` is a writable `rusage_info_v6`, which holds either flavor's record

@@ -69,6 +69,7 @@ use std::time::{Duration, Instant};
 
 use crate::floor::GIB;
 use crate::ledger::{Held, Laid, Ledger, Record, millis};
+use crate::overrun::{Overrun, overruns_of};
 use crate::reading::{Machine, Procs, Reading, TreeUse, Volume};
 use crate::{Admit, Need};
 
@@ -488,6 +489,10 @@ pub struct Holder {
     /// The processes it is credited with ([`Record::credit`]: a VM's, outside its holder's tree),
     /// whose work is its holder's.
     pub credit: Vec<u32>,
+    /// What its holder's tree holds past the memory its held claims claim, in pages the kernel
+    /// compressed or swapped among them ([`Overrun`]): of a held claim of memory only, read by
+    /// the waiter; `None` where it holds less than a tenth of a GiB past them.
+    pub overrun: Option<Overrun>,
 }
 
 impl fmt::Display for Holder {
@@ -538,6 +543,9 @@ impl fmt::Display for Holder {
         write!(f, " for {}: \"{}\"", span(self.age), self.what)?;
         if !self.checkout.is_empty() {
             write!(f, " in {}", self.checkout)?;
+        }
+        if let Some(o) = self.overrun {
+            write!(f, ", its tree holds {o}")?;
         }
         if let Some(span) = self.stalled {
             write!(f, ", {}", aterm_toolchain::stall::no_progress(span))?;
@@ -678,6 +686,7 @@ pub(crate) fn others<'r>(
                     && let Some(u) = trees.get(pid)
                 {
                     credited.footprint = credited.footprint.saturating_add(u.footprint);
+                    credited.whole = credited.whole.saturating_add(u.whole);
                     credited.written = credited.written.saturating_add(u.written);
                 }
             }
@@ -1010,7 +1019,10 @@ pub(crate) fn reserving<'r>(
         .iter()
         .filter(|r| {
             (r.held.is_some() || (r.need.rank, r.order()) < (mine.need.rank, mine.order()))
-                && (r.accounting == crate::Accounting::Whole || !kin(r.pid))
+                && (matches!(
+                    r.accounting,
+                    crate::Accounting::Whole | crate::Accounting::CohortOwned
+                ) || !kin(r.pid))
         })
         .find_map(|r| r.reserves(now).map(|left| (*r, left)))
 }
@@ -1077,9 +1089,13 @@ pub(crate) fn decide(
         .collect();
     let volume = reading.volume.as_ref();
     let reserves = reservations(&ahead, volume);
-    // A waiter of this claim's own process: its process orders its own claims, so it holds none
-    // of this one's memory back.
-    let sibling = |o: &Other<'_>| o.record.held.is_none() && o.record.pid == mine.1;
+    // An ordinary same-process waiter is ordered by its holder and reserves no memory
+    // against this one. Independently owned cohort budgets never use that exemption.
+    let sibling = |o: &Other<'_>| {
+        o.record.accounting != crate::Accounting::CohortOwned
+            && o.record.held.is_none()
+            && o.record.pid == mine.1
+    };
     let mut shorts = Vec::new();
     if need.rank == crate::Rank::Background
         && others.iter().any(|o| {
@@ -1175,6 +1191,7 @@ pub(crate) fn decide(
         shorts.push(Short::Cores);
     }
     if !shorts.is_empty() {
+        let overruns = overruns_of(others);
         let holders = ahead
             .iter()
             .zip(&reserves)
@@ -1198,6 +1215,14 @@ pub(crate) fn decide(
                 order: o.record.order(),
                 stalled: None,
                 credit: o.record.credit.clone(),
+                overrun: overruns
+                    .get(&o.record.pid)
+                    .filter(|_| {
+                        o.record.accounting == crate::Accounting::Holder
+                            && o.record.held.is_some()
+                            && o.record.need.mem > 0
+                    })
+                    .copied(),
             })
             .collect();
         return Err(Shortfall { shorts, holders });
@@ -1889,6 +1914,19 @@ impl Claim {
         })
     }
 
+    /// Durably require a later authenticated boot of this host to close spawned work.
+    /// Call before the first ARM. Group death, signaling and holder death cannot close
+    /// bound work in its original boot. This policy establishes no containment.
+    /// An exact no-child cancellation still permits releasing an unused claim.
+    ///
+    /// # Errors
+    /// The claim is not an admitted private cohort claim, has already armed, has uncertain
+    /// custody, or the policy cannot be durably committed.
+    #[cfg(unix)]
+    pub fn require_boot_closure(&mut self) -> io::Result<()> {
+        self.laid.require_boot_closure()
+    }
+
     /// Durably ARM this admitted private cohort claim before passing the returned one-use
     /// attempt to the controlled spawn. A partial failure conservatively retains the budget.
     ///
@@ -1898,7 +1936,9 @@ impl Claim {
     #[cfg(unix)]
     pub fn arm_cohort(&mut self) -> io::Result<aterm_uds::spawnfd::BirthAttempt> {
         let attempt = self.laid.arm_cohort()?;
-        self.record.accounting = crate::Accounting::Whole;
+        if self.record.accounting != crate::Accounting::CohortOwned {
+            self.record.accounting = crate::Accounting::Whole;
+        }
         Ok(attempt)
     }
 
@@ -1937,6 +1977,94 @@ impl Claim {
         crate::cohort::launch::launch_member(self, leader, command)
     }
 
+    /// Launch a new host-owned dedicated process group under this claim's original root.
+    /// Durable subgroup ARM precedes native spawn and BIND precedes success. The complete
+    /// claim remains reserved until the root and every registered subgroup have drained;
+    /// a pending unknown ARM retains it. This does not contain foreign escaping descendants.
+    /// Subgroup admission remains bounded by the durable record's byte budget.
+    ///
+    /// # Errors
+    /// The actual root is not live, current and original, custody is stale or full, native
+    /// spawn fails, or persistence fails. `Unbound` preserves the real child for retry.
+    #[cfg(unix)]
+    pub fn launch_subgroup(
+        &mut self,
+        root: &mut crate::cohort::launch::CohortChild,
+        command: &mut aterm_uds::spawnfd::Command,
+    ) -> Result<crate::cohort::launch::CohortChild, crate::cohort::launch::LaunchError> {
+        crate::cohort::launch::launch_subgroup(self, root, command)
+    }
+
+    /// Retry durable subgroup BIND using the actual one-use spawn receipt retained by an
+    /// `Unbound` launch error. An error returns that same actual child again.
+    ///
+    /// # Errors
+    /// The receipt or durable ARM does not match, the child was replaced, or persistence fails.
+    #[cfg(unix)]
+    pub fn bind_subgroup(
+        &mut self,
+        spawned: aterm_uds::spawnfd::Spawned,
+    ) -> Result<crate::cohort::launch::CohortChild, crate::cohort::launch::LaunchError> {
+        crate::cohort::launch::bind_subgroup(self, spawned)
+    }
+
+    /// Cancel only a subgroup attempt's exact controlled no-child receipt.
+    ///
+    /// # Errors
+    /// The receipt does not match an outstanding subgroup ARM or durable cancellation fails.
+    #[cfg(unix)]
+    pub fn cancel_subgroup(&mut self, proof: aterm_uds::spawnfd::NotSpawned) -> io::Result<()> {
+        self.laid.cancel_subgroup(proof)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn check_subgroup_cancel(
+        &self,
+        proof: &aterm_uds::spawnfd::NotSpawned,
+    ) -> io::Result<()> {
+        self.laid.check_subgroup_cancel(proof)
+    }
+
+    /// Durably retire a registered actual subgroup only after its scoped kernel drain.
+    /// The original root and all other scopes remain; covered snapshots bound sequential
+    /// campaign history. BootOnly still retains the claim through this authenticated boot.
+    ///
+    /// # Errors
+    /// The receipt is stale, foreign, replaced or unregistered, the group is live/unknown,
+    /// or the retirement or snapshot cannot be durably committed.
+    #[cfg(unix)]
+    pub fn retire_subgroup(
+        &mut self,
+        subgroup: &crate::cohort::launch::CohortChild,
+    ) -> io::Result<()> {
+        crate::cohort::launch::retire_subgroup(self, subgroup)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn arm_subgroup(
+        &mut self,
+        root: &crate::cohort::Cohort,
+    ) -> io::Result<aterm_uds::spawnfd::BirthAttempt> {
+        self.laid.arm_subgroup(root)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn bind_subgroup_actual(
+        &mut self,
+        spawned: &mut aterm_uds::spawnfd::Spawned,
+    ) -> io::Result<crate::cohort::Cohort> {
+        self.laid.bind_subgroup(spawned)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn retire_subgroup_actual(
+        &mut self,
+        key: &aterm_uds::spawnfd::BirthKey,
+        cohort: &crate::cohort::Cohort,
+    ) -> io::Result<()> {
+        self.laid.retire_subgroup(key, cohort)
+    }
+
     /// Bind the actual controlled child to its exact durable ARM before acknowledging work.
     /// Guard closure and holder death subsequently leave the entire reservation in the ledger.
     ///
@@ -1959,7 +2087,9 @@ impl Claim {
     #[cfg(unix)]
     pub fn cancel_cohort(&mut self, proof: aterm_uds::spawnfd::NotSpawned) -> io::Result<()> {
         self.laid.cancel_cohort(proof)?;
-        self.record.accounting = crate::Accounting::Holder;
+        if self.record.accounting != crate::Accounting::CohortOwned {
+            self.record.accounting = crate::Accounting::Holder;
+        }
         Ok(())
     }
 
@@ -1980,7 +2110,9 @@ impl Claim {
     #[cfg(unix)]
     pub fn finish_cohort(&mut self) -> io::Result<()> {
         self.laid.finish_cohort()?;
-        self.record.accounting = crate::Accounting::Holder;
+        if self.record.accounting != crate::Accounting::CohortOwned {
+            self.record.accounting = crate::Accounting::Holder;
+        }
         Ok(())
     }
 
@@ -2058,7 +2190,31 @@ impl Waiter {
     ///
     /// # Errors
     /// The ledger's directory or the claim file could not be made, locked or written.
-    pub fn enter(ledger: &Ledger, machine: &dyn Machine, mut need: Need) -> io::Result<Waiter> {
+    pub fn enter(ledger: &Ledger, machine: &dyn Machine, need: Need) -> io::Result<Waiter> {
+        Self::enter_accounted(ledger, machine, need, crate::Accounting::Holder)
+    }
+
+    /// Queue an independent cohort budget, without numeric creator-tree credit or coverage.
+    /// This immutable reservation law starts before admission and survives ARM and cancellation.
+    ///
+    /// # Errors
+    /// The ledger is not a private cohort ledger, or entering its queue fails.
+    pub fn enter_cohort(ledger: &Ledger, machine: &dyn Machine, need: Need) -> io::Result<Waiter> {
+        if !ledger.cohort_aware()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cohort-owned admission requires a private cohort ledger",
+            ));
+        }
+        Self::enter_accounted(ledger, machine, need, crate::Accounting::CohortOwned)
+    }
+
+    fn enter_accounted(
+        ledger: &Ledger,
+        machine: &dyn Machine,
+        mut need: Need,
+        accounting: crate::Accounting,
+    ) -> io::Result<Waiter> {
         if machine.release_run() {
             need.rank = crate::Rank::Release;
         }
@@ -2085,7 +2241,11 @@ impl Waiter {
         let stalled_after = need
             .stuck_ends
             .unwrap_or(aterm_toolchain::stall::STALLED_AFTER);
-        let (record, laid) = ledger.lay(&need, now_ms())?;
+        let (record, laid) = if accounting == crate::Accounting::Holder {
+            ledger.lay(&need, now_ms())?
+        } else {
+            ledger.lay_accounted(&need, now_ms(), accounting)?
+        };
         Ok(Waiter {
             ledger: ledger.clone(),
             record,
@@ -2301,7 +2461,10 @@ impl Waiter {
         let mut need = self.record.need.clone();
         // Ancestor coverage is resource exclusion only. Even a measured parent supplies no
         // CPU window here: this waiter samples its own admission and later its own entry.
-        if need.quiet.is_some() && covered(self.record.pid, &records, procs.as_ref()) {
+        if self.record.accounting == crate::Accounting::Holder
+            && need.quiet.is_some()
+            && covered(self.record.pid, &records, procs.as_ref())
+        {
             need.quiet = None;
         }
         let bound = if measured {
@@ -2320,14 +2483,19 @@ impl Waiter {
                 .is_some_and(|(p, next)| now >= next.saturating_add(millis(p.start)));
         // A loaded claim its own process or an ancestor holds has already spent the patience of
         // the work under it: this need's first window decides, quiet or loaded.
-        let spent = measured
+        let spent = self.record.accounting == crate::Accounting::Holder
+            && measured
             && self.record.need.at_bound == crate::AtBound::RunLoaded
             && loaded_cover(self.record.pid, &records, procs.as_ref());
         let past = past || spent;
         if past && need.quiet.is_some() {
             need.quiet = Some(f64::INFINITY);
         }
-        let records = counted(records, self.record.pid, procs.as_ref());
+        let records = if self.record.accounting == crate::Accounting::CohortOwned {
+            records
+        } else {
+            counted(records, self.record.pid, procs.as_ref())
+        };
         let mut claimants = HashSet::with_capacity(records.len() + 1);
         claimants.extend(records.iter().map(|r| r.pid));
         claimants.insert(self.record.pid);
@@ -2432,6 +2600,7 @@ impl Waiter {
                 order: r.order(),
                 stalled: None,
                 credit: r.credit.clone(),
+                overrun: None,
             };
             decided = match decided {
                 Ok(_) => Err(Shortfall {
@@ -3371,3 +3540,7 @@ mod timing_completion_tests {
         assert_eq!(claim.timing_admission(), Err(crate::TimingIssue::Expired));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "cohort_budget_tests.rs"]
+mod cohort_budget_tests;

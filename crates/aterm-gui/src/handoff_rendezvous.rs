@@ -41,19 +41,23 @@ pub(crate) fn grant_caps(chunks: bool, empty: bool) -> Option<String> {
     (!caps.is_empty()).then(|| caps.join(","))
 }
 
+// ATRZ1/ATRZ1C keep their existing packet shape across app versions. A larger
+// generic rights buffer for resource delegation cannot enlarge this wire lane.
+const GRANT_MESSAGE_FDS: usize = 64;
+const _: () = assert!(GRANT_MESSAGE_FDS <= fdpass::MAX_FDS);
 pub(crate) const MAX_CHUNKED_SESSIONS: usize = crate::seamless::MAX_HANDOFF_SESSIONS;
 const MAX_GRANT_FDS: usize = MAX_CHUNKED_SESSIONS + RENDEZVOUS_CHANNEL_FDS;
-const MAX_GRANT_CHUNKS: usize = MAX_GRANT_FDS.div_ceil(fdpass::MAX_FDS);
+const MAX_GRANT_CHUNKS: usize = MAX_GRANT_FDS.div_ceil(GRANT_MESSAGE_FDS);
 const GRANT_HEADER_LEN: usize = GRANT_MAGIC.len() + 2;
 const MAX_GRANT_BODY_BYTES: usize = 32 * 1024;
 
 pub(crate) const RENDEZVOUS_CHANNEL_FDS: usize = 2;
 
-pub(crate) const MAX_RENDEZVOUS_SESSIONS: usize = fdpass::MAX_FDS - RENDEZVOUS_CHANNEL_FDS;
+pub(crate) const MAX_RENDEZVOUS_SESSIONS: usize = GRANT_MESSAGE_FDS - RENDEZVOUS_CHANNEL_FDS;
 
 const _: () = assert!(
     MAX_RENDEZVOUS_SESSIONS < 256,
-    "the transport, not the protocol, is what bounds this lane"
+    "the existing handoff session count must fit its one-byte field"
 );
 
 /// Returns the maximum number of sessions a grant may carry (`MAX_CHUNKED_SESSIONS` or `MAX_GRANT_SESSIONS`).
@@ -92,11 +96,11 @@ const fn grant_shape(
 fn grant_chunk_sizes(sessions: usize) -> Vec<usize> {
     let mut sizes = Vec::new();
     let mut left = sessions;
-    while left > fdpass::MAX_FDS {
-        sizes.push(fdpass::MAX_FDS);
-        left -= fdpass::MAX_FDS;
+    while left > GRANT_MESSAGE_FDS {
+        sizes.push(GRANT_MESSAGE_FDS);
+        left -= GRANT_MESSAGE_FDS;
     }
-    if left + RENDEZVOUS_CHANNEL_FDS <= fdpass::MAX_FDS {
+    if left + RENDEZVOUS_CHANNEL_FDS <= GRANT_MESSAGE_FDS {
         sizes.push(left + RENDEZVOUS_CHANNEL_FDS);
     } else {
         sizes.push(left);
@@ -1983,7 +1987,7 @@ fn recv_fds_by_deadline(
     loop {
         arm_read_timeout(stream, remaining_io_budget(deadline)?)
             .map_err(|error| RendezvousError::Grant(error.to_string()))?;
-        match fdpass::recv_with_fds(stream, buf, fdpass::MAX_FDS) {
+        match fdpass::recv_with_fds(stream, buf, GRANT_MESSAGE_FDS) {
             Ok(received) => return Ok(received),
             Err(error)
                 if matches!(
@@ -2511,7 +2515,7 @@ mod tests {
             let mut received = 0;
             let mut buf = [0u8; 4096];
             while let Ok(got) =
-                aterm_uds::fdpass::recv_with_fds(&stream, &mut buf, aterm_uds::fdpass::MAX_FDS)
+                aterm_uds::fdpass::recv_with_fds(&stream, &mut buf, GRANT_MESSAGE_FDS)
             {
                 if got.bytes == 0 && got.fds.is_empty() {
                     break;
@@ -2604,9 +2608,7 @@ mod tests {
         let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
         let mut received = 0;
         let mut buf = [0u8; 4096];
-        while let Ok(got) =
-            aterm_uds::fdpass::recv_with_fds(stream, &mut buf, aterm_uds::fdpass::MAX_FDS)
-        {
+        while let Ok(got) = aterm_uds::fdpass::recv_with_fds(stream, &mut buf, GRANT_MESSAGE_FDS) {
             if got.bytes == 0 && got.fds.is_empty() {
                 break;
             }
@@ -2965,7 +2967,7 @@ mod tests {
                 .and_then(|()| (&stream).flush())
                 .expect("claim");
             let mut header = [0u8; GRANT_HEADER_LEN];
-            let received = fdpass::recv_with_fds(&stream, &mut header, fdpass::MAX_FDS)
+            let received = fdpass::recv_with_fds(&stream, &mut header, GRANT_MESSAGE_FDS)
                 .expect("the header and its descriptors");
             let count = received.fds.len();
             drop(received);
@@ -3628,7 +3630,7 @@ mod tests {
             assert!(
                 sizes
                     .iter()
-                    .all(|size| (1..=fdpass::MAX_FDS).contains(size)),
+                    .all(|size| (1..=GRANT_MESSAGE_FDS).contains(size)),
                 "{sessions}: {sizes:?} fits the message ceiling"
             );
             assert!(
@@ -3940,7 +3942,7 @@ mod tests {
             .expect("a read bound");
         let mut header = [0u8; GRANT_HEADER_LEN];
         let received =
-            fdpass::recv_with_fds(&dialer, &mut header, fdpass::MAX_FDS).expect("the header");
+            fdpass::recv_with_fds(&dialer, &mut header, GRANT_MESSAGE_FDS).expect("the header");
         assert_eq!(received.bytes, GRANT_HEADER_LEN);
         assert_eq!(received.fds.len(), 5, "every descriptor in the one message");
         let body = encode_grant_body(TEST_NONCE, &sessions, None).expect("a body");

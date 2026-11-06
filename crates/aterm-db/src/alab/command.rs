@@ -1889,23 +1889,29 @@ fn review_text(text: &str, reveal: bool) -> String {
         .chars()
         .map(|c| if c == '\t' || c.is_control() { ' ' } else { c })
         .collect();
-    if reveal {
+    if reveal || !flat.contains('@') {
         return flat;
     }
-    flat.split(' ')
-        .map(|word| {
-            if word.contains('@') {
-                grid::mask(word)
-            } else {
-                word.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(flat.len());
+    for (i, word) in flat.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if word.contains('@') {
+            out.push_str(&grid::mask(word));
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 fn tsv(rows: &[Vec<String>]) -> String {
-    let mut out = String::new();
+    let cap: usize = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.len() + 1).sum::<usize>() + 1)
+        .sum();
+    let mut out = String::with_capacity(cap);
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
@@ -1930,7 +1936,8 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
         .suffix(".noindex")
         .tempdir()
         .map_err(|_| Error::new("the review's private folder could not be made"))?;
-    let mut findings = vec![
+    let mut findings = Vec::with_capacity(1 + plan.findings.len());
+    findings.push(
         [
             "finding",
             "collection",
@@ -1943,20 +1950,28 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
         ]
         .map(str::to_owned)
         .to_vec(),
-    ];
+    );
     for finding in &plan.findings {
         let base = [
-            finding.kind.word().to_owned(),
-            finding.collection.unwrap_or_default().to_owned(),
+            finding.kind.word(),
+            finding.collection.unwrap_or_default(),
             finding
                 .pk
                 .as_deref()
-                .map_or("", crate::att::command::safe_key)
-                .to_owned(),
-            finding.column.clone().unwrap_or_default(),
+                .map_or("", crate::att::command::safe_key),
+            finding.column.as_deref().unwrap_or_default(),
         ];
         if finding.at.is_empty() {
-            findings.push([base.to_vec(), vec![String::new(); 4]].concat());
+            findings.push(vec![
+                base[0].to_owned(),
+                base[1].to_owned(),
+                base[2].to_owned(),
+                base[3].to_owned(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]);
         }
         for at in &finding.at {
             let (file, text) = match sheets.get(at.sheet) {
@@ -1971,20 +1986,24 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
                 None if at.sheet == import::ROSTER => ("swarm roster".to_owned(), String::new()),
                 None => (String::new(), String::new()),
             };
-            findings.push(
-                [
-                    base.to_vec(),
-                    vec![file, at.row.to_string(), at.col.to_string(), text],
-                ]
-                .concat(),
-            );
+            findings.push(vec![
+                base[0].to_owned(),
+                base[1].to_owned(),
+                base[2].to_owned(),
+                base[3].to_owned(),
+                file,
+                at.row.to_string(),
+                at.col.to_string(),
+                text,
+            ]);
         }
     }
-    let mut planned = vec![
+    let mut planned = Vec::with_capacity(1 + plan.planned.len());
+    planned.push(
         ["collection", "pk", "column", "value", "step"]
             .map(str::to_owned)
             .to_vec(),
-    ];
+    );
     for item in &plan.planned {
         let shown = match item.column.split_once('.') {
             Some((_, elem)) => elem.to_owned(),

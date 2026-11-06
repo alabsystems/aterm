@@ -315,6 +315,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
             walled_until: None,
             last_used: Some(1_793_159_900),
             read_at: None,
+            launch: None,
         })
         .collect();
     let expected = SwarmSurveyFacts {

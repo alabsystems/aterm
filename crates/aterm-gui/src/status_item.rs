@@ -943,6 +943,14 @@ impl Herald {
     }
 
     /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), or a restore after a quit brought it back with the told ids its leaf carried, at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note_spent`]), each need of it marked told (§14.18) — an update is no new need, and the owner was told once. The carried told ids are this session's memory here ([`Told::carried`]): kept until the owner's first plain Enter in this process, or a take-down after the first need noted here, so a need told before the restart is told once across it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "HeraldToldOnce",
+            action = "Restart",
+            project = "aterm_gui::status_item::herald_told_once_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn adopt(
         &mut self,
         session: u64,
@@ -974,9 +982,9 @@ impl Herald {
         );
     }
 
-    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when, and whether the need it shows is told — noted and nothing owed for it.
+    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when, whether the need it shows is told — noted and nothing owed for it — and the told ids it would still keep at `owner_turn`, the tab's owner turn now ([`Self::told_ids`]).
     #[cfg(any(unix, test))]
-    pub(crate) fn carry_of(&self, session: u64) -> StatusCarry {
+    pub(crate) fn carry_of(&self, session: u64, owner_turn: u64) -> StatusCarry {
         let since = self.since.get(&session).copied().unwrap_or_default();
         let told = since
             .need
@@ -984,17 +992,18 @@ impl Herald {
         StatusCarry {
             need: since.need.map(|(word, _, at)| (word, at)),
             told,
-            told_ids: self.told_ids(session),
+            told_ids: self.told_ids(session, owner_turn),
             held: since.held,
             done: None,
             box_receipt: None,
         }
     }
 
-    /// The ids `session`'s told-once memory holds, oldest first ([`Told`]): what a quit's restore leaf and a seamless update's status row carry.
-    pub(crate) fn told_ids(&self, session: u64) -> Vec<u64> {
+    /// The ids `session`'s told-once memory holds, oldest first ([`Told`]), while the tab's owner turn is still `owner_turn` (`SessionRow::owner_turn`, the turn now): none once the owner has had a turn since the memory was kept, which its next note would forget (§14.18). What a restart's restore leaf and a seamless update's status row carry.
+    pub(crate) fn told_ids(&self, session: u64, owner_turn: u64) -> Vec<u64> {
         self.slots
             .get(&session)
+            .filter(|slot| slot.told.turn == owner_turn)
             .map(|slot| slot.told.ids.iter().copied().collect())
             .unwrap_or_default()
     }
@@ -6764,7 +6773,7 @@ mod tests {
         let boxed = agent_row(4, "builder", "prompt", 5);
         let _ = before.observe(4, Some(&boxed), 100);
         assert!(herald_note(&mut before, &boxed, false, t0).notice.is_some());
-        let told = before.carry_of(4);
+        let told = before.carry_of(4, 0);
         assert!(told.told, "PRECONDITION: told and nothing owed");
         let told = StatusCarry::parse(&told.row().expect("a row"));
         let reboxed = agent_row(9, "builder", "prompt", 1);

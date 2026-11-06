@@ -10,8 +10,8 @@ use std::time::Duration;
 use aterm_uds::spawnfd::{Stdio, command};
 
 use super::{
-    Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, Scratch, arena_dir, build_aterm,
-    ghostty_tip, in_scratch_world, live, macos_version, pins, preflight, private,
+    Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, Scratch, arena_dir, ghostty_tip,
+    in_scratch_world, live, macos_version, pins, preflight, private,
 };
 use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
@@ -258,7 +258,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let trials = args.trials.unwrap_or(5);
     let (machine, ledgers) = preflight(args.dev_smoke)?;
     let ghostty = ghostty_tip(&pins()?, args.dmg.as_deref())?;
-    let aterm = build_aterm()?;
+    let aterm = super::supplied_or_build(args.binary.as_deref())?;
     let mut rows = Vec::new();
     for corpus in [Corpus::Ascii, Corpus::Unicode] {
         let file = corpus_file(corpus, CORPUS_MB)?;
@@ -329,8 +329,11 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
             dim: "D1 ARENA-CAT (cat 150MB ascii + unicode, PTY-drain)",
             machine: &machine.label(),
             macos: &macos_version(),
-            aterm: &aterm
-                .provenance("targo --unverified build --release -p aterm, shipping default"),
+            aterm: &aterm.provenance(if args.binary.is_some() {
+                "supplied --binary, unchanged"
+            } else {
+                "targo --unverified build --release -p aterm, shipping default"
+            }),
             competitors: &format!(
                 "ghostty tip {} (official dmg, sha256={})",
                 ghostty.commit, ghostty.sha256

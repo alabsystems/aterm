@@ -579,7 +579,10 @@ fn preparation_id(account: [u8; 32], revision: [u8; 32]) -> native_keys::Prepara
 }
 
 fn preparation_key(account: [u8; 32]) -> String {
-    format!("native:{}", aterm_codec::hex::encode_lower(&account))
+    let mut key = String::with_capacity(71);
+    key.push_str("native:");
+    aterm_codec::hex::push_lower(&mut key, &account);
+    key
 }
 
 fn launcher(provider: Provider, config: &Path) -> Result<Option<PathBuf>, String> {
@@ -884,11 +887,15 @@ fn run(
     permits(&approved, &observed, config, deadline)?;
     let access = prepare_one(&approved, config, &mut native_keys::LiveProbe, deadline)?;
     let now = current(&approved, &observed, config, deadline)?;
-    let profile = approved.paths.dir.join("native-profiles").join(format!(
-        "{}-{}",
-        aterm_codec::hex::encode_lower(&observed.network),
-        aterm_codec::hex::encode_lower(&approved.account)
-    ));
+    let mut profile_name = String::with_capacity(129);
+    aterm_codec::hex::push_lower(&mut profile_name, &observed.network);
+    profile_name.push('-');
+    aterm_codec::hex::push_lower(&mut profile_name, &approved.account);
+    let profile = approved
+        .paths
+        .dir
+        .join("native-profiles")
+        .join(profile_name);
     let mut command = child_command(provider, &program, &profile, args, std::env::vars_os())?;
     access.bind_child(&now.input, &mut command, || {
         permits(&approved, &observed, config, deadline)

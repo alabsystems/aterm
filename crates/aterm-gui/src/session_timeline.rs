@@ -3616,14 +3616,22 @@ pub(crate) struct SessionTimeline {
     /// The worker's launcher is installing its program or preparing its Google sign-in now
     /// (`task_launch::InstallingMark`).
     worker_installing: bool,
+    /// How many times that mark has been set ([`Self::worker_install_mark`]).
+    worker_install_mark: u64,
     /// The atpkg child that install runs, once the launcher has spawned it, while the mark stands.
     worker_install_child: Option<u32>,
+    /// Why atpkg keeps the worker's program off this Mac, as its launcher's admission found.
+    worker_kept_off: Option<String>,
     /// The worker's launcher is holding its launch for a pool now (`task_launch::PoolHoldMark`).
     worker_pool_hold: Option<WorkerPoolHold>,
     /// When its last hold ended, so a line typed then has a whole startup deadline to start in.
     worker_pool_hold_ended: Option<std::time::Instant>,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
+    /// When each word of [`Self::claude_excerpts`] or [`Self::codex_survey`] last changed as read
+    /// ([`crate::survey::WordsRead`]): what a worker's last topic post is newer than, or not, where
+    /// the word's row carries no time ([`crate::survey::last_words`]).
+    words_read: crate::survey::WordsRead,
     /// The background terminals codex-alab's own record counts for the codex process in group `.0`
     /// ([`Self::set_codex_terminals`]).
     codex_terminals: Option<(i32, u32)>,
@@ -4611,8 +4619,19 @@ impl SessionTimeline {
     /// Note whether the worker's launcher is installing its program or preparing its Google sign-in
     /// now (`task_launch::InstallingMark`).
     pub(crate) fn set_worker_installing(&mut self, installing: bool) {
+        if installing {
+            self.worker_install_mark = self.worker_install_mark.wrapping_add(1);
+        }
         self.worker_installing = installing;
         self.worker_install_child = None;
+    }
+
+    /// Which of the launcher's install marks stands or stood last. Two marks can follow each other
+    /// between two looks of the startup deadline, which would read one `installing` from them;
+    /// this tells them apart, so each has its quiet limit whole
+    /// (`harness_host::INSTALL_QUIET_LIMIT`).
+    pub(crate) const fn worker_install_mark(&self) -> u64 {
+        self.worker_install_mark
     }
 
     /// Note the atpkg child the launcher's install just spawned (`task_launch::install_with`).
@@ -4633,6 +4652,18 @@ impl SessionTimeline {
     /// deadline's own 120 s (`harness_host::look_at_startups`, `harness_host::INSTALL_QUIET_LIMIT`).
     pub(crate) const fn worker_installing(&self) -> bool {
         self.worker_installing
+    }
+
+    /// Note why atpkg keeps the worker's program off this Mac, or that it does not, as the launcher's
+    /// admission found.
+    pub(crate) fn set_worker_kept_off(&mut self, why: Option<String>) {
+        self.worker_kept_off = why;
+    }
+
+    /// Why atpkg keeps the worker's program off this Mac, which a stall names if no copy of the
+    /// shell's own starts (`harness_host::kept_off_held`).
+    pub(crate) fn worker_kept_off(&self) -> Option<&str> {
+        self.worker_kept_off.as_deref()
     }
 
     /// Note the hold the worker's launcher has its launch under now, or that it ended
@@ -4757,6 +4788,27 @@ impl SessionTimeline {
             task.agent = Some(agent);
             task.trusted_cwd = trusted_cwd;
         }
+    }
+
+    /// The Mac the task's manager runs on, where that is another Mac
+    /// ([`crate::task_record::TaskRecord::manager_node`]).
+    pub(crate) fn set_task_manager_node(&mut self, node: Option<String>) {
+        if let Some(task) = self.task.as_mut() {
+            task.manager_node = node;
+        }
+    }
+
+    /// What the worker's mail told its manager of the task begun at `started_unix_ms`
+    /// ([`crate::task_record::TaskRecord::told`]), where that is still the task: moves no rev,
+    /// since nothing a waiter reads changed.
+    pub(crate) fn task_told_mut(
+        &mut self,
+        started_unix_ms: u64,
+    ) -> Option<&mut crate::worker_mail::Told> {
+        self.task
+            .as_mut()
+            .filter(|task| task.started_unix_ms == started_unix_ms)
+            .map(|task| &mut task.told)
     }
 
     /// The row a seamless update carries for the record, `None` with no task.
@@ -5600,7 +5652,25 @@ impl SessionTimeline {
         if self.agent.program_pgid != pgid {
             return;
         }
+        let held = self
+            .claude_excerpts
+            .as_ref()
+            .filter(|(held, _)| *held == pgid)
+            .map(|(_, e)| crate::survey::excerpt_words(&e.excerpts));
+        self.words_read.note(
+            held,
+            excerpts
+                .as_ref()
+                .map(|e| crate::survey::excerpt_words(&e.excerpts)),
+            aterm_gui_timing::wall_ms(),
+        );
         self.claude_excerpts = excerpts.map(|e| (pgid, e));
+    }
+
+    /// When each of the agent's words this timeline holds last changed as read
+    /// ([`Self::words_read`]).
+    pub(crate) const fn words_read(&self) -> crate::survey::WordsRead {
+        self.words_read
     }
 
     /// The survey's excerpts for the current foreground group, or `None` when the program in front
@@ -5668,6 +5738,16 @@ impl SessionTimeline {
             return false;
         }
         let (ctx, goal) = (survey.facts.ctx_left_pct, survey.goal.is_some());
+        let held = self
+            .codex_survey
+            .as_ref()
+            .filter(|(held, _)| *held == pgid)
+            .map(|(_, held)| crate::survey::excerpt_words(&held.facts.excerpts));
+        self.words_read.note(
+            held,
+            Some(crate::survey::excerpt_words(&survey.facts.excerpts)),
+            aterm_gui_timing::wall_ms(),
+        );
         self.codex_survey = Some((pgid, survey));
         let at = self.slog().now();
         self.slog_mut().observe_codex_facts(ctx, Some(goal), at);

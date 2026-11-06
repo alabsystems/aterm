@@ -240,7 +240,9 @@ impl Facts {
 
     /// The facts that differ between `self` and `now`, named.
     fn changed(&self, now: &Self) -> String {
-        let show = |v: &Option<String>| v.as_deref().unwrap_or("unread").to_string();
+        fn show(v: &Option<String>) -> &str {
+            v.as_deref().unwrap_or("unread")
+        }
         [
             ("OS build", &self.os_build, &now.os_build),
             ("model", &self.model, &now.model),
@@ -1108,12 +1110,14 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
     let mut content = reads.map(|reads| {
         let mut digest = aterm_digest::Sha256::new();
         field(&mut digest, SCHEMA);
-        (digest, reads)
+        (digest, reads, Box::new([0u8; 64 * 1024]))
     });
     let mut newest_change_ns = None;
     let mut previous = None;
     let mut visits = 0;
-    let mut stats = Vec::new();
+    let mut stats = Vec::with_capacity(roots.len());
+    let mut relative = Vec::new();
+    let mut ancestors = BTreeSet::new();
     for (label, root) in roots {
         if label.is_empty() || previous == Some(label) {
             return Err(format!(
@@ -1121,7 +1125,7 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
             ));
         }
         previous = Some(label);
-        if let Some((digest, _)) = &mut content {
+        if let Some((digest, _, _)) = &mut content {
             field(digest, label.as_bytes());
         }
         // Resolve the root itself before walking, so a root alias has the same identity.
@@ -1129,14 +1133,18 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
             .canonicalize()
             .map_err(|e| format!("resolve build input {}: {e}", root.display()))?;
         let mut sink = Sink {
-            content: content.as_mut().map(|(digest, reads)| (digest, reads)),
+            content: content
+                .as_mut()
+                .map(|(digest, reads, buf)| (digest, reads, &mut **buf)),
             stat: StatDigest::new(label.as_bytes()),
         };
+        relative.clear();
+        ancestors.clear();
         walk(
             &mut sink,
             &root,
-            &mut Vec::new(),
-            &mut BTreeSet::new(),
+            &mut relative,
+            &mut ancestors,
             0,
             &mut visits,
         )?;
@@ -1148,7 +1156,7 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
         });
     }
     Ok(Walked {
-        digest: content.map(|(digest, _)| aterm_codec::hex::encode_lower(&digest.finalize())),
+        digest: content.map(|(digest, _, _)| aterm_codec::hex::encode_lower(&digest.finalize())),
         roots: stats,
         newest_change_ns,
     })
@@ -1164,14 +1172,18 @@ fn field(digest: &mut aterm_digest::Sha256, bytes: &[u8]) {
 /// recheck, which reads no file), and the root's status digest.
 #[cfg(any(test, target_os = "macos"))]
 struct Sink<'a, 'r> {
-    content: Option<(&'a mut aterm_digest::Sha256, &'a mut Reads<'r>)>,
+    content: Option<(
+        &'a mut aterm_digest::Sha256,
+        &'a mut Reads<'r>,
+        &'a mut [u8; 64 * 1024],
+    )>,
     stat: StatDigest,
 }
 
 #[cfg(any(test, target_os = "macos"))]
 impl Sink<'_, '_> {
     fn field(&mut self, bytes: &[u8]) {
-        if let Some((digest, _)) = &mut self.content {
+        if let Some((digest, _, _)) = &mut self.content {
             field(digest, bytes);
         }
     }
@@ -1268,7 +1280,7 @@ fn walk(
             return Err(format!("build input directory cycle: {}", path.display()));
         }
         let mut names = match &mut sink.content {
-            Some((_, reads)) => (reads.list)(&resolved_buf),
+            Some((_, reads, _)) => (reads.list)(&resolved_buf),
             None => list_names(&resolved_buf),
         }
         .map_err(|e| format!("read build input {}: {e}", resolved_buf.display()))?;
@@ -1297,14 +1309,13 @@ fn walk(
         ancestors.remove(&resolved_buf);
     } else if metadata.is_file() {
         sink.field(b"file");
-        if let Some((digest, reads)) = &mut sink.content {
+        if let Some((digest, reads, buffer)) = &mut sink.content {
             let mut file = (reads.open)(&resolved)
                 .map_err(|e| format!("read build input {}: {e}", resolved.display()))?;
             let mut content = aterm_digest::Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
             loop {
                 let read = file
-                    .read(&mut buffer)
+                    .read(&mut **buffer)
                     .map_err(|e| format!("read build input {}: {e}", resolved.display()))?;
                 if read == 0 {
                     break;

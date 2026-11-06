@@ -70,7 +70,7 @@ pub fn run(fd: OwnedFd, exec: &Exec, span: Duration) -> Result<Output, String> {
             format!("the command connection: {e}")
         }
     })?;
-    wire::write_frame(&mut stream, &Frame::Exec(exec.clone())).map_err(|e| format!("Exec: {e}"))?;
+    wire::write_exec(&mut stream, exec).map_err(|e| format!("Exec: {e}"))?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
     loop {
         match wire::read_frame(&mut stream) {

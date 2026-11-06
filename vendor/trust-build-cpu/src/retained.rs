@@ -21,6 +21,7 @@ use crate::{DIRECTORY_NAME, MAX_RECORD_BYTES, MAX_SLOTS, Owner, invalid};
 /// Backend directory inside a newly created retained private capacity domain.
 pub const RETAINED_DIRECTORY_NAME: &str = "build-cpu-retained-v1";
 const VERSION: &str = "trust-build-cpu-retained-v1";
+const RECOVERABLE_VERSION: &str = "trust-build-cpu-retained-v2";
 const MANIFEST_MAX: usize = 512 + MAX_SLOTS as usize * 64;
 const FENCE_MAX: usize = 512;
 
@@ -66,6 +67,46 @@ struct Inner {
     identities: Vec<Identity>,
     slots: NonZeroU32,
     next: AtomicU32,
+}
+
+/// A one-use generated CPU nonce bundle for a custodian's pre-grant journal.
+/// Nonce bytes are observations, never constructors or settlement authority.
+/// This type intentionally cannot be cloned or rebuilt from observed bytes.
+pub struct PreparedReservation {
+    width: NonZeroU32,
+    nonces: Option<Vec<[u8; 16]>>,
+}
+impl PreparedReservation {
+    /// Generate the complete bounded bundle before any slot record is written.
+    pub fn new(width: NonZeroU32) -> io::Result<Self> {
+        if width.get() > MAX_SLOTS {
+            return Err(invalid("prepared CPU reservation is too large"));
+        }
+        let mut nonces = Vec::with_capacity(width.get() as usize);
+        let mut distinct = std::collections::BTreeSet::new();
+        for _ in 0..width.get() {
+            let nonce = new_nonce()?;
+            if !distinct.insert(nonce) {
+                return Err(invalid("prepared CPU nonce collision"));
+            }
+            nonces.push(nonce);
+        }
+        Ok(Self { width, nonces: Some(nonces) })
+    }
+    /// Original requested width, not an acquired grant.
+    pub const fn width(&self) -> NonZeroU32 {
+        self.width
+    }
+    /// Persist these identities together with the exact memory cohort reference
+    /// BEFORE calling reserve. Observing them cannot mint another prepared plan.
+    pub fn nonces(&self) -> io::Result<&[[u8; 16]]> {
+        self.nonces
+            .as_deref()
+            .ok_or_else(|| invalid("prepared CPU reservation was already consumed"))
+    }
+    pub(crate) fn take(&mut self) -> io::Result<Vec<[u8; 16]>> {
+        self.nonces.take().ok_or_else(|| invalid("prepared CPU reservation was already consumed"))
+    }
 }
 
 /// A private crash-retained pool. It is never an automatic alternate global pool.
@@ -243,6 +284,23 @@ impl RetainedPool {
     /// A stale retained record remains unavailable even without a kernel holder.
     /// Unknown or damaged state is an error, never silently free capacity.
     pub fn try_acquire(&self, owner: Owner) -> io::Result<Option<RetainedLease>> {
+        self.try_acquire_prepared(owner, new_nonce()?)
+    }
+
+    pub(crate) fn try_acquire_prepared(
+        &self,
+        owner: Owner,
+        nonce: [u8; 16],
+    ) -> io::Result<Option<RetainedLease>> {
+        self.acquire_with(owner, nonce, |_| None)
+    }
+
+    fn acquire_with(
+        &self,
+        owner: Owner,
+        nonce: [u8; 16],
+        commitment: impl Fn(u32) -> Option<[u8; 32]>,
+    ) -> io::Result<Option<RetainedLease>> {
         self.validate()?;
         if owner.pid == 0 {
             return Err(invalid("CPU owner pid is zero"));
@@ -255,14 +313,18 @@ impl RetainedPool {
             match file.try_lock() {
                 Ok(()) => match read_record(&mut file, slot)? {
                     State::Free => {
-                        let nonce = new_nonce()?;
-                        write_record(&mut file, &State::Retained { owner, nonce }.encode(slot))?;
+                        let recovery = commitment(slot);
+                        write_record(
+                            &mut file,
+                            &State::Retained { owner, nonce, recovery }.encode(slot),
+                        )?;
                         self.validate()?;
                         return Ok(Some(RetainedLease {
                             pool: self.clone(),
                             slot,
                             owner,
                             nonce,
+                            recovery,
                             file,
                         }));
                     }
@@ -373,10 +435,57 @@ pub struct RetainedLease {
     slot: u32,
     owner: Owner,
     nonce: [u8; 16],
+    recovery: Option<[u8; 32]>,
     file: File,
 }
 
+/// Persistable identity of one original retained debt generation.
+///
+/// These fields are observations, not a settlement or recovery capability.
+/// Reconstructing them cannot prove cohort closure, reclaim a lock, or release
+/// debt. A recovery transaction must validate its original durable binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedLeaseIdentity {
+    /// Device and inode of the original retained pool manifest.
+    pub manifest: (u64, u64),
+    /// Slot index within that exact pool.
+    pub slot: u32,
+    /// Device and inode of the original slot file.
+    pub file: (u64, u64),
+    /// One-use debt generation, distinct even when the same slot is reused.
+    pub nonce: [u8; 16],
+    /// Original diagnostic owner; PID/birth alone authorizes no recovery.
+    pub owner: Owner,
+}
+
 impl RetainedLease {
+    /// Capture identity while this original capability is still owned.
+    /// This neither creates a recovery grant nor closes the reserve-to-bind
+    /// crash gap: unbound debt must remain conservative after that gap.
+    pub fn identity(&self) -> io::Result<RetainedLeaseIdentity> {
+        self.pool.validate()?;
+        check_private(&self.file, false)?;
+        let identity = Identity::of(&self.file)?;
+        let mut current = self.pool.open_slot(self.slot, false)?;
+        if identity != Identity::of(&current)? {
+            return Err(invalid("retained CPU identity no longer names the original slot"));
+        }
+        match read_record(&mut current, self.slot)? {
+            State::Retained { owner, nonce, recovery }
+                if owner == self.owner && nonce == self.nonce && recovery == self.recovery => {}
+            _ => {
+                return Err(invalid("retained CPU identity no longer matches its debt generation"));
+            }
+        }
+        Ok(RetainedLeaseIdentity {
+            manifest: (self.pool.0.manifest.dev as u64, self.pool.0.manifest.ino as u64),
+            slot: self.slot,
+            file: (identity.dev as u64, identity.ino as u64),
+            nonce: self.nonce,
+            owner: self.owner,
+        })
+    }
+
     /// Slot whose debt this capability controls.
     #[must_use]
     pub fn slot(&self) -> u32 {
@@ -406,7 +515,8 @@ impl RetainedLease {
         }
         check_private(&self.file, false)?;
         match read_record(&mut self.file, self.slot)? {
-            State::Retained { owner, nonce } if owner == self.owner && nonce == self.nonce => {}
+            State::Retained { owner, nonce, recovery }
+                if owner == self.owner && nonce == self.nonce && recovery == self.recovery => {}
             _ => return Err(invalid("retained CPU claim does not match settlement capability")),
         }
         write_record(&mut self.file, &State::Free.encode(self.slot))
@@ -416,20 +526,30 @@ impl RetainedLease {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Free,
-    Retained { owner: Owner, nonce: [u8; 16] },
+    Retained { owner: Owner, nonce: [u8; 16], recovery: Option<[u8; 32]> },
 }
 
 impl State {
     fn encode(self, slot: u32) -> String {
         match self {
             Self::Free => format!("{VERSION} slot={slot} free=1\n"),
-            Self::Retained { owner, nonce } => {
+            Self::Retained { owner, nonce, recovery } => {
                 let birth = owner.birth.map_or_else(|| "-".into(), |value| value.to_string());
                 let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-                format!(
-                    "{VERSION} slot={slot} pid={} birth={birth} nonce={nonce} retained=1\n",
-                    owner.pid
-                )
+                match recovery {
+                    None => format!(
+                        "{VERSION} slot={slot} pid={} birth={birth} nonce={nonce} retained=1\n",
+                        owner.pid
+                    ),
+                    Some(commitment) => {
+                        let commitment: String =
+                            commitment.iter().map(|byte| format!("{byte:02x}")).collect();
+                        format!(
+                            "{RECOVERABLE_VERSION} slot={slot} pid={} birth={birth} nonce={nonce} commitment={commitment} retained=1\n",
+                            owner.pid
+                        )
+                    }
+                }
             }
         }
     }
@@ -446,10 +566,11 @@ fn read_record(file: &mut File, slot: u32) -> io::Result<State> {
         .ok_or_else(|| invalid("unterminated retained CPU record"))?
         .split(' ')
         .collect();
-    if words.len() != 6
-        || words[0] != VERSION
+    let recoverable = words.first() == Some(&RECOVERABLE_VERSION);
+    if words.len() != if recoverable { 7 } else { 6 }
+        || words[0] != if recoverable { RECOVERABLE_VERSION } else { VERSION }
         || words[1] != format!("slot={slot}")
-        || words[5] != "retained=1"
+        || words.last() != Some(&"retained=1")
     {
         return Err(invalid("invalid retained CPU record"));
     }
@@ -468,7 +589,21 @@ fn read_record(file: &mut File, slot: u32) -> io::Result<State> {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
             .map_err(|_| invalid("invalid retained CPU nonce"))?;
     }
-    let state = State::Retained { owner: Owner { pid, birth }, nonce };
+    let recovery = if recoverable {
+        let text = words[5]
+            .strip_prefix("commitment=")
+            .filter(|text| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| invalid("invalid recovery commitment"))?;
+        let mut commitment = [0; 32];
+        for (index, byte) in commitment.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16)
+                .map_err(|_| invalid("invalid recovery commitment"))?;
+        }
+        Some(commitment)
+    } else {
+        None
+    };
+    let state = State::Retained { owner: Owner { pid, birth }, nonce, recovery };
     if state.encode(slot) != text {
         return Err(invalid("non-canonical retained CPU record"));
     }
@@ -608,3 +743,7 @@ fn parse_manifest(text: &str, seal: Seal) -> io::Result<Vec<Identity>> {
     }
     Ok(identities)
 }
+
+#[path = "retained_recovery.rs"]
+mod recovery;
+pub use recovery::RecoveredReservation;

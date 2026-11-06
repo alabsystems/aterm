@@ -270,3 +270,24 @@ pub(crate) fn take_rgb_harvest_cells() -> usize {
         v
     })
 }
+
+thread_local! {
+    static ROW_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one write into a row that settles its length after it: a glyph from the
+/// per-character writers, or a run.
+#[cfg(test)]
+pub(crate) fn count_row_write() {
+    ROW_WRITES.with(|c| c.set(c.get() + 1));
+}
+
+/// Take (read and reset) the row write count.
+#[cfg(test)]
+pub(crate) fn take_row_writes() -> usize {
+    ROW_WRITES.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}

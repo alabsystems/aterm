@@ -311,17 +311,17 @@ impl Reader {
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
-        let mut set = String::with_capacity(wanted.len().saturating_mul(8));
+        let mut cmd = String::with_capacity(72 + wanted.len().saturating_mul(8));
+        cmd.push_str("UID FETCH ");
         for (i, id) in wanted.iter().enumerate() {
             use std::fmt::Write as _;
             if i > 0 {
-                set.push(',');
+                cmd.push(',');
             }
-            let _ = write!(set, "{id}");
+            let _ = write!(cmd, "{id}");
         }
-        let reply = self.session.command(&format!(
-            "UID FETCH {set} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])"
-        ))?;
+        cmd.push_str(" (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])");
+        let reply = self.session.command(&cmd)?;
         let mut parts = fetch_parts(reply)?;
         if parts
             .iter()

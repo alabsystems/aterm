@@ -98,22 +98,22 @@ pub enum Heard {
 /// never selected, never adopted.
 #[must_use]
 pub fn split(remote: &BTreeSet<Digest>) -> (BTreeSet<Digest>, Heard) {
-    let mut tables = BTreeSet::new();
+    split_owned(remote.clone())
+}
+
+pub(crate) fn split_owned(mut remote: BTreeSet<Digest>) -> (BTreeSet<Digest>, Heard) {
     let mut heard = Heard::Nothing;
-    for id in remote {
-        match read_mark(id) {
-            Some(ms) => {
-                heard = match heard {
-                    Heard::Nothing => Heard::One(ms),
-                    _ => Heard::Several,
-                }
-            }
-            None => {
-                tables.insert(*id);
-            }
+    remote.retain(|id| match read_mark(id) {
+        Some(ms) => {
+            heard = match heard {
+                Heard::Nothing => Heard::One(ms),
+                _ => Heard::Several,
+            };
+            false
         }
-    }
-    (tables, heard)
+        None => true,
+    });
+    (remote, heard)
 }
 
 /// What a reading was taken from.

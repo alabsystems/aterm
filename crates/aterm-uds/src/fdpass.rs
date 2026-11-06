@@ -9,7 +9,9 @@ use std::io::IoSlice;
 use crate::CtlStream;
 
 /// Maximum descriptors carried by one [`send_with_fds`] or [`recv_with_fds`] call.
-pub const MAX_FDS: usize = 64;
+// A subgroup can carry stdio/event4, CPU1, GNU2 and the original127 fences.
+// This stays below Linux's253-right single-message kernel limit.
+pub const MAX_FDS: usize = 134;
 
 /// Control-buffer descriptor capacity used by [`recv_with_fds`].
 #[cfg(any(
@@ -19,7 +21,13 @@ pub const MAX_FDS: usize = 64;
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
-pub const CONTROL_FDS: usize = 2 * MAX_FDS;
+// XNU can install rights before truncating ancillary copyout. Keep room for
+// its entire UIPC_MAX_CMSG_FD512 message, even when the caller accepts only4;
+// otherwise undisclosed installed descriptors cannot be closed on refusal.
+// Linux's253-right maximum also fits this storage. This is receive storage,
+// never permission to accept more than the caller's exact descriptor count.
+// XNU: bsd/kern/uipc_usrreq.c, bsd/kern/uipc_syscalls.c.
+pub const CONTROL_FDS: usize = 512;
 
 /// Borrowed descriptor type accepted by [`send_with_fds`].
 #[cfg(unix)]
@@ -784,14 +792,14 @@ mod scm {
         }
 
         /// A peer that sends past `MAX_FDS` (`send_with_fds` refuses to; a raw `sendmsg` does
-        /// not), up to the twice-`MAX_FDS` budget of `CONTROL_FDS`, is still a visible
+        /// not), within the complete kernel-message storage, is still a visible
         /// over-count: every descriptor it sent is named, closed and refused, and none stays
         /// here.
         #[test]
         fn an_over_send_past_the_cap_is_named_closed_and_refused() {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
             use std::os::unix::fs::MetadataExt as _;
-            const SENT: usize = 2 * super::MAX_FDS;
+            const SENT: usize = super::MAX_FDS + 1;
             #[repr(C, align(8))]
             struct SenderControl([u8; cmsg_space(SENT * FD_LEN)]);
             let scratch = aterm_tempfile::Builder::new()
@@ -839,6 +847,37 @@ mod scm {
                 Some(std::io::ErrorKind::InvalidData)
             );
             assert_eq!(copies(), before, "a descriptor the peer sent stayed open");
+        }
+
+        #[test]
+        fn subgroup_maximum_rights_keep_original_open_descriptions() {
+            use std::io::{Seek as _, SeekFrom};
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let mut original = std::fs::File::create(scratch.path().join("original")).unwrap();
+            let (sender, receiver) = crate::CtlStream::pair().unwrap();
+            let rights: Vec<_> = (0..super::MAX_FDS).map(|_| original.as_fd()).collect();
+            assert_eq!(super::send_with_fds(&sender, &[17], &rights).unwrap(), 1);
+            let mut marker = [0; 2];
+            let mut received =
+                super::recv_with_fds(&receiver, &mut marker, super::MAX_FDS).unwrap();
+            assert_eq!(
+                (received.bytes, marker[0], received.fds.len()),
+                (1, 17, super::MAX_FDS)
+            );
+            for fd in &received.fds {
+                // SAFETY: each borrowed descriptor remains owned and live in
+                // the receive vector; F_GETFD only reads its descriptor flags.
+                assert_ne!(
+                    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+            let mut first = std::fs::File::from(received.fds.remove(0));
+            let mut last = std::fs::File::from(received.fds.pop().unwrap());
+            first.seek(SeekFrom::Start(7)).unwrap();
+            assert_eq!(last.stream_position().unwrap(), 7);
+            assert_eq!(original.stream_position().unwrap(), 7);
         }
 
         /// A receiver at its descriptor limit, where the kernel installs fewer descriptors than

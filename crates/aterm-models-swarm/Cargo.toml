@@ -8,12 +8,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm's formal models of ALab swarm ledger publishing, lease, pool assignment, join phrases, the membership log, a vault server's records file, the membership log's record capacity, re-key convergence, gap healing and the machine-number negotiation (ty_model! and derive)"
+description = "aterm's formal models of ALab swarm ledger publishing, lease, pool assignment, join phrases, the membership log, a vault server's records file, the membership log's record capacity, re-key convergence, gap healing, the machine-number negotiation and the mesh relay (ty_model! and derive)"
 # No tests of its own: `aterm-models` sweeps these models, and `aterm-secrets` holds ledger
 # publishing, lease coordination, its join phrase book, the membership log, the server's
 # records file, the record budgets, proof reserve and crossed fence, and the re-key tender
-# to them in conformance tests, and `aterm-types` holds `settle`, `choose` and `check` to the
-# machine-number models.
+# to them in conformance tests, `aterm-types` holds `settle`, `choose` and `check` to the
+# machine-number models, and `aterm-mesh` holds its relay, egress, `Inventory` and revocation
+# pass to the mesh relay (`tests::tables::relay_conformance`).
 autotests = false
 
 [lib]

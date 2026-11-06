@@ -149,6 +149,8 @@ enum Aim {
 
 /// What the front and its forwarding thread share.
 struct Shared {
+    /// Every signal read by this front, including one received after its leader exited.
+    observed: AtomicI32,
     aim: Mutex<Aim>,
     moved: Condvar,
     /// The last signal passed on to the build.
@@ -243,6 +245,7 @@ fn forward(read: OwnedFd, shared: &Shared) {
             return;
         }
         let sig = libc::c_int::from(byte);
+        shared.observed.store(sig, Ordering::SeqCst);
         let mut aim = shared.aim.lock().unwrap_or_else(PoisonError::into_inner);
         while matches!(*aim, Aim::Arming) {
             aim = shared
@@ -294,6 +297,7 @@ impl Front {
             .unwrap_or_else(PoisonError::into_inner);
         let (read, write) = pipe().ok()?;
         let shared = Arc::new(Shared {
+            observed: AtomicI32::new(0),
             aim: Mutex::new(Aim::Arming),
             moved: Condvar::new(),
             passed: Mutex::new(None),
@@ -434,6 +438,20 @@ impl Front {
     /// core signals use the shell-style exit code `128 + signal`, as [`super::end_like`] does.
     pub fn disarm(mut self) {
         self.end();
+    }
+
+    /// Disarm after native cohort drain and retain cancellation observed during settlement.
+    pub(super) fn disarm_observed(mut self) -> Option<libc::c_int> {
+        self.end();
+        self.observed()
+    }
+
+    /// Last signal decoded by this front, including settlement after leader exit.
+    pub(super) fn observed(&self) -> Option<libc::c_int> {
+        match self.shared.observed.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
     }
 
     fn end(&mut self) {

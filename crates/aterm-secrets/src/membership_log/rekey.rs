@@ -387,39 +387,81 @@ impl Log {
         head_due(self.gate_misses(epoch).is_empty(), wraps_revoked)
     }
 
-    /// The `Remove`s that keep `epoch`'s gate shut, as indices into this log's order: for each
-    /// revoked seat row ([`Membership::revoking_rows`]) whose gate row is shut
-    /// (`aterm_mesh_core::revocation::gate_row`: no `Remove` that took it lies in the epoch's
-    /// causal past, or one is missing while a live row binds its recipient), the ones the
-    /// epoch's past lacks; every one of them when this log does not hold `epoch`. Empty exactly
-    /// when the gate is open.
+    /// The `Remove`s that keep `epoch`'s gate shut, as indices into this log's order
+    /// ([`Log::gate_misses_where`], over the epoch's causal past); every `Remove` that took a
+    /// revoking row where this log does not hold `epoch`.
     fn gate_misses(&self, epoch: &RecordId) -> BTreeSet<usize> {
         let epoch_at = self.held.get(epoch).copied();
+        let effective = self.effective();
+        self.gate_misses_where(|at| epoch_at.is_some_and(|e| effective.before(at, e)))
+    }
+
+    /// The `Remove`s that keep an epoch's gate shut, where `in_past(at)` says whether the record
+    /// at index `at` of this log's order lies in the epoch's causal past: for each revoked seat
+    /// row ([`Membership::revoking_rows`]) whose gate row is shut
+    /// (`aterm_mesh_core::revocation::gate_row`: that past holds neither the row's entry and
+    /// every `Remove` that took it, nor, while no live row binds its recipient, the row's entry
+    /// and one `Remove` that takes it by itself,
+    /// [`RevokingRow::alone`](super::eval::RevokingRow::alone)), the `Remove`s the past lacks,
+    /// and every one of them where it lacks the row. Empty exactly when the gate is open.
+    ///
+    /// The row's entry counts as the `Remove`s do (one-mesh proofs P1b, `gateFix`): a Mac that
+    /// holds the epoch but not the row (a seat moved onto a co-holder's recipient beside its
+    /// `Remove`) reads that recipient as current and wraps the epoch to it. A quorum's share
+    /// that lies in the row's entry's past takes the row only where the view holds enough shares
+    /// to accept the quorum, which a Mac that holds the epoch need not, and an Undo's share that
+    /// a Mac the Undo's target removed signed is no removal there: neither opens a gate alone.
+    pub(super) fn gate_misses_where(&self, in_past: impl Fn(usize) -> bool) -> BTreeSet<usize> {
         #[cfg(any(test, debug_assertions))]
         if aterm_types::negative_control::on("held-wrap-gate") {
             return BTreeSet::new();
         }
-        let effective = self.effective();
+        // NEGATIVE CONTROL `rowless-gate`: ask for the `Remove`s alone, as the gate before P1b.
+        // NEGATIVE CONTROL `quorum-some-gate`: let any `Remove` that took the row, a quorum's
+        // share included, open the one-`Remove` clause, as before P1b.
+        #[cfg(any(test, debug_assertions))]
+        let (rowless, shares) = (
+            aterm_types::negative_control::on("rowless-gate"),
+            aterm_types::negative_control::on("quorum-some-gate"),
+        );
+        #[cfg(not(any(test, debug_assertions)))]
+        let (rowless, shares) = (false, false);
         let mut misses = BTreeSet::new();
         for row in self.membership_ref().revoking_rows() {
-            let takers: Vec<(usize, bool)> = row
+            let entered = rowless || self.held.get(&row.entry).is_some_and(|&at| in_past(at));
+            let takers: Vec<(usize, bool, bool)> = row
                 .removes
                 .iter()
-                .filter_map(|id| self.held.get(id).copied())
-                .map(|at| (at, epoch_at.is_some_and(|e| effective.before(at, e))))
+                .filter_map(|id| {
+                    let at = *self.held.get(id)?;
+                    Some((at, in_past(at), shares || row.alone.contains(id)))
+                })
                 .collect();
-            let every = takers.iter().fold(true, |all, &(_, before)| all && before);
-            let some = takers.iter().fold(false, |any, &(_, before)| any || before);
-            if !gate_row(true, every, row.recipient_live, some) {
+            let every = takers
+                .iter()
+                .fold(true, |all, &(_, before, _)| all && before);
+            let some = takers
+                .iter()
+                .fold(false, |any, &(_, before, alone)| any || (before && alone));
+            if !gate_row(true, entered && every, row.recipient_live, entered && some) {
                 misses.extend(
                     takers
                         .iter()
-                        .filter(|&&(_, before)| !before)
-                        .map(|&(at, _)| at),
+                        .filter(|&&(_, before, _)| !entered || !before)
+                        .map(|&(at, _, _)| at),
                 );
             }
         }
         misses
+    }
+
+    /// Whether an epoch whose parents are `parents` would have its gate open in this log
+    /// ([`Log::gate_misses_where`] over the records `parents` reach): what a fresh epoch's own
+    /// batch, which seals under it without asking [`Log::head_due`], needs of its draft.
+    pub(super) fn gate_opens_after(&self, parents: &[RecordId]) -> bool {
+        let from = self.indexes(parents);
+        self.gate_misses_where(|at| self.reach.in_past_of(at, &from))
+            .is_empty()
     }
 
     /// The epochs of `epochs` whose minter's batch this log may hold only a prefix of: it holds
@@ -481,11 +523,13 @@ impl Log {
     /// its causal past (what its minter could carry on), that no held
     /// `Wrap` hands it, that sorts above every recipient its minter's `Wrap`s of it reach here (a
     /// batch wraps in ascending recipient order, so a recipient below one of them that it lacks
-    /// was left out on purpose), and that no `Remove` before it took out. Empty for an epoch this
-    /// log does not hold or that settled, for one the Mac holding `mine` minted (its batch is whole
-    /// here), for one whose minter's later batch wrapped it too (so its own is whole), and for an
-    /// audience's first epoch. A recipient with no seat is named too, so this bounds what sealing
-    /// under `epoch` may reach; [`Log::in_flight`] carries only the seated ones.
+    /// was left out on purpose), and that no `Remove` before it took out (but an Undo's share that
+    /// a Mac the Undo's target removed signed, which is no removal to a minter that holds too few
+    /// of its quorum's shares). Empty for an epoch this log does not hold or that settled, for one
+    /// the Mac holding `mine` minted (its batch is whole here), for one whose minter's later batch
+    /// wrapped it too (so its own is whole), and for an audience's first epoch. A recipient with no
+    /// seat is named too, so this bounds what sealing under `epoch` may reach; [`Log::in_flight`]
+    /// carries only the seated ones.
     #[must_use]
     pub fn batch_may_wrap(&self, epoch: &RecordId, mine: &Recipient) -> BTreeSet<Recipient> {
         let none = BTreeSet::new();
@@ -508,6 +552,27 @@ impl Log {
             return none;
         }
         let effective = self.effective();
+        // A `Remove` before the epoch its minter read as one: any that counts here but an Undo's
+        // share, which a minter holding too few of its quorum's shares reads as no removal.
+        // NEGATIVE CONTROL `removed-before-unauthorized`: every counted `Remove`, an Undo's share
+        // included. NEGATIVE CONTROL `removed-before-plain`: only one authorized with nothing
+        // void, which leaves out every `Remove` a Mac an Undo restored signs.
+        #[cfg(any(test, debug_assertions))]
+        let known = {
+            let unauthorized = aterm_types::negative_control::on("removed-before-unauthorized");
+            let plain_only = aterm_types::negative_control::on("removed-before-plain");
+            move |i: usize| {
+                if unauthorized {
+                    effective.counts(i)
+                } else if plain_only {
+                    effective.counts_plain(i)
+                } else {
+                    effective.counts_where_held(i)
+                }
+            }
+        };
+        #[cfg(not(any(test, debug_assertions)))]
+        let known = |i: usize| effective.counts_where_held(i);
         let mut wrapped: BTreeSet<Recipient> = BTreeSet::new();
         let mut frontier: Option<Recipient> = None;
         let mut before: Vec<usize> = Vec::new();
@@ -544,7 +609,7 @@ impl Log {
                 {
                     before.push(i);
                 }
-                Body::Remove { member, .. } if effective.before(i, at) => {
+                Body::Remove { member, .. } if effective.before(i, at) && known(i) => {
                     removed_before.extend(seats.get(member).into_iter().flatten().copied());
                 }
                 _ => {}

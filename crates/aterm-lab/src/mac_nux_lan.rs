@@ -398,11 +398,17 @@ pub enum LanStatus {
         build: String,
         socket: String,
     },
+    /// No broker is installed, and `aterm lan status` served itself under macOS's allowance
+    /// (the design's §5 direct path): the allowance, in its words.
+    Direct(String),
     /// The build has the verb, and no broker answered: why, in its words.
     Not(String),
     /// The build has no `lan` verb: no broker is part of it.
     NoVerb,
 }
+
+/// What `aterm lan status` says before the allowance its own process served itself under.
+const DIRECT_SAYS: &str = "aterm makes its own LAN connections as ";
 
 /// [`LanStatus`] over `aterm lan status`'s output. A build with no `lan` verb says so in one of
 /// two wordings: with no terminal on stdin (a `tart exec`'d command) the word goes to the window
@@ -411,6 +417,12 @@ pub enum LanStatus {
 pub fn read_lan_status(out: &str) -> LanStatus {
     if out.contains("unknown command 'lan'") || out.contains("unknown command lan") {
         return LanStatus::NoVerb;
+    }
+    if let Some((_, rest)) = out.split_once(DIRECT_SAYS) {
+        let words = rest
+            .split_once(" (socket=")
+            .map_or(rest, |(words, _)| words);
+        return LanStatus::Direct(squeeze(words.trim(), 200));
     }
     for line in out.lines() {
         let Some(rest) = line.trim().strip_prefix("broker ") else {
@@ -493,6 +505,7 @@ pub(super) fn broker_cells(
                 build,
                 socket,
             } => format!("serving: protocol={protocol} build={build} socket={socket}"),
+            LanStatus::Direct(allowed) => format!("no broker; served directly: {allowed}"),
             LanStatus::Not(why) => format!("no broker: {why}"),
             LanStatus::NoVerb => unreachable!("handled above"),
         }),
@@ -909,6 +922,24 @@ mod tests {
         assert!(matches!(
             read_lan_status("no broker: setup's elevation has not installed it\n"),
             LanStatus::Not(why) if why.contains("not installed")
+        ));
+        // The direct path's line (crates/aterm/src/lan_verb.rs), and the plain one beside it.
+        assert_eq!(
+            read_lan_status(
+                "the LAN broker is not installed: until setup's Mac password installs it, aterm \
+                 makes its own LAN connections as macOS allowed com.aterm.aterm (team A66A9P66Z7) \
+                 on the local network (socket=/var/run/systems.alab.aterm-lan/broker.sock)\n"
+            ),
+            LanStatus::Direct(
+                "macOS allowed com.aterm.aterm (team A66A9P66Z7) on the local network".into()
+            )
+        );
+        assert!(matches!(
+            read_lan_status(
+                "the LAN broker is not installed: setup's Mac password installs it \
+                 (`sudo aterm machines here apply --plain`) (socket=/var/run/systems.alab.aterm-lan/broker.sock)\n"
+            ),
+            LanStatus::Not(_)
         ));
     }
 

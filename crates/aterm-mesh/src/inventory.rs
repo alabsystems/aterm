@@ -4,13 +4,24 @@
 //! The `Inventory` exchange (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.6, "No anti-entropy
 //! timer", and §11 B7b): the digest exchange Commons repair runs
 //! (`aterm_db::replica::exchange_inventory`), with one neighbour, over an `Inventory` stream on its
-//! `atm/1` link. Each side lists the digests it holds of the membership log and of each table both
-//! hold, and the missing records move in batches of [`crate::ingest::BATCH`] into the stores' own
-//! checks, the membership log first so a writer's seat lands before its operations. A record that
-//! enters this way is never published again by this Mac.
+//! `atm/1` link. Each side lists the digests it holds of the membership log and of each table
+//! either holds, and the missing records move in batches of [`crate::ingest::BATCH`] into the
+//! stores' own checks, the membership log first so a writer's seat lands before its operations. A
+//! record that enters this way is never published again by this Mac.
 //!
-//! Each table both hold moves its conflict proofs first (Commons repair's conflicts phase, with its
-//! fork rule: a proof the neighbour holds the fork proof of is not sent), then its operations.
+//! Each table moves its conflict proofs first (Commons repair's conflicts phase, with its fork
+//! rule: a proof the neighbour holds the fork proof of is not sent), then its operations. The
+//! tables both hold go first, then each table one side holds and the other does not: the other
+//! gets every record of it where its stores take the table ([`Stores::takes`]), so a Mac that never
+//! held a table gets it here, one first written and cut from every log while it was away included.
+//! The read right is the seat: every current seat opens every Commons table (no descriptor names
+//! readers, and a table's key derives from the Commons network key, which the fold derives from
+//! the `[everyone]` epoch key), and both sides exchange only with a current seat
+//! ([`Mesh::admits`]), as the relay's `/t/>` grant serves only seats. Going after the tables
+//! both hold, a table only one side holds reaches a vault whose catalog it just declared: the
+//! declaration moved with the catalog, which every Mac holds, and subscribes that vault at once.
+//! A ring window's table (claims, recoveries, the journal), which no declaration names, the vault
+//! takes up when it is offered one, as Commons repair does (`Replica::mesh_takes`).
 //!
 //! It runs only on an event, never on a timer ([`Reason`]):
 //! - **a gap notice**: a relay read that its neighbour's cursor fell below what `tables.log` keeps
@@ -41,23 +52,29 @@
 //! after a doubling back-off.
 //!
 //! **`NO_INVENTORY_ON_GAP`** (`no-inventory-on-gap`) is the gap rule's negative control: a gap
-//! notice starts no exchange, so a record cut below a sleeping Mac's cursor never reaches it.
+//! notice starts no exchange, so a record cut below a sleeping Mac's cursor reaches it only by
+//! the digest trigger, where presence runs (in a lab without presence, never).
 //! **`NO_DIGEST_TRIGGER`** (`no-digest-trigger`) is the digest trigger's: a neighbour's rows ask
 //! nothing, so a record that reached a Mac by `Inventory` stays one hop from where it was cut.
 //! **`NO_SECOND_ASK`** (`no-second-ask`) is the second ask's (the island's `noSecondAsk`): a
 //! start's exchange is never asked again, so a record its stores had not yet ingested never
 //! reaches a neighbour whose relay started at the head.
+//! **`BOTH_HOLD_ONLY`** (`both-hold-only`) is the one-sided tables' (the rule before §11 B8): only
+//! the tables both hold move, so a table a Mac never held never reaches it here.
 //!
-//! **The wire.** Both sides first send `atm-inv 1` and their summary digest (over every digest
+//! **The wire.** Both sides first send `atm-inv 2` and their summary digest (over every digest
 //! they would list); equal summaries end the exchange. Then each table list, then per unit (the
-//! membership log, then each common table's proofs and operations) the key lists, then the initiator's batches (a `u32` count, that many length-prefixed records,
-//! a zero count to end), then the responder's.
+//! membership log, then each table both listed, then each table one listed, in order, a table's
+//! proofs before its operations) the key lists, then the initiator's batches (a `u32` count, that
+//! many length-prefixed records, a zero count to end), then the responder's. The unit list is a
+//! function of the two table lists alone, so both sides walk it in step; for a table it does not
+//! take, a side sends no key list (`exchange_inventory`'s unavailable), and is sent nothing.
 
 use crate::egress::Egress;
 use crate::logs::Mesh;
 use crate::presence::Held;
 use crate::relay::{self, Event};
-use crate::stores::{Digest, Kind, ProofKey, Stores, Verdict};
+use crate::stores::{Digest, Kind, Stores, Verdict};
 use aterm_mesh_core::relay_digest::Trigger;
 use aterm_mesh_core::relay_live;
 use aterm_net::fleet::FleetOp;
@@ -69,8 +86,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// The greeting's head.
-const HEAD: &[u8] = b"atm-inv 1";
+/// The greeting's head. `atm-inv 1` walked only the tables both sides hold, a prefix of this
+/// unit list: a pair of the two would move those and then break off where the old side ended
+/// early, so each refuses the other's greeting instead.
+const HEAD: &[u8] = b"atm-inv 2";
 
 /// The most tables a list holds (`aterm_db::replica::MAX_TABLES`).
 const TABLES_MAX: usize = 64;
@@ -190,6 +209,27 @@ const fn no_second_ask() -> bool {
     false
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the one-sided tables (`both-hold-only`): while set on the thread
+    /// that opens a mesh, its exchanges walk only the tables both sides hold, so a table a Mac
+    /// never held reaches it by no `Inventory`. Both sides of a lab's exchange read one thread's
+    /// flag, so they walk one unit list. A lab instance turns it on for its whole process with
+    /// `both-hold-only` in `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static BOTH_HOLD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`BOTH_HOLD_ONLY`] is on for a mesh opened on this thread.
+#[cfg(any(test, debug_assertions))]
+fn both_hold_only() -> bool {
+    BOTH_HOLD_ONLY.with(std::cell::Cell::get) || aterm_types::negative_control::on("both-hold-only")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+const fn both_hold_only() -> bool {
+    false
+}
+
 /// What one exchange moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Moved {
@@ -233,6 +273,12 @@ pub struct Inventory {
     /// The neighbours whose last exchange left records a busy store did not take: asked again
     /// after [`Self::busy_wait`].
     busy: Mutex<BTreeSet<String>>,
+    /// Each neighbour whose ask has no link to run over (the link it was asked over closed before
+    /// it ran, or its exchange broke off on the link it ran over, and no other live link is
+    /// registered): asked again over the next link a relay follows ([`Self::linked`]). A duplicate
+    /// that replaces a new link before its start's ask ran leaves the relay resuming on the
+    /// replacement with its cursor, which asks nothing itself (`relay_live::start_repair`).
+    parked: Mutex<BTreeMap<String, Reason>>,
     /// The digest trigger's memory of each neighbour's presence rows ([`Self::digest_row`]).
     digests: Mutex<BTreeMap<String, Triggers>>,
     /// The neighbours a relay start asks again once this Mac's ingest floor passes the last table
@@ -241,6 +287,8 @@ pub struct Inventory {
     no_gap: bool,
     no_digest: bool,
     no_second_ask: bool,
+    /// Whether exchanges walk only the tables both sides hold ([`BOTH_HOLD_ONLY`]).
+    both_hold_only: bool,
     /// Whether the worker runs an exchange now, and its change's notice.
     inflight: (Mutex<bool>, std::sync::Condvar),
     stop: AtomicBool,
@@ -267,11 +315,13 @@ impl Inventory {
             links: Mutex::new(BTreeMap::new()),
             waiting: Mutex::new(BTreeSet::new()),
             busy: Mutex::new(BTreeSet::new()),
+            parked: Mutex::new(BTreeMap::new()),
             digests: Mutex::new(BTreeMap::new()),
             after_ingest: Mutex::new(BTreeMap::new()),
             no_gap: no_inventory_on_gap(),
             no_digest: no_digest_trigger(),
             no_second_ask: no_second_ask(),
+            both_hold_only: both_hold_only(),
             inflight: (Mutex::new(false), std::sync::Condvar::new()),
             stop: AtomicBool::new(false),
             #[cfg(any(test, debug_assertions))]
@@ -279,19 +329,70 @@ impl Inventory {
         })
     }
 
-    /// A relay to `peer` follows its log over `link`.
+    /// A relay to `peer` follows its log over `link`, which runs the ask parked for `peer`. A link
+    /// already closed registers nothing: a relay on a link a duplicate replaced can get here after
+    /// the replacement's relay did, and would hide the live link from every later ask.
     pub(crate) fn linked(&self, peer: &str, link: &Arc<Link>) {
-        let mut links = self.links.lock_or_recover();
-        let weak = Arc::downgrade(link);
-        if let Some(slot) = links.get_mut(peer) {
-            *slot = weak;
-        } else {
-            links.insert(peer.to_owned(), weak);
+        let parked = {
+            let mut links = self.links.lock_or_recover();
+            if link.closed().is_some() {
+                return;
+            }
+            let weak = Arc::downgrade(link);
+            if let Some(slot) = links.get_mut(peer) {
+                *slot = weak;
+            } else {
+                links.insert(peer.to_owned(), weak);
+            }
+            self.parked.lock_or_recover().remove(peer)
+        };
+        if let Some(reason) = parked {
+            self.request(peer, link, reason);
         }
+    }
+
+    /// The live link registered for `peer` in `links`, unless it is `ended`.
+    fn live(
+        links: &BTreeMap<String, Weak<Link>>,
+        peer: &str,
+        ended: Option<&Link>,
+    ) -> Option<Arc<Link>> {
+        links.get(peer).and_then(Weak::upgrade).filter(|link| {
+            link.closed().is_none() && ended.is_none_or(|ended| !std::ptr::eq(link.as_ref(), ended))
+        })
+    }
+
+    /// The live link registered for `peer`, parking nothing where there is none: the digest
+    /// trigger's lookup, whose row asks only while a relay follows ([`Self::digest_row`]).
+    fn link_to(&self, peer: &str) -> Option<Arc<Link>> {
+        Self::live(&self.links.lock_or_recover(), peer, None)
+    }
+
+    /// The live link registered for `peer`, unless it is `ended` (the link an ask for `reason`
+    /// broke off on). With none, the ask is parked for `peer`'s next link: the check and the park
+    /// hold the links, so a link [`Self::linked`] registers after the check runs it.
+    fn relink(&self, peer: &str, ended: Option<&Link>, reason: Reason) -> Option<Arc<Link>> {
+        let links = self.links.lock_or_recover();
+        let newer = Self::live(&links, peer, ended);
+        if newer.is_none() {
+            self.parked
+                .lock_or_recover()
+                .entry(peer.to_owned())
+                .or_insert(reason);
+        }
+        newer
     }
 
     /// Ask for an exchange with `peer` over `link`, for `reason`. A gap notice under
     /// [`NO_INVENTORY_ON_GAP`] asks nothing (`relay_live::requests`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "GapSkip",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
     pub fn request(&self, peer: &str, link: &Arc<Link>, reason: Reason) {
         if !relay_live::requests(reason == Reason::Gap, self.no_gap) {
             return;
@@ -376,7 +477,7 @@ impl Inventory {
     pub(crate) fn ingested(&self, floor: u64) {
         let due: BTreeMap<String, (u64, Reason)> = {
             let mut after = self.after_ingest.lock_or_recover();
-            if after.is_empty() {
+            if !after.values().any(|(last, _)| *last < floor) {
                 return;
             }
             let (due, wait) = std::mem::take(&mut *after)
@@ -415,18 +516,10 @@ impl Inventory {
     pub(crate) fn members_landed(&self) {
         let peers = std::mem::take(&mut *self.waiting.lock_or_recover());
         for peer in peers {
-            if let Some(link) = self.link_to(&peer) {
+            if let Some(link) = self.relink(&peer, None, Reason::Members) {
                 self.request(&peer, &link, Reason::Members);
             }
         }
-    }
-
-    fn link_to(&self, peer: &str) -> Option<Arc<Link>> {
-        self.links
-            .lock_or_recover()
-            .get(peer)
-            .and_then(Weak::upgrade)
-            .filter(|link| link.closed().is_none())
     }
 
     /// The ingest consumer's group lost records: exchange with every neighbour a relay follows.
@@ -485,7 +578,7 @@ impl Inventory {
                     }
                     busy_wait = busy_wait.saturating_mul(2).min(BUSY_MAX);
                     for peer in std::mem::take(&mut *self.busy.lock_or_recover()) {
-                        if let Some(link) = self.link_to(&peer) {
+                        if let Some(link) = self.relink(&peer, None, Reason::Members) {
                             self.request(&peer, &link, Reason::Members);
                         }
                     }
@@ -499,7 +592,7 @@ impl Inventory {
             let Some(link) = link
                 .upgrade()
                 .filter(|link| link.closed().is_none())
-                .or_else(|| self.link_to(&peer))
+                .or_else(|| self.relink(&peer, None, reason))
             else {
                 self.not_run(&peer);
                 continue;
@@ -515,7 +608,8 @@ impl Inventory {
         self.inflight.1.notify_all();
     }
 
-    /// Wait until no exchange is asked or running, or `deadline`: whether none is.
+    /// Wait until no exchange is queued or running, or `deadline`: whether none is. An ask parked
+    /// for a link waits for that link, not for the worker, so it leaves the worker idle.
     #[cfg(test)]
     pub(crate) fn wait_idle_for_test(&self, deadline: std::time::Instant) -> bool {
         let mut inflight = self.inflight.0.lock_or_recover();
@@ -538,8 +632,38 @@ impl Inventory {
 
     /// Exchange with `peer` over `link` as the initiator, unless the last exchange with it moved
     /// nothing and this Mac's summary has not changed since (`relay_live::runs`, whose island
-    /// proves the skip safe: the neighbour holds whatever this Mac holds then).
+    /// proves the skip safe: the neighbour holds whatever this Mac holds then, of every table its
+    /// stores take), or `peer` is not a current seat here: an ask queued or parked before its
+    /// removal sends it nothing, as [`Mesh::serve_inventory`] answers no such key.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "InventoryAB",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "InventoryCB",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "InventoryAD",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
     fn initiate(&self, mesh: &Mesh, peer: &str, link: &Link, reason: Reason) {
+        if mesh.admits(link.peer().key.bytes()) != Some(true) {
+            aterm_log::info!("mesh: no Inventory with {peer}, which is not a current seat here");
+            return;
+        }
         let summary = match summary(self.stores.as_ref()) {
             Ok(summary) => summary,
             Err(e) => {
@@ -561,7 +685,14 @@ impl Inventory {
             .and_then(|stream| {
                 stream.set_read_timeout(Some(relay::IO_WITHIN));
                 stream.set_write_timeout(Some(relay::IO_WITHIN));
-                exchange(self.stores.as_ref(), &self.egress, &stream, summary, true)
+                exchange(
+                    self.stores.as_ref(),
+                    &self.egress,
+                    &stream,
+                    summary,
+                    true,
+                    self.both_hold_only,
+                )
             });
         match ran {
             Ok(moved) => {
@@ -576,6 +707,10 @@ impl Inventory {
             Err(e) => {
                 aterm_log::info!("mesh: an Inventory with {peer} ended: {e}");
                 self.not_run(peer);
+                // The exchange did not finish: ask it again over a newer link, or the next one.
+                if let Some(next) = self.relink(peer, Some(link), reason) {
+                    self.request(peer, &next, reason);
+                }
             }
         }
     }
@@ -630,8 +765,15 @@ impl Inventory {
         let ran = summary(self.stores.as_ref()).and_then(|summary| {
             stream.set_read_timeout(Some(relay::IO_WITHIN));
             stream.set_write_timeout(Some(relay::IO_WITHIN));
-            exchange(self.stores.as_ref(), &self.egress, stream, summary, false)
-                .map(|moved| (summary, moved))
+            exchange(
+                self.stores.as_ref(),
+                &self.egress,
+                stream,
+                summary,
+                false,
+                self.both_hold_only,
+            )
+            .map(|moved| (summary, moved))
         });
         match ran {
             Ok((summary, moved)) => {
@@ -665,9 +807,10 @@ impl Mesh {
             Some(false) => return incoming.refuse("out"),
             Some(true) => {}
         }
-        let peer = astream_broker::identity_principal(&key);
+        let peer_buf = crate::logs::principal_buf(&key);
+        let peer = crate::logs::principal_str(&peer_buf);
         let stream = incoming.accept();
-        inventory.answer(self, &peer, &stream);
+        inventory.answer(self, peer, &stream);
     }
 }
 
@@ -690,14 +833,12 @@ fn summary(stores: &dyn Stores) -> io::Result<Digest> {
     for id in &members {
         hash.update(id);
     }
-    for table in stores.tables()? {
-        let ids = stores.table_inventory(table)?.unwrap_or_default();
+    for (table, ids, proofs) in stores.tables_summary()? {
         hash.update(table);
         hash.update((ids.len() as u64).to_le_bytes());
         for id in &ids {
             hash.update(id);
         }
-        let proofs = stores.table_proofs(table)?.unwrap_or_default();
         hash.update((proofs.len() as u64).to_le_bytes());
         for key in &proofs {
             hash.update(key);
@@ -771,31 +912,58 @@ fn read_frame(stream: &LinkStream, max: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The key list exchange of one unit (or of the table lists), in Commons repair's encoding.
+/// The key list exchange of one unit (or of the table lists), in Commons repair's encoding: `None`
+/// where this side sends no list (a table its stores do not take), and the neighbour's list, or
+/// `None` where it sent none.
 fn exchange_ids<const N: usize>(
     stream: &LinkStream,
     initiator: bool,
-    local: &BTreeSet<[u8; N]>,
+    local: Option<&BTreeSet<[u8; N]>>,
     maximum: usize,
-) -> io::Result<BTreeSet<[u8; N]>> {
+) -> io::Result<Option<BTreeSet<[u8; N]>>> {
     let side = if initiator {
         aterm_db::replica::Side::Initiator
     } else {
         aterm_db::replica::Side::Responder
     };
     let mut io = stream;
-    aterm_db::replica::exchange_inventory::<N>(&mut io, side, Some(local), maximum, || Ok(()))
+    aterm_db::replica::exchange_inventory::<N>(&mut io, side, local, maximum, || Ok(()))
         .map_err(|e| io_of(&e))
-        .map(Option::unwrap_or_default)
 }
 
-/// Run one exchange over `stream` with this Mac's `summary`, as the initiator or the responder.
+/// Whether this side sends a key list for `table`: it holds the table (it listed it), or its
+/// stores take it now, as a vault does a table whose declaration this exchange's catalog unit
+/// just brought.
+fn opens(stores: &dyn Stores, mine: &BTreeSet<Digest>, table: Digest) -> io::Result<bool> {
+    Ok(mine.contains(&table) || stores.takes(table)?)
+}
+
+/// What a side gives of a unit: the keys it holds that the neighbour's list lacks, by `lacks`;
+/// nothing where either side sent no list.
+fn lacking<const N: usize>(
+    local: Option<&BTreeSet<[u8; N]>>,
+    remote: Option<&BTreeSet<[u8; N]>>,
+    lacks: impl Fn(&BTreeSet<[u8; N]>, &[u8; N]) -> bool,
+) -> Vec<[u8; N]> {
+    match (local, remote) {
+        (Some(local), Some(remote)) => local
+            .iter()
+            .filter(|key| lacks(remote, key))
+            .copied()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Run one exchange over `stream` with this Mac's `summary`, as the initiator or the responder;
+/// with `both_hold_only` ([`BOTH_HOLD_ONLY`]) over the tables both sides hold alone.
 fn exchange(
     stores: &dyn Stores,
     egress: &Egress,
     stream: &LinkStream,
     summary: Digest,
     initiator: bool,
+    both_hold_only: bool,
 ) -> io::Result<Moved> {
     let mut greeting = [0u8; HEAD.len() + 32];
     greeting[..HEAD.len()].copy_from_slice(HEAD);
@@ -813,40 +981,68 @@ fn exchange(
         return Ok(moved);
     }
     let mine = stores.tables()?;
-    let their_tables = exchange_ids(stream, initiator, &mine, TABLES_MAX)?;
-    let mut units = Vec::with_capacity(1 + 2 * mine.len().min(their_tables.len()));
+    let their_tables =
+        exchange_ids(stream, initiator, Some(&mine), TABLES_MAX)?.unwrap_or_default();
+    // One unit list, a function of the two lists alone, so both sides walk it in step: the
+    // membership log, each table both listed, then each table one listed. The catalog, which
+    // every vault holds, goes before the tables it declares to a vault that lacked them.
+    let mut tables: Vec<Digest> = mine.intersection(&their_tables).copied().collect();
+    if !both_hold_only {
+        tables.extend(mine.symmetric_difference(&their_tables).copied());
+    }
+    let mut units = Vec::with_capacity(1 + 2 * tables.len());
     units.push(Unit::Members);
-    for table in mine.intersection(&their_tables) {
-        units.extend([Unit::Proofs(*table), Unit::Table(*table)]);
+    for table in tables {
+        units.extend([Unit::Proofs(table), Unit::Table(table)]);
     }
     for unit in units {
         let wires = match unit {
             Unit::Members => {
                 let local = stores.members_inventory()?;
-                let remote = exchange_ids(stream, initiator, &local, MEMBERS_MAX)?;
-                let give: Vec<Digest> = local.difference(&remote).copied().collect();
-                stores.members_wires(&give)?
+                let remote = exchange_ids(stream, initiator, Some(&local), MEMBERS_MAX)?;
+                let give = lacking(Some(&local), remote.as_ref(), |remote, id| {
+                    !remote.contains(id)
+                });
+                if give.is_empty() {
+                    Vec::new()
+                } else {
+                    stores.members_wires(&give)?
+                }
             }
             Unit::Proofs(table) => {
-                let local = stores.table_proofs(table)?.unwrap_or_default();
-                let remote = exchange_ids(stream, initiator, &local, PROOFS_MAX)?;
-                let give: Vec<ProofKey> = local
-                    .iter()
-                    .filter(|key| {
-                        let mut fork = [0u8; 81];
-                        fork[..48].copy_from_slice(&key[..48]);
-                        fork[48] = 1;
-                        !remote.contains(*key) && !remote.contains(&fork)
-                    })
-                    .copied()
-                    .collect();
-                stores.table_proof_wires(table, &give)?
+                let local = if opens(stores, &mine, table)? {
+                    Some(stores.table_proofs(table)?.unwrap_or_default())
+                } else {
+                    None
+                };
+                let remote = exchange_ids(stream, initiator, local.as_ref(), PROOFS_MAX)?;
+                let give = lacking(local.as_ref(), remote.as_ref(), |remote, key| {
+                    let mut fork = [0u8; 81];
+                    fork[..48].copy_from_slice(&key[..48]);
+                    fork[48] = 1;
+                    !remote.contains(key) && !remote.contains(&fork)
+                });
+                if give.is_empty() {
+                    Vec::new()
+                } else {
+                    stores.table_proof_wires(table, &give)?
+                }
             }
             Unit::Table(table) => {
-                let local = stores.table_inventory(table)?.unwrap_or_default();
-                let remote = exchange_ids(stream, initiator, &local, DIGESTS_MAX)?;
-                let give: Vec<Digest> = local.difference(&remote).copied().collect();
-                stores.table_wires(table, &give)?
+                let local = if opens(stores, &mine, table)? {
+                    Some(stores.table_inventory(table)?.unwrap_or_default())
+                } else {
+                    None
+                };
+                let remote = exchange_ids(stream, initiator, local.as_ref(), DIGESTS_MAX)?;
+                let give = lacking(local.as_ref(), remote.as_ref(), |remote, id| {
+                    !remote.contains(id)
+                });
+                if give.is_empty() {
+                    Vec::new()
+                } else {
+                    stores.table_wires(table, &give)?
+                }
             }
         };
         if initiator {

@@ -76,8 +76,12 @@ impl Rests {
             if !s.bytes().any(|b| b.is_ascii_uppercase()) {
                 hasher.update(s.as_bytes());
             } else {
-                for b in s.bytes() {
-                    hasher.update([b.to_ascii_lowercase()]);
+                let mut buf = [0u8; 64];
+                for chunk in s.as_bytes().chunks(buf.len()) {
+                    for (dst, &src) in buf.iter_mut().zip(chunk) {
+                        *dst = src.to_ascii_lowercase();
+                    }
+                    hasher.update(&buf[..chunk.len()]);
                 }
             }
         }
@@ -93,8 +97,12 @@ impl Rests {
     /// Whether a pass for `login` and `target` may start now, marking it running if so: not while
     /// one runs, nor within [`REST`] of one that settled. Each sign-in address is its own pair, so
     /// the second address signed in on a day still reaches its birth.
+    #[cfg(test)]
     fn begin(&self, login: &str, target: Option<&str>, now: Instant) -> bool {
-        let key = Self::key(login, target);
+        self.begin_key(Self::key(login, target), now)
+    }
+
+    fn begin_key(&self, key: [u8; 32], now: Instant) -> bool {
         let Ok(mut by) = self.by.lock() else {
             return false;
         };
@@ -114,8 +122,12 @@ impl Rests {
     /// A pass ended: one that `settled` rests its pair for [`REST`]; one that did not (the
     /// registry not caught up here, the mailbox not yet known, an error) leaves the pair due at
     /// the next code fetch.
+    #[cfg(test)]
     fn end(&self, login: &str, target: Option<&str>, settled: bool, now: Instant) {
-        let key = Self::key(login, target);
+        self.end_key(Self::key(login, target), settled, now);
+    }
+
+    fn end_key(&self, key: [u8; 32], settled: bool, now: Instant) {
         if let Ok(mut by) = self.by.lock() {
             if settled {
                 by.insert(key, Rest::Settled(now));
@@ -237,23 +249,18 @@ fn take_up(
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     pass: fn(&Listing) -> Result<Discovered, String>,
 ) {
-    let target = seen.target.as_deref();
-    if !rests.begin(&seen.login, target, Instant::now()) {
+    let key = Rests::key(&seen.login, seen.target.as_deref());
+    if !rests.begin_key(key, Instant::now()) {
         return;
     }
     let listing = listing(seen);
     let spawned = spawn(Box::new(move || {
         let done = pass(&listing);
         log_pass(&done);
-        rests.end(
-            &listing.login,
-            listing.target.as_deref(),
-            settled(&done),
-            Instant::now(),
-        );
+        rests.end_key(key, settled(&done), Instant::now());
     }));
     if spawned.is_err() {
-        rests.end(&seen.login, target, false, Instant::now());
+        rests.end_key(key, false, Instant::now());
         aterm_log::debug!("lab mailbox discovery: no thread");
     }
 }

@@ -81,10 +81,15 @@ pub(super) fn cfb(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<
     Ok(plain)
 }
 
-pub(super) fn encrypt_cfb(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub(super) fn encrypt_cfb_into(
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
     let key = Key::new(key)?;
     let mut feedback: [u8; 16] = iv.try_into().map_err(|_| "Invalid AES IV")?;
-    let mut output = Vec::with_capacity(plaintext.len());
+    output.reserve(plaintext.len());
     for chunk in plaintext.chunks(16) {
         let mut mask = key.block(feedback, false);
         for (i, byte) in chunk.iter().enumerate() {
@@ -94,7 +99,7 @@ pub(super) fn encrypt_cfb(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec
         mask.zeroize();
     }
     feedback.zeroize();
-    Ok(output)
+    Ok(())
 }
 
 pub(super) fn wrap(key: &[u8], input: &[u8]) -> Result<Vec<u8>, String> {

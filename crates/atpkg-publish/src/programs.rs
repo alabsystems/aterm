@@ -355,7 +355,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
         system: None,
         unavailable_hint: Some("The qualified Node reference runtime is available for macOS only"),
         shape: Shape::Bottle(BottleDef {
-            exposes: &["node"],
+            exposes: &["node22"],
             darwin: DUAL_DARWIN,
             linux: &[],
             origin: BottleOrigin::Pinned(&aterm_uds::host::upstream::NODE),

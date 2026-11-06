@@ -95,7 +95,10 @@ web_terminal_impl!(bind);
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::MAX_QUEUED_NOTIFICATIONS;
+    use super::{
+        drain_notifications_json, enqueue, Notification, NotificationQueue, NotificationUrgency,
+        MAX_QUEUED_NOTIFICATIONS,
+    };
 
     #[test]
     fn authorized_osc9_round_trips_through_the_drain() {
@@ -145,14 +148,20 @@ mod tests {
         );
     }
 
+    /// The queue's own bound: past its cap a notification is refused, the queued ones kept.
     #[test]
     fn queue_is_bounded_and_drops_new_when_full() {
-        let mut t = crate::system_font_terminal(24, 80, 16.0);
-        t.authorize_notifications(true);
+        let queue = NotificationQueue::default();
+        let note = |i: usize| Notification {
+            id: None,
+            title: None,
+            body: Some(format!("n {i}")),
+            urgency: NotificationUrgency::Normal,
+        };
         for i in 0..(MAX_QUEUED_NOTIFICATIONS + 8) {
-            t.process(format!("\x1b]9;n {i}\x07").as_bytes());
+            enqueue(&queue, note(i));
         }
-        let json = t.take_notifications().expect("queued notifications");
+        let json = drain_notifications_json(&queue).expect("queued notifications");
         assert_eq!(
             json.matches("\"body\":\"n ").count(),
             MAX_QUEUED_NOTIFICATIONS,
@@ -166,13 +175,43 @@ mod tests {
             !json.contains(&format!("\"n {MAX_QUEUED_NOTIFICATIONS}\"")),
             "overflow notifications are refused, not evicting old ones"
         );
-        assert!(t.take_notifications().is_none(), "drain empties the queue");
-        t.process(b"\x1b]9;after\x07");
         assert!(
-            t.take_notifications()
+            drain_notifications_json(&queue).is_none(),
+            "drain empties the queue"
+        );
+        enqueue(&queue, note(0));
+        assert!(
+            drain_notifications_json(&queue)
                 .expect("post-drain enqueue works")
-                .contains("after"),
+                .contains("\"n 0\""),
             "capacity is restored by draining"
+        );
+    }
+
+    /// A program's flood reaches the queue at the engine's notification pace, oldest first, so
+    /// it stays under the queue's cap. Every read is at one clock, so the pace refills nothing
+    /// however long the loop takes. NEGATIVE CONTROL: with the engine unpaced, the queue fills
+    /// to its cap.
+    #[test]
+    fn a_flood_reaches_the_queue_at_the_engines_pace() {
+        let mut t = crate::system_font_terminal(24, 80, 16.0);
+        t.authorize_notifications(true);
+        let at = aterm_core::terminal::ClockReading::now();
+        for i in 0..(MAX_QUEUED_NOTIFICATIONS + 8) {
+            t.term
+                .process_at(format!("\x1b]9;n {i}\x07").as_bytes(), at);
+        }
+        let json = t.take_notifications().expect("queued notifications");
+        let queued = json.matches("\"body\":\"n ").count();
+        assert!(
+            (1..MAX_QUEUED_NOTIFICATIONS).contains(&queued),
+            "the pace holds a flood under the cap: {queued}"
+        );
+        assert!(json.contains("\"n 0\""), "the first is delivered");
+        t.term.process_at(b"\x1b]9;later\x07", at);
+        assert!(
+            t.take_notifications().is_none(),
+            "a spent pace queues none at the same clock"
         );
     }
 }

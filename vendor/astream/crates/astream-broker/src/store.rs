@@ -1755,6 +1755,11 @@ pub struct RetentionTick {
     /// the broker logs, one line each, and what a read below them is told
     /// (`retained-from=`).
     pub lost: Vec<(String, u64)>,
+    /// Subjects the tick FORGOT ([`Rule::forgetting`](crate::Rule::forgetting)): every record
+    /// of each given up, each left the last-value index and gave its charged producer one
+    /// subject of its budget back, by a marked `/a/retire` record the tick appended
+    /// (`retention.rs`, "Forgetting").
+    pub forgotten: u64,
 }
 
 /// A retention by the rules, begun under the log lock: the compaction its cut takes, or,
@@ -10519,23 +10524,133 @@ impl BrokerLog {
     #[cfg(feature = "retention")]
     /// RETAIN BY THE RULES at `now_ms` (the caller's clock, unix ms; a test's hand clock):
     /// the whole tick on this thread — plan, write the held store, compact to the cut,
-    /// apply. The cut never rises above the visible head. Nothing without rules. A broker
-    /// runs the same tick with its copy off the ack path
+    /// apply, then forget what a forgetting rule lets go (`retention.rs`, "Forgetting"),
+    /// whether or not the rules changed anything else. The cut never rises above the
+    /// visible head. Nothing without rules. A broker runs the same tick with its copy off
+    /// the ack path and its forgets staged by its writer
     /// ([`Broker::retention_tick_at`](crate::Broker::retention_tick_at)).
     pub fn retain_by_rules(&mut self, now_ms: u64) -> io::Result<RetentionTick> {
         let ceiling = self.visible_head().0;
-        let Some(mut job) = self.retention_begin(now_ms, ceiling, 0)? else {
-            return Ok(RetentionTick {
+        let mut tick = match self.retention_begin(now_ms, ceiling, 0)? {
+            Some(mut job) => {
+                if let Err(e) = job.run() {
+                    self.retention_abandon(job);
+                    return Err(e);
+                }
+                self.retention_finish(job)?
+            }
+            None => RetentionTick {
                 base_before: self.base.0,
                 base: self.base.0,
                 ..RetentionTick::default()
-            });
+            },
         };
-        if let Err(e) = job.run() {
-            self.retention_abandon(job);
-            return Err(e);
+        tick.forgotten = self.forget_given_up()?;
+        Ok(tick)
+    }
+
+    #[cfg(feature = "retention")]
+    /// THE SUBJECTS RETENTION HAS FORGOTTEN, appended and committed here, on a log with no
+    /// writer of its own ([`retain_by_rules`](Self::retain_by_rules)): what a broker's
+    /// writer stages for its tick ([`stage_forgets`](Self::stage_forgets)), one batch.
+    fn forget_given_up(&mut self) -> io::Result<u64> {
+        let subjects = self.forgettable();
+        if subjects.is_empty() {
+            return Ok(0);
         }
-        self.retention_finish(job)
+        let n = match self.stage_forgets(subjects) {
+            Ok(n) => n,
+            Err(e) => {
+                self.abort_batch();
+                return Err(match e {
+                    StageErr::Io(e) => e,
+                    _ => io::Error::other("retention: a forget could not be staged"),
+                });
+            }
+        };
+        self.commit_batch()?;
+        Ok(n)
+    }
+
+    #[cfg(feature = "retention")]
+    /// THE SUBJECTS A TICK MAY FORGET now (`retention.rs`, "Forgetting"), each with the
+    /// offset of its `Last` row: at most [`FORGET_MAX`](crate::retention::FORGET_MAX), among
+    /// the quiet subjects whose rows the cuts carried (`carried_last`, every subject whose
+    /// newest record is below the base), each one [`forget_charge`](Self::forget_charge)
+    /// allows. Nothing unless some rule this open set forgets, so a log whose rules forget
+    /// nothing pays no scan. Under the log lock, between batches.
+    pub(crate) fn forgettable(&self) -> Vec<(String, Offset)> {
+        let mut out = Vec::new();
+        if !self.hold.active || self.replica || self.uncarried_cut_tainted {
+            return out;
+        }
+        match self.hold.rules.as_ref() {
+            Some(rules) if rules.forgets_any() => {}
+            _ => return out,
+        }
+        for (subject, rec) in &self.carried_last {
+            if out.len() >= crate::retention::FORGET_MAX {
+                break;
+            }
+            if self.forget_charge(subject, rec.seq).is_some() {
+                out.push((subject.clone(), rec.seq));
+            }
+        }
+        out
+    }
+
+    #[cfg(feature = "retention")]
+    /// Whether retention may FORGET `subject`, whose `Last` row a tick found at `off`: the
+    /// producer it is charged to when every guard holds, the guards of a retire
+    /// (`check_retire_target`) and retention's own. The log is no replica (a follower
+    /// applies its leader's forgets and makes none) and no uncarried cut tainted its
+    /// charges; the subject is no broker-internal one, falls to a forgetting rule of the
+    /// rules this open set, and its newest record, staged ones included, is still the row
+    /// at `off`, below the base, so every record of it is below the base; the held store
+    /// holds none of them, so retention gave every one up; and no will that can still
+    /// append targets it. `None` keeps the subject, carried as before.
+    fn forget_charge(&self, subject: &str, off: Offset) -> Option<u64> {
+        if self.replica || self.uncarried_cut_tainted || !self.hold.active {
+            return None;
+        }
+        if is_hidden_subject(subject) || subject.starts_with("/a/") || subject == "/a" {
+            return None;
+        }
+        if !self.hold.rules.as_ref()?.forgets(subject) {
+            return None;
+        }
+        let (now, charged) = self.batch_subject_state(subject)?;
+        if now != off || off.0 >= self.base.0 {
+            return None;
+        }
+        if self.hold.holds_subject(subject) || self.will_targets_subject(subject) {
+            return None;
+        }
+        Some(charged)
+    }
+
+    #[cfg(feature = "retention")]
+    /// STAGE THE FORGETS a tick found ([`forgettable`](Self::forgettable)), each judged
+    /// again against the batch ([`forget_charge`](Self::forget_charge): a record of the
+    /// subject staged or landed since, a will registered since, keeps it): one marked
+    /// [`RETIRE_SUBJECT`] record per subject under the producer it is charged to, credited
+    /// as a staged retire is. How many were staged.
+    pub(crate) fn stage_forgets(
+        &mut self,
+        subjects: Vec<(String, Offset)>,
+    ) -> Result<u64, StageErr> {
+        self.check_poisoned_stage()?;
+        let mut n = 0u64;
+        for (subject, off) in subjects {
+            let Some(charged) = self.forget_charge(&subject, off) else {
+                continue;
+            };
+            let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
+            self.stage_record(BrokerRecord::marked_retire(seq, charged, &subject))?;
+            self.credit_staged_retire(charged, subject);
+            n = n.saturating_add(1);
+        }
+        Ok(n)
     }
 
     #[cfg(feature = "retention")]

@@ -166,6 +166,20 @@ fn existing_as(sys: &Fake, who: &User, path: &Path, owner: &str, name: &str, pin
     );
     sys.on(
         &git()
+            .args([
+                "rev-list",
+                "--objects",
+                "--no-walk",
+                "--quiet",
+                "--missing=error",
+                &format!("{pin}^{{commit}}"),
+                "--",
+            ])
+            .display(),
+        Ran::ok(""),
+    );
+    sys.on(
+        &git()
             .args(["rev-parse", "--git-path", "objects/info/alternates"])
             .display(),
         Ran::ok(".git/objects/info/alternates\n"),
@@ -252,12 +266,6 @@ fn download_as(
     );
     existing_as(sys, who, &stage, owner, name, PIN);
     existing_as(sys, who, &parent.join(path), owner, name, PIN);
-    sys.on(
-        &local(sys, who, Some(&stage))
-            .args(["cat-file", "-e", &format!("{PIN}^{{commit}}")])
-            .display(),
-        Ran::ok(""),
-    );
     sys.on(
         &local(sys, who, Some(&stage))
             .args(checkout::NO_SIDE_RUNS)
@@ -593,6 +601,109 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
         .unwrap()
         .status
             == Some(1)
+    );
+
+    let backup = scratch.path().join("donor.git");
+    run(
+        scratch.path(),
+        &[
+            "clone",
+            "--bare",
+            "--no-hardlinks",
+            "--",
+            child.to_str().unwrap(),
+            backup.to_str().unwrap(),
+        ],
+    );
+    let blob = run(&child, &["rev-parse", &format!("{pin}:library.rs")])
+        .trim()
+        .to_owned();
+    let object_path = child.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    let original = sys.read_file(&object_path).unwrap();
+    // Missing objects at an already selected pin are unfinished too. Storage repair
+    // must preserve the person's same-pin branch and edits without another checkout.
+    run(&child, &["checkout", "-b", "owner-work"]);
+    sys.write_file(&child.join("library.rs"), b"owner edits\n", 0o600)
+        .unwrap();
+    sys.remove(&object_path).unwrap();
+    assert!(!ready(&sys, &who, &parent, &repo).unwrap());
+    let why = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
+    assert!(why.starts_with("cannot fetch the required dependency's recorded commit"));
+    assert_eq!(
+        run(&child, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/owner-work"
+    );
+    assert_eq!(
+        sys.read_file(&child.join("library.rs")).unwrap(),
+        b"owner edits\n"
+    );
+    sys.remove(&child.join("library.rs")).unwrap();
+    assert!(repair(&sys, &who, &parent, &repo, &|| Ok(())).is_err());
+    assert!(sys.stat(&child.join("library.rs")).is_err());
+    sys.write_file(&object_path, &original, 0o444).unwrap();
+    repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert!(sys.stat(&child.join("library.rs")).is_err());
+    sys.write_file(
+        &child.join("library.rs"),
+        b"required preloaded source\n",
+        0o600,
+    )
+    .unwrap();
+
+    // A commit object does not imply that its checkout objects are present. Leave the
+    // recorded old checkout clean, then remove only the new revision's loose blob.
+    run(&child, &["checkout", "--detach", &old]);
+    sys.remove(&object_path).unwrap();
+    assert!(run(&child, &["status", "--porcelain"]).is_empty());
+    assert!(
+        sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args([
+            "cat-file",
+            "-e",
+            &format!("{pin}^{{commit}}"),
+        ]))
+        .unwrap()
+        .success()
+    );
+    assert!(
+        !sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args(["cat-file", "-e", &blob]))
+            .unwrap()
+            .success()
+    );
+    let result = repair(&sys, &who, &parent, &repo, &|| Ok(()));
+    assert!(
+        result.is_err(),
+        "incomplete checkout reported {result:?}; ready={:?}; head={}; file={:?}",
+        ready(&sys, &who, &parent, &repo),
+        run(&child, &["rev-parse", "HEAD"]).trim(),
+        sys.read_file(&child.join("library.rs"))
+    );
+    let why = result.unwrap_err();
+    assert!(
+        why.starts_with("cannot fetch the required dependency's recorded commit"),
+        "an incomplete local checkout must try the admitted transport: {why}"
+    );
+    assert_eq!(run(&child, &["rev-parse", "HEAD"]).trim(), old);
+    assert_eq!(
+        sys.read_file(&child.join("library.rs")).unwrap(),
+        b"previous recorded source\n"
+    );
+    // A real, isolated donor refetch restores the absent object. The ordinary repair
+    // can then finish from that complete local store while SSH remains unavailable.
+    read(
+        &sys,
+        local(&sys, &who, Some(&child))
+            .args(["fetch", "--refetch", "--no-recurse-submodules", "--"])
+            .arg(&backup)
+            .arg(&pin),
+        "isolated donor refetch failed",
+    )
+    .unwrap();
+    repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert_eq!(
+        sys.read_file(&child.join("library.rs")).unwrap(),
+        b"required preloaded source\n"
     );
 }
 
@@ -965,7 +1076,7 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
         assert!(
             sys.calls().iter().all(|call| !call.contains(" clone ")
                 && !call.contains(" fetch ")
-                && !call.contains("cat-file -e")
+                && !call.contains("rev-list --objects")
                 && !call.contains(" checkout ")
                 && !call.starts_with("rename-noreplace ")),
             "{mode}"
@@ -987,12 +1098,6 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
     );
     existing(&sys, &who, &path, "library", OLD);
     let git = || local(&sys, &who, Some(&path));
-    sys.on(
-        &git()
-            .args(["cat-file", "-e", &format!("{PIN}^{{commit}}")])
-            .display(),
-        Ran::exit(1, "synthetic pin not stored locally"),
-    );
     sys.on(
         &git()
             .args([
@@ -1024,6 +1129,7 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
         Ran::ok(PARENT),
     );
     let moved = AtomicBool::new(false);
+    let fetched = AtomicBool::new(false);
     let inside = path.clone();
     sys.simulate(move |_, command| {
         let call = command.display();
@@ -1031,7 +1137,15 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
             return Some(Ran::ok("https://github.com/alice/library.git"));
         }
         if call.contains(" fetch ") {
+            fetched.store(true, Ordering::SeqCst);
             return Some(Ran::ok(""));
+        }
+        if call.contains("rev-list --objects") {
+            return Some(if fetched.load(Ordering::SeqCst) {
+                Ran::ok("")
+            } else {
+                Ran::exit(1, "synthetic checkout objects not stored locally")
+            });
         }
         if call.contains(" checkout ") {
             moved.store(true, Ordering::SeqCst);
@@ -1061,6 +1175,7 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
     assert!(
         fetch.contains("credential.helper= ")
             && fetch.contains("protocol.allow=never")
+            && fetch.contains("--refetch")
             && fetch.contains("--no-recurse-submodules"),
         "{fetch}"
     );

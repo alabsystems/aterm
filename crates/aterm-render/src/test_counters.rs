@@ -96,6 +96,19 @@ pub fn take_glass_slabs() -> usize {
 }
 
 thread_local! {
+    static RAMP_STOPS_READ: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_ramp_stop_read() {
+    RAMP_STOPS_READ.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's COLR colour-ramp stops compared while sampling since the last take, zeroed.
+pub fn take_ramp_stops_read() -> usize {
+    RAMP_STOPS_READ.with(|n| n.replace(0))
+}
+
+thread_local! {
     static BLOOM_PIXELS: Cell<usize> = const { Cell::new(0) };
 }
 

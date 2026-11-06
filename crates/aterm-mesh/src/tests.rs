@@ -21,7 +21,7 @@ use aterm_secrets::membership_log::{Body, Entrant, Evidence, Log, MemberId, Reco
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -39,13 +39,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// What every Mac of one test shares: the link clock, the wall clock, the address book the
 /// overlays dial from (less the Macs a partition cut off, and for each Mac the ones it is kept
-/// apart from), and the keys every link seats.
+/// apart from), each running Mac's neighbour table (which a partition closes links in), and the
+/// keys every link seats.
 struct Lab {
     clock: Arc<ManualClock>,
     wall: Arc<AtomicU64>,
     book: Arc<Mutex<BTreeMap<String, SocketAddr>>>,
     cut: Arc<Mutex<BTreeSet<String>>>,
     apart: Arc<Mutex<BTreeSet<(String, String)>>>,
+    tables: Arc<Mutex<BTreeMap<String, Weak<Neighbours>>>>,
     seated: Arc<Mutex<Vec<NodeKey>>>,
 }
 
@@ -57,6 +59,7 @@ impl Lab {
             book: Arc::default(),
             cut: Arc::default(),
             apart: Arc::default(),
+            tables: Arc::default(),
             seated: Arc::default(),
         }
     }
@@ -305,6 +308,7 @@ impl Mac {
         let thread = {
             let (serving, table, mesh) =
                 (Arc::clone(&serving), Arc::clone(&table), Arc::clone(&mesh));
+            let (cut, principal) = (Arc::clone(&lab.cut), self.principal.clone());
             std::thread::spawn(move || {
                 const SERVES: &[FleetOp] = &[FleetOp::Neighbour];
                 let listening = Listening {
@@ -325,7 +329,18 @@ impl Mac {
                     move |served, op| {
                         if op == FleetOp::Neighbour {
                             let link = served.into_link(&me, table.config())?;
+                            // A partition refuses a link to or from a Mac it cut off: a dial that
+                            // read its hints before the cut lands here after it. The check and the
+                            // adopt hold the cut, so a cut taken later finds this end in this table
+                            // ([`Mac::cut`] closes the links of every table to the Mac it cuts).
+                            let cut = lock(&cut);
+                            let peer = astream_broker::identity_principal(link.peer().key.bytes());
+                            if cut.contains(&principal) || cut.contains(&peer) {
+                                link.close("a partition");
+                                return Ok(());
+                            }
                             table.adopt(link);
+                            drop(cut);
                             mesh.poke();
                         }
                         Ok(())
@@ -335,6 +350,7 @@ impl Mac {
             })
         };
         lock(&lab.book).insert(self.principal.clone(), addr);
+        lock(&lab.tables).insert(self.principal.clone(), Arc::downgrade(&table));
         let (book, cut, apart) = (
             Arc::clone(&lab.book),
             Arc::clone(&lab.cut),
@@ -384,12 +400,24 @@ impl Mac {
         run.mesh.close();
     }
 
-    /// Cut this Mac off: it dials no Mac, no Mac dials it, and it closes every link it holds;
-    /// each neighbour learns of the end from its own end of the link.
+    /// Cut this Mac off: it dials no Mac, no Mac dials it or takes its link, and every link to it
+    /// closes, at its end and at each neighbour's. A link whose listener took it before the cut
+    /// is in the listener's table by then, and its dialer's end, which the dialer adopts only once
+    /// its dial returns, fails on the other end's close.
     fn cut(&self, lab: &Lab) {
+        assert!(self.run.is_some(), "the Mac runs");
         lock(&lab.cut).insert(self.principal.clone());
-        for link in self.run.as_ref().expect("the Mac runs").table.links() {
-            link.close("a partition");
+        let tables: Vec<(String, Arc<Neighbours>)> = lock(&lab.tables)
+            .iter()
+            .filter_map(|(owner, table)| table.upgrade().map(|table| (owner.clone(), table)))
+            .collect();
+        for (owner, table) in tables {
+            for link in table.links() {
+                let peer = astream_broker::identity_principal(link.peer().key.bytes());
+                if owner == self.principal || peer == self.principal {
+                    link.close("a partition");
+                }
+            }
         }
     }
 

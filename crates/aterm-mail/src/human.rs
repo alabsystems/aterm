@@ -62,18 +62,20 @@ impl Recovery {
         if code.is_empty() || code.len() > 128 || code.chars().any(char::is_control) {
             return Err("Invalid recovery-code format".into());
         }
-        let response = request(
-            Method::Post,
-            &format!("{}/{}", self.path(), crate::oauth::encode(code)),
-        )?;
+        let mut path = self.path();
+        path.push('/');
+        crate::oauth::encode_into(&mut path, code);
+        let response = request(Method::Post, &path)?;
         verified(&response, &self.method)
     }
     fn path(&self) -> String {
-        format!(
-            "/core/v4/verification/{}/{}",
-            self.method,
-            crate::oauth::encode(self.token.expose())
-        )
+        let token = self.token.expose();
+        let mut path = String::with_capacity(24 + self.method.len() + token.len());
+        path.push_str("/core/v4/verification/");
+        path.push_str(&self.method);
+        path.push('/');
+        crate::oauth::encode_into(&mut path, token);
+        path
     }
 }
 fn decode_details(details: &Value) -> Result<(String, Purpose), String> {

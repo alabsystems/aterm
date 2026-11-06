@@ -554,7 +554,12 @@ GOTCHAS
         name: "resource-run",
         tagline: "run a command with authenticated per-tab resource ownership",
         body: Some(
-            "aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]\n\n\
+            "aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]\n\
+             aterm resource-run --cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd FD] --session @self --job LABEL -- PROGRAM [ARGS...]\n\n\
+             Explicit CPU and memory budgets request retained host admission. Both budget\n\
+             fields are required. Unready admission exits75 before submitting execution;\n\
+             actual launch starts the timeout. An optional private status descriptor receives\n\
+             versioned JSON lines separately from child stdout and stderr.\n\n\
              Registers this wrapper's kernel PID/start identity with the authenticated target\n\
              before execing PROGRAM. Its PID, arguments, environment, cwd, descriptors and\n\
              process group persist; CPU and physical footprint are charged once to the\n\
@@ -567,6 +572,16 @@ GOTCHAS
              An absent, initializing or unreadable pool reports no available count.\n\n\
              Query support via `aterm ctl @self resources capabilities`. A started command is\n\
              never retried; job labels should name the task, not secret argv.\n",
+        ),
+    },
+    Topic {
+        name: "resource-inspect",
+        tagline: "inspect this process tree's authenticated retained host coverage",
+        body: Some(
+            "aterm resource-inspect --json [--session @self|@<sid>]\n\n\
+            Reports versioned original CPU and memory custody for the authenticated calling\n\
+            process tree. Unready or unverifiable coverage exits75. Read-only observations\n\
+            never create a reservation or authorize a new root launch.\n",
         ),
     },
     Topic {
@@ -2415,6 +2430,7 @@ fn overview_page() -> String {
             crate::Verb::ResourceRun => {
                 "run a command with authenticated per-tab resource ownership"
             }
+            crate::Verb::ResourceInspect => "inspect this process tree's retained host coverage",
             crate::Verb::Pkg => "install / update / verify the toolchain",
             crate::Verb::Agh => {
                 "GitHub for agents: reads and writes as routed identities, JSON, typed exits"
@@ -3243,11 +3259,13 @@ AGENTS
   out, it opens xAI's sign-in page by itself). Any agent whose program atpkg's store
   does not hold yet (a fresh Mac before the update pass lands it) is then installed
   by atpkg's verified install (a failed install is `stalled why=install`, and one
-  that makes no progress for 45 minutes `stalled why=startup`, naming the install);
+  that makes no progress for 45 minutes `stalled why=startup`, naming the install;
+  each names the member and the cause in `attention=`);
   where `[packages] exclude`, a person's removal or a no to unattended installs (Keep
   ALab tools up to date or Install ALab tools off in Settings ▸ Packages, or the
   toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed,
-  the launch says so and the line runs any copy of the shell's own.
+  the launch says so and the line runs any copy of the shell's own (if none starts,
+  its `stalled why=startup` says why).
   `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
 ANY OTHER PROGRAM
@@ -3289,10 +3307,20 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
                          - < task
                              one survey of every member picks the Mac: of those that let
                              this Mac drive them, meet every `need=` by their own survey
-                             facts and have an enrolled, unwalled account of that program,
-                             one read working before an unseen one and an unseen one before
-                             a low one, then the least used week, then five hours, then the
-                             fewest busy sessions, then by host. `repo:<name>`: a checkout
+                             facts and would start it on an account of that program with no
+                             known wall or sign-out, one read working before an unseen one
+                             and an unseen one before a low one, then the least used week,
+                             then five hours, then the fewest busy sessions, then by host. A
+                             Claude account with no `dir` counts with no look at its login,
+                             so a worker there can meet a sign-in. Each Mac is weighed by the
+                             one account its survey says a launch there starts on
+                             (`launch=1`), under its accounts mode, pin and Codex build; an
+                             aterm too old to say is weighed by its best account. A Mac that
+                             says no account takes its launch, which then runs on a login no
+                             account lists or none can show a wall on, or is refused, is never
+                             chosen: `--host <node>` still starts a worker there unless it is
+                             refused.
+                             `repo:<name>`: a checkout
                              `~/<name>` its last read, within 30 min on its clock, found with
                              a HEAD; `free:<n>m|g|t`: that much free on its home's volume
                              (binary units: 150g is 150 GiB); a `cwd=~/…` needs a Mac that
@@ -3302,8 +3330,9 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
                              old to say: update that Mac, or name it with `--host <node>`.
                              The spawn says on stderr which it chose (`--host any: chose
                              <host> (<addr>): …`, with what it has of each need), prints
-                             `OK <sid>` as `--host <that Mac>` does, and refuses with counts
-                             where none can. The worker's `await task` and `@<sid>` verbs
+                             `OK <sid>` as `--host <that Mac>` does, and where none can, refuses
+                             with how many stopped at each cause and what mends it. The
+                             worker's `await task` and `@<sid>` verbs
                              under `--host any` follow it to that Mac by this Mac's board
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
@@ -3346,7 +3375,15 @@ THE SURVEY & CHANNELS
                              its rows did not all come: unknown, never none)
   Topic channels (with `aterm fabric on`, this machine only): `aterm ctl @self topic add
   <t>`, wait in the background with `aterm ctl @self await inbox since=<id> topic=<t>`,
-  and broadcast with `aterm ctl @self post to=say:<t> kind=note -- '<text>'`.
+  and broadcast with `aterm ctl @self post to=say:<t> kind=note -- '<text>'`. A worker's
+  last topic post is its step (`survey`'s `step=`, its Workers row) while it is newer
+  than its screen's words.
+  Worker mail: each new `NEEDS YOU:` line of a worker, and its conclusion, arrive once in
+  its manager's inbox as a `kind=report` (`<what> | sid= state= conclusion= why=
+  result= | step: …`), from the worker's sid here and from `fleet:<node>` when the
+  manager spawned it from another Mac; a tab that closes before its conclusion was told
+  sends `state=closed` to a manager on another Mac. Mail nothing takes is a record in
+  Messages.
 
 GOTCHAS
   * Hand over a task with `spawn agent=… -`, never by typing a `turn` into someone

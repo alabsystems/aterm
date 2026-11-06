@@ -992,8 +992,7 @@ fn restore_hyperlink_spans(
                 break 'restore;
             }
             let extra = extras.entry(hcol).or_default();
-            extra.set_hyperlink(Some(span.url.clone()));
-            extra.set_hyperlink_id(span.id.clone());
+            extra.set_hyperlink_data(Some(Arc::clone(&span.payload)));
             budget -= 1;
         }
     }

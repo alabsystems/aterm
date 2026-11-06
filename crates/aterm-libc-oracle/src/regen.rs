@@ -3,10 +3,10 @@
 
 //! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them and stamp each one's seal ([`aterm_census::seal`]).
 //!
-//! The cell this box is native to is documented and probed under Trust; every
-//! other cell under a stock rustup toolchain (`--stock`, default `stable`, with
-//! each cross triple's std installed) — this crate's one STOCK EXCEPTION, since
-//! Trust ships std for its host only.
+//! Native cells and cross cells with actual std/core in the selected Trust
+//! sysroot are documented and probed under Trust. Remaining cells need a stock
+//! rustup toolchain (`--stock`, default `stable`, with each cross triple's std
+//! installed): this crate's one STOCK EXCEPTION.
 pub mod behaviour;
 pub mod decls;
 pub mod handwritten;
@@ -36,6 +36,8 @@ pub const GENERATOR: &str = "`aterm-libc-oracle regen`";
 /// Where and how to regenerate.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Explicit authoring cell; absent retains the complete four-cell regeneration.
+    pub cell: Option<String>,
     /// The checkout: it holds `libc-oracle/union.json`.
     pub root: PathBuf,
     /// Where the eight modules are written, as a checkout (`<out>/crates/…`).
@@ -81,7 +83,7 @@ fn io(what: &str, path: &Path) -> impl FnOnce(std::io::Error) -> Stop {
     }
 }
 
-/// The compiler for one cell: Trust where this box is native, else stock.
+/// The compiler for one cell: Trust with matching target libraries, else stock.
 pub enum Compiler<'t> {
     Trust(&'t Trust),
     Stock(&'t Stock),
@@ -107,6 +109,9 @@ impl Compiler<'_> {
                     .current_dir(dir)
                     .env("RUSTC", &trust.trustc)
                     .env("RUSTDOC", &trust.trustdoc);
+                if cell.triple != trust.host {
+                    command.args(["--target", cell.triple]);
+                }
                 command
             }
             Self::Stock(stock) => {
@@ -135,7 +140,8 @@ impl Compiler<'_> {
     /// Where `rustdoc -p libc` leaves its JSON.
     fn doc_json(&self, cell: &Cell, target: &Path) -> PathBuf {
         match self {
-            Self::Trust(_) => target.join("doc/libc.json"),
+            Self::Trust(trust) if cell.triple == trust.host => target.join("doc/libc.json"),
+            Self::Trust(_) => target.join(cell.triple).join("doc/libc.json"),
             Self::Stock(_) => target.join(cell.triple).join("doc/libc.json"),
         }
     }
@@ -289,9 +295,10 @@ fn supplied_doc(docs: Option<&Path>, cell: &Cell) -> Option<PathBuf> {
 }
 
 /// The toolchains a run needs: Trust always (the host cell, the formatter),
-/// the stock one only when a cell is not native here.
+/// the stock one only when a selected cell lacks matching Trust target libraries.
 struct Toolchains {
     trust: Trust,
+    trust_cells: std::collections::BTreeSet<&'static str>,
     stock: Option<Stock>,
 }
 
@@ -303,9 +310,15 @@ impl Toolchains {
         cells: impl IntoIterator<Item = &'c Cell>,
     ) -> Result<Self, Stop> {
         let trust = trust::discover(root)?;
+        let cells: Vec<_> = cells.into_iter().collect();
+        let trust_cells = cells
+            .iter()
+            .filter(|cell| cell.triple == trust.host || trust.has_target(cell.triple))
+            .map(|cell| cell.triple)
+            .collect::<std::collections::BTreeSet<_>>();
         let foreign: Vec<&Cell> = cells
             .into_iter()
-            .filter(|c| c.triple != trust.host)
+            .filter(|c| !trust_cells.contains(c.triple))
             .collect();
         let stock = if foreign.is_empty() {
             None
@@ -330,11 +343,15 @@ impl Toolchains {
             }
             Some(found)
         };
-        Ok(Self { trust, stock })
+        Ok(Self {
+            trust,
+            trust_cells,
+            stock,
+        })
     }
 
     fn compiler(&self, cell: &Cell) -> Result<Compiler<'_>, Stop> {
-        if cell.triple == self.trust.host {
+        if self.trust_cells.contains(cell.triple) {
             return Ok(Compiler::Trust(&self.trust));
         }
         self.stock
@@ -498,15 +515,16 @@ fn print_report(report: &CellReport, sink: &mut dyn Write) -> std::io::Result<()
     )
 }
 
-/// Regenerate every cell, then write and format the modules, then fail on any coverage gap.
+/// Regenerate the selected cells, write and format their modules, then fail on any coverage gap.
 /// # Errors
 /// [`Stop::CouldNotRun`] when a prerequisite is missing; [`Stop::Failed`] when the reference, the measurements, the layout engine or the audit refused, the reason named.
 pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, Stop> {
     let union = Union::load(&options.root)?;
-    let toolchains = Toolchains::find(&options.root, &options.stock, &CELLS)?;
+    let cells = selected_cells(options.cell.as_deref())?;
+    let toolchains = Toolchains::find(&options.root, &options.stock, cells.iter().copied())?;
     let reference = Reference::scaffold(&options.work)?;
     let mut generated = Vec::new();
-    for cell_row in &CELLS {
+    for cell_row in cells {
         let compiler = toolchains.compiler(cell_row)?.name();
         let _ = writeln!(
             sink,
@@ -549,6 +567,17 @@ pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, St
     Ok(written)
 }
 
+fn selected_cells(key: Option<&str>) -> Result<Vec<&'static Cell>, Stop> {
+    match key {
+        None => Ok(CELLS.iter().collect()),
+        Some(key) => CELLS
+            .iter()
+            .find(|cell| cell.key == key)
+            .map(|cell| vec![cell])
+            .ok_or_else(|| Stop::Failed(format!("unknown regeneration cell {key}"))),
+    }
+}
+
 /// One cell's reference rustdoc, for `harvest`: a supplied dump, else documented under that cell's compiler.
 /// # Errors
 /// As [`regen`].
@@ -563,6 +592,13 @@ pub fn reference_for(options: &Options, cell: &Cell) -> Result<Doc, Stop> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_cell_selection_preserves_default_and_refuses_unknown() {
+        assert_eq!(super::selected_cells(None).unwrap().len(), 4);
+        assert_eq!(super::selected_cells(Some("mac")).unwrap()[0].key, "mac");
+        assert_eq!(super::selected_cells(Some("mac")).unwrap().len(), 1);
+        assert!(super::selected_cells(Some("native-guess")).is_err());
+    }
     use std::ffi::OsStr;
 
     use super::*;
@@ -629,6 +665,7 @@ mod tests {
         );
         assert_eq!(command.get_current_dir(), Some(Path::new("/")));
         let trust = Trust {
+            formatter: Some("/s/trustfmt".into()),
             targo: "/s/targo".into(),
             trustc: "/s/trustc".into(),
             trustdoc: "/s/trustdoc".into(),

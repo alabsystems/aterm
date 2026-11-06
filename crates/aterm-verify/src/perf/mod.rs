@@ -580,9 +580,9 @@ const OPTIONS: &[OptSpec] = &[
     OptSpec {
         flag: "--binary",
         value: Some("PATH"),
-        lanes: &[Lane::Start, Lane::CliStart],
+        lanes: &[Lane::Start, Lane::CliStart, Lane::Cat],
         help: "the aterm to time (start: default target/profiling/aterm, else \
-               target/release/aterm; cli-start: default a fresh release build)",
+               target/release/aterm; cat and cli-start: default a fresh release build)",
     },
     OptSpec {
         flag: "--baseline",
@@ -1769,6 +1769,16 @@ mod tests {
         );
         let why = parse(&args("start --profile opt")).unwrap_err();
         assert!(why.contains("--profile") && why.contains("fabric"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cat_accepts_an_explicit_product_without_losing_its_identity_at_parse() {
+        let cli = parse(&args("cat --binary /guest/aterm --dev-smoke")).unwrap();
+        let (arena, _, _) = lane_args(&cli).unwrap();
+        assert_eq!(arena.binary, Some(PathBuf::from("/guest/aterm")));
+        // NEGATIVE CONTROL: this option must not redirect unrelated library floor lanes.
+        assert!(parse(&args("throughput --binary /guest/aterm")).is_err());
     }
 
     /// `cli-start` is a floor lane that takes no quiet claim, records, and reads `--binary`,

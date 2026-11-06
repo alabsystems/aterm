@@ -118,6 +118,31 @@ impl Command {
     pub(crate) fn stops(&self) -> bool {
         matches!(self, Self::Write { changes, .. } if changes.iter().any(|c| c.value.is_none()))
     }
+    /// Consume the command and return its cell changes if it is a `Write` or `Revert`.
+    pub fn into_changes(self) -> Option<Vec<Change>> {
+        match self {
+            Self::Write { changes, .. } | Self::Revert { changes, .. } => Some(changes),
+            _ => None,
+        }
+    }
+    /// Encode a `Write` command payload without taking ownership of `changes`.
+    pub fn encode_write(request: [u8; 16], changes: &[Change]) -> Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct Encoded<'a> {
+            changes: &'a [Change],
+            kind: &'static str,
+            request: &'a str,
+            v: u8,
+        }
+        let request_hex = hex::encode_lower(&request);
+        aterm_json::to_vec(&Encoded {
+            changes,
+            kind: "write",
+            request: &request_hex,
+            v: 1,
+        })
+        .map_err(|e| Error::new(&format!("command encode failed: {e}")))
+    }
     /// Decisions signed on the authority's independent hash chain.
     pub fn is_control(&self) -> bool {
         matches!(self, Self::Budget { .. } | Self::Revoke { .. })
@@ -142,21 +167,7 @@ impl Command {
                     v: 1,
                 })
             }
-            Self::Write { changes, .. } => {
-                #[derive(serde::Serialize)]
-                struct Encoded<'a> {
-                    changes: &'a [Change],
-                    kind: &'static str,
-                    request: &'a str,
-                    v: u8,
-                }
-                aterm_json::to_vec(&Encoded {
-                    changes,
-                    kind: "write",
-                    request: &request_hex,
-                    v: 1,
-                })
-            }
+            Self::Write { request, changes } => return Self::encode_write(*request, changes),
             Self::Revert {
                 operation, changes, ..
             } => {
@@ -481,6 +492,12 @@ impl History {
     /// Unsupported or unauthorized application payloads are inert evidence. They
     /// remain in inventories and fork detection, so one cannot poison every repair.
     pub fn insert(&mut self, opened: Opened) -> Result<bool> {
+        if !self.check_insert(&opened)? {
+            return Ok(false);
+        }
+        self.retain(opened)
+    }
+    pub(crate) fn check_insert(&self, opened: &Opened) -> Result<bool> {
         let id = opened.header.id;
         if self.index.get(&id).is_some() {
             return Ok(false);
@@ -495,7 +512,14 @@ impl History {
                 ));
             }
         }
-        self.retain(opened)
+        if self.records.len().saturating_add(self.refused.len()) >= MAX_RECORDS
+            || Index::new(1).insert(opened.header.clone()).is_err()
+        {
+            return Err(Error::new(
+                "causal header refused or history capacity exhausted",
+            ));
+        }
+        Ok(true)
     }
     /// A record already in this replica's journal. An earlier build kept a control record outside
     /// the writer quotas, so counting it now would refuse the whole folder, its rekey included.
@@ -506,8 +530,15 @@ impl History {
             self.insert(opened)
         }
     }
-    fn retain(&mut self, opened: Opened) -> Result<bool> {
+    pub(crate) fn retain(&mut self, opened: Opened) -> Result<bool> {
         let id = opened.header.id;
+        let inserted = self
+            .index
+            .insert(opened.header.clone())
+            .map_err(|_| Error::new("causal header refused or history capacity exhausted"))?;
+        if !inserted {
+            return Ok(false);
+        }
         let decoded = Command::decode(&opened.plaintext).and_then(|command| {
             if opened.control && self.no_authority {
                 return Err(Error::new(
@@ -533,21 +564,15 @@ impl History {
             }
             Ok(command)
         });
-        let inserted = self
-            .index
-            .insert(opened.header.clone())
-            .map_err(|_| Error::new("causal header refused or history capacity exhausted"))?;
-        if inserted {
-            match decoded {
-                Ok(command) => {
-                    self.records.insert(id, (opened, command));
-                }
-                Err(error) => {
-                    self.refused.insert(id, (opened, error.0));
-                }
+        match decoded {
+            Ok(command) => {
+                self.records.insert(id, (opened, command));
+            }
+            Err(error) => {
+                self.refused.insert(id, (opened, error.0));
             }
         }
-        Ok(inserted)
+        Ok(true)
     }
     /// Original ciphertext for inventory repair; includes pending and quarantined records.
     pub fn wire(&self, id: &Digest) -> Option<&[u8]> {
@@ -856,31 +881,35 @@ impl History {
                 revocations.entry(*actor).or_default().push(*through);
             }
         }
-        let excluded = self
-            .records
-            .iter()
-            .filter_map(|(id, (opened, command))| {
-                let denied = authority_fault
-                    || request_conflicts.contains(id)
-                    || (command.changes().is_some()
-                        && revocations.get(&opened.header.actor).is_some_and(|cuts| {
-                            !cuts.iter().all(|cut| {
-                                cut.is_some_and(|tip| {
-                                    self.index
-                                        .get(&tip)
-                                        .is_some_and(|head| head.actor == opened.header.actor)
-                                        && self.index.observes(&tip, id)
-                                })
-                            })
-                        }));
-                denied.then_some(*id)
-            })
-            .collect();
-        let causal = self.project(&excluded);
-        let eligible: BTreeSet<_> = causal.ordered.iter().copied().collect();
+        let excluded: BTreeSet<Digest> =
+            if !authority_fault && request_conflicts.is_empty() && revocations.is_empty() {
+                BTreeSet::new()
+            } else {
+                self.records
+                    .iter()
+                    .filter_map(|(id, (opened, command))| {
+                        let denied = authority_fault
+                            || request_conflicts.contains(id)
+                            || (command.changes().is_some()
+                                && revocations.get(&opened.header.actor).is_some_and(|cuts| {
+                                    !cuts.iter().all(|cut| {
+                                        cut.is_some_and(|tip| {
+                                            self.index.get(&tip).is_some_and(|head| {
+                                                head.actor == opened.header.actor
+                                            }) && self.index.observes(&tip, id)
+                                        })
+                                    })
+                                }));
+                        denied.then_some(*id)
+                    })
+                    .collect()
+            };
+        let causal = (!excluded.is_empty()).then(|| self.project(&excluded));
+        let eligible_override: Option<BTreeSet<_>> =
+            causal.as_ref().map(|c| c.ordered.iter().copied().collect());
         let evidence_ordered: BTreeSet<_> = evidence.ordered.iter().copied().collect();
+        let eligible = eligible_override.as_ref().unwrap_or(&evidence_ordered);
         let mut view = View {
-            causal,
             revocations,
             authority_fault,
             ..View::default()
@@ -1032,6 +1061,7 @@ impl History {
                 Command::Revoke { .. } => {}
             }
         }
+        view.causal = causal.unwrap_or(evidence);
         view
     }
 }

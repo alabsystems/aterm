@@ -156,6 +156,7 @@ impl crate::App {
             agent: Program::Claude,
             model: None,
             caller: None,
+            manager_node: None,
             trusted_cwd: Some(trusted),
             fact_line: false,
             autopilot: aterm_agent::supervise::Autopilot::Land,

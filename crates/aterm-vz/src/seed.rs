@@ -180,10 +180,10 @@ impl Seed {
     }
 }
 
-/// `text` indented by `pad` spaces on every line, for a YAML block scalar.
-fn indented(text: &str, pad: usize) -> String {
+/// Write `text` indented by `pad` spaces on every line into `out`, for a YAML block scalar.
+fn write_indented(out: &mut String, text: &str, pad: usize) {
     let lines = text.lines().count();
-    let mut out = String::with_capacity(text.len() + lines.saturating_mul(pad + 1));
+    out.reserve(text.len() + lines.saturating_mul(pad + 1));
     for line in text.lines() {
         if line.is_empty() {
             out.push('\n');
@@ -195,7 +195,6 @@ fn indented(text: &str, pad: usize) -> String {
             out.push('\n');
         }
     }
-    out
 }
 
 /// The `#cloud-config` for `user` (its name already checked by [`Seed::new`]).
@@ -203,18 +202,18 @@ fn user_data(user: &User) -> String {
     let fstab = format!(
         "{BOOT_TAG} {BOOT_MOUNT} virtiofs ro 0 0\n{ROSETTA_TAG} {ROSETTA_MOUNT} virtiofs ro 0 0\n"
     );
-    let mut out = String::from(
+    let mut out = String::with_capacity(2048);
+    out.push_str(
         "#cloud-config\n\
          # aterm-vz's bake seed (docs/DESIGN-vz-guest-2026-10-23.md §4): attached to one boot.\n",
     );
     let _ = write!(
         out,
-        "users:\n  - name: {name}\n    uid: {uid}\n    homedir: {home}\n    shell: /bin/bash\n    \
+        "users:\n  - name: {name}\n    uid: {uid}\n    homedir: /home/{name}.guest\n    shell: /bin/bash\n    \
          sudo: \"ALL=(ALL) NOPASSWD:ALL\"\n    lock_passwd: true\n\
          ssh_pwauth: false\npackage_update: false\npackage_upgrade: false\n",
         name = user.name,
         uid = user.uid,
-        home = user.home(),
     );
     out.push_str("write_files:\n");
     for (path, text, append) in [
@@ -230,35 +229,33 @@ fn user_data(user: &User) -> String {
         if append {
             out.push_str("    append: true\n");
         }
-        let _ = write!(out, "    content: |\n{}", indented(text, 6));
+        out.push_str("    content: |\n");
+        write_indented(&mut out, text, 6);
     }
-    out.push_str("runcmd:\n");
-    let holds = format!("linux-image-{KERNEL_RELEASE}, linux-modules-{KERNEL_RELEASE}");
-    for line in [
-        format!("[mkdir, -p, {BOOT_MOUNT}, {ROSETTA_MOUNT}]"),
-        format!("[mount, {BOOT_MOUNT}]"),
-        format!("[mount, {ROSETTA_MOUNT}]"),
-        // Stopped, then masked: `mask --now` reloads before it stops, and a running timer
-        // whose unit file vanished fails ("Unit to trigger vanished"), leaving the guest
-        // `degraded`.
-        format!("[systemctl, stop, {}]", MASKED.join(", ")),
-        format!("[systemctl, mask, {}]", MASKED.join(", ")),
-        format!("[apt-mark, hold, {holds}]"),
-        // The VM boots the host's pinned kernel and initrd, never the guest's own, and
-        // flash-kernel's initramfs hook finds no platform under that direct boot ("Unsupported
-        // platform ''", measured in V4's first bake): every package that triggers
-        // update-initramfs failed to configure. Diverted aside, dpkg keeps it there through
-        // flash-kernel's upgrades; run-parts skips the dotted name.
-        format!(
-            "[dpkg-divert, --local, --rename, --divert, {FLASH_KERNEL_HOOK}.aterm-vz, --add, {FLASH_KERNEL_HOOK}]"
-        ),
-        format!("[loginctl, enable-linger, {}]", user.name),
-        "[systemctl, daemon-reload]".to_string(),
-        "[systemctl, enable, --now, --no-block, aterm-vz-agent.service, rosettad.service]"
-            .to_string(),
-    ] {
-        let _ = writeln!(out, "  - {line}");
-    }
+    let masked = MASKED.join(", ");
+    // Stopped, then masked: `mask --now` reloads before it stops, and a running timer
+    // whose unit file vanished fails ("Unit to trigger vanished"), leaving the guest
+    // `degraded`.
+    // The VM boots the host's pinned kernel and initrd, never the guest's own, and
+    // flash-kernel's initramfs hook finds no platform under that direct boot ("Unsupported
+    // platform ''", measured in V4's first bake): every package that triggers
+    // update-initramfs failed to configure. Diverted aside, dpkg keeps it there through
+    // flash-kernel's upgrades; run-parts skips the dotted name.
+    let _ = write!(
+        out,
+        "runcmd:\n\
+         \x20 - [mkdir, -p, {BOOT_MOUNT}, {ROSETTA_MOUNT}]\n\
+         \x20 - [mount, {BOOT_MOUNT}]\n\
+         \x20 - [mount, {ROSETTA_MOUNT}]\n\
+         \x20 - [systemctl, stop, {masked}]\n\
+         \x20 - [systemctl, mask, {masked}]\n\
+         \x20 - [apt-mark, hold, linux-image-{KERNEL_RELEASE}, linux-modules-{KERNEL_RELEASE}]\n\
+         \x20 - [dpkg-divert, --local, --rename, --divert, {FLASH_KERNEL_HOOK}.aterm-vz, --add, {FLASH_KERNEL_HOOK}]\n\
+         \x20 - [loginctl, enable-linger, {name}]\n\
+         \x20 - [systemctl, daemon-reload]\n\
+         \x20 - [systemctl, enable, --now, --no-block, aterm-vz-agent.service, rosettad.service]\n",
+        name = user.name,
+    );
     out
 }
 

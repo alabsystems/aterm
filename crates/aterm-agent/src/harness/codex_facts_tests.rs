@@ -521,3 +521,18 @@ fn a_rollout_past_the_window_is_read_from_the_first_whole_line_of_its_end() {
     assert_eq!(facts.excerpts.said.as_deref(), Some("After the jump."));
     assert_eq!(facts.model, None, "its turn context is out of reach now");
 }
+
+/// What the agent said carries the time its row was written, the newest message's; a row with no
+/// time gives none.
+#[test]
+fn said_carries_when_its_row_was_written() {
+    let at = super::super::codex_rollout::stamp_ms("2026-10-24T12:00:00.000Z");
+    assert!(at.is_some(), "PRECONDITION: the rows' stamp reads");
+    let facts = facts_of(&[assistant("First thoughts."), assistant("Done.")]);
+    assert_eq!(facts.excerpts.said_at_ms, at);
+    let later = assistant("Later.").replace("12:00:00.000Z", "12:00:07.250Z");
+    let facts = facts_of(&[assistant("First thoughts."), later]);
+    assert_eq!(facts.excerpts.said_at_ms, at.map(|at| at + 7_250));
+    let unstamped = assistant("Done.").replace("\"timestamp\":\"2026-10-24T12:00:00.000Z\",", "");
+    assert_eq!(facts_of(&[unstamped]).excerpts.said_at_ms, None);
+}

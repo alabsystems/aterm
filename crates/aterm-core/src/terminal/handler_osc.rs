@@ -200,7 +200,7 @@ impl TerminalHandler<'_> {
     #[inline]
     pub(super) fn apply_cwd_report(&mut self, report: super::shell::CwdReport) {
         if let Some(event) = report.event {
-            self.queue_osc_event(7, event);
+            self.queue_osc_event(7, || event);
         }
         self.store_reported_cwd(report.path.as_deref(), report.host.as_deref());
     }
@@ -383,7 +383,7 @@ impl TerminalHandler<'_> {
             return;
         };
 
-        self.queue_osc_event(52, content.clone());
+        self.queue_osc_event(52, || content.clone());
 
         super::clipboard_auth::invoke_set(&mut self.clipboard.callback, token, selections, content);
     }
@@ -587,6 +587,7 @@ mod tests {
 
     fn assert_host_only_cwd_change_is_observable(report: &[u8], event: Option<&str>) {
         let mut term = Terminal::new(4, 20);
+        term.set_osc_event_polling(true);
         term.process(b"\x1b]2;fixed title\x07source text\r\nkept row\x1b[2;5H");
         let remote = b"\x1b]7;file://build-box.example/c/work\x07";
         term.process(remote);
@@ -872,6 +873,7 @@ mod tests {
     #[test]
     fn osc_7_oversized_cwd_path_not_queued() {
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
 
         term.process(b"\x1b]7;file:///home/user\x07");
         assert_eq!(term.current_working_directory(), Some("/home/user"));
@@ -915,6 +917,7 @@ mod tests {
     #[test]
     fn osc_7_cwd_with_a_nul_byte_is_ignored() {
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.process(b"\x1b]7;file:///home/user\x07");
         assert_eq!(term.current_working_directory(), Some("/home/user"));
         assert!(
@@ -1213,6 +1216,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.authorize_clipboard_access(ClipboardAccess::Write);
         let captured = Arc::new(Mutex::new(None::<String>));
         let captured_clone = Arc::clone(&captured);
@@ -1247,6 +1251,7 @@ mod tests {
         use crate::terminal::ClipboardAccess;
 
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.authorize_clipboard_access(ClipboardAccess::Write);
 
         let content = vec![0u8; MAX_OSC52_QUERY_RESPONSE_BYTES];

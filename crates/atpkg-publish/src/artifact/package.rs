@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::pkgdoc::{self, Header, Kind, Row};
 use super::tools::{self, HostTools, Tools};
-use super::{arch, lineage_switch, pack, tarwrite, toolchain, upload};
+use super::{arch, pack, tarwrite, upload};
 use crate::api::Build;
 use crate::channel::{Log, Scratch, download_retried};
 use crate::ctx::Ctx;
@@ -770,6 +770,27 @@ pub fn pack_package_with(
     request: &PackageRequest,
     tools: &dyn Tools,
 ) -> Result<PackageOutcome> {
+    let inputs = crate::project_toolchain::Inputs::process(ctx, &request.source_repo);
+    pack_package_with_signed_root(ctx, request, tools, &inputs, &|build| {
+        atpkg::cli::signed_tree_root("trust", build)
+    })
+}
+
+/// [`pack_package_with`] over explicit environment and signed-head authority, for fixture hosts.
+/// # Errors
+/// Every package/source/compiler gate; a refused signed build never falls back to another.
+pub fn pack_package_with_signed_root(
+    ctx: &Ctx,
+    request: &PackageRequest,
+    tools: &dyn Tools,
+    inputs: &crate::project_toolchain::Inputs,
+    signed_root: &dyn Fn(u64) -> std::result::Result<String, String>,
+) -> Result<PackageOutcome> {
+    if inputs.prefix != ctx.pkg_prefix || inputs.repo != request.source_repo {
+        return Err(Error::refused(
+            "compiler selection inputs do not belong to this package request",
+        ));
+    }
     let program = request.program.as_str();
     let (def, row, triple) = package_row(program)?;
     let tool = row.exposes[0];
@@ -798,18 +819,19 @@ pub fn pack_package_with(
         &pkg,
     )?;
 
-    let tc = toolchain::resolve(ctx, request.toolchain.as_deref())?;
-    let _lease = toolchain::lease(
-        ctx,
-        &tc.bin,
-        &format!("atpkg-publish pack-package {program}"),
+    let authority =
+        crate::project_toolchain::Authority::committed(&request.source_repo, &pkg.source)?;
+    let selected = crate::project_toolchain::select(
+        inputs,
+        authority,
+        request.toolchain.as_deref(),
+        signed_root,
+        tools,
     )?;
-    let trust_repo = lineage_switch::default_trust_repo(ctx);
-    let switch = lineage_switch::read(ctx, &trust_repo)?;
-    pack::say_switch(ctx, &trust_repo, &switch);
-    let compiler = toolchain::admit(tools, &tc.bin, &switch)?;
-    let vv = tools::version(tools, &tc.trustc()).map_err(Error::refused)?;
-    check_compiler(&pkg.compiler, &compiler, &vv)?;
+    let compiler = selected.compiler();
+    let vv =
+        tools::version(tools, &selected.execution().join("bin/trustc")).map_err(Error::refused)?;
+    check_compiler(&pkg.compiler, compiler, &vv)?;
     eprintln!(
         "atpkg-publish: compiler OK — built by the admitted Trust {} ({})",
         compiler.content.version.commit,
@@ -822,7 +844,7 @@ pub fn pack_package_with(
         "atpkg-publish: tree OK — {objects} object(s) are {triple}; the client's ALab pack \
          gate passes (marker, bin/{tool}, codesign --verify --strict)"
     );
-    let provenance = pack::scan(&pkg.root, &compiler)?;
+    let provenance = pack::scan(&pkg.root, compiler)?;
 
     let _lock = pack::pack_lock(ctx, program, pack::LOCK_WAIT)?;
     let stage_dir = request.out.join(program);
@@ -862,6 +884,7 @@ pub fn pack_package_with(
     };
     let doc = pkgdoc::fresh(&header, &row_doc)?;
     let manifest = stage_dir.join(pkgdoc::manifest_name(program, request.build));
+    selected.recheck()?;
     let signature = pack::write_manifest(ctx, &doc, &header, &row_doc, &manifest, Some(&signer))?
         .ok_or_else(|| Error::refused("the manifest was not signed"))?;
 

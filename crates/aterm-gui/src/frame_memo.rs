@@ -92,15 +92,22 @@ pub(crate) struct StyledFrame {
     image_payloads: bool,
 }
 
+/// The most bytes a styled frame's body may hold: a `screen --json` reply's line cap, which a
+/// `cells` push is held to as well.
+pub(crate) const STYLED_FRAME_CAP: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
+
 impl StyledFrame {
-    /// Serialize `snap`, gathered under the hold that read `key`.
-    pub(crate) fn of(key: FrameKey, snap: &StyledFrameSnapshot) -> StyledFrame {
-        let body = crate::control::serialize_styled_frame(snap);
+    /// Serialize `snap` within [`STYLED_FRAME_CAP`] ([`styled_body_within`]).
+    pub(crate) fn within(key: FrameKey, snap: &StyledFrameSnapshot) -> Result<StyledFrame, usize> {
+        styled_body_within(snap).map(|(body, payloads)| Self::with_body(key, body, payloads))
+    }
+
+    fn with_body(key: FrameKey, body: String, image_payloads: bool) -> StyledFrame {
         StyledFrame {
             key,
             id: (aterm_hash::fnv1a_64(body.as_bytes()), body.len()),
             body,
-            image_payloads: snap.carries_image_payloads(),
+            image_payloads,
         }
     }
 
@@ -121,11 +128,29 @@ impl StyledFrame {
     }
 }
 
+/// Serialize `snap` within [`STYLED_FRAME_CAP`]: with its image payloads when they fit (and
+/// whether it carries them), else without them, else `Err` with the bytes it reached before it
+/// stopped.
+pub(crate) fn styled_body_within(snap: &StyledFrameSnapshot) -> Result<(String, bool), usize> {
+    let payloads = snap.carries_image_payloads();
+    match crate::control::serialize_styled_frame_within(snap, payloads, STYLED_FRAME_CAP) {
+        Ok(body) => Ok((body, payloads)),
+        Err(_) if payloads => {
+            crate::control::serialize_styled_frame_within(snap, false, STYLED_FRAME_CAP)
+                .map(|body| (body, false))
+        }
+        Err(reached) => Err(reached),
+    }
+}
+
 /// A [`Look::styled`] answer.
 pub(crate) enum Styled {
     Hit(Arc<StyledFrame>),
     Miss(StyledFrameSnapshot),
 }
+
+/// The most `cells` watches one session serves at once ([`FrameSlot::hold_cells`]).
+pub(crate) const MAX_CELLS_WATCHES: usize = 16;
 
 /// One session's published text and styled frame.
 #[derive(Default)]
@@ -133,6 +158,10 @@ pub(crate) struct FrameSlot {
     /// A STRICT LEAF, never nested with the term lock in either order: held
     /// only to clone or store an `Arc` or move the cells count.
     inner: Mutex<Published>,
+    /// A `cells` watch's turn to read (and on a miss build) the styled frame, taken for its
+    /// content pass before the term lock and never under it, so watches of one session that
+    /// miss together build its styled frame once: each after the first finds it published.
+    pub(crate) build: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -142,6 +171,9 @@ struct Published {
     styled: Option<Arc<StyledFrame>>,
     /// Live [`CellsHold`]s.
     cells_watches: usize,
+    /// The key of the last styled frame a `cells` watch found past [`STYLED_FRAME_CAP`], and the
+    /// bytes it reached; kept only while `cells_watches` is nonzero.
+    refused: Option<(FrameKey, usize)>,
 }
 
 impl FrameSlot {
@@ -153,6 +185,7 @@ impl FrameSlot {
             text: published.text.clone(),
             styled: published.styled.clone(),
             keeps_styled: published.cells_watches > 0,
+            refused: published.refused,
             built: None,
         }
     }
@@ -163,10 +196,15 @@ impl FrameSlot {
         drop(old);
     }
 
-    /// Keep the styled frame for a `cells` watch, for as long as the hold lives.
-    pub(crate) fn hold_cells(slot: &Arc<FrameSlot>) -> CellsHold {
-        slot.inner.lock_or_recover().cells_watches += 1;
-        CellsHold(Arc::clone(slot))
+    /// Keep the styled frame for a `cells` watch, for as long as the hold lives; `None` when the
+    /// session already serves [`MAX_CELLS_WATCHES`].
+    pub(crate) fn hold_cells(slot: &Arc<FrameSlot>) -> Option<CellsHold> {
+        let mut published = slot.inner.lock_or_recover();
+        if published.cells_watches >= MAX_CELLS_WATCHES {
+            return None;
+        }
+        published.cells_watches += 1;
+        Some(CellsHold(Arc::clone(slot)))
     }
 }
 
@@ -176,6 +214,7 @@ pub(crate) struct Look<'a> {
     text: Option<Arc<ScreenText>>,
     styled: Option<Arc<StyledFrame>>,
     keeps_styled: bool,
+    refused: Option<(FrameKey, usize)>,
     built: Option<Arc<ScreenText>>,
 }
 
@@ -205,26 +244,60 @@ impl Look<'_> {
         }
     }
 
+    /// The styled frame the slot held when this look was taken.
+    #[cfg(test)]
+    pub(crate) fn styled_for_test(&self) -> Option<&Arc<StyledFrame>> {
+        self.styled.as_ref()
+    }
+
+    /// The bytes the styled frame under `key` reached before a `cells` watch refused it at
+    /// [`STYLED_FRAME_CAP`], when the slot held that refusal as this look was taken.
+    pub(crate) fn refused(&self, key: &FrameKey) -> Option<usize> {
+        self.refused
+            .filter(|(refused, _)| refused == key)
+            .map(|(_, reached)| reached)
+    }
+
     /// Whether a `cells` watch held the slot when this look was taken.
     pub(crate) const fn keeps_styled(&self) -> bool {
         self.keeps_styled
     }
 
-    /// Serialize a miss's snapshot (no term guard held) and publish the frame while a cells.
-    pub(crate) fn publish_styled(
+    /// Serialize a miss's snapshot (no term guard held) within [`STYLED_FRAME_CAP`]
+    /// ([`StyledFrame::within`]) and publish the frame while a cells watch holds the slot, or
+    /// `Err` with the bytes it reached, the refusal kept under `key` while a cells watch holds
+    /// the slot ([`Self::refused`]).
+    pub(crate) fn publish_styled_within(
         &mut self,
         key: FrameKey,
         snap: &StyledFrameSnapshot,
-    ) -> Arc<StyledFrame> {
-        let frame = Arc::new(StyledFrame::of(key, snap));
+    ) -> Result<Arc<StyledFrame>, usize> {
+        match StyledFrame::within(key, snap) {
+            Ok(frame) => {
+                let frame = Arc::new(frame);
+                self.publish(&frame);
+                Ok(frame)
+            }
+            Err(reached) => {
+                let mut published = self.slot.inner.lock_or_recover();
+                if published.cells_watches > 0 {
+                    published.refused = Some((key, reached));
+                }
+                Err(reached)
+            }
+        }
+    }
+
+    fn publish(&mut self, frame: &Arc<StyledFrame>) {
         let old = {
             let mut published = self.slot.inner.lock_or_recover();
-            (published.cells_watches > 0 && same(&published.styled, &self.styled))
-                .then(|| published.styled.replace(Arc::clone(&frame)))
+            (published.cells_watches > 0
+                && frame.body().len() <= STYLED_FRAME_CAP
+                && same(&published.styled, &self.styled))
+            .then(|| published.styled.replace(Arc::clone(frame)))
         };
         drop(old);
-        self.styled = Some(Arc::clone(&frame));
-        frame
+        self.styled = Some(Arc::clone(frame));
     }
 }
 
@@ -257,6 +330,7 @@ impl Drop for CellsHold {
             let mut published = self.0.inner.lock_or_recover();
             published.cells_watches = published.cells_watches.saturating_sub(1);
             if published.cells_watches == 0 {
+                published.refused = None;
                 published.styled.take()
             } else {
                 None

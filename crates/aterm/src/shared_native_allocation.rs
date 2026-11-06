@@ -44,7 +44,10 @@ pub(super) fn request(
         .map_err(|e| e.to_string())
 }
 
-fn label(roster: &aterm_secrets::swarm_roster::SwarmRoster, binding: &Binding) -> Option<String> {
+fn label<'a>(
+    roster: &'a aterm_secrets::swarm_roster::SwarmRoster,
+    binding: &Binding,
+) -> Option<&'a str> {
     let row = roster.member_by_recipient(&binding.recipient().to_bech32())?;
     (!roster.is_member_denied(row)
         && !roster.members.iter().any(|other| {
@@ -52,7 +55,7 @@ fn label(roster: &aterm_secrets::swarm_roster::SwarmRoster, binding: &Binding) -
                 && !roster.is_member_denied(other)
                 && other.recipient != row.recipient
         }))
-    .then(|| row.label.clone())
+    .then_some(row.label.as_str())
 }
 
 fn available(
@@ -276,13 +279,16 @@ fn choose(
         .iter()
         .filter_map(|ticket| {
             let actor = ticket["actor"].as_str()?;
-            let (_, member) = candidates
+            let (candidate, member) = candidates
                 .iter()
                 .find(|(candidate, member)| candidate == actor && !kept.contains(member))?;
-            Some((ticket["order"].as_u64()?, actor, member.as_str()))
+            Some((
+                ticket["order"].as_u64()?,
+                candidate.as_str(),
+                member.as_str(),
+            ))
         })
-        .min()
-        .map(|(order, actor, member)| (order, actor.to_owned(), member));
+        .min();
     if let Some((_, actor, member)) = waiting {
         if kept.len() == 3 {
             let oldest = row["grants"]
@@ -302,7 +308,7 @@ fn choose(
         let order = next(row)?;
         items_mut(row, "grants").push(json!({"member":member,"order":order}));
         for ticket in items_mut(row, "tickets") {
-            if ticket["actor"].as_str() == Some(actor.as_str()) {
+            if ticket["actor"].as_str() == Some(actor) {
                 ticket
                     .as_object_mut()
                     .unwrap()
@@ -383,10 +389,8 @@ pub(super) fn step_at(
             if !prepared.contains(member) {
                 continue;
             }
-            if let Some(label) =
-                label(&roster, member).filter(|label| !fixed.contains(label.as_str()))
-            {
-                valid.insert(label);
+            if let Some(label) = label(&roster, member).filter(|&label| !fixed.contains(label)) {
+                valid.insert(label.to_owned());
                 actors.insert(aterm_codec::hex::encode_lower(&member.actor()));
             }
             check_time(deadline)?;
@@ -396,11 +400,11 @@ pub(super) fn step_at(
             .iter()
             .filter_map(|request| {
                 label(&roster, &request.requester)
-                    .filter(|label| valid.contains(label))
+                    .filter(|&label| valid.contains(label))
                     .map(|label| {
                         (
                             aterm_codec::hex::encode_lower(&request.requester.actor()),
-                            label,
+                            label.to_owned(),
                         )
                     })
             })
@@ -479,8 +483,9 @@ pub(super) fn step_at(
         let published = policy.automatic(provider)?.unwrap();
         let prepared = available(paths, &admin.config, assignment.subject, deadline)?;
         for member in &fresh.members {
-            if label(&roster, member).is_some_and(|label| published.warm.contains(&label))
-                && !prepared.contains(member)
+            if !prepared.contains(member)
+                && label(&roster, member)
+                    .is_some_and(|label| published.warm.iter().any(|w| w == label))
             {
                 return Err("native preparation changed before allocation".into());
             }

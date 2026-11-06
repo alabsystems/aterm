@@ -17,16 +17,16 @@ const USAGE: &str = "usage: aterm lan serve --source <app bundle> | aterm lan st
 
 /// `aterm lan <args>`.
 pub(crate) fn run(args: &[std::ffi::OsString]) -> ExitCode {
-    let words: Vec<std::borrow::Cow<'_, str>> = args.iter().map(|a| a.to_string_lossy()).collect();
-    match words
-        .iter()
-        .map(std::convert::AsRef::as_ref)
-        .collect::<Vec<&str>>()
-        .as_slice()
-    {
-        ["serve", "--source", source] => serve(source),
-        ["status"] => status(),
-        ["fdpass", host, port, seconds] => fdpass(host, port, seconds),
+    match args {
+        [verb, flag, source] if verb == "serve" && flag == "--source" => {
+            serve(&source.to_string_lossy())
+        }
+        [verb] if verb == "status" => status(),
+        [verb, host, port, seconds] if verb == "fdpass" => fdpass(
+            &host.to_string_lossy(),
+            &port.to_string_lossy(),
+            &seconds.to_string_lossy(),
+        ),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -69,6 +69,18 @@ fn fdpass(host: &str, port: &str, seconds: &str) -> ExitCode {
 fn status() -> ExitCode {
     let socket = aterm_uds::lan::socket_path();
     match aterm_uds::lan::broker::hello() {
+        // No broker: this process served itself under macOS's allowance (§5's direct path).
+        Ok(aterm_uds::lan::BrokerHello {
+            direct: Some(allowed),
+            ..
+        }) => {
+            println!(
+                "the LAN broker is not installed: until setup's Mac password installs it, aterm \
+                 makes its own LAN connections as {allowed} (socket={})",
+                socket.display()
+            );
+            ExitCode::FAILURE
+        }
         Ok(hello) => {
             println!(
                 "broker protocol={} build={} socket={}",

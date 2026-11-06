@@ -29,6 +29,10 @@ mod held_conformance_tests;
 #[path = "log_entries/enrollment_seat_tests.rs"]
 mod enrollment_seat_tests;
 
+#[cfg(test)]
+#[path = "log_entries/no_leak_tests.rs"]
+mod no_leak_tests;
+
 const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
 
 /// Deterministic SHA-256 digest over a [`Log`]'s current head [`RecordId`]s.
@@ -1751,6 +1755,83 @@ pub(super) fn local_roster_denies_for_log(
     Ok(nonempty_roster(roster))
 }
 
+/// The one deny of the gap closer, the carry and a removal's mint (one-mesh M1, proofs P2): this
+/// Mac's own roster ([`local_roster_denies_for_log`]) and the opened one
+/// ([`roster_from_doc_or_opened`]), joined by `aterm_mesh_core::gap_heal::denied`, so a seat
+/// either denies is never healed and never carried. Before PF2 the closer read both while the
+/// carry and the removal's mint read the opened roster alone, so a seat only this Mac's roster
+/// denied was carried into each new epoch it minted and then refused by its own heal.
+pub(super) struct Denies {
+    local: Option<crate::swarm_roster::SwarmRoster>,
+    opened: Option<crate::swarm_roster::SwarmRoster>,
+}
+
+impl Denies {
+    /// Both rosters of this Mac's view of `log`, `opened` being what it opened there.
+    ///
+    /// # Errors
+    /// As [`local_roster_denies_for_log`].
+    pub(super) fn read(
+        paths: &Paths,
+        log: &Log,
+        opened: &crate::membership_log::entries::OpenedAudienceEntries,
+        lock: Option<&StateLock>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            local: local_roster_denies_for_log(paths, log, lock)?,
+            opened: roster_from_doc_or_opened(None, Some(opened), Some(log)),
+        })
+    }
+
+    /// The two rosters as given: a draft's (the roster of the document it publishes, this Mac's
+    /// own, and the opened one) or a fixture's.
+    pub(super) const fn of(
+        local: Option<crate::swarm_roster::SwarmRoster>,
+        opened: Option<crate::swarm_roster::SwarmRoster>,
+    ) -> Self {
+        Self { local, opened }
+    }
+
+    /// The opened roster alone, for a view no local roster is read beside: a fixture's.
+    #[cfg(test)]
+    pub(super) fn opened_only(
+        log: &Log,
+        opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    ) -> Self {
+        Self::of(
+            None,
+            roster_from_doc_or_opened(None, Some(opened), Some(log)),
+        )
+    }
+
+    /// This Mac's own roster. NEGATIVE CONTROL `opened-roster-deny` drops it, so every reader
+    /// reads the opened roster alone (the carry and the removal's mint before PF2).
+    fn local(&self) -> Option<&crate::swarm_roster::SwarmRoster> {
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("opened-roster-deny") {
+            return None;
+        }
+        self.local.as_ref()
+    }
+
+    /// Whether either roster denies `seat` (its node, writer, incarnation or machine key, or its
+    /// label).
+    pub(super) fn member(&self, seat: &crate::membership_log::Member) -> bool {
+        let by = |roster: Option<&crate::swarm_roster::SwarmRoster>| {
+            roster.is_some_and(|r| member_denied_by_roster(r, seat))
+        };
+        aterm_mesh_core::gap_heal::denied(by(self.local()), by(self.opened.as_ref()))
+    }
+
+    /// Whether either roster, or the log's node removals, deny `recipient`.
+    pub(super) fn recipient(&self, log: &Log, recipient: &Recipient) -> bool {
+        aterm_mesh_core::gap_heal::denied(
+            recipient_denied_by_roster_or_log(self.local(), log, recipient),
+            recipient_denied_by_roster_or_log(self.opened.as_ref(), log, recipient),
+        )
+    }
+}
+
 /// A roster that names a member or a deny, or none.
 fn nonempty_roster(
     roster: crate::swarm_roster::SwarmRoster,
@@ -2986,9 +3067,30 @@ pub(super) struct Flight {
 }
 
 impl Flight {
-    /// For a writer or an overlay: `[everyone]`'s and Commons'.
+    /// For an overlay: `[everyone]`'s and Commons'.
     fn of_reader(log: &Log, mine: &Recipient) -> Self {
         Self::of_audiences(log, mine, [EpochAudience::Everyone, EpochAudience::Commons])
+    }
+
+    /// For a writer, the Mac whose recipient is `mine`: `[everyone]`'s, Commons' and each host
+    /// list's `opened` reads, as [`Flight::of_batch`] reads them, since a dropped host list's
+    /// tombstones carry the hosts its newest epoch's batch may still wrap.
+    fn of_writer(
+        log: &Log,
+        opened: &crate::membership_log::entries::OpenedAudienceEntries,
+        mine: &Recipient,
+    ) -> Self {
+        // NEGATIVE CONTROL `tombstone-reader-flight`: `[everyone]`'s and Commons' alone, as a
+        // writer read them before P1b.
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("tombstone-reader-flight") {
+            return Self::of_reader(log, mine);
+        }
+        let audiences: BTreeSet<EpochAudience> = [EpochAudience::Everyone, EpochAudience::Commons]
+            .into_iter()
+            .chain(opened.maximal_epochs.keys().cloned())
+            .collect();
+        Self::of_audiences(log, mine, audiences)
     }
 
     /// For a batch of re-keys over `opened`, signed by the Mac whose seat is `me`: `[everyone]`'s,
@@ -3390,7 +3492,11 @@ fn draft_document_diff_with(
         .filter_map(|m| Recipient::parse(&m.recipient).ok())
         .collect();
     let roster = roster_from_doc_or_opened(Some(doc), Some(&opened), Some(&log));
-    let flight = Flight::of_reader(&log, &identity.recipient());
+    let flight = Flight::of_writer(&log, &opened, &identity.recipient());
+    let denies = Denies::of(
+        roster.clone(),
+        roster_from_doc_or_opened(None, Some(&opened), Some(&log)),
+    );
     let everyone_log_recipients: BTreeSet<Recipient> = membership
         .members()
         .iter()
@@ -4052,7 +4158,14 @@ fn draft_document_diff_with(
             }
         }
 
-        // Tombstone entries in any unwrapped host audience section removed completely from `doc`.
+        // Tombstone entries in any unwrapped host audience section removed completely from `doc`,
+        // sealed as every other write is: under the epoch `sealing_epoch` names for the Macs the
+        // section still reaches (one newest epoch or the lowest secure twin, P1's gate open, no
+        // batch still arriving that may wrap another Mac), else under a fresh epoch for them. A
+        // section whose newest key this Mac lacks is the loop below's, which mints that epoch
+        // against `base`. A `Delete` under a due epoch tells a Mac the log took out which names
+        // the section held after it left (one-mesh proofs P1b: a tombstone is a `Put` step of the
+        // no-leak World).
         for (aud, log_entries) in &opened.by_audience {
             if active_plan_audiences.contains(aud) || log_entries.is_empty() {
                 continue;
@@ -4061,18 +4174,69 @@ fn draft_document_diff_with(
             let Some(max_ids) = opened.maximal_epochs.get(&ep_aud) else {
                 continue;
             };
-            let Some((&ep_id, ep_key)) = max_ids
-                .iter()
-                .find_map(|id| opened.unwrapped_keys.get(id).map(|k| (id, k)))
-            else {
-                continue;
+            // A host list's Macs are the ones its own epochs carry; `[everyone]`'s, the current
+            // seats (`carried_audience_recipients`). Both read PF2's one deny: the roster this
+            // document publishes (this Mac's own) joined to the opened one.
+            let seats = if matches!(ep_aud, EpochAudience::Hosts(_)) {
+                BTreeSet::new()
+            } else {
+                log.current_recipients_where(&ep_aud, |seat| denies.member(seat))
             };
-            for name in log_entries.keys() {
-                let del_rec = log
-                    .draft_delete(&actor, authored_ms, ep_id, ep_key, name)?
-                    .sign(writer_seed, incarnation)?;
-                let _ = log.insert(del_rec.clone())?;
-                minted.push(del_rec);
+            let still = carried_audience_recipients(
+                &log,
+                &opened,
+                &flight,
+                &ep_aud,
+                &seats,
+                &BTreeSet::new(),
+                &denies,
+            );
+            // NEGATIVE CONTROL `tombstone-ungated`: the first newest epoch this Mac holds a key
+            // of, as before P1b.
+            #[cfg(any(test, debug_assertions))]
+            let ungated = aterm_types::negative_control::on("tombstone-ungated");
+            #[cfg(not(any(test, debug_assertions)))]
+            let ungated = false;
+            let sealing = if ungated {
+                max_ids
+                    .iter()
+                    .find(|id| opened.unwrapped_keys.contains_key(*id))
+                    .copied()
+            } else {
+                sealing_epoch(
+                    &log,
+                    &opened,
+                    max_ids,
+                    identity,
+                    &still,
+                    flight.undecided(&ep_aud),
+                )
+            };
+            let names: Vec<&String> = log_entries.keys().collect();
+            if let Some((ep_id, ep_key)) =
+                sealing.and_then(|id| opened.unwrapped_keys.get(&id).map(|key| (id, key)))
+            {
+                for name in names {
+                    let del_rec = log
+                        .draft_delete(&actor, authored_ms, ep_id, ep_key, name)?
+                        .sign(writer_seed, incarnation)?;
+                    let _ = log.insert(del_rec.clone())?;
+                    minted.push(del_rec);
+                }
+            } else if !ungated && !still.is_empty() && !sealed_away(aud) {
+                draft_sealed_away(
+                    &mut log,
+                    &actor,
+                    writer_seed,
+                    incarnation,
+                    authored_ms,
+                    aud,
+                    next_generation(aud),
+                    &still,
+                    &[],
+                    &names,
+                    &mut minted,
+                )?;
             }
         }
 
@@ -5216,6 +5380,7 @@ pub(super) fn draft_retire_in_log_with(
     let Some(opened) = log.open_audience_entries(&identity)? else {
         return Err(Error::new("this machine cannot open membership log epochs"));
     };
+    let denies = Denies::read(paths, &log, &opened, lock)?;
 
     let membership = log.membership();
     let voided = membership.voided();
@@ -5360,6 +5525,7 @@ pub(super) fn draft_retire_in_log_with(
                 },
                 exclude_recipients,
                 fold,
+                &denies,
                 &mut minted,
             )?;
         }
@@ -5426,7 +5592,8 @@ fn flight_after_mint(
 ///
 /// For `[everyone]` and Commons the carry is the current seats (one-mesh M1, M4,
 /// [`Log::current_recipients`]): each of `active_members` that is a current seat of the log, that
-/// `exclude_recipients` does not name and that no roster denies. A seat a newest epoch omitted is
+/// `exclude_recipients` does not name and that `denies` (both rosters) does not deny
+/// (`aterm_mesh_core::gap_heal::carried`). A seat a newest epoch omitted is
 /// carried: only a `Remove` revokes, so a missing `Wrap` is a gap, never a reason to drop a Mac
 /// for good (on 2026-11-03 the old carry, which dropped every left-out seat and kept only the
 /// seatless recipients every newest head wrapped, ratcheted Commons from 89 recipients to 3). A
@@ -5445,25 +5612,23 @@ pub(super) fn carried_audience_recipients(
     audience: &EpochAudience,
     active_members: &BTreeSet<Recipient>,
     exclude_recipients: &BTreeSet<Recipient>,
+    denies: &Denies,
 ) -> BTreeSet<Recipient> {
-    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
     #[cfg(any(test, debug_assertions))]
     let old_carry = OLD_CARRY.with(std::cell::Cell::get);
     #[cfg(not(any(test, debug_assertions)))]
     let old_carry = false;
     if !matches!(audience, EpochAudience::Hosts(_)) && !old_carry {
-        let current = log.current_recipients_where(audience, |seat| {
-            roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, seat))
-        });
+        let current = log.current_recipients_where(audience, |seat| denies.member(seat));
         return active_members
             .iter()
             .copied()
             .filter(|r| {
-                current.contains(r)
-                    && !exclude_recipients.contains(r)
-                    && !recipient_denied_by_roster_or_log(roster.as_ref(), log, r)
+                aterm_mesh_core::gap_heal::carried(
+                    current.contains(r),
+                    exclude_recipients.contains(r),
+                    denies.recipient(log, r),
+                )
             })
             .collect();
     }
@@ -5481,9 +5646,7 @@ pub(super) fn carried_audience_recipients(
         if (log.left_out(opened, audience, actor) && !flight.contains(&rec))
             || (log.left_out(opened, &EpochAudience::Everyone, actor)
                 && !flight_everyone.contains(&rec))
-            || roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, m))
+            || denies.member(m)
         {
             has_left_out_seat.insert(rec);
         } else {
@@ -5498,7 +5661,7 @@ pub(super) fn carried_audience_recipients(
         !removed.contains(r)
             && !exclude_recipients.contains(r)
             && !left_out_recipients.contains(r)
-            && !recipient_denied_by_roster_or_log(roster.as_ref(), log, r)
+            && !denies.recipient(log, r)
             && !left(flight, audience, r)
             && !left(flight_everyone, &EpochAudience::Everyone, r)
     };
@@ -5547,12 +5710,52 @@ pub(super) fn opens_newest(
     })
 }
 
+/// `remove_member`'s guard (one-mesh proofs P2, `last_holder_strands`): the seat audiences
+/// (`[everyone]`, Commons) a removal would strand, read from `after`, the log with the removal's
+/// `Remove`s in it, and `opened`, what this Mac opened before them. An audience is stranded when
+/// one of its newest epochs is left with no current seat holding it while this Mac's batch does
+/// not re-key it (this Mac does not open the newest there, M4): that epoch would stay due with no
+/// carrier to re-key it and no holder to heal it, and only a person's `commons restore` would
+/// undo it. Each newest epoch is asked of `aterm_mesh_core::gap_heal::strands`; the holders are
+/// the log's current seats, which no roster narrows (a denied holder still holds the key).
+pub(super) fn stranded_audiences(
+    after: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+) -> Vec<EpochAudience> {
+    use aterm_mesh_core::gap_heal::{holder, strands_any};
+    // NEGATIVE CONTROL `unguarded-removal`: nothing strands, so every removal is signed (the
+    // removal before PF2's guard).
+    #[cfg(any(test, debug_assertions))]
+    if aterm_types::negative_control::on("unguarded-removal") {
+        return Vec::new();
+    }
+    let current = after.current_recipients(&EpochAudience::Everyone);
+    [EpochAudience::Everyone, EpochAudience::Commons]
+        .into_iter()
+        .filter(|audience| {
+            let mints = opens_newest(opened, audience);
+            let heads: Vec<(bool, bool)> = opened
+                .maximal_epochs
+                .get(audience)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|epoch| {
+                    let wrapped = opened.wrapped_recipients.get(epoch).into_iter().flatten();
+                    (holder(wrapped.map(|r| (current.contains(r), true))), mints)
+                })
+                .collect();
+            strands_any(heads)
+        })
+        .collect()
+}
+
 fn rotate_epochs_after_remove(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
     fold: bool,
+    denies: &Denies,
     minted: &mut Vec<Record>,
 ) -> crate::Result<()> {
     rotate_after_removal(
@@ -5564,6 +5767,7 @@ fn rotate_epochs_after_remove(
             fold,
             ..Rotation::default()
         },
+        denies,
         minted,
     )
     .map(|_| ())
@@ -5625,16 +5829,12 @@ pub(super) fn rotate_after_removal(
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
     rotation: &Rotation<'_>,
+    denies: &Denies,
     minted: &mut Vec<Record>,
 ) -> crate::Result<Vec<String>> {
     let mut rotated = Vec::new();
-    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
     let remaining_members: BTreeSet<Recipient> = log
-        .current_recipients_where(&EpochAudience::Everyone, |m| {
-            roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, m))
-        })
+        .current_recipients_where(&EpochAudience::Everyone, |m| denies.member(m))
         .into_iter()
         .filter(|r| !exclude_recipients.contains(r))
         .collect();
@@ -5650,6 +5850,7 @@ pub(super) fn rotate_after_removal(
         &EpochAudience::Everyone,
         &remaining_members,
         exclude_recipients,
+        denies,
     );
     let commons_recipients = carried_audience_recipients(
         log,
@@ -5658,6 +5859,7 @@ pub(super) fn rotate_after_removal(
         &EpochAudience::Commons,
         &remaining_members,
         exclude_recipients,
+        denies,
     );
 
     if opened.max_generation.contains_key(&EpochAudience::Everyone)
@@ -5718,6 +5920,7 @@ pub(super) fn rotate_after_removal(
             &flight,
             author,
             exclude_recipients,
+            denies,
             minted,
             None,
         )?);
@@ -5785,12 +5988,17 @@ pub(super) fn rotate_after_removal(
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the batch's view (opened, flight), its author and the one deny (one-mesh proofs P2) are separate reads every caller already holds"
+)]
 pub(super) fn rotate_host_lists(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     flight: &Flight,
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
+    denies: &Denies,
     minted: &mut Vec<Record>,
     only: Option<&[EpochAudience]>,
 ) -> crate::Result<Vec<String>> {
@@ -5822,6 +6030,7 @@ pub(super) fn rotate_host_lists(
             &audience,
             &BTreeSet::new(),
             exclude_recipients,
+            denies,
         );
         reseal_audience(log, opened, author, &audience, &recipients, minted)?;
         rotated.push(Audience::Hosts(hosts).header());
@@ -6332,12 +6541,17 @@ pub(super) fn owed_rekeys(
         project = "aterm_secrets::client::remove::tests::keyed_epochs_transition"
     )
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the batch's view (opened, flight), its author and the one deny (one-mesh proofs P2) are separate reads every caller already holds"
+)]
 pub(super) fn coalesce_concurrent_commons_epochs(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     flight: &Flight,
     author: &AuthorCtx<'_>,
     active_recipients: &BTreeSet<Recipient>,
+    denies: &Denies,
     minted: &mut Vec<Record>,
     only: &[EpochAudience],
 ) -> crate::Result<()> {
@@ -6358,6 +6572,14 @@ pub(super) fn coalesce_concurrent_commons_epochs(
             && newest
                 .iter()
                 .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
+        // A newest epoch is stale where twins disagree, where it wraps a removed recipient, or
+        // where P1's gate is shut ([`heads_due`]): a due only the gate makes (a seat moved beside
+        // its `Remove`, one-mesh proofs P1b) is rotated too, or every writer waits on it.
+        // NEGATIVE CONTROL `coalesce-gateless`: judge by twins and held `Wrap`s alone, as before.
+        #[cfg(any(test, debug_assertions))]
+        let gateless = aterm_types::negative_control::on("coalesce-gateless");
+        #[cfg(not(any(test, debug_assertions)))]
+        let gateless = false;
         let stale = (newest.len() > 1
             && !secure_twins(newest, &opened.wrapped_recipients, &removed))
             || newest.iter().any(|ep_id| {
@@ -6365,7 +6587,8 @@ pub(super) fn coalesce_concurrent_commons_epochs(
                     .wrapped_recipients
                     .get(ep_id)
                     .is_some_and(|set| !set.is_disjoint(&removed))
-            });
+            })
+            || (!gateless && heads_due(log, opened, newest, &removed));
         // F21 rule 7: an audience with an uncovered keyed epoch this Mac does not open waits for
         // a holder's reseal, and only an audience it opens whole is resealed entry by entry;
         // rule 5: a holder of every uncovered keyed epoch reseals it.
@@ -6385,6 +6608,7 @@ pub(super) fn coalesce_concurrent_commons_epochs(
             &audience,
             active_recipients,
             &empty_exclude,
+            denies,
         );
         reseal_audience(log, opened, author, &audience, &recipients, minted)?;
     }
@@ -7616,22 +7840,20 @@ fn wrap_gaps_pass(
         write_gap_mark(paths, &digest, 0, &none_seen)?;
         return nothing;
     };
-    let local_roster = local_roster_denies_for_log(paths, &log, lock)?;
-    let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
+    let denies = Denies::read(paths, &log, &opened, lock)?;
     let membership = log.membership();
     let audiences = crate::membership_log::admission_audiences(&opened);
     let mut ranked = Vec::new();
     let mut next_due: Option<u64> = None;
     let mut seen = BTreeMap::new();
-    let gaps = log.wrap_gaps(&opened, &audiences);
+    let gaps = log.wrap_gaps_denying(&opened, &audiences, |seat| denies.member(seat));
     let gap_epochs: Vec<RecordId> = gaps.iter().map(|gap| gap.epoch).collect();
     let unsettled = unsettled_of_others(&log, &gap_epochs, &actor);
     for gap in gaps {
-        if gap_denied(
-            &log,
-            &membership,
-            &gap,
-            [local_roster.as_ref(), opened_roster.as_ref()],
+        // `wrap_gaps_denying` named it a gap; the closer signs it unless the one deny names it.
+        if !aterm_mesh_core::gap_heal::heal_signs(
+            true,
+            gap_denied(&log, &membership, &gap, &denies),
         ) {
             continue;
         }
@@ -7801,21 +8023,19 @@ fn heal_room(
         .unwrap_or(0)
 }
 
-/// Whether a roster denies `gap`'s seat or recipient (one-mesh M1: until wave D turns each
-/// swarm-roster deny into a `Remove`, a denied seat is no current seat): the gap closer never
-/// wraps it, as the carry never does.
+/// Whether the one deny ([`Denies`]) names `gap`'s seat or recipient (one-mesh M1: until wave D
+/// turns each swarm-roster deny into a `Remove`, a denied seat is no current seat): the gap
+/// closer never wraps it, as the carry never does.
 fn gap_denied(
     log: &Log,
     membership: &crate::membership_log::Membership,
     gap: &crate::membership_log::Gap,
-    rosters: [Option<&crate::swarm_roster::SwarmRoster>; 2],
+    denies: &Denies,
 ) -> bool {
-    rosters.into_iter().any(|roster| {
-        membership
-            .get(&gap.member)
-            .is_some_and(|m| roster.is_some_and(|r| member_denied_by_roster(r, m)))
-            || recipient_denied_by_roster_or_log(roster, log, &gap.recipient)
-    })
+    membership
+        .get(&gap.member)
+        .is_some_and(|m| denies.member(m))
+        || denies.recipient(log, &gap.recipient)
 }
 
 #[cfg(test)]
@@ -8423,6 +8643,7 @@ mod tests {
                 },
                 &BTreeSet::new(),
                 &Rotation::default(),
+                &Denies::opened_only(log, &opened),
                 &mut minted,
             )
             .expect("rotate");
@@ -8532,6 +8753,7 @@ mod tests {
                 &audience,
                 &active,
                 &BTreeSet::new(),
+                &Denies::opened_only(&log, &opened),
             );
             assert_eq!(
                 carried,
@@ -8597,14 +8819,177 @@ mod tests {
                 .flat_map(|aud| [(aud.clone(), seats[2].actor), (aud, seats[3].actor)])
                 .collect();
         assert_eq!(named, expected, "m3 and m4 lack both epochs 2; m5 is out");
-        let roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
+        let denies = Denies::opened_only(&log, &opened);
         let membership = log.membership();
         let healed: BTreeSet<MemberId> = gaps
             .iter()
-            .filter(|gap| !gap_denied(&log, &membership, gap, [roster.as_ref(), None]))
+            .filter(|gap| !gap_denied(&log, &membership, gap, &denies))
             .map(|gap| gap.member)
             .collect();
         assert_eq!(healed, BTreeSet::from([seats[2].actor]), "m4 is denied");
+    }
+
+    /// A roster that denies the seat labelled `label`, as this Mac's own.
+    fn denying(label: &str) -> SwarmRoster {
+        SwarmRoster {
+            members: Vec::new(),
+            deny_labels: vec![label.to_owned()],
+            deny_nodes: Vec::new(),
+        }
+    }
+
+    /// One-mesh M1, proofs P2's one deny: the heal and the carry read this Mac's own roster joined
+    /// to the opened one. In [`carry_lab`], a roster only this Mac holds denies m3: the carry
+    /// drops m3 as it drops the opened roster's m4, and the closer heals neither. Before PF2 the
+    /// carry read the opened roster alone, so it wrapped m3 into each new epoch while the closer,
+    /// which read both, refused m3 the heal.
+    ///
+    /// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=opened-roster-deny` reads the opened roster
+    /// alone and the first assert fails.
+    #[test]
+    fn the_carry_and_the_heal_read_one_deny_of_both_rosters() {
+        let (log, seats, _) = carry_lab();
+        let rec = |i: usize| seats[i].identity.recipient();
+        let opened = seats[0].opened(&log);
+        let denies = Denies::of(
+            Some(denying("m3")),
+            Denies::opened_only(&log, &opened).opened,
+        );
+        let flight = Flight::of_batch(&log, &opened, &seats[0].actor);
+        let current = log.current_recipients(&EpochAudience::Everyone);
+        for audience in [EpochAudience::Everyone, EpochAudience::Commons] {
+            let carried = carried_audience_recipients(
+                &log,
+                &opened,
+                &flight,
+                &audience,
+                &current,
+                &BTreeSet::new(),
+                &denies,
+            );
+            assert_eq!(
+                carried,
+                BTreeSet::from([rec(0), rec(1)]),
+                "{audience:?}: m3, denied by this Mac's roster alone, is not carried"
+            );
+        }
+        let audiences = crate::membership_log::admission_audiences(&opened);
+        let membership = log.membership();
+        let healed: Vec<MemberId> = log
+            .wrap_gaps_denying(&opened, &audiences, |seat| denies.member(seat))
+            .iter()
+            .filter(|gap| !gap_denied(&log, &membership, gap, &denies))
+            .map(|gap| gap.member)
+            .collect();
+        assert!(healed.is_empty(), "m3 and m4 are denied: {healed:?}");
+    }
+
+    /// Founders m1 and m2; m1 admits m3. `[everyone]` and Commons epoch 1 are wrapped to all
+    /// three; then m3 re-keys Commons to epoch 2, wrapped to itself alone, so m3 is the last holder
+    /// of the newest Commons key and m1 cannot open it. Returns the log, the seats and epoch 2.
+    fn last_holder_lab() -> (Log, Vec<Seat>, (RecordId, zeroize::Zeroizing<[u8; 32]>)) {
+        let (seats, entrants): (Vec<Seat>, Vec<Entrant>) = (1..=3).map(Seat::new).unzip();
+        let genesis = Record::found(&[99; 32], entrants[..2].to_vec(), 1_000).expect("genesis");
+        let mut log = Log::new(genesis).expect("log");
+        seats[0].sign(
+            &mut log,
+            1_001,
+            crate::membership_log::Body::Admit {
+                entrant: entrants[2].clone(),
+                evidence: crate::membership_log::Evidence::Phrase,
+            },
+        );
+        let all: Vec<Recipient> = seats.iter().map(|s| s.identity.recipient()).collect();
+        seats[0].mint(&mut log, 1_100, EpochAudience::Everyone, 1, &all);
+        seats[0].mint(&mut log, 1_101, EpochAudience::Commons, 1, &all);
+        let epoch2 = seats[2].mint(&mut log, 1_200, EpochAudience::Commons, 2, &all[2..]);
+        (log, seats, epoch2)
+    }
+
+    /// `log` with `seats[by]`'s `Remove` of `seats[target]` in it, its cutoff the target's last
+    /// record, as `draft_removal` picks it.
+    fn removed(log: &Log, seats: &[Seat], by: usize, target: usize) -> Log {
+        let mut after = log.clone();
+        let member = seats[target].actor;
+        let cutoff = after
+            .records()
+            .filter(|r| r.kind() != crate::membership_log::Kind::Genesis && *r.actor() == member)
+            .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
+            .map_or_else(
+                || after.membership().get(&member).expect("a member").entry,
+                |r| *r.id(),
+            );
+        seats[by].sign(
+            &mut after,
+            1_300,
+            crate::membership_log::Body::Remove { member, cutoff },
+        );
+        after
+    }
+
+    /// One-mesh proofs P2, `last_holder_strands` and `remove_member`'s guard: m1 removing m3, the
+    /// last holder of the newest Commons epoch, which m1 cannot open to re-key, strands Commons
+    /// and nothing else. m1 removing m2 strands nothing (m3 still holds it), nor does m3 removing
+    /// m2 (m3 re-keys), nor m1 removing m3 once epoch 2 wraps m1 too (m1 re-keys). What the guard
+    /// refuses: unguarded, m1's batch re-keys `[everyone]` alone, and no current Mac holds the
+    /// newest Commons key.
+    ///
+    /// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=unguarded-removal` strands nothing and the
+    /// first assert fails.
+    #[test]
+    fn a_removal_that_strands_the_last_holder_is_refused() {
+        let (log, seats, (epoch2, key2)) = last_holder_lab();
+        let commons = EpochAudience::Commons;
+        let opened = seats[0].opened(&log);
+        assert!(
+            !opens_newest(&opened, &commons),
+            "m1 cannot open Commons epoch 2"
+        );
+        let after = removed(&log, &seats, 0, 2);
+        assert_eq!(stranded_audiences(&after, &opened), vec![commons.clone()]);
+        assert!(
+            stranded_audiences(&removed(&log, &seats, 0, 1), &opened).is_empty(),
+            "m3 still holds Commons epoch 2"
+        );
+        assert!(
+            stranded_audiences(&removed(&log, &seats, 2, 1), &seats[2].opened(&log)).is_empty(),
+            "m3 re-keys Commons"
+        );
+
+        let mut unguarded = after.clone();
+        let (rotated, _) = seats[0].rotate(&mut unguarded);
+        assert_eq!(rotated, vec!["everyone".to_owned()]);
+        let view = seats[0].opened(&unguarded);
+        let current = unguarded.current_recipients(&EpochAudience::Everyone);
+        let holders: Vec<&Recipient> = view.maximal_epochs[&commons]
+            .iter()
+            .flat_map(|epoch| view.wrapped_recipients.get(epoch).into_iter().flatten())
+            .filter(|r| current.contains(*r))
+            .collect();
+        assert!(
+            holders.is_empty(),
+            "the newest Commons key is held by {holders:?}"
+        );
+
+        let mut shared = log;
+        let wrap = shared
+            .draft_wrap(
+                &seats[2].actor,
+                1_250,
+                epoch2,
+                &key2,
+                seats[0].identity.recipient(),
+            )
+            .expect("wrap")
+            .sign(&seats[2].seed, seats[2].incarnation)
+            .expect("sign");
+        shared.insert(wrap).expect("insert wrap");
+        let opened = seats[0].opened(&shared);
+        assert!(opens_newest(&opened, &commons));
+        assert!(
+            stranded_audiences(&removed(&shared, &seats, 0, 2), &opened).is_empty(),
+            "m1 re-keys Commons"
+        );
     }
 
     /// The held-wrap leak (one-mesh review item 4, L1). Founders A, W, S and H. A mints

@@ -158,6 +158,26 @@ fn read_journal(
     Ok(held)
 }
 
+/// The witnessed length of one enrolled table store (`table`, recovery or primary); `None` where
+/// the claim is absent, pending, damaged or misnamed.
+///
+/// # Errors
+/// Unused (always returns `Ok`); signature matches [`held_lengths`].
+pub fn held_length(paths: &Paths, table: Digest, recovery: bool) -> Result<Option<u64>> {
+    let region = region(recovery);
+    let (claim_dir, _) = dirs(paths, region);
+    let name = format!("{}.claim", aterm_codec::hex::encode_lower(&table));
+    let Ok(claim) = private_file::read_private(&claim_dir, &name, CLAIM_LEN) else {
+        return Ok(None);
+    };
+    if let Ok(Some((scope, witness))) = ready(&claim, region)
+        && scope.digest() == table
+    {
+        return Ok(Some(witness.count));
+    }
+    Ok(None)
+}
+
 /// Every enrolled table store (ready claims under the primary and recovery claim dirs): its
 /// digest, whether it is a recovery store, and its witnessed length. A pending, damaged or
 /// misnamed claim holds no record this reader can vouch for, and is left out.

@@ -52,6 +52,7 @@ bench = false
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
 aterm-gui = { path = "../aterm-gui" }     # the WINDOW (aterm-window/aterm-gpu) + headless engine
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
+aterm-resource-host = { workspace = true }
 # `aterm ctl cast drift` computed client-side (an older server, or saved files): the replay audit
 # is aterm-control's, the code the server runs, handed to the dependency-free aterm-ctl as a plain
 # fn (`CTL_LOCAL`). Already in the graph through aterm-gui.
@@ -123,7 +124,8 @@ aterm-link = { path = "../aterm-link" }
 # refuses by name (`secrets_unavailable` in src/main.rs).
 aterm-secrets = { workspace = true }
 # `aterm lan serve | status` (hidden): the root LAN broker the LaunchDaemon runs, and its
-# reader for `aterm doctor` and the lab lane (docs/DESIGN-lan-broker-2026-11-05.md).
+# reader for `aterm doctor` and the lab lane (docs/DESIGN-lan-broker-2026-11-05.md); on macOS
+# also the allowed direct path every aterm process is given at start (§5).
 aterm-lan = { workspace = true }
 aterm-db = { workspace = true }
 # The shared-login composition binds full Commons identities and parses public

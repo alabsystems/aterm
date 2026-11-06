@@ -2619,8 +2619,8 @@ fn a_quit_carries_each_tabs_told_ids_to_its_cold_restore() {
         0,
         now,
     );
-    assert_eq!(parent.presence.herald.told_ids(0), told, "PRECONDITION");
-    let mut manifest = parent.capture_restore_manifest();
+    assert_eq!(parent.presence.herald.told_ids(0, 0), told, "PRECONDITION");
+    let mut manifest = parent.capture_desk_manifest();
     parent.quit_agents(&mut manifest, false);
     let leaf = manifest.windows[0].restored_tabs[0]
         .root
@@ -2631,7 +2631,8 @@ fn a_quit_carries_each_tabs_told_ids_to_its_cold_restore() {
         crate::status_item::told_ids_row(&told).as_deref(),
         "the quit's leaf names the told ids"
     );
-    // The crash journal's image names them too, so a crash's restore carries them as a quit's.
+    // The crash journal's image names them too, so a crash's restore carries them as a quit's
+    // (its scratch journal is a unix test seam, `crash_journal::tests`).
     #[cfg(unix)]
     {
         let journal_dir = crate::crash_journal::tests::scratch("cj-told");
@@ -2691,7 +2692,7 @@ fn a_quit_carries_each_tabs_told_ids_to_its_cold_restore() {
     );
     cold.herald_session(filled);
     assert_eq!(
-        cold.presence.herald.told_ids(filled),
+        cold.presence.herald.told_ids(filled, 0),
         told,
         "its herald's memory after its first publication"
     );
@@ -2699,8 +2700,98 @@ fn a_quit_carries_each_tabs_told_ids_to_its_cold_restore() {
     let mut bare = manifest.clone();
     bare.fill_told(&|_| None);
     let (cold, filled) = restored(&bare);
-    assert!(cold.presence.herald.told_ids(filled).is_empty());
+    assert!(cold.presence.herald.told_ids(filled, 0).is_empty());
     assert!(cold.status_carry.is_empty(), "no carry");
+}
+
+/// The App of `told` seeded as session 0's carried told-once memory at the owner's turn 0.
+fn told_parent(told: &[u64]) -> App {
+    let mut parent = App::headless_for_test();
+    parent.presence.herald.adopt(
+        0,
+        crate::status_item::StatusCarry {
+            told_ids: told.to_vec(),
+            ..crate::status_item::StatusCarry::default()
+        },
+        0,
+        std::time::Instant::now(),
+    );
+    parent
+}
+
+/// The told ids the first terminal leaf of `manifest` names.
+fn first_leaf_told(manifest: &restore::RestoreManifest) -> Option<String> {
+    manifest.windows[0].restored_tabs[0]
+        .root
+        .first_terminal_leaf()
+        .and_then(|leaf| leaf.told.clone())
+}
+
+/// CLOSING THE LAST WINDOW CARRIES EACH TAB'S TOLD-ONCE IDS TO THE COLD RESTORE (design §14.18,
+/// 2026-11-05 review): the last window's close takes the quit's layout before its teardown
+/// retires each tab's herald slot, so the told ids are filled into that layout then
+/// (`App::capture_desk_manifest`), and the quit writes them though no slot is left by its turn.
+/// Mutant: the close taking the bare layout (`capture_restore_manifest`) leaves the leaf naming
+/// none, and every need still standing is told again after the restart.
+#[test]
+fn closing_the_last_window_carries_each_tabs_told_ids() {
+    let told = [0x7_u64, 0x9];
+    let mut parent = told_parent(&told);
+    assert!(matches!(
+        parent.close_window_logical(WindowId(0)),
+        CloseOutcome::Exit
+    ));
+    assert!(
+        parent.presence.herald.told_ids(0, 0).is_empty(),
+        "PRECONDITION: the teardown retired the tab's herald slot"
+    );
+    let mut manifest = parent
+        .quit_capture
+        .take()
+        .expect("stashed at close-decision time");
+    parent.quit_agents(&mut manifest, false);
+    assert_eq!(
+        first_leaf_told(&manifest),
+        crate::status_item::told_ids_row(&told),
+        "the quit's leaf names the told ids"
+    );
+}
+
+/// AN OWNER'S TURN SINCE THE HERALD'S LAST NOTE SPENDS WHAT A RESTART CARRIES (design §14.18,
+/// 2026-11-05 review): a plain Enter in the tab moves no row, so the memory stays in the herald's
+/// slot until its next note; what a quit's layout and a seamless update's status row carry is the
+/// memory at the tab's turn now (`HumanInputStamp::last_plain_enter`), none after that Enter.
+/// CONTROL: before it, both carry the ids. Mutant: `Herald::told_ids` ignoring the turn carries
+/// them after the Enter too.
+#[test]
+fn an_owner_turn_since_the_last_note_spends_what_a_restart_carries() {
+    use crate::human_input::Gesture;
+    let told = [0x7_u64, 0x9];
+    let parent = told_parent(&told);
+    #[cfg(unix)]
+    let carried = |app: &App| {
+        app.status_carry_snapshots()
+            .into_iter()
+            .find(|(id, _, _)| *id == 0)
+            .map(|(_, carry, _)| carry.told_ids)
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        first_leaf_told(&parent.capture_desk_manifest()),
+        crate::status_item::told_ids_row(&told),
+        "CONTROL: the layout carries them before the owner's turn"
+    );
+    #[cfg(unix)]
+    assert_eq!(carried(&parent), told, "CONTROL: so does the status row");
+    let ctx = parent.pool.get(0).expect("session 0").ctx.clone();
+    let _ = ctx.human_input.note(2_000, Gesture::PlainEnter);
+    assert_eq!(
+        first_leaf_told(&parent.capture_desk_manifest()),
+        None,
+        "their turn spent what the layout carries"
+    );
+    #[cfg(unix)]
+    assert!(carried(&parent).is_empty(), "and what the status row does");
 }
 
 /// A CLAIM WORKER THE PTY KEEPER HANDS BACK KEEPS ITS TIME (2026-11-02 review): after a crash the

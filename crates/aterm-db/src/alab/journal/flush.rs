@@ -250,31 +250,25 @@ pub(crate) fn pass_with(
     if !off && let Some(held) = holdings() {
         book.hold(&held, now);
     }
-    let owed = !off
-        && !new_week
-        && book.sum_off == off
-        && outbox.is_empty()
-        && now >= book.flushed_at.saturating_add(book::ROUTINE_S)
-        && (!book.uses_due(n, period, now)?.is_empty()
-            || !book.places_due(n, period, now).is_empty()
-            || !book.relays_due(&heard_now, &me, n, period, now)?.is_empty());
-    if !book.due(&outbox, owed, now, period, under, off) {
+    if !book.due(&outbox, true, now, period, under, off) {
         book.checked_at = now;
         book.save(spool)?;
         return Ok(Flushed::Idle);
     }
-    let planned = book.plan(&outbox, &heard_now, &presence(), &me, n, period, now, off)?;
+    let sum_due = book.sum_period != Some(period) || book.sum_off != off;
+    let presence = if sum_due {
+        presence()
+    } else {
+        Presence::default()
+    };
+    let planned = book.plan(&outbox, &heard_now, &presence, &me, n, period, now, off)?;
     if planned.changes.is_empty() {
         book.checked_at = now;
         book.save(spool)?;
         return Ok(Flushed::Idle);
     }
     let request = typed::request_id(super::APPLICATION, super::ROLE, &planned.changes)?;
-    let payload = Command::Write {
-        request,
-        changes: planned.changes.clone(),
-    }
-    .encode()?;
+    let payload = Command::encode_write(request, &planned.changes)?;
     // The week's first record goes whatever its size; any other keeps to the line in bytes too.
     if !new_week && !paced(payload.len()) {
         book.held_until = admits(payload.len());
@@ -432,9 +426,9 @@ pub(crate) fn window(session: &Session<'_>, directory: &Directory, now: u64) -> 
         let log = Log::read_with(session, &store, scope, att::decode)?;
         used.insert(epoch, log.local_use());
         ops.extend(
-            log.eligible()
-                .into_iter()
-                .filter_map(|(operation, command)| Op::from_eligible(epoch, operation, command)),
+            log.into_eligible().filter_map(|(operation, command)| {
+                Op::from_eligible_owned(epoch, operation, command)
+            }),
         );
     }
     Ok(Window {

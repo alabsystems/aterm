@@ -1041,10 +1041,10 @@ impl Shared {
     }
 
     /// Journal `line` once a run under `key`.
-    fn say_once(&self, key: String, line: fmt::Arguments<'_>) {
+    fn say_once(&self, key: fmt::Arguments<'_>, line: fmt::Arguments<'_>) {
         let first = {
             let mut said = self.said.lock_or_recover();
-            said.len() < SAID_MAX && said.insert(key)
+            said.len() < SAID_MAX && said.insert(key.to_string())
         };
         if first {
             aterm_log::info!("mesh: presence: {line}");
@@ -1053,19 +1053,18 @@ impl Shared {
 
     /// Publish this Mac's row once.
     fn publish_once(&self) {
-        let facts = (self.facts)();
+        let mut facts = (self.facts)();
+        facts.addresses.truncate(ADDRESSES_MAX);
+        for address in &mut facts.addresses {
+            *address = travelling(*address);
+        }
         let row = PresenceRow {
             at_ms: relay::wall_ms(&self.mesh.wall),
             build: facts.build,
-            addresses: facts
-                .addresses
-                .into_iter()
-                .map(travelling)
-                .take(ADDRESSES_MAX)
-                .collect(),
+            addresses: facts.addresses,
             membership: facts.membership,
             tables: facts.tables,
-            topics: row_topics(&facts.topics),
+            topics: facts.topics,
         };
         match self
             .mesh
@@ -1075,7 +1074,7 @@ impl Shared {
             Err(e) => {
                 let why = e.to_string();
                 self.say_once(
-                    format!("publish:{why}"),
+                    format_args!("publish:{why}"),
                     format_args!("no row this tick: {why}"),
                 );
                 self.report(&Event::NotPublished { why });
@@ -1128,7 +1127,7 @@ impl Shared {
             Ok(judged) => judged,
             Err(why) => {
                 self.say_once(
-                    format!("refused:{subject}:{why}"),
+                    format_args!("refused:{subject}:{why}"),
                     format_args!("refused a row on {subject}: {why}"),
                 );
                 if let Some(observe) = &self.observe {
@@ -1212,7 +1211,7 @@ impl Shared {
                 self.report(&Event::Wrote { seats });
             }
             Err(e) => self.say_once(
-                format!("seen:{e}"),
+                format_args!("seen:{e}"),
                 format_args!("{SEEN_FILE} could not be written: {e}"),
             ),
         }
@@ -1411,7 +1410,7 @@ fn tail(shared: &Shared) {
                     break;
                 }
                 shared.say_once(
-                    format!("tail:{e}"),
+                    format_args!("tail:{e}"),
                     format_args!("the tail ended ({e}); it opens again"),
                 );
             }

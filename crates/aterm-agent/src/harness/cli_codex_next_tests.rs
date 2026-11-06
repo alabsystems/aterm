@@ -735,6 +735,7 @@ fn off_report_of_claude_code_moves_no_session() {
 /// `early`, the default, all of the JSON); no `rotation off:` line, and the JSON's `next` holds
 /// the keys it held before rotation off had words (`to`, `wait_until` with its RFC 3339 twin,
 /// `not`, and on a Codex that keeps no row's login its own `only_default` and `none`), no `off`.
+/// Claude Code's also holds `worker`, since its `to` is a rotation's.
 #[test]
 fn rotation_on_reports_as_before() {
     for (cli, program, want) in [
@@ -776,6 +777,9 @@ fn rotation_on_reports_as_before() {
                     "wait_until",
                     "wait_until_rfc3339",
                 ]
+            } else if cli == Cli::Claude {
+                // Claude Code's `to` is a rotation's, so what a worker takes is said apart.
+                &["not", "to", "wait_until", "wait_until_rfc3339", "worker"]
             } else {
                 &["not", "to", "wait_until", "wait_until_rfc3339"]
             };
@@ -1009,6 +1013,84 @@ fn a_keyring_login_takes_no_row_in_any_mode_and_the_report_says_so() {
             }
         }
     }
+}
+
+/// A LAUNCH ON A LOGIN NO ROW LISTS, AS THE REPORT SAYS IT: on a roster of directories alone, with
+/// Codex's login in the OS keyring or with rotation off and no pin, a launch takes no row, so
+/// `--host any` passes the member over, and `next:` says which and why. A refused launch says so
+/// too: a wall on one row and another Mac's hold on the other leave a wait, each row's reason, and
+/// no launch's row.
+#[test]
+fn the_report_says_where_a_launch_a_survey_passes_over_would_run() {
+    let dir_rows = |pool: &Pool| {
+        let row = |label: &str| {
+            let dir = pool.tmp.path().join("logins").join(label);
+            let login = dir.join("auth.json");
+            std::fs::create_dir_all(&dir).expect("a login's home");
+            std::fs::write(&login, "{}").expect("a stand-in login");
+            accounts::Row {
+                label: label.into(),
+                dir: Some(dir.display().to_string()),
+                ..accounts::Row::default()
+            }
+        };
+        pool.rows(&[row("first"), row("second")]);
+    };
+    let lists_none = "this machine's own, which no row of the roster lists for a plain one";
+    let passed_over = |pool: &Pool, at: &str| {
+        let config = pool.env.config.clone().expect("aterm.toml");
+        let places = (
+            config.as_path(),
+            pool.env.state.as_path(),
+            pool.env.home.as_deref(),
+        );
+        let rows = survey_accounts(Cli::Codex, places, pool.env.now)
+            .expect("the pool reads")
+            .rows;
+        assert!(rows.iter().any(|row| row.enrolled), "{at}: {rows:?}");
+        assert!(rows.iter().all(|row| !row.launch), "{at}: {rows:?}");
+    };
+    let keyring = Pool::new("passed-over-keyring");
+    dir_rows(&keyring);
+    keyring.keyring();
+    let off = Pool::new("passed-over-off");
+    dir_rows(&off);
+    off.mode("off");
+    for (at, pool, why) in [
+        ("the keyring", &keyring, "keeps its login in the OS keyring"),
+        ("rotation off", &off, "no account is pinned"),
+    ] {
+        passed_over(pool, at);
+        assert_eq!(pool.launch_on(Some(&pool.new)), Ok(None), "{at}");
+        let (text, _) = pool.report(Some(&pool.new));
+        let next = next_line(&text);
+        for said in [why, "takes no row", lists_none] {
+            assert!(next.contains(said), "{at}: {said}: {next}");
+        }
+    }
+
+    let refused = Pool::new("passed-over-refused");
+    let walled = refused.wall("main", refused.env.now + 3_600);
+    let mut roster = refused.roster();
+    for row in &mut roster.rows {
+        if row.label == "work" {
+            row.held_by = Some("other-mac".into());
+        }
+    }
+    refused.rows(&roster.rows);
+    passed_over(&refused, "refused");
+    let launch = refused.launch_on(Some(&refused.new));
+    assert!(launch.is_err(), "the launch is refused: {launch:?}");
+    let (text, _) = refused.report(Some(&refused.new));
+    assert!(
+        next_line(&text).contains(&rfc3339_utc(walled)),
+        "a wait for the wall: {text}"
+    );
+    let not = not_next(&text);
+    assert!(
+        not.contains_key("main") && not.contains_key("work"),
+        "{text}"
+    );
 }
 
 /// UNDER ROTATION OFF WITH CODEX'S LOGIN IN THE OS KEYRING, THE `rotation off:` LINE OFFERS NO

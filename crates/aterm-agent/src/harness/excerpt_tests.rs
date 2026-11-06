@@ -448,3 +448,29 @@ fn muse_excerpts_read_prompts_said_and_doing_from_session_log() {
     let done = muse_excerpts_from(completed.as_bytes());
     assert_eq!(done.doing, None);
 }
+
+/// What the agent said carries the time its transcript row was written, the newest text's row's,
+/// not a later tool call's; a row with no time gives none.
+#[test]
+fn said_carries_when_its_row_was_written() {
+    let stamped = |row: String, at: &str| {
+        row.replacen(
+            "{\"type\":\"assistant\"",
+            &format!("{{\"type\":\"assistant\",\"timestamp\":\"{at}\""),
+            1,
+        )
+    };
+    let rows = vec![
+        user("build it"),
+        stamped(said("m1", "Building."), "2026-11-06T10:00:01.500Z"),
+        stamped(call("m1", "t1", "Bash"), "2026-11-06T10:00:09.000Z"),
+    ];
+    let e = excerpts(&rows);
+    assert_eq!(e.said.as_deref(), Some("Building."));
+    assert_eq!(
+        e.said_at_ms,
+        super::super::codex_rollout::stamp_ms("2026-11-06T10:00:01.500Z")
+    );
+    assert!(e.said_at_ms.is_some());
+    assert_eq!(excerpts(&[said("m1", "Building.")]).said_at_ms, None);
+}

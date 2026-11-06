@@ -266,9 +266,8 @@ const fn origin_name(origin: FakeOrigin) -> &'static str {
 }
 
 /// Record every wire rule this request breaks.
-fn violations(state: &mut State, req: &Request) {
+fn violations(state: &mut State, req: &Request, path: &str, target_has_cred: bool) {
     let m = &req.method;
-    let path = shown_target(state, req);
     let foreign = matches!(req.origin, FakeOrigin::Web | FakeOrigin::Cdn);
     let o = origin_name(req.origin);
     let mut found = Vec::new();
@@ -289,7 +288,7 @@ fn violations(state: &mut State, req: &Request) {
             "more than one credential header at the {o} origin: {m} {path}"
         ));
     }
-    if target_credential(state, req) {
+    if target_has_cred {
         found.push(format!(
             "credential in the target sent to the {o} origin: {m} {path}"
         ));
@@ -343,17 +342,24 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
         .cloned()
         .collect();
     let foreign = matches!(req.origin, FakeOrigin::Web | FakeOrigin::Cdn);
-    let credentialed =
-        headers.len() < req.headers.len() || (foreign && target_credential(state, req));
+    let target_has_cred = target_credential(state, req);
+    let credentialed = headers.len() < req.headers.len() || (foreign && target_has_cred);
+    let shown = shown_target(state, req);
+    violations(state, req, &shown, target_has_cred);
+    if req.over {
+        state.violations.push(format!(
+            "body over agh-fake's 16 MiB bound: {} {shown}",
+            req.method
+        ));
+    }
     state.seen.push(Seen {
         origin: req.origin,
         method: req.method.clone(),
-        path_and_query: shown_target(state, req),
+        path_and_query: shown,
         headers,
         had_authorization: credentialed,
         as_login: login.clone(),
     });
-    violations(state, req);
     if req.cut {
         return Outcome::Close;
     }
@@ -366,11 +372,6 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
         n,
     };
     let outcome = if req.over {
-        let shown = shown_target(state, req);
-        state.violations.push(format!(
-            "body over agh-fake's 16 MiB bound: {} {shown}",
-            req.method
-        ));
         Outcome::Answer(finish(
             state,
             req,
@@ -420,10 +421,11 @@ fn capture_body(state: &mut State, req: &Request) {
     if req.body.is_empty() {
         return;
     }
-    let json = (req.body.len() <= BODY_JSON_MAX
-        && aterm_json::from_slice::<Value>(&req.body).is_ok())
-    .then(|| String::from_utf8(req.body.clone()).ok())
-    .flatten();
+    let json = (req.body.len() <= BODY_JSON_MAX)
+        .then(|| std::str::from_utf8(&req.body).ok())
+        .flatten()
+        .filter(|s| aterm_json::from_str::<Value>(s).is_ok())
+        .map(str::to_owned);
     state.bodies.push(crate::SeenBody {
         seen: state.seen.len().saturating_sub(1),
         len: u64::try_from(req.body.len()).unwrap_or(u64::MAX),
@@ -561,11 +563,9 @@ fn starve(state: &mut State, id: u64) {
 /// The repository a path names, by `/repos/{o}/{r}` or `/repositories/{id}`.
 fn repo_of_path(state: &State, path: &str) -> Option<usize> {
     match segments(path).as_slice() {
-        ["repos", o, r, ..] => state.repo_index(&format!(
-            "{}/{}",
-            aterm_codec::pct::decode(o),
-            aterm_codec::pct::decode(r)
-        )),
+        ["repos", o, r, ..] => {
+            state.repo_index_parts(&aterm_codec::pct::decode(o), &aterm_codec::pct::decode(r))
+        }
         ["repositories", id, ..] => state.repo_by_id(crate::parse_uint(id)?),
         _ => None,
     }
@@ -810,14 +810,11 @@ fn api(state: &State, req: &Request, ctx: &Ctx) -> Answer {
             None => Answer::not_found(),
         },
         ["repos", o, r, rest @ ..] => {
-            let slug = format!(
-                "{}/{}",
-                aterm_codec::pct::decode(o),
-                aterm_codec::pct::decode(r)
-            );
-            match state.repo_index(&slug) {
+            let owner = aterm_codec::pct::decode(o);
+            let repo = aterm_codec::pct::decode(r);
+            match state.repo_index_parts(&owner, &repo) {
                 Some(i) => repo_route(state, req, ctx, i, rest),
-                None => moved(state, req, ctx, &slug, rest),
+                None => moved(state, req, ctx, &format!("{owner}/{repo}"), rest),
             }
         }
         ["repositories", id, rest @ ..] => {
@@ -1350,9 +1347,13 @@ fn digest_json(spec: &crate::AssetSpec) -> Value {
         DigestSpec::True => crate::sha256_prefixed(&spec.bytes).into(),
         DigestSpec::Null => Value::Null,
         DigestSpec::Wrong => {
-            let mut other = spec.bytes.clone();
-            other.extend_from_slice(b"\0wrong");
-            crate::sha256_prefixed(&other).into()
+            let mut hasher = aterm_digest::Sha256::new();
+            hasher.update(&spec.bytes);
+            hasher.update(b"\0wrong");
+            let mut out = String::with_capacity(7 + 64);
+            out.push_str("sha256:");
+            aterm_codec::hex::push_lower(&mut out, &hasher.finalize());
+            out.into()
         }
     }
 }
@@ -1752,14 +1753,11 @@ fn web(state: &State, req: &Request) -> Answer {
     if tag.is_empty() || !req.is_read() {
         return Answer::text(404, "Not Found");
     }
-    let slug = format!(
-        "{}/{}",
-        aterm_codec::pct::decode(segs[0]),
-        aterm_codec::pct::decode(segs[1])
-    );
+    let owner = aterm_codec::pct::decode(segs[0]);
+    let repo = aterm_codec::pct::decode(segs[1]);
     let (tag, name) = (joined(tag), aterm_codec::pct::decode(name));
     let found = state
-        .repo_index(&slug)
+        .repo_index_parts(&owner, &repo)
         .map(|i| &state.repos[i])
         .filter(|r| !r.spec.private)
         .and_then(|r| {
@@ -1919,12 +1917,9 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let ["repos", o, r, rest @ ..] = segs.as_slice() else {
         return Answer::not_found();
     };
-    let slug = format!(
-        "{}/{}",
-        aterm_codec::pct::decode(o),
-        aterm_codec::pct::decode(r)
-    );
-    let Some(index) = state.repo_index(&slug) else {
+    let Some(index) =
+        state.repo_index_parts(&aterm_codec::pct::decode(o), &aterm_codec::pct::decode(r))
+    else {
         return Answer::not_found();
     };
     if let Some(refused) = unwritable(&state.repos[index], ctx) {
@@ -2501,12 +2496,9 @@ fn upload(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     if req.method != "POST" {
         return Answer::not_found();
     }
-    let slug = format!(
-        "{}/{}",
-        aterm_codec::pct::decode(o),
-        aterm_codec::pct::decode(r)
-    );
-    let Some(index) = state.repo_index(&slug) else {
+    let Some(index) =
+        state.repo_index_parts(&aterm_codec::pct::decode(o), &aterm_codec::pct::decode(r))
+    else {
         return Answer::not_found();
     };
     if let Some(refused) = unwritable(&state.repos[index], ctx) {

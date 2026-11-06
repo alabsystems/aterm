@@ -490,9 +490,9 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn scrub_controls(text: &str) -> String {
+fn scrub_controls(text: String) -> String {
     if !text.chars().any(char::is_control) {
-        return text.to_owned();
+        return text;
     }
     text.chars()
         .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
@@ -500,7 +500,7 @@ fn scrub_controls(text: &str) -> String {
 }
 
 fn text_status(value: &aterm_json::Value) -> String {
-    let mut lines = vec![scrub_controls(&format!(
+    let mut lines = vec![scrub_controls(format!(
         "release: {}",
         value["state"].as_str().unwrap_or("unknown")
     ))];
@@ -510,7 +510,7 @@ fn text_status(value: &aterm_json::Value) -> String {
         ("verification log", "verification_log"),
     ] {
         if let Some(text) = value[field].as_str() {
-            lines.push(scrub_controls(&format!("{label}: {text}")));
+            lines.push(scrub_controls(format!("{label}: {text}")));
         }
     }
     if let Some(stages) = value["unfinished_verification_stages"].as_array() {
@@ -521,7 +521,7 @@ fn text_status(value: &aterm_json::Value) -> String {
                     .map_or_else(String::new, |age| {
                         format!(" ({} s since start, wall clock)", age / 1000)
                     });
-                lines.push(scrub_controls(&format!(
+                lines.push(scrub_controls(format!(
                     "unfinished verification stage: {title}{age}"
                 )));
             }
@@ -536,7 +536,7 @@ fn text_status(value: &aterm_json::Value) -> String {
         ("latest verification event", "latest_verification_event"),
     ] {
         if !value[field].is_null() {
-            lines.push(scrub_controls(&format!("{label}: {}", value[field])));
+            lines.push(scrub_controls(format!("{label}: {}", value[field])));
         }
     }
     if let Some(line) = timeline_line(&value["timeline"]) {
@@ -990,7 +990,7 @@ mod tests {
         let old = crate::release::Journal {
             commit: "old-source".into(),
             version: "0.148.0".into(),
-            done: vec!["check".into()],
+            done: vec!["check".into(), "tap-aligned".into()],
             ..Default::default()
         };
         let event = aterm_json::json!({"source":"?", "version":"?"});

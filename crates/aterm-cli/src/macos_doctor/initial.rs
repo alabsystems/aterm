@@ -10,8 +10,15 @@ use aterm_types::macos_setup::{Plan, Subject};
 
 mod check;
 mod input_activation;
+mod pending_inputs;
 pub use check::{check_initial_setup, check_initial_setup_observed};
-pub use input_activation::{activate_input_attachments, input_activation_revision};
+#[cfg(any(test, debug_assertions))]
+pub use input_activation::input_setup_scope_at;
+pub use input_activation::{
+    InputServiceSet, InputSetupScope, activate_input_attachments, input_activation_revision,
+    input_setup_scope,
+};
+pub use pending_inputs::initial_setup_pending_workstation_revision;
 mod background_observation;
 pub use background_observation::check_background_workstation;
 mod background_vault_authorization;
@@ -3898,11 +3905,21 @@ fn decision_at(root: &Path) -> Result<Decision, String> {
 ///   not finished: the sign-outs after a preferences pass that failed, or the preferences
 ///   before the sign-outs' pass.
 ///
-/// A pass checkpoints each selected Mac stage it fully verified before the decision,
-/// so a later bookkeeping failure cannot repeat its effects. A partial stage receives
-/// no completion credit. A failed state read changes no completion record.
+/// A pass checkpoints each verified preference in its remaining scope before the decision,
+/// so another preference's failure or a later bookkeeping failure cannot repeat its effects.
+/// A stage finishes only once every selected setting is verified. A failed state read changes
+/// no completion record.
 pub(super) fn record_applied(root: &Path, set: Selection) -> Result<(), String> {
     record_applied_with(root, set, decision_record)
+}
+
+/// A partial preference cohort only checkpoints a coherent, admitted modern run. An older
+/// selection-only decision records the whole verified pass, never per-setting completion.
+pub(super) fn record_verified_preferences(root: &Path, set: Selection) -> Result<(), String> {
+    if admission_at(root)?.is_some_and(|admission| !admission.completed) {
+        record_applied(root, set)?;
+    }
+    Ok(())
 }
 
 fn record_applied_with(
@@ -3911,7 +3928,7 @@ fn record_applied_with(
     read: impl FnOnce(&Path) -> Result<(Decision, Option<Restored>), String>,
 ) -> Result<(), String> {
     let planned = authorized_selection(root)?.unwrap_or_default();
-    let (progress, plan) = (progress(root)?, saved_plan(root)?);
+    let (mut progress, plan) = (progress(root)?, saved_plan(root)?);
     let restored = match read(root)? {
         (decision, Some(restored)) => Some((
             decision == Decision::Stopped(Stop::Restored),
@@ -3928,6 +3945,12 @@ fn record_applied_with(
                     && (stage != Stage::Workstation
                         || verified.only.is_none_or(|only| only.contains(setting)))
             });
+            if stage == Stage::Workstation && verified.done & stage.bit() == 0 {
+                let remaining = filtered(required, |setting| !set.contains(setting));
+                if remaining != required {
+                    verified.only = Some(remaining).filter(|only| !only.is_empty());
+                }
+            }
             if !required.is_empty()
                 && Setting::ALL
                     .into_iter()
@@ -3938,21 +3961,11 @@ fn record_applied_with(
         }
         if Some(verified) != progress {
             save_progress(root, verified)?;
+            progress = Some(verified);
         }
     }
     let stage_owed = progress.zip(plan.as_ref()).is_some_and(|(progress, plan)| {
-        progress.belongs_to(plan)
-            && [
-                (
-                    Stage::Workstation,
-                    preferences as fn(Selection) -> Selection,
-                ),
-                (Stage::Accounts, accounts),
-            ]
-            .into_iter()
-            .any(|(stage, part)| {
-                stage.selected(plan) && part(set).is_empty() && progress.done & stage.bit() == 0
-            })
+        progress.belongs_to(plan) && !mac_settings_kept(plan, progress.done)
     });
     if !stage_owed && !restored.is_some_and(|(_, restored)| restored.owes(planned)) {
         // Applied, keeping a Restore's record while it still stands for something.
@@ -5020,6 +5033,12 @@ pub struct InitialSetupParkMark {
     git: Option<RepositoryGit>,
     /// The selected repository inputs and pinned helper, without running either Git or helper.
     repository_inputs: Option<aterm_machines::init_github::RepositoryInputMark>,
+    /// An admitted pending Workstation stage whose local console can become available.
+    workstation_run: Option<u64>,
+    console: Option<bool>,
+    /// A still-owed, unheld Caps setting whose native service set can become available.
+    keyboard_run: Option<u64>,
+    keyboards: Option<InputServiceSet>,
     retry_due: Option<u64>,
     mac_settings_retry_due: Option<u64>,
     /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
@@ -5048,6 +5067,18 @@ impl InitialSetupParkMark {
             current
                 .as_ref()
                 .is_some_and(|current| before.as_ref() != Some(current))
+        }
+        if self.workstation_run.is_some()
+            && self.workstation_run == before.workstation_run
+            && changed(&self.console, &before.console)
+        {
+            return true;
+        }
+        if self.keyboard_run.is_some()
+            && self.keyboard_run == before.keyboard_run
+            && changed(&self.keyboards, &before.keyboards)
+        {
+            return true;
         }
         if self.network_run.is_none() || self.network_run != before.network_run {
             return false;
@@ -5092,9 +5123,33 @@ impl InitialSetupParkMark {
         self
     }
 
+    fn with_console(mut self, read: impl FnOnce() -> Option<bool>) -> Self {
+        self.console = self.workstation_run.and_then(|_| read());
+        self
+    }
+
+    fn with_keyboard_services(mut self, read: impl FnOnce() -> Result<Vec<u64>, String>) -> Self {
+        if self.keyboard_run.is_some() && self.console == Some(true) {
+            self.keyboards = read().ok().and_then(|ids| InputServiceSet::new(ids).ok());
+        }
+        self
+    }
+
     /// A contended or unreadable local state gives no new fact. Keep the
     /// last known materialization, service or Git state only within its same run.
     pub fn retain_known_from(&mut self, previous: &Self) {
+        if self.keyboard_run.is_some()
+            && self.keyboard_run == previous.keyboard_run
+            && self.keyboards.is_none()
+        {
+            self.keyboards = previous.keyboards.clone();
+        }
+        if self.workstation_run.is_some()
+            && self.workstation_run == previous.workstation_run
+            && self.console.is_none()
+        {
+            self.console = previous.console;
+        }
         if self.materialization_run.is_some()
             && self.materialization_run == previous.materialization_run
             && self.materialization.is_none()
@@ -5151,7 +5206,8 @@ impl InitialSetupParkMark {
 
     /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
     /// secrets folder and network while a pending run selects Secrets or Repositories, and Git
-    /// activation while it selects Repositories. A run without network groups watches none.
+    /// activation while it selects Repositories. The existing GUI input keeper observes a
+    /// pending Caps setting's native service set; it needs no additional watch or timer here.
     pub fn watches(&self) -> Watches {
         Watches {
             secrets: self.network_run.is_some(),
@@ -5179,6 +5235,8 @@ pub fn initial_setup_park_mark() -> InitialSetupParkMark {
     .with_lan_broker(|| access::lan_unavailable().is_some())
     .with_git(|| Some(RepositoryGit::read(&sys)))
     .with_repository_inputs(|| aterm_machines::init_github::repository_input_mark(&sys).ok())
+    .with_console(|| Some(!aterm_machines::console::remote(&sys)))
+    .with_keyboard_services(|| sys.keyboard_service_ids())
 }
 
 fn initial_setup_park_mark_at(
@@ -5236,9 +5294,13 @@ fn initial_setup_park_mark_reading(
         // A subscriber's heartbeat alone changes no setup answer.
         *heard = 0;
     }
+    let mut workstation_run = None;
+    let mut keyboard_run = None;
     let pending = root.and_then(|root| {
         let observation = observation_at(root).ok()?;
         let records = &observation.records;
+        workstation_run = pending_inputs::revision(records);
+        keyboard_run = pending_inputs::caps_revision(root, records);
         let (plan, true) = records.plan.as_ref()? else {
             return None;
         };
@@ -5291,6 +5353,10 @@ fn initial_setup_park_mark_reading(
             .map(|(_, progress, _, _, _, _)| progress.revision),
         git: None,
         repository_inputs: None,
+        workstation_run,
+        console: None,
+        keyboard_run,
+        keyboards: None,
         retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _, _)| {
             secrets_retry::retry_due(root, progress.revision, now)
         }),
@@ -6693,24 +6759,26 @@ fn current_setup_vault_plan(
 
 /// Network stages can finish while another selected stage stays pending across launches.
 /// Their old done bits cannot complete that later pass after local vault or checkout state
-/// changes. Read them without effects; an unfinished reading reopens only its ordinary stage.
+/// changes. Read them without effects; an unfinished reading reopens only its ordinary stage
+/// and is returned for a pass that is about to publish completion.
 fn revalidate_completed_network_stages(
     host: &mut dyn InitialHost,
     root: &Path,
     plan: &Plan,
     progress: &mut Progress,
-) -> Result<(), String> {
+) -> Result<Vec<(Stage, Vec<Row>)>, String> {
     let before = progress.done;
     let completed = [Stage::Secrets, Stage::Repositories];
     if !completed
         .iter()
         .any(|stage| stage.selected(plan) && before & stage.bit() != 0)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let sharing = host.swarm_enabled();
     let uses_vault = Stage::Secrets.selected(plan) && sharing == Ok(true);
     let mut current_vault = None;
+    let mut reopened = Vec::new();
     for stage in completed {
         if !stage.selected(plan) || progress.done & stage.bit() == 0 {
             continue;
@@ -6752,12 +6820,29 @@ fn revalidate_completed_network_stages(
         };
         if !reading.as_ref().is_ok_and(|rows| rows_ready(rows)) {
             progress.done &= !stage.bit();
+            let mut rows = reading.unwrap_or_else(|detail| {
+                vec![Row {
+                    name: stage.name().into(),
+                    status: "unverified".into(),
+                    detail,
+                    elapsed_ms: None,
+                }]
+            });
+            if rows.is_empty() {
+                rows.push(Row {
+                    name: stage.name().into(),
+                    status: "unverified".into(),
+                    detail: "current readiness was not returned".into(),
+                    elapsed_ms: None,
+                });
+            }
+            reopened.push((stage, rows));
         }
     }
     if progress.done != before {
         save_progress(root, *progress)?;
     }
-    Ok(())
+    Ok(reopened)
 }
 
 /// One pass over the selected stages that are not done, in order, asking `hooks` and the durable
@@ -7151,6 +7236,7 @@ fn execute_pass(
                     })
                     .ok_or("setup progress changed while the Mac settings step ran")?;
                 progress.done |= recorded.done & (Stage::Workstation.bit() | Stage::Accounts.bit());
+                progress.only = recorded.only;
             }
             if stage == Stage::Secrets {
                 vault = left;
@@ -7246,6 +7332,29 @@ fn execute_pass(
         }
     }
     if stages_finished {
+        // A final person step can outlast the vault, repository inventory or credential
+        // route observed at this pass's start. Use the same admitted plan's readback before
+        // publishing completion; completed sign-outs stay recorded while only stale network
+        // stages reopen for their ordinary guarded repair on the next pass.
+        let reopened = revalidate_completed_network_stages(host, root, &plan, &mut progress)?;
+        for (stage, rows) in reopened {
+            next = next.and(SetupNext::of(&rows));
+            let at = report.rows.len();
+            let page = if stage == Stage::Secrets {
+                Some(secrets_page(root, progress.revision, &rows))
+            } else {
+                items_page(stage, &rows)
+            };
+            if let Some(page) = page {
+                pages.push((at..at + rows.len(), page));
+            }
+            report.rows.extend(rows);
+        }
+    }
+    if Stage::ALL
+        .iter()
+        .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0)
+    {
         progress.completed = true;
         save_progress(root, progress)?;
         next = SetupNext::Done;
@@ -7420,10 +7529,12 @@ mod tests {
     mod deferred_mac_deadline_tests;
     mod embedded_restore_tests;
     mod ledger_conformance;
+    mod pending_local_inputs_tests;
     pub(super) mod run_ledger_tests;
     mod upgrade_completion_tests;
 
     type StageReading = (bool, Vec<Setting>, Vec<Subject>);
+    type AccountsEnd = Box<dyn FnOnce(&mut Fake)>;
 
     /// A pass nobody stops; acquisition no longer requires a particular page to be visible.
     const AT_THE_PAGE: SetupHooks = SetupHooks::NONE;
@@ -7442,6 +7553,8 @@ mod tests {
         vault_error: bool,
         /// A sign-out still has work, so the Accounts stage needs System State on screen.
         accounts_pending: bool,
+        /// A local input changes after the sign-outs verified their effects.
+        accounts_end: Option<AccountsEnd>,
         /// The access revision the last Permissions stage read.
         access_read: Option<u64>,
         /// While this stage runs, a person stops the run (System State's Stop)
@@ -7457,6 +7570,8 @@ mod tests {
         /// The live Accounts stage adapter over an inert account machine.
         native_accounts: Option<(aterm_machines::port::Fake, NativeHost)>,
         native_accounts_now: Option<std::time::SystemTime>,
+        /// The live preference stage adapter over an inert preference machine.
+        native_workstation: Option<NativeHost>,
         /// The reason its failed part gave ([`repositories::failure_note`]).
         repositories_failure: Option<&'static str>,
         /// Whether it stopped for want of a GitHub token ([`repositories::want_token`]).
@@ -7490,6 +7605,11 @@ mod tests {
     }
 
     impl Fake {
+        pub(super) fn with_workstation(mut self, host: NativeHost) -> Self {
+            self.native_workstation = Some(host);
+            self
+        }
+
         fn stage(&mut self, stage: Stage) -> Result<Vec<Row>, String> {
             self.calls.push(stage);
             assert_ne!(
@@ -7594,6 +7714,9 @@ mod tests {
             if rows_ready(&rows) {
                 let planned = authorized_selection(root)?.unwrap_or_default();
                 record_applied(root, accounts(planned))?;
+                if let Some(changed) = self.accounts_end.take() {
+                    changed(self);
+                }
             }
             Ok(Some(Report {
                 action: Action::Apply,
@@ -7609,6 +7732,17 @@ mod tests {
             root: &Path,
             only: Option<Selection>,
         ) -> Result<Option<Report>, String> {
+            if let Some(host) = &mut self.native_workstation {
+                self.calls.push(Stage::Workstation);
+                return apply_part_with(
+                    root,
+                    &super::super::tests::Inert::default(),
+                    host,
+                    "inert-init-preference-completion",
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+                    Part::Preferences { only },
+                );
+            }
             if first_run_complete(root)? {
                 return Ok(None);
             }
@@ -7685,10 +7819,18 @@ mod tests {
             self.repositories_failure
         }
 
-        fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
+        fn current_repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
             match &self.native_repositories {
                 Some((sys, ctx)) => {
-                    repositories::run(sys, ctx, vault, aterm_machines::model::Mode::Plan)
+                    // This host injects vault readiness separately. Observe the same native
+                    // local inputs its repositories stage applies; the repositories module's
+                    // joined-vault fixtures exercise the actual materialization boundary.
+                    aterm_machines::init_github::run_initial_repositories(
+                        sys,
+                        ctx,
+                        aterm_machines::model::Mode::Plan,
+                    )
+                    .map(item_rows)
                 }
                 None => Ok(vec![readiness_row(
                     Stage::Repositories.name(),
@@ -10377,7 +10519,8 @@ mod tests {
             host.vault_error = false;
             execute_initial(&mut host, root.path(), &mut None).unwrap();
             assert_eq!(host.calls, [Stage::Secrets, Stage::Repositories]);
-            assert_eq!(host.vault_checks, 3);
+            // One read precedes repository effects and another verifies completion.
+            assert_eq!(host.vault_checks, 4);
             assert!(finished_at(root.path()).unwrap());
         }
     }
@@ -10477,6 +10620,8 @@ mod tests {
             "inventory",
             "credential-route",
             "profile-path",
+            "inventory-during-accounts",
+            "credential-route-during-accounts",
             "unchanged",
             "stopped",
         ] {
@@ -10610,6 +10755,22 @@ mod tests {
                     assert!(paths.contains(&PathBuf::from(&new_source)));
                     assert!(!paths.contains(&PathBuf::from(&old_source)));
                 }
+                "inventory-during-accounts" => {
+                    let inventory = inventory.clone();
+                    let after = metadata("after");
+                    let changed = stat(false, after.len() as u64);
+                    host.accounts_end = Some(Box::new(move |host| {
+                        let (sys, _) = host.native_repositories.as_ref().unwrap();
+                        sys.file(&inventory, &after).stat_of(&inventory, changed);
+                    }));
+                }
+                "credential-route-during-accounts" => {
+                    let launcher = launcher.clone();
+                    host.accounts_end = Some(Box::new(move |host| {
+                        let (sys, _) = host.native_repositories.as_ref().unwrap();
+                        sys.file(&launcher, b"badexec!");
+                    }));
+                }
                 "stopped" => request_stop_at(root.path(), revision).unwrap(),
                 "unchanged" => {}
                 _ => unreachable!(),
@@ -10675,8 +10836,35 @@ mod tests {
                         "{change}: old repository readiness cannot complete a changed setup"
                     );
                     assert_eq!(saved.done & Stage::Repositories.bit(), 0, "{change}");
-                    assert!(!rows_ready(&pass.unwrap().0.rows), "{change}");
+                    let (report, next) = pass.unwrap();
+                    assert!(!rows_ready(&report.rows), "{change}");
+                    assert_ne!(next, SetupNext::Done, "{change}");
                 }
+            }
+            if change.ends_with("during-accounts") {
+                assert_ne!(saved.done & Stage::Accounts.bit(), 0);
+                let (sys, _) = host.native_repositories.as_ref().unwrap();
+                sys.file(&inventory, &before)
+                    .stat_of(&inventory, stat(false, before.len() as u64));
+                sys.file(&launcher, b"launcher");
+                host.calls.clear();
+                let repaired = execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    revision,
+                    &mut None,
+                    SetupHooks::NONE,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(rows_ready(&repaired.0.rows));
+                assert_eq!(repaired.1, SetupNext::Done);
+                assert_eq!(
+                    host.calls,
+                    [Stage::Repositories],
+                    "sign-outs stay completed"
+                );
+                assert!(progress(root.path()).unwrap().unwrap().completed);
             }
             let (sys, _) = host.native_repositories.as_ref().unwrap();
             assert!(
@@ -14285,9 +14473,12 @@ mod tests {
 
         #[test]
         fn a_completed_vault_is_rechecked_before_pending_accounts_finish() {
-            for (subscriber_stopped, person_stopped) in
-                [(false, false), (true, true), (true, false)]
-            {
+            for (subscriber_stopped, person_stopped, during_accounts) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, false),
+                (true, false, true),
+            ] {
                 let root = aterm_tempfile::tempdir().unwrap();
                 let plan = selected(&[Setting::Secrets, Setting::Messages]);
                 let lan = Lan::new(true, "home");
@@ -14315,13 +14506,19 @@ mod tests {
                 assert!(!finished_at(root.path()).unwrap());
                 assert!(lan.log().is_empty());
 
-                if subscriber_stopped {
+                if subscriber_stopped && !during_accounts {
                     lan.set(joined.clone(), false);
+                }
+                if during_accounts {
+                    let lan = Arc::clone(&lan);
+                    let joined = joined.clone();
+                    host.rest.accounts_end = Some(Box::new(move |_| lan.set(joined, false)));
                 }
                 if person_stopped {
                     request_stop_at(root.path(), revision).unwrap();
                 }
                 host.rest.waiting = None;
+                host.rest.calls.clear();
                 let resumed = execute_initial_for_revision(
                     &mut host,
                     root.path(),
@@ -14334,6 +14531,42 @@ mod tests {
                     assert!(resumed.is_none());
                     assert!(!*lan.subscribed.lock().unwrap());
                     assert!(lan.log().is_empty(), "Stop authorizes no subscriber repair");
+                } else if during_accounts {
+                    let (report, next) = resumed.unwrap();
+                    assert!(!rows_ready(&report.rows), "{:?}", report.rows);
+                    assert_ne!(next, SetupNext::Done);
+                    assert!(!*lan.subscribed.lock().unwrap());
+                    assert!(
+                        lan.log().is_empty(),
+                        "readback does not repair the subscriber"
+                    );
+                    let saved = progress(root.path()).unwrap().unwrap();
+                    assert_eq!(saved.done & Stage::Secrets.bit(), 0);
+                    assert_ne!(saved.done & Stage::Accounts.bit(), 0);
+                    assert!(!finished_at(root.path()).unwrap());
+                    assert_eq!(host.rest.calls, [Stage::Accounts]);
+
+                    host.rest.calls.clear();
+                    let (repaired, next) = execute_initial_for_revision(
+                        &mut host,
+                        root.path(),
+                        revision,
+                        &mut None,
+                        SetupHooks::NONE,
+                    )
+                    .unwrap()
+                    .expect("the ordinary Secrets stage repairs its withdrawn subscriber");
+                    assert!(rows_ready(&repaired.rows), "{:?}", repaired.rows);
+                    assert_eq!(next, SetupNext::Done);
+                    assert!(
+                        host.rest.calls.is_empty(),
+                        "verified sign-outs do not repeat"
+                    );
+                    assert_eq!(
+                        lan.log().iter().filter(|entry| *entry == "install").count(),
+                        1
+                    );
+                    assert!(finished_at(root.path()).unwrap());
                 } else {
                     assert!(resumed.is_some());
                     assert!(

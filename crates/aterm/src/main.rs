@@ -670,6 +670,10 @@ pub(crate) fn main() -> ExitCode {
 }
 
 fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
+    #[cfg(unix)]
+    if let Some(code) = argv.get(1..).and_then(aterm_resource_host::entry) {
+        return code;
+    }
     // First, while this process has one thread: a build's claim holder forks away from its
     // front's spawn (BUILD-ADMIT), and a window's tethered helper starts as its verb.
     if let Some(code) = atpkg::build_admit::hold::entry() {
@@ -688,6 +692,10 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     settle_developer_dir();
     #[cfg(target_os = "macos")]
     aterm_uds::process::register_allocator_relief(compact_zone::release_free_memory);
+    // Every aterm process keeps its LAN while no broker is installed on a Mac whose aterm macOS
+    // already allowed (docs/DESIGN-lan-broker-2026-11-05.md §5); it reads nothing until then.
+    #[cfg(target_os = "macos")]
+    aterm_lan::provide_direct();
     #[cfg(windows)]
     if let Some(code) = aterm_pty::serve_console_client() {
         return code;
@@ -806,19 +814,15 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
 
     let argv0 = argv0_os
         .as_ref()
-        .map(|a| {
-            std::path::Path::new(a)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        })
+        .and_then(|a| std::path::Path::new(a).file_name())
+        .map(std::ffi::OsStr::to_string_lossy)
         .unwrap_or_default();
     let argv0 = argv0
         .strip_suffix(std::env::consts::EXE_SUFFIX)
         .unwrap_or(&argv0);
     let first = rest
         .first()
-        .map(|a| a.to_string_lossy().into_owned())
+        .map(|a| a.to_string_lossy())
         .unwrap_or_default();
     match alias_route(argv0, &first) {
         AliasRoute::Ctl => return aterm_ctl::main_entry_with(rest, CTL_LOCAL),
@@ -892,6 +896,17 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
             aterm_cli::Verb::ResourceRun => aterm_ctl::resource_run_main_entry(forwarded),
+            aterm_cli::Verb::ResourceInspect => {
+                #[cfg(unix)]
+                if aterm_ctl::native_resource_inspection::register(
+                    aterm_resource_host::inspect_native,
+                )
+                .is_err()
+                {
+                    return ExitCode::from(75);
+                }
+                aterm_ctl::resource_inspect_main_entry(forwarded)
+            }
             aterm_cli::Verb::Pkg => package_entry(forwarded),
             aterm_cli::Verb::Agh => agh::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
@@ -977,28 +992,26 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
             }
             #[cfg(unix)]
             aterm_cli::Verb::Secrets => {
-                let first = forwarded
-                    .first()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_owned);
-                if first.as_deref() == Some("need") {
+                let first = forwarded.first().and_then(|s| s.to_str());
+                if first == Some("need") {
                     // The need verbs read the lab's table, which aterm-db holds.
                     return aterm_db::credentials::cli::main_entry(
                         forwarded.into_iter().skip(1).collect(),
                     );
                 }
-                if first.as_deref() == Some("service-repair") {
+                if first == Some("service-repair") {
                     return service_repair::run(forwarded.into_iter().skip(1).collect());
                 }
+                let sync_after = matches!(
+                    first,
+                    Some("join" | "sync" | "set" | "init" | "create" | "edit")
+                );
                 #[cfg(target_os = "macos")]
                 let code = input_attachments::secrets_entry(forwarded);
                 #[cfg(not(target_os = "macos"))]
                 let code = aterm_secrets::cli::main_entry(forwarded);
                 if code == ExitCode::SUCCESS
-                    && matches!(
-                        first.as_deref(),
-                        Some("join" | "sync" | "set" | "init" | "create" | "edit")
-                    )
+                    && sync_after
                     && let Ok(env) = aterm_agent::harness::cli::Env::from_process()
                     && let (Some(home), Some(roster_path)) =
                         (env.home.as_deref(), env.accounts_roster())
@@ -1075,37 +1088,37 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
         return aterm_cli::amacs_launch::run(rest.get(1..).unwrap_or(&[]).to_vec());
     }
 
-    if aterm_cli::is_tool_candidate(Some(first.as_str())) && store_resolves(&first) {
-        // `run <tool> -- <args…>`: `pkg run` strips exactly one leading `--`, so the tool's
-        // own flags are never parsed by it and a user's `--` survives. `split_first`, not
-        // `rest[0]`/`rest[1..]`: the verifier refuted both bounds checks.
-        if let Some((tool, tool_args)) = rest.split_first() {
+    if aterm_cli::is_tool_candidate(Some(&first)) {
+        if store_resolves(&first) {
+            // `run <tool> -- <args…>`: `pkg run` strips exactly one leading `--`, so the tool's
+            // own flags are never parsed by it and a user's `--` survives. `split_first`, not
+            // `rest[0]`/`rest[1..]`: the verifier refuted both bounds checks.
+            if let Some((tool, tool_args)) = rest.split_first() {
+                let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
+                run_args.push(OsString::from("--"));
+                run_args.extend(tool_args.iter().cloned());
+                return atpkg::cli::main_entry(run_args);
+            }
+        }
+
+        if pending_stub_resolves(&first) {
+            let Some((tool, tool_args)) = rest.split_first() else {
+                return ExitCode::from(2);
+            };
+            let mut pending_args: Vec<OsString> = vec![OsString::from("__pending"), tool.clone()];
+            pending_args.extend(tool_args.iter().cloned());
+            return atpkg::cli::main_entry(pending_args);
+        }
+
+        if atpkg::stub::describe(&first).is_some() || atpkg::stub::program_of(&first) != first {
+            let Some((tool, tool_args)) = rest.split_first() else {
+                return ExitCode::from(2);
+            };
             let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
             run_args.push(OsString::from("--"));
             run_args.extend(tool_args.iter().cloned());
             return atpkg::cli::main_entry(run_args);
         }
-    }
-
-    if aterm_cli::is_tool_candidate(Some(first.as_str())) && pending_stub_resolves(&first) {
-        let Some((tool, tool_args)) = rest.split_first() else {
-            return ExitCode::from(2);
-        };
-        let mut pending_args: Vec<OsString> = vec![OsString::from("__pending"), tool.clone()];
-        pending_args.extend(tool_args.iter().cloned());
-        return atpkg::cli::main_entry(pending_args);
-    }
-
-    if aterm_cli::is_tool_candidate(Some(first.as_str()))
-        && (atpkg::stub::describe(&first).is_some() || atpkg::stub::program_of(&first) != first)
-    {
-        let Some((tool, tool_args)) = rest.split_first() else {
-            return ExitCode::from(2);
-        };
-        let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
-        run_args.push(OsString::from("--"));
-        run_args.extend(tool_args.iter().cloned());
-        return atpkg::cli::main_entry(run_args);
     }
 
     let scan = rest.get(..payload_boundary(&rest)).unwrap_or(&rest);
@@ -1123,9 +1136,9 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
             ControlFlow::Break(code) => return code,
             ControlFlow::Continue(spawn) => spawn,
         };
-        let handoff = match &spawn {
-            Some(request) => spawn_handoff_argv(request),
-            None => rest.clone(),
+        let handoff: std::borrow::Cow<'_, [OsString]> = match &spawn {
+            Some(request) => std::borrow::Cow::Owned(spawn_handoff_argv(request)),
+            None => std::borrow::Cow::Borrowed(&rest),
         };
         return run_window(mode_args, window_host_for(scan), &handoff);
     }
@@ -4134,7 +4147,8 @@ trait SetupRetryHost {
     fn register(&mut self);
     fn apply(&mut self) -> Result<PassNext, String>;
     /// Wait a minute before the next pass, or less once a wake ends it (never a window's focus
-    /// gain). `true` when a person pressed Check again meanwhile: the run's tries start afresh.
+    /// gain). `true` when a person pressed Check again or the pending preferences' console
+    /// returned meanwhile: the run's tries start afresh.
     fn backoff(&mut self) -> bool;
     /// Wait until something a parked run waits on may have moved: a person's
     /// grant, Check again, a new plan, Stop, System State coming to the front, a
@@ -4197,7 +4211,7 @@ fn release_setup_pass<C, B>(claim: &mut Option<C>, busy: &mut Option<B>) {
 /// Give the slot and the claim back and wait before trying a pass again. Nothing the run failed
 /// counts as retried meanwhile: what it waits on (a claim another process holds, a failing read)
 /// may last, and its failure must reach the menu line (System State design §3.6). A person's
-/// Check again meanwhile starts the run's tries afresh (`retries`).
+/// Check again or a useful console return meanwhile starts the run's tries afresh (`retries`).
 #[cfg(any(target_os = "macos", test))]
 fn back_off_before_a_pass<H: SetupRetryHost>(
     host: &mut H,
@@ -4544,7 +4558,7 @@ impl SetupRetryHost for LiveSetupRetry {
         // window gaining focus does not: it is no reason to try again sooner.
         let seen = self.wakes_seen;
         SETUP_WAKES.back_off_run(&mut self.wakes_seen, std::time::Duration::from_secs(60));
-        self.wakes_seen.checked_since(seen)
+        self.wakes_seen.refreshed_since(seen)
     }
     fn park(&mut self) -> bool {
         // Local vault facts, interfaces for pending Secrets or Repositories, the
@@ -4619,12 +4633,12 @@ impl SetupRetryHost for LiveSetupRetry {
         );
         self.park_due_seen
             .consume(mark.retry_due(), mark.mac_settings_retry_due());
-        // A fact the park is marked on that moved since the last pass began, or a person's
-        // Check again, starts the run's tries afresh; a due try or any other wake does not.
+        // A fact the park is marked on, a useful console return, or a person's Check again
+        // starts the run's tries afresh; a due try or any other wake does not.
         before_pass
             .as_ref()
             .is_some_and(|before| mark.facts_changed_since(before))
-            || SETUP_WAKES.marks().checked_since(seen)
+            || SETUP_WAKES.marks().refreshed_since(seen)
     }
     fn retrying(&mut self, retrying: bool) {
         set_setup_retrying(self.revision, retrying);
@@ -5164,7 +5178,7 @@ mod alab_watch_tests {
 mod setup_retry_tests {
     use super::{
         PassNext, SETUP_RETRY_LIMIT, SetupRetryHost, SetupWakes, begin_check_again, idle_after,
-        run_setup_retry,
+        run_setup_retry, wake_setup_for_console_with,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -5605,7 +5619,8 @@ mod setup_retry_tests {
 
     /// A window's focus gain ends a run's wait only where the run waits on what a person does in
     /// System Settings or macOS (an Accounts or Permissions stage left); the startup's waits hear
-    /// every one. Any other wake ends a run's wait, and only Check again starts its tries afresh.
+    /// every one. Any other wake ends a run's wait; Check again and a useful native input
+    /// start its tries afresh.
     #[test]
     fn a_focus_gain_ends_only_a_run_wait_that_listens_for_it() {
         use std::time::Duration;
@@ -5632,6 +5647,57 @@ mod setup_retry_tests {
         assert!(!wakes.marks().checked_since(seen), "no press");
         wakes.raise_check();
         assert!(wakes.marks().checked_since(seen));
+    }
+
+    #[test]
+    fn a_current_console_return_refreshes_retry_without_becoming_check_again() {
+        use std::time::Duration;
+        let wakes = SetupWakes::new();
+        let seen = wakes.marks();
+        wake_setup_for_console_with(
+            || Ok(Some(17)),
+            |revision| {
+                assert_eq!(revision, 17);
+                false
+            },
+            || wakes.raise_input(),
+        )
+        .unwrap();
+        assert!(wakes.wait_for_run(seen, false, Duration::ZERO));
+        assert!(wakes.marks().refreshed_since(seen));
+        assert!(
+            !wakes.marks().checked_since(seen),
+            "a local input grants no ledger override"
+        );
+        let mut consumed = seen;
+        assert!(wakes.back_off_run(&mut consumed, Duration::ZERO));
+        assert!(consumed.refreshed_since(seen));
+        assert!(!wakes.back_off_run(&mut consumed, Duration::ZERO));
+        assert!(
+            !wakes.marks().refreshed_since(consumed),
+            "one recovery, not a retry loop"
+        );
+        let current = wakes.marks();
+        for (revision, stopped) in [(None, false), (Some(18), true)] {
+            wake_setup_for_console_with(
+                || Ok(revision),
+                |read| {
+                    assert_eq!(Some(read), revision);
+                    stopped
+                },
+                || panic!("Off, withdrawn, or stopped preferences wake no run"),
+            )
+            .unwrap();
+        }
+        assert!(
+            wake_setup_for_console_with(
+                || Err("records unread".into()),
+                |_| panic!("unknown revision"),
+                || panic!("unread scope")
+            )
+            .is_err()
+        );
+        assert_eq!(wakes.marks(), current);
     }
 
     #[test]
@@ -6692,6 +6758,9 @@ struct WakeMarks {
     /// A fact a parked run watches may have moved ([`SetupWakes::raise_facts`]): counted apart
     /// from `all`, so a park or local membership wait ends on it, but a retry backoff does not.
     facts: u64,
+    /// A useful native console return for a current pending settings run. It restarts only
+    /// the retry budget; it is never a person's Check or a ledger-hold override.
+    inputs: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -6715,6 +6784,10 @@ impl WakeMarks {
     fn checked_since(self, seen: Self) -> bool {
         self.checks != seen.checks
     }
+
+    fn refreshed_since(self, seen: Self) -> bool {
+        self.checked_since(seen) || self.inputs != seen.inputs
+    }
 }
 
 /// A count of wakes and the condition a parked or backing-off worker waits on.
@@ -6733,6 +6806,7 @@ impl SetupWakes {
                 focus: 0,
                 checks: 0,
                 facts: 0,
+                inputs: 0,
             }),
             raised: std::sync::Condvar::new(),
         }
@@ -6761,6 +6835,10 @@ impl SetupWakes {
     /// A person pressed Check again.
     fn raise_check(&self) {
         self.raise_with(|marks| marks.checks = marks.checks.wrapping_add(1));
+    }
+
+    fn raise_input(&self) {
+        self.raise_with(|marks| marks.inputs = marks.inputs.wrapping_add(1));
     }
 
     /// A fact a parked run watches may have moved (`aterm_cli::macos_doctor::ParkWatch`): the
@@ -7104,6 +7182,31 @@ fn wake_setup_for_check() {
 #[cfg(target_os = "macos")]
 fn wake_setup_facts() {
     SETUP_WAKES.raise_facts();
+}
+
+/// A native console return can make an unheld Workstation stage runnable. Recheck its exact
+/// current revision and the process's immediate Stop; the eventual pass owns every effect.
+#[cfg(target_os = "macos")]
+fn wake_setup_for_console() -> Result<(), String> {
+    wake_setup_for_console_with(
+        aterm_cli::macos_doctor::initial_setup_pending_workstation_revision,
+        setup_stop_requested,
+        || SETUP_WAKES.raise_input(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wake_setup_for_console_with(
+    current: impl FnOnce() -> Result<Option<u64>, String>,
+    stopped: impl FnOnce(u64) -> bool,
+    wake: impl FnOnce(),
+) -> Result<(), String> {
+    if let Some(revision) = current()?
+        && !stopped(revision)
+    {
+        wake();
+    }
+    Ok(())
 }
 
 /// What the setup worker hears from the window, registered once before the GUI
@@ -13770,11 +13873,10 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     aterm_gui::install_session_log();
     let build = aterm_gui::running_build_number();
     let first = rest.first().map(|a| a.to_string_lossy());
-    let words = rest
+    let mut non_verbose = rest
         .iter()
-        .filter(|a| !matches!(a.to_str(), Some("-v" | "--verbose")))
-        .collect::<Vec<_>>();
-    if words.len() == 1 && words[0] == "identity" {
+        .filter(|a| !matches!(a.to_str(), Some("-v" | "--verbose")));
+    if non_verbose.next().is_some_and(|a| a == "identity") && non_verbose.next().is_none() {
         return match aterm_update::binary_identity_json(&aterm_gui::running_binary_identity()) {
             Ok(identity) => {
                 println!("{identity}");
@@ -14072,6 +14174,26 @@ fn staged_tries(staged: u64, lane: Option<&aterm_update::ApplyLaneReport>) -> u3
         .map_or(0, |lane| lane.failures_for_target)
 }
 
+fn downloaded_update_line(
+    running_version: &str,
+    running_build: u64,
+    staged_version: Option<&str>,
+    staged_build: u64,
+) -> String {
+    let next = staged_version
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("build {staged_build}"));
+    let (next, running) = if next == running_version {
+        (
+            format!("build {staged_build}"),
+            format!("build {running_build}"),
+        )
+    } else {
+        (next, running_version.to_string())
+    };
+    format!("aterm {next} is downloaded (running {running})")
+}
+
 /// What `aterm update status|check` says: one plain line for stdout and, when something is
 /// wrong, one for stderr.
 #[allow(
@@ -14107,9 +14229,9 @@ fn update_summary(
         })
         .filter(|(b, _)| *b > build)
     {
-        let next = staged.1.unwrap_or_else(|| format!("build {}", staged.0));
+        let downloaded = downloaded_update_line(version, build, staged.1.as_deref(), staged.0);
         return (
-            format!("aterm {next} is downloaded \u{2014} `aterm update apply` installs it"),
+            format!("{downloaded} \u{2014} `aterm update apply` installs it"),
             None,
         );
     }
@@ -14168,16 +14290,14 @@ fn update_summary(
         return (line, None);
     }
     if let Some(staged) = st.staged_build.filter(|staged| *staged > build) {
-        let next = st
-            .staged_version
-            .clone()
-            .unwrap_or_else(|| format!("build {staged}"));
+        let downloaded =
+            downloaded_update_line(version, build, st.staged_version.as_deref(), staged);
         if let Some(refusal) = lane
             .map(|lane| lane.last_refusal.trim())
             .filter(|refusal| !refusal.is_empty())
         {
             return (
-                format!("aterm {next} is downloaded; installation is waiting"),
+                format!("{downloaded}; installation is waiting"),
                 Some(refusal.to_string()),
             );
         }
@@ -14189,13 +14309,13 @@ fn update_summary(
                 format!("{failed} tries")
             };
             (
-                format!("aterm {next} is downloaded but didn\u{2019}t install ({tries})"),
+                format!("{downloaded} but didn\u{2019}t install ({tries})"),
                 Some(log_hint.to_string()),
             )
         } else if installs_by_itself {
             (
                 format!(
-                    "aterm {next} is downloaded and installs within a minute while an aterm \
+                    "{downloaded} and installs within a minute while an aterm \
                      window is open"
                 ),
                 None,
@@ -14203,7 +14323,7 @@ fn update_summary(
         } else {
             (
                 format!(
-                    "aterm {next} is downloaded \u{2014} install it from Settings \u{25b8} \
+                    "{downloaded} \u{2014} install it from Settings \u{25b8} \
                      Software Update"
                 ),
                 None,
@@ -16035,6 +16155,70 @@ mod tests {
         assert!(summary(&staged, Some(&lane), true).1.is_none());
         staged.staged_build = None;
         assert!(summary(&staged, Some(&lane), true).1.is_none());
+    }
+
+    #[test]
+    fn downloaded_update_summaries_distinguish_candidate_and_running_identity() {
+        for linux in [false, true] {
+            for next in [Some("0.92.0"), Some("0.91.0"), None] {
+                for automatic in [false, true] {
+                    for lane in [
+                        aterm_update::ApplyLaneReport::default(),
+                        aterm_update::ApplyLaneReport {
+                            last_refusal: "waiting for work to retire".into(),
+                            ..Default::default()
+                        },
+                        aterm_update::ApplyLaneReport {
+                            last_failure_target_build: 101,
+                            failures_for_target: 1,
+                            ..Default::default()
+                        },
+                    ] {
+                        let mut status = update_status();
+                        status.staged_build = Some(101);
+                        status.staged_version = next.map(str::to_owned);
+                        if linux {
+                            status.linux = Some(aterm_update::LinuxUpdateStatus {
+                                installed_build: 100,
+                                installed_version: "0.91.0".into(),
+                                staged_build: Some(101),
+                                staged_version: next.map(str::to_owned),
+                                staged_commit: None,
+                                trial_phase: None,
+                                trial_starts: 0,
+                                trial_healthy: true,
+                                refused_newer: false,
+                            });
+                        }
+                        let line = update_summary(
+                            "0.91.0",
+                            100,
+                            &status,
+                            Some(&lane),
+                            0,
+                            automatic,
+                            true,
+                            &DevCopy::No,
+                            "details",
+                        )
+                        .0;
+                        let (candidate, running) = if next == Some("0.91.0") {
+                            ("101", "100")
+                        } else {
+                            (next.unwrap_or("101"), "0.91.0")
+                        };
+                        assert!(
+                            line.contains(candidate),
+                            "missing candidate {candidate}: {line}"
+                        );
+                        assert!(
+                            line.contains(running),
+                            "missing running identity {running}: {line}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn scratch_layout(label: &str) -> atpkg::store::Layout {

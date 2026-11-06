@@ -578,16 +578,19 @@ impl<'a> Table<'a> {
     /// Outlines a glyph.
     #[inline]
     pub fn outline(&self, glyph_id: GlyphId, builder: &mut dyn OutlineSink) -> Option<Rect> {
+        self.outline_within(glyph_id, builder, &mut crate::work::OutlineWork::default())
+    }
+
+    /// [`Table::outline`] under `work`.
+    pub(crate) fn outline_within(
+        &self,
+        glyph_id: GlyphId,
+        builder: &mut dyn OutlineSink,
+        work: &mut crate::work::OutlineWork,
+    ) -> Option<Rect> {
         let mut b = Builder::new(Transform::default(), RectF::new(), builder);
         let glyph_data = self.get(glyph_id)?;
-        outline_impl(
-            self.loca_table,
-            self.data,
-            glyph_data,
-            0,
-            &mut b,
-            &mut crate::work::OutlineWork::default(),
-        )?
+        outline_impl(self.loca_table, self.data, glyph_data, 0, &mut b, work)?
     }
 
     /// [`Table::outline`], also sending each stored point to `tap`.

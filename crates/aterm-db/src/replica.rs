@@ -33,6 +33,9 @@ use std::{
 
 /// The bound of a table-ID list: the tables one Mac selects, and a round's clock mark.
 pub const MAX_TABLES: usize = 64;
+
+/// One selected table's digest, operation digests, and conflict proof keys.
+pub type MeshTableSummary = (Digest, BTreeSet<Digest>, BTreeSet<ProofKey>);
 /// The bound of one table's operation inventory.
 pub const MAX_RECORDS: usize = 8192;
 /// The bound of one table's conflict-proof inventory.
@@ -1160,6 +1163,43 @@ impl Replica {
         })
     }
 
+    /// Whether this Mac takes `table`'s records now, held or not (the mesh's `Inventory` asks
+    /// before a neighbour gives it a table it does not hold): a table it selects, which a
+    /// declaration that entered a moment ago subscribes; or a table of a ring's current window it
+    /// has no storage for, which it takes up here as a repair round takes up one a peer offers
+    /// (`adopt_ring_tables`: held durably under the control writer, local policy honoured), so the
+    /// next selection lists it. A take-up that does not happen now (policy, no storage slot left,
+    /// recovery, a writer it could not get) answers `false`, and the table is offered again on the
+    /// next exchange, as a round's is.
+    ///
+    /// # Errors
+    /// Custody, admission, the subscription read or the ring window's read fails.
+    pub fn mesh_takes(&self, table: Digest) -> Result<bool> {
+        let mut round = self.round(None)?;
+        round.select_tables(None, &mut Report::default())?;
+        if round.tables.contains_key(&table) {
+            return Ok(true);
+        }
+        let (Some((directory, _)), Some(policy)) = (&round.commons, &round.policy) else {
+            return Ok(false);
+        };
+        if directory.is_recovery() {
+            return Ok(false);
+        }
+        let now = round.now;
+        if !round
+            .local(None, |session| directory.ring_window(session, now))?
+            .contains(&table)
+        {
+            return Ok(false);
+        }
+        let offered = BTreeSet::from([table]);
+        let taken = round.local_write(None, |session| {
+            directory.adopt_ring_tables(session, policy, now, &offered)
+        });
+        Ok(taken.is_ok_and(|taken| taken.contains_key(&table)))
+    }
+
     /// The tables this replica selects (its subscriptions), by digest.
     ///
     /// # Errors
@@ -1168,6 +1208,35 @@ impl Replica {
         let mut round = self.round(None)?;
         round.select_tables(None, &mut Report::default())?;
         Ok(round.tables.keys().copied().collect())
+    }
+
+    /// Each selected table with its operation digests and conflict proof keys, read in one
+    /// catalog selection and one store open per table.
+    ///
+    /// # Errors
+    /// Custody, admission, the subscription read, or a busy store fails.
+    pub fn mesh_tables_summary(&self) -> Result<Vec<MeshTableSummary>> {
+        let mut round = self.round(None)?;
+        round.select_tables(None, &mut Report::default())?;
+        let tables: Vec<Digest> = round.tables.keys().copied().collect();
+        round.local(None, |session| {
+            let mut out = Vec::with_capacity(tables.len());
+            for &table in &tables {
+                round.active_table.set(Some(table));
+                match round.store(session, table) {
+                    Ok(store) => {
+                        let ids = store.inventory(session)?.copied().collect();
+                        let proofs = store.proof_inventory(session)?;
+                        out.push((table, ids, proofs));
+                    }
+                    Err(error) if error.is_busy() => return Err(error),
+                    Err(_) => {
+                        out.push((table, BTreeSet::new(), BTreeSet::new()));
+                    }
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// A round with no channel peer that has selected this Mac's tables, with `table` its active
@@ -1634,19 +1703,26 @@ impl Round<'_> {
         if let Some(salt) = salt {
             listed.insert(witness::ask(salt));
         }
-        let received = match side {
-            Side::Initiator => exchange_ids(stream, side, &listed, MAX_TABLES, || {
-                self.local(peer, |_| Ok(()))
-            })?,
+        let (received, answered) = match side {
+            Side::Initiator => {
+                let received = exchange_ids(stream, side, &listed, MAX_TABLES, || {
+                    self.local(peer, |_| Ok(()))
+                })?;
+                if self.witnesses {
+                    witness::split(received)
+                } else {
+                    (received, witness::Heard::default())
+                }
+            }
             Side::Responder => {
                 // As `exchange_ids`, but a peer's ask is answered in the list this side sends:
                 // the witnesses of the tables both list, as many chunks as fit below the bound.
                 let received = receive_ids(stream, MAX_TABLES)?;
                 self.local(peer, |_| Ok(()))?;
-                let (tables, heard) = if self.witnesses {
-                    witness::split(received.clone())
+                let (received, heard) = if self.witnesses {
+                    witness::split(received)
                 } else {
-                    (BTreeSet::new(), witness::Heard::default())
+                    (received, witness::Heard::default())
                 };
                 if let [salt] = heard.asks[..] {
                     // The peer starts over with this side: this side's next round asks it too,
@@ -1663,8 +1739,11 @@ impl Round<'_> {
                     {
                         repair.listed_ms = None;
                     }
-                    let (tables, _) = crate::clock::split(&tables);
-                    let common: BTreeSet<_> = local.intersection(&tables).copied().collect();
+                    let common: BTreeSet<_> = local
+                        .intersection(&received)
+                        .filter(|id| crate::clock::read_mark(id).is_none())
+                        .copied()
+                        .collect();
                     // Only the chunks that fit go out, so only their tables are read.
                     let room = MAX_TABLES.saturating_sub(listed.len());
                     let witnesses = self.table_witnesses(
@@ -1678,16 +1757,11 @@ impl Round<'_> {
                     self.local(peer, |_| Ok(()))?;
                 }
                 send_ids(stream, &listed, MAX_TABLES)?;
-                received
+                (received, heard)
             }
         };
-        let (received, answered) = if self.witnesses {
-            witness::split(received)
-        } else {
-            (received, witness::Heard::default())
-        };
         let (remote, heard) = if self.marks {
-            crate::clock::split(&received)
+            crate::clock::split_owned(received)
         } else {
             (received, crate::clock::Heard::Nothing)
         };

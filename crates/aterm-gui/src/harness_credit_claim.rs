@@ -614,6 +614,7 @@ pub(crate) fn claim_order(offer: &Offer, folder: Option<&Path>) -> crate::task_l
         agent: aterm_phase::Program::Claude,
         model: None,
         caller: None,
+        manager_node: None,
         trusted_cwd: folder
             .and_then(Path::to_str)
             .and_then(crate::spawn_folder::canonical_folder),

@@ -220,7 +220,7 @@ fn head(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<String> {
     let on_no_origin = || {
         Error::protocol(format!(
             "{} is on none of this client's origins",
-            Redactor::shapes(&req.url)
+            Redactor::shapes_cow(&req.url)
         ))
     };
     let (origin, path_and_query) = Origin::parse(&req.url).ok_or_else(on_no_origin)?;
@@ -424,10 +424,10 @@ by_slug!(
 );
 
 /// One line of a taped text: `Redactor::shapes`, with a CR or LF written as a space.
-fn one_line(text: &str) -> String {
-    let shaped = Redactor::shapes(text);
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    let shaped = Redactor::shapes_cow(text);
     if shaped.contains(['\r', '\n']) {
-        shaped.replace(['\r', '\n'], " ")
+        std::borrow::Cow::Owned(shaped.replace(['\r', '\n'], " "))
     } else {
         shaped
     }
@@ -835,7 +835,7 @@ pub fn failure(error: &WireError) -> Vec<u8> {
         "failed {} {} {}",
         phase_word(error.phase),
         error.kind.slug(),
-        Redactor::shapes(&error.detail)
+        Redactor::shapes_cow(&error.detail)
     )
     .into_bytes()
 }

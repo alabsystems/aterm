@@ -240,7 +240,7 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 fn wanted(ctx: &Ctx) -> Vec<StageId> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
     if ctx.compile_only {
-        wanted.retain(|id| *id == StageId::TestCompile);
+        wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::MeasurePrebuild));
     }
     if ctx.cursor_pacing {
         wanted.retain(|id| *id == StageId::GuiSmoke);
@@ -248,7 +248,7 @@ fn wanted(ctx: &Ctx) -> Vec<StageId> {
     if ctx.scope.selects_nothing() {
         wanted.retain(|id| *id != StageId::TestCompile);
     }
-    if folds(ctx, &wanted) || named_skip(ctx, StageId::MeasuringTests) {
+    if folds(ctx, &wanted) || (!ctx.compile_only && named_skip(ctx, StageId::MeasuringTests)) {
         wanted.retain(|id| *id != StageId::MeasurePrebuild);
     }
     wanted
@@ -739,6 +739,40 @@ mod tests {
             plan(&ctx(&[Check::Test], Scope::Workspace))
                 .iter()
                 .any(|s| s.id == StageId::Test)
+        );
+    }
+
+    #[test]
+    fn compile_only_measure_builds_its_matrix_without_a_product_or_timing_admission() {
+        let parsed = crate::cli::parse(["measure", "--compile-only"]).unwrap();
+        assert!(parsed.compile_only);
+        assert!(crate::cli::parse(["release", "--app", "a", "--compile-only"]).is_err());
+        assert!(
+            crate::cli::parse(["measure", "--app", "a", "--compile-only", "--cursor-pacing"])
+                .is_err()
+        );
+        let prepare = ctx(&[Check::Measure], Scope::Workspace).with_compile_only(true);
+        let planned = plan(&prepare);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].id, StageId::MeasurePrebuild);
+        assert!(!planned[0].id.timed());
+        assert!(prepare.rerun(Check::Measure).ends_with(" --compile-only"));
+        // NEGATIVE CONTROL: the normal command must still execute the matrices and GUI smoke.
+        let normal = ctx(&[Check::Measure], Scope::Workspace)
+            .with_measure_artifact(Some(crate::MeasureArtifact::unnamed("/a/aterm.app")));
+        assert!(
+            plan(&normal)
+                .iter()
+                .any(|s| s.id == StageId::MeasuringTests)
+        );
+        assert!(plan(&normal).iter().any(|s| s.id == StageId::GuiSmoke));
+        assert_ne!(
+            crate::disk::selection_of(&prepare),
+            crate::disk::selection_of(&normal)
+        );
+        assert_eq!(
+            crate::disk::scope_of(&prepare),
+            crate::disk::scope_of(&normal)
         );
     }
 

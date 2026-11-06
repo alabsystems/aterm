@@ -790,12 +790,12 @@ fn a_need_told_before_a_restart_is_told_once_across_it() {
             .notice
             .is_some()
     );
-    let row = before.carry_of(1).row().expect("a row");
+    let row = before.carry_of(1, 0).row().expect("a row");
     assert!(row.contains("told_ids="), "{row}");
     let carried = StatusCarry::parse(&row);
-    assert_eq!(carried.told_ids, before.told_ids(1));
-    let left = told_ids_row(&before.told_ids(1)).expect("a leaf's row");
-    assert_eq!(parse_told_ids(&left), before.told_ids(1));
+    assert_eq!(carried.told_ids, before.told_ids(1, 0));
+    let left = told_ids_row(&before.told_ids(1, 0)).expect("a leaf's row");
+    assert_eq!(parse_told_ids(&left), before.told_ids(1, 0));
 
     // A seamless update: B stands, then A comes back.
     let mut update = Herald::default();
@@ -863,6 +863,46 @@ fn a_need_told_before_a_restart_is_told_once_across_it() {
             .notice
             .is_some()
     );
+}
+
+/// AN OWNER'S TURN THE HERALD HAS NOT NOTED YET IS NOT CARRIED AWAY (§14.18, 2026-11-05 review):
+/// a keypress re-notes no row, so the memory of a need told before the owner's plain Enter stands
+/// in the slot until the next note forgets it. What a restart carries (`told_ids`, `carry_of`) is
+/// the memory at the tab's turn now: none once the owner has had a turn since, so a need told
+/// before that Enter is news again after a restart, as it would have been in the same process.
+/// CONTROL: at the turn the memory was kept under, the ids ride the restart and the need stays
+/// quiet. Mutant: `told_ids` ignoring the turn carries the memory, and the need is quiet.
+#[test]
+fn an_owner_turn_not_yet_noted_is_not_carried_across_a_restart() {
+    let t0 = std::time::Instant::now();
+    let mut before = Herald::default();
+    assert!(
+        note(&mut before, Some(&asks(&[A])), true, at(t0, 0))
+            .notice
+            .is_some()
+    );
+    let told = before.told_ids(1, 0);
+    assert!(!told.is_empty(), "PRECONDITION: A told at turn 0");
+    let restart = |turn: u64| {
+        let carry = StatusCarry::parse(&before.carry_of(1, turn).row().unwrap_or_default());
+        let mut after = Herald::default();
+        after.adopt(1, carry, 1_000, at(t0, 1));
+        let _ = note(&mut after, None, true, at(t0, 1));
+        note(&mut after, Some(&asks(&[A])), true, at(t0, 2))
+    };
+    // The owner pressed Enter (turn 1) after A was told; nothing re-noted the row before the quit.
+    assert!(before.told_ids(1, 1).is_empty(), "their turn spent it");
+    assert!(before.carry_of(1, 1).told_ids.is_empty());
+    let news = restart(1);
+    assert_eq!(
+        body(&news),
+        Some(format!("worker: {A}").as_str()),
+        "news again after their turn: {news:?}"
+    );
+    // CONTROL: no turn since.
+    assert_eq!(before.carry_of(1, 0).told_ids, told);
+    let quiet = restart(0);
+    assert!(quiet.notice.is_none(), "told once across it: {quiet:?}");
 }
 
 /// TOLD ONCE ACROSS THE FLEET (design §14.18): a content survey row names its ask's needs as this

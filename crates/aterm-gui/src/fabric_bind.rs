@@ -85,6 +85,12 @@ impl FabricSession for crate::SessionCtx {
         self.watchers.ring_watchers();
     }
 
+    /// A hold decides what the startup deadline may judge, so the host looks right after it moves,
+    /// and a hold standing at that look is seen.
+    fn hold_moved(&self) {
+        crate::harness_host::ring();
+    }
+
     fn holder_token(&self) -> Option<String> {
         let now = crate::metrics::now_us();
         self.turn_lease

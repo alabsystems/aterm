@@ -691,6 +691,7 @@ pub(super) fn log_path(
                 name: name.to_owned(),
                 label: label.clone(),
             };
+            let denies = log_entries::Denies::read(paths, &log, &opened, Some(lock))?;
             let signed = super::readmit::sign_seat_move(
                 &mut log,
                 &opened,
@@ -698,6 +699,7 @@ pub(super) fn log_path(
                 &signer,
                 (*seat, *cutoff),
                 entrant,
+                &denies,
                 now_ms,
             )?;
             let admit = signed

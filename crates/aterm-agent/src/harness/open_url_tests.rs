@@ -821,14 +821,7 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
                 let result = match method {
                     "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
                     "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
-                    "Page.enable" | "Runtime.enable" | "Page.navigate" | "Target.closeTarget" => {
-                        aterm_json::json!({})
-                    }
-                    "Browser.close" => {
-                        let reply = format!("{{\"id\":{id},\"result\":{{}}}}\0");
-                        let _ = from_browser_w.write_all(reply.as_bytes());
-                        return;
-                    }
+                    "Page.enable" | "Runtime.enable" | "Page.navigate" => aterm_json::json!({}),
                     "Runtime.evaluate" => {
                         eval_step += 1;
                         let val = match eval_step {
@@ -869,7 +862,7 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
         &mut cdp,
         authorize_url,
         None,
-        Duration::from_secs(10),
+        aterm_spec::wait::MUST_HAPPEN,
         Duration::ZERO,
         |em| {
             assert_eq!(em, Some("m27@example.test"));
@@ -880,6 +873,9 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
             Ok(200)
         },
     );
+    // The stand-in ends at its pipe's end, not at the drive's `Browser.close`: that teardown is
+    // best effort, on budgets of its own a loaded machine can overrun.
+    drop(cdp);
     browser_thread.join().expect("stand-in browser thread");
     assert_eq!(res, Ok(()));
     assert_eq!(
@@ -1629,14 +1625,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                             .unwrap_or("t1");
                         aterm_json::json!({"sessionId": format!("s_{tid}")})
                     }
-                    "Page.enable" | "Runtime.enable" | "Page.navigate" | "Target.closeTarget" => {
-                        aterm_json::json!({})
-                    }
-                    "Browser.close" => {
-                        let reply = format!("{{\"id\":{id},\"result\":{{}}}}\0");
-                        let _ = from_browser_w.write_all(reply.as_bytes());
-                        return;
-                    }
+                    "Page.enable" | "Runtime.enable" | "Page.navigate" => aterm_json::json!({}),
                     "Runtime.evaluate" if session_id == "s_t2" || session_id == "s_t3" => {
                         webmail_step += 1;
                         let expr = msg
@@ -1781,6 +1770,9 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             Ok(200)
         },
     );
+    // Its pipe's end ends the stand-in, not the drive's best-effort `Browser.close`.
+    drop(cdp);
+    browser_thread.join().expect("browser thread");
     assert_eq!(res, Ok(()));
     assert_eq!(
         delivered,
@@ -1788,7 +1780,10 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             "http://127.0.0.1:9123/callback?code=auth_code_webmail&state=st_webmail_42".to_owned()
         ]
     );
-    browser_thread.join().expect("browser thread");
+    // The Maildir polls below take a client whose browser is gone, as that one's now is.
+    let (_, to_browser_w) = std::io::pipe().expect("pipe1");
+    let (from_browser_r, _) = std::io::pipe().expect("pipe2");
+    let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
 
     fn poll_webmail_fixture(
         cfg: &MailboxConfig,
@@ -2455,9 +2450,6 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                     out.push(0);
                     let _ = from_w.write_all(&out);
                     let _ = from_w.flush();
-                    if method == "Browser.close" {
-                        return;
-                    }
                 }
             }
         });
@@ -2466,16 +2458,17 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             &mut wrong_cdp,
             "https://claude.com/cai/oauth/authorize?client_id=c1&redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=st_wrong",
             Some("sol-m27@proton.me"),
-            Duration::from_secs(5),
+            aterm_spec::wait::MUST_HAPPEN,
             Duration::ZERO,
             |_, _| Err("mailbox must not be polled on wrong_account"),
             |_| Ok(200),
         );
+        drop(wrong_cdp);
+        wrong_thread.join().expect("wrong_account browser fixture");
         assert_eq!(
             wrong_res,
             Err("headless browser profile is signed in to a different account")
         );
-        wrong_thread.join().expect("wrong_account browser fixture");
 
         assert_eq!(
             super::super::headless_oauth::derive_account_label_from_email("sol-m27@proton.me")
@@ -3262,9 +3255,8 @@ fn recovered_callbacks_require_delivery_but_reached_callbacks_allow_duplicates()
                             aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result}))
                                 .unwrap();
                         out.push(0);
-                        from_w.write_all(&out).unwrap();
-                        from_w.flush().unwrap();
-                        if method == "Browser.close" {
+                        // A teardown reply the drive stopped waiting for finds its reader gone.
+                        if from_w.write_all(&out).is_err() {
                             return;
                         }
                     }

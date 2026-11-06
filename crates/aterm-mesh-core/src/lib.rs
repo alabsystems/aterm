@@ -64,6 +64,9 @@ verify_island! {
     #[path = "revocation_binding_island.rs"]
     mod revocation_binding;
     #[rustfmt::skip]
+    #[path = "revocation_no_leak_binding_island.rs"]
+    mod revocation_no_leak_binding;
+    #[rustfmt::skip]
     #[path = "capacity_binding_island.rs"]
     mod capacity_binding;
 }
@@ -96,4 +99,9 @@ verify_island! {
     #[rustfmt::skip]
     #[path = "convergence_binding_island.rs"]
     mod convergence_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "gap_heal_binding_island.rs"]
+    mod gap_heal_binding;
 }

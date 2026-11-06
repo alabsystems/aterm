@@ -35,6 +35,7 @@ mod gates;
 mod harness_versions;
 
 mod github;
+mod github_remote;
 
 mod hook;
 
@@ -86,7 +87,16 @@ mod trust_lock;
 mod trust_oblig;
 mod verify;
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match github_remote::helper_arguments(&args) {
+        Ok(Some(args)) => return agh::cli::main_entry(args),
+        Ok(None) => {}
+        Err(why) => {
+            eprintln!("aterm-release: {why}");
+            return std::process::ExitCode::from(2);
+        }
+    }
     cutter::judge_at_start();
     std::process::exit(cli::run());
 }

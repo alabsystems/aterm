@@ -15,6 +15,45 @@ pub struct MacroBody {
 
 const DARWIN_MACROS: &[MacroBody] = &[
     MacroBody {
+        name: "CMSG_LEN",
+        is_const: true,
+        body: "(cmsg_align(::core::mem::size_of::<cmsghdr>()) + length as usize) as c_uint",
+    },
+    MacroBody {
+        name: "CMSG_SPACE",
+        is_const: true,
+        body: "(cmsg_align(::core::mem::size_of::<cmsghdr>()) + cmsg_align(length as usize)) as c_uint",
+    },
+    MacroBody {
+        name: "CMSG_FIRSTHDR",
+        is_const: false,
+        body: r"// SAFETY: the caller supplies a valid msghdr describing one control allocation.
+unsafe {
+    if (*mhdr).msg_controllen as usize >= ::core::mem::size_of::<cmsghdr>() {
+        (*mhdr).msg_control.cast::<cmsghdr>()
+    } else { ::core::ptr::null_mut() }
+}",
+    },
+    MacroBody {
+        name: "CMSG_DATA",
+        is_const: false,
+        body: r"// SAFETY: the caller supplies a header in its valid control-message allocation.
+unsafe { (cmsg as *mut c_uchar).add(cmsg_align(::core::mem::size_of::<cmsghdr>())) }",
+    },
+    MacroBody {
+        name: "CMSG_NXTHDR",
+        is_const: false,
+        body: r"// SAFETY: both pointers describe the caller's valid control allocation/header.
+unsafe {
+    if cmsg.is_null() { return CMSG_FIRSTHDR(mhdr); }
+    let next = cmsg as usize + cmsg_align((*cmsg).cmsg_len as usize);
+    let max = (*mhdr).msg_control as usize + (*mhdr).msg_controllen as usize;
+    if next + cmsg_align(::core::mem::size_of::<cmsghdr>()) > max {
+        ::core::ptr::null_mut()
+    } else { next as *mut cmsghdr }
+}",
+    },
+    MacroBody {
         name: "WSTOPSIG",
         is_const: true,
         body: "status >> 8",
@@ -229,6 +268,11 @@ pub fn safety_doc(name: &str) -> Option<&'static [&'static str]> {
             "`msg_controllen` describe one allocation.",
         ],
         "CMSG_LEN" | "CMSG_SPACE" => ARITHMETIC,
+        "CMSG_DATA" => &["`cmsg` must point to a header in a valid control-message allocation."],
+        "CMSG_NXTHDR" => &[
+            "`mhdr` must describe one valid control allocation; `cmsg` is null or points",
+            "to a valid header within it whose length can be read.",
+        ],
         _ => return None,
     })
 }

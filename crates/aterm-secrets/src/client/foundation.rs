@@ -5,12 +5,31 @@
 //! retried byte-for-byte; an already published root is finished, never replaced.
 //! `aterm secrets commons init` founds it at a person's word ([`admin_commons_init`]); the
 //! converge pass of a vault's only admin founds it by itself ([`commons_foundable`],
-//! [`admin_commons_found_by_default`]), under the same authority.
+//! [`admin_commons_found_by_default`]), under the same authority. One founding runs on a Mac
+//! at a time ([`FoundationLock`]).
 
 use super::*;
-use crate::commons::{bootstrap::Descriptor, node::Node};
+use crate::commons::{
+    bootstrap::{Availability, Bootstrap, Descriptor},
+    node::Node,
+};
+use aterm_uds::file_lock::LockFile;
 
 const PREPARED: &str = "commons-foundation";
+
+/// The lock one founding on this Mac holds from its read of the vault and of a kept attempt
+/// ([`prepare`]) through the publication that carries it ([`FoundationLock`]).
+const LOCK: &str = "commons-foundation.lock";
+
+/// How long `aterm secrets commons init` waits for another founding on this Mac to let
+/// [`LOCK`] go: a window's founding by default reads the vault, publishes once and syncs,
+/// each exchange under its request's own deadline (a publication's is `transport::EXCHANGE`).
+const WAITS_OUT: Duration = Duration::from_secs(600);
+
+/// How long a founding's read-back waits for this Mac's subscriber, which the publication
+/// wakes, to let the vault's state lock go ([`installed`]): its apply of one version holds the
+/// lock for a moment.
+const SETTLE: Duration = Duration::from_secs(5);
 
 /// The first release whose approver shares the Commons root with every machine it lets in, an
 /// open approval included (`enrollment::include_approved`), and counts an `Open` decision as
@@ -103,6 +122,47 @@ pub enum Foundable {
     /// The vault's state is changing (a sync holds its lock), as the Commons observation reads
     /// it busy: the next read finds it settled.
     Busy,
+}
+
+/// One founding of this vault's Commons on this Mac at a time: a person's `aterm secrets
+/// commons init` and a window's founding by default each hold it from their read of the vault
+/// and of a kept attempt ([`prepare`]) through the publication that carries it, so neither
+/// publishes from a copy of the vault the other's publication made stale, which the server
+/// refuses (its 409). Let go by `LOCK_UN` as it drops ([`LockFile`]).
+struct FoundationLock {
+    _held: LockFile,
+}
+
+impl FoundationLock {
+    /// The lock, waited for up to [`WAITS_OUT`]: a person's command waits out a window's
+    /// founding.
+    fn held_waiting(paths: &Paths) -> crate::Result<Self> {
+        Self::held_by(paths, Instant::now() + WAITS_OUT)?.ok_or_else(|| {
+            Error::new(format!(
+                "another founding of this vault's Commons on this Mac held {} for {} minutes: run \
+                 it again once it ends",
+                paths.dir.join(LOCK).display(),
+                WAITS_OUT.as_secs() / 60
+            ))
+        })
+    }
+
+    /// The lock where it is free; `None` while another founding on this Mac holds it.
+    fn held_if_free(paths: &Paths) -> crate::Result<Option<Self>> {
+        Self::held_by(paths, Instant::now())
+    }
+
+    /// The lock, taken by `deadline` ([`LockFile::take`], which tries once at least); `None`
+    /// while another holder has it then.
+    fn held_by(paths: &Paths, deadline: Instant) -> crate::Result<Option<Self>> {
+        fsx::ensure_private_dir(&paths.dir)?;
+        let path = paths.dir.join(LOCK);
+        match LockFile::take(&path, deadline, "another founding holds it") {
+            Ok(held) => Ok(Some(Self { _held: held })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+        }
+    }
 }
 
 fn prepared(paths: &Paths) -> crate::Result<Option<Descriptor>> {
@@ -332,10 +392,27 @@ fn published_root(paths: &Paths, admin: &Admin) -> crate::Result<Option<Descript
     Ok(Some(descriptor))
 }
 
+/// The Commons root installed here, read once this Mac's subscriber lets the vault's state lock
+/// go, by `deadline`: a founding's publication wakes it, and its apply holds the lock for a
+/// moment, which a read at once meets as busy ([`Bootstrap::observe_until`]).
+///
+/// # Errors
+/// The local state, the applied copy or the Commons custody cannot be read, or the root is not
+/// visible here: the state lock still held at `deadline` says the vault is busy.
+fn installed(paths: &Paths, deadline: Instant) -> crate::Result<Bootstrap> {
+    match Bootstrap::observe_until(paths, deadline)? {
+        Availability::Available(bootstrap) => Ok(*bootstrap),
+        Availability::Unavailable(reason) => {
+            Err(reason.failure("published Commons control is not visible after sync"))
+        }
+    }
+}
+
 fn finish(paths: &Paths, descriptor: &Descriptor, published: bool) -> crate::Result<CommonsInit> {
     let _ = sync(paths, None)?;
-    let bootstrap = crate::commons::bootstrap::Bootstrap::cached(paths)?
-        .ok_or_else(|| Error::new("published Commons control is not visible after sync"))?;
+    #[cfg(test)]
+    tests::synced();
+    let bootstrap = installed(paths, Instant::now() + SETTLE)?;
     if bootstrap.trust() != descriptor.trust() {
         return Err(Error::new(
             "installed Commons history belongs to another foundation",
@@ -358,6 +435,46 @@ fn finish(paths: &Paths, descriptor: &Descriptor, published: bool) -> crate::Res
     })
 }
 
+/// Finish the published root `descriptor`, publishing nothing but, at `commons init`
+/// (`vouch`), the approvals an earlier aterm's founding left out ([`vouched`]).
+fn finish_published(
+    paths: &Paths,
+    descriptor: &Descriptor,
+    vouch: bool,
+) -> crate::Result<CommonsInit> {
+    // Readiness first, so a run that fails has changed nothing.
+    let done = finish(paths, descriptor, false)?;
+    if !vouch {
+        return Ok(done);
+    }
+    // After this build's founding every machine it shares the root with holds a decision,
+    // this admin included (`audience` names it). A root whose admin holds none was founded
+    // by an earlier aterm, which recorded none; on any other root an undecided machine in
+    // the audience came by an edit that recorded no decision, which never admits it.
+    let admin = admin_open(paths)?;
+    let own = machine_identity(paths)?.recipient();
+    if admin.admissions.evidence(&own).is_some() {
+        return Ok(done);
+    }
+    let vouched = vouched(&admin, &admin.doc);
+    if vouched.is_empty() {
+        return Ok(done);
+    }
+    let approved = approve(paths, &admin, &admin.doc, vouched)?;
+    Ok(CommonsInit { approved, ..done })
+}
+
+/// After a founding's publication met another that landed first (the server's 409, which
+/// stored nothing of it): reopen the vault once and finish the root that landed so, if one did
+/// (`vouch` as [`finish_published`]'s); `None` where none did, and the attempt kept in
+/// [`PREPARED`] is published again at the next try.
+fn landed_first(paths: &Paths, vouch: bool) -> crate::Result<Option<CommonsInit>> {
+    let admin = admin_open(paths)?;
+    published_root(paths, &admin)?
+        .map(|descriptor| finish_published(paths, &descriptor, vouch))
+        .transpose()
+}
+
 /// Initialize Commons on an existing vault, or finish an earlier uncertain attempt.
 /// Existing roots and local history are never replaced. All current vault machines
 /// receive the control descriptor, and the same publication records an approval of each one
@@ -365,32 +482,21 @@ fn finish(paths: &Paths, descriptor: &Descriptor, published: bool) -> crate::Res
 /// vault's `Open` on an open one ([`approve`]). On a published root an earlier aterm
 /// founded, which recorded no decisions, a call that finds the root ready records it for
 /// each machine in the root's audience still without one; on a root this build founded it
-/// approves nothing. Membership still requires the normal proofs.
+/// approves nothing. Membership still requires the normal proofs. It waits for another
+/// founding on this Mac to end ([`FoundationLock`]), and a publication that another landed
+/// before finishes the root that landed so, if one did ([`landed_first`]).
 ///
 /// # Errors
 /// The caller is not an admin, the vault is unbound or has an opaque control entry,
 /// unrelated local Commons history exists, the retained descriptor is for another
-/// authority, or publication/bootstrap fails.
+/// authority, another founding on this Mac held its lock past [`WAITS_OUT`], or
+/// publication/bootstrap fails (where another publish landed first with no root, the
+/// error, of [`crate::ErrorKind::NotStored`], says to run it again).
 pub fn admin_commons_init(paths: &Paths) -> crate::Result<CommonsInit> {
+    let _founding = FoundationLock::held_waiting(paths)?;
     let admin = admin_open(paths)?;
     if let Some(descriptor) = published_root(paths, &admin)? {
-        // Readiness first, so a run that fails has changed nothing.
-        let done = finish(paths, &descriptor, false)?;
-        // After this build's founding every machine it shares the root with holds a decision,
-        // this admin included (`audience` names it). A root whose admin holds none was founded
-        // by an earlier aterm, which recorded none; on any other root an undecided machine in
-        // the audience came by an edit that recorded no decision, which never admits it.
-        let admin = admin_open(paths)?;
-        let own = machine_identity(paths)?.recipient();
-        if admin.admissions.evidence(&own).is_some() {
-            return Ok(done);
-        }
-        let vouched = vouched(&admin, &admin.doc);
-        if vouched.is_empty() {
-            return Ok(done);
-        }
-        let approved = approve(paths, &admin, &admin.doc, vouched)?;
-        return Ok(CommonsInit { approved, ..done });
+        return finish_published(paths, &descriptor, true);
     }
     if admin.doc.commons_audience().is_some() {
         return Err(Error::new(
@@ -410,7 +516,18 @@ pub fn admin_commons_init(paths: &Paths) -> crate::Result<CommonsInit> {
         &descriptor.bytes(),
     )
     .map_err(|error| Error::new(error.to_string()))?;
-    let approved = approve(paths, &admin, &doc, vouched(&admin, &doc))?;
+    let approved = match approve(paths, &admin, &doc, vouched(&admin, &doc)) {
+        Ok(approved) => approved,
+        Err(error) if error.kind() == crate::ErrorKind::NotStored => {
+            return landed_first(paths, true)?.ok_or_else(|| {
+                Error::of_kind(
+                    crate::ErrorKind::NotStored,
+                    format!("{error}: another publish landed first: run it again"),
+                )
+            });
+        }
+        Err(error) => return Err(error),
+    };
     Ok(CommonsInit {
         approved,
         ..finish(paths, &descriptor, true)?
@@ -498,16 +615,26 @@ pub fn commons_foundable(paths: &Paths) -> crate::Result<Foundable> {
 /// does. `Open` keeps the anchored credentials (identity, roster, agh token, Name) from them,
 /// where a recorded `Manual` would say a person approved them. On a published root it finishes
 /// what it finds and records nothing, where `commons init` adds the approvals an earlier aterm
-/// left out.
+/// left out. It founds nothing while another founding on this Mac holds its lock
+/// ([`FoundationLock`]), and a publication that another landed before finishes the root that
+/// landed so, if one did ([`landed_first`]).
 ///
 /// # Errors
-/// As [`admin_commons_init`]'s, and where the vault names an admin besides this Mac or is not
-/// open, or this Mac's approver would leave the Macs it lets in later outside Commons
-/// (`approver_strands`), each before anything is prepared or published.
+/// As [`admin_commons_init`]'s but for its wait on the lock, and where the vault names an admin
+/// besides this Mac or is not open, or this Mac's approver would leave the Macs it lets in later outside Commons
+/// (`approver_strands`), each before anything is prepared or published; where another founding
+/// on this Mac holds its lock, before anything is read; and where another publish landed first
+/// with no root ([`crate::ErrorKind::NotStored`]).
 pub fn admin_commons_found_by_default(paths: &Paths) -> crate::Result<CommonsInit> {
+    let Some(_founding) = FoundationLock::held_if_free(paths)? else {
+        return Err(Error::new(
+            "another founding of this vault's Commons runs on this Mac now (`aterm secrets \
+             commons init`, or another aterm's pass)",
+        ));
+    };
     let admin = admin_open(paths)?;
     if let Some(descriptor) = published_root(paths, &admin)? {
-        return finish(paths, &descriptor, false);
+        return finish_published(paths, &descriptor, false);
     }
     let own = machine_identity(paths)?.recipient().to_bech32();
     founds_by_default(&admin.published_doc, admin.commons_bound, &own)
@@ -532,7 +659,18 @@ pub fn admin_commons_found_by_default(paths: &Paths) -> crate::Result<CommonsIni
                 .map(|machine| (machine.recipient, AdmissionMethod::Open)),
         )
         .collect::<Vec<_>>();
-    let _ = publish_as(paths, &admin, &doc, false, &admissions, false)?;
+    match publish_as(paths, &admin, &doc, false, &admissions, false) {
+        Ok(_) => {}
+        Err(error) if error.kind() == crate::ErrorKind::NotStored => {
+            return landed_first(paths, false)?.ok_or_else(|| {
+                Error::of_kind(
+                    crate::ErrorKind::NotStored,
+                    format!("{error}: another publish landed first"),
+                )
+            });
+        }
+        Err(error) => return Err(error),
+    }
     let approved = doc
         .machines()
         .into_iter()

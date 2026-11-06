@@ -179,7 +179,7 @@ pub(super) fn reclaim_on(
                 .map(PathBuf::as_path)
                 .chain([current])
                 .collect();
-            fence.clear_all(&paths)
+            fence.clear_all(current, &paths)
         };
         // A stage an earlier pass left is in its stage from its intent on.
         let asked = if why == Unused::Unfinished {

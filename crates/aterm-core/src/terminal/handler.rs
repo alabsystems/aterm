@@ -264,10 +264,13 @@ impl TerminalHandler<'_> {
         self.transient.owed_len().saturating_add(additional_len) <= MAX_RESPONSE_BUFFER_SIZE
     }
 
-    /// Queue an OSC app-event `(code, payload)` for the host to poll.
+    /// Queue an OSC app-event `(code, payload)` for the host to poll, building the payload only
+    /// when the host polls.
     #[inline]
-    pub(super) fn queue_osc_event(&mut self, code: u32, payload: String) {
-        self.transient.osc_events.push(code, payload);
+    pub(super) fn queue_osc_event(&mut self, code: u32, payload: impl FnOnce() -> String) {
+        if self.transient.osc_events.polled() {
+            self.transient.osc_events.push(code, payload());
+        }
     }
 
     /// Filter DCS data for echoing in responses.
@@ -295,16 +298,11 @@ pub(super) fn apply_absolute_row_update(
         shell.current_block = None;
         marks_state.marks.clear();
         marks_state.annotations.clear();
-        transient
-            .osc_events
-            .retain(|code, payload| shell_event_row(payload, code).is_none());
+        transient.osc_events.drop_marks();
         return;
     };
 
-    transient.osc_events.rewrite(|code, payload| {
-        let (command, row, col) = shell_event_row(payload, code)?;
-        (row >= at).then(|| format!("{command};row={};col={col}", row.saturating_add(inserted)))
-    });
+    transient.osc_events.shift_marks(at, inserted);
 
     let shift_point = |row: &mut u64| {
         if *row >= at {
@@ -526,21 +524,6 @@ const fn restart_prompt(prompt: &mut u64, command: &mut Option<u64>, top: u64) {
 #[path = "scrollback_erase_anchor_tests.rs"]
 mod scrollback_erase_anchor_tests;
 
-fn shell_event_row(payload: &str, code: u32) -> Option<(char, u64, u16)> {
-    if code != 133 {
-        return None;
-    }
-    let (command, rest) = payload.split_once(";row=")?;
-    let command = match command {
-        "A" => 'A',
-        "B" => 'B',
-        "C" => 'C',
-        _ => return None,
-    };
-    let (row, col) = rest.split_once(";col=")?;
-    Some((command, row.parse().ok()?, col.parse().ok()?))
-}
-
 /// The gates every program-originated reply passes, debiting the rate limit at the batch's clock when both open.
 pub(super) fn program_response_admitted(
     policy: &mut super::policy_gates::PolicyState,
@@ -583,7 +566,8 @@ mod absolute_row_update_tests {
 
         let mut revision = 0;
         let mut transient = TransientState::new();
-        transient.osc_events.push(133, "A;row=3;col=0".into());
+        transient.osc_events.set_polled(true);
+        transient.osc_events.push_mark('A', 3, 0);
         transient.osc_events.push(133, "D;exit=0".into());
         transient.osc_events.push(7, "/tmp".into());
         apply_absolute_row_update(
@@ -601,7 +585,7 @@ mod absolute_row_update_tests {
         assert_eq!(marks.marks[0].row, 4);
         assert_eq!(marks.annotations[0].row, 4);
         assert_eq!(
-            transient.osc_events.iter().cloned().collect::<Vec<_>>(),
+            transient.osc_events.snapshot(),
             vec![
                 (133, "A;row=4;col=0".into()),
                 (133, "D;exit=0".into()),
@@ -620,10 +604,11 @@ mod absolute_row_update_tests {
         let mut shell = ShellIntegrationState::new();
         let mut marks = MarksState::new();
         let mut transient = TransientState::new();
+        transient.osc_events.set_polled(true);
+        for (command, col) in [('A', 0), ('B', 1), ('C', 2)] {
+            transient.osc_events.push_mark(command, 3, col);
+        }
         for event in [
-            (133, "A;row=3;col=0".into()),
-            (133, "B;row=3;col=1".into()),
-            (133, "C;row=3;col=2".into()),
             (133, "D;exit=0".into()),
             (7, "/tmp".into()),
             (52, "clipboard".into()),
@@ -641,7 +626,7 @@ mod absolute_row_update_tests {
         );
 
         assert_eq!(
-            transient.osc_events.iter().cloned().collect::<Vec<_>>(),
+            transient.osc_events.snapshot(),
             vec![
                 (133, "D;exit=0".into()),
                 (7, "/tmp".into()),

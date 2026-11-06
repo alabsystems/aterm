@@ -51,6 +51,49 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
           clones complete without fetching an unpublished Git commit. This does not exempt \
           its registry dependencies from the third-party ratchet.",
     },
+    FirstPartyVendored {
+        dir: "vendor/trust-jobserver-utils",
+        upstream: "Trust src/jobserver_utils at 263e40c542b1; the manifest's \
+          [package.metadata.aterm-origin] records the commit and path",
+        why: "Original Andrew Yates code: Trust's own scheduling descriptor handoff, added to \
+          Trust on 2026-10-24, which depends on the registry `jobserver` crate rather than \
+          copying it. Runtime and test sources are unchanged from the recorded commit \
+          (vendor/trust-jobserver-utils/README.aterm.md); the manifest only isolates the package \
+          and drops an upstream workspace-relative path. A path dependency keeps hermetic \
+          releases and public clones complete. This does not exempt its registry dependencies \
+          from the third-party ratchet.",
+    },
+    FirstPartyVendored {
+        dir: "vendor/trust-resource-controller",
+        upstream: "Trust crates/trust-resource-controller at 0116515bbffd; the manifest's \
+          [package.metadata.aterm-vendor] records the repository and commit",
+        why: "Original Andrew Yates code shared with the Trust compiler: the private native \
+          resource member proxy codec. Its Rust source is exact upstream; the manifest only \
+          redirects libc to aterm-libc (vendor/trust-resource-controller/README.aterm.md). A \
+          path dependency keeps hermetic releases and public clones complete. This does not \
+          exempt its registry dependencies from the third-party ratchet.",
+    },
+    FirstPartyVendored {
+        dir: "vendor/trust-resource-provenance",
+        upstream: "Trust crates/trust-resource-provenance at 1f4f39cd0f69; the manifest's \
+          [package.metadata.aterm-vendor] records the repository and commit",
+        why: "Original Andrew Yates code shared with the Trust compiler: read-only native \
+          provenance for retained resource custodians. Its Rust sources, README and licences \
+          are exact upstream bytes, whose SHA-256 values \
+          vendor/trust-resource-provenance/README.aterm.md records; the manifest only redirects \
+          dependencies to maintained first-party crates. A path dependency keeps hermetic \
+          releases and public clones complete. This does not exempt its registry dependencies \
+          from the third-party ratchet.",
+    },
+    FirstPartyVendored {
+        dir: "vendor/trust-sha2",
+        upstream: "Trust crates/trust-sha2 at 21a4afd96990; the manifest's \
+          [package.metadata.aterm-origin] records the commit and path",
+        why: "Original Andrew Yates code: Trust's own SHA-2 family, transcribed from FIPS PUB \
+          180-4, with no dependencies. vendor/trust-build-cpu's manifest points its hash \
+          dependency here (vendor/README-trust-build-cpu.md). A path dependency keeps hermetic \
+          releases and public clones complete.",
+    },
 ];
 
 /// The roster row whose directory contains `rel`, if any.
@@ -167,10 +210,18 @@ pub fn stale_rows(root: &Path) -> Vec<&'static FirstPartyVendored> {
         .collect()
 }
 
-/// Consumers under `crates/` whose dependency resolves inside `rel_root`,
-/// including paths inherited from the workspace, sorted and deduplicated.
+/// Consumers whose dependency resolves inside `rel_root`, sorted and deduplicated: each member
+/// under `crates/` (by its directory name, paths inherited from the workspace included), and
+/// each roster root (by its `vendor/…` path) whose own manifest depends on it while that root is
+/// itself consumed. A first-party crate reached only through another one (`trust-sha2` through
+/// `trust-build-cpu`) is in the graph; a roster root that only other unconsumed roots reach,
+/// a cycle among them included, is not.
 #[must_use]
 pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
+    path_dependants_outside(root, rel_root, &mut vec![rel_root.to_owned()])
+}
+
+fn path_dependants_outside(root: &Path, rel_root: &str, visiting: &mut Vec<String>) -> Vec<String> {
     let target = normalize(&root.join(rel_root));
     let workspace = crate::read_regular_text(root.join("Cargo.toml"))
         .ok()
@@ -196,6 +247,31 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         out.push(name);
+    }
+    for row in FIRST_PARTY_VENDORED {
+        if visiting.iter().any(|seen| seen == row.dir) {
+            continue;
+        }
+        let vendored = root.join(row.dir);
+        let Some(doc) = crate::read_regular_text(vendored.join("Cargo.toml"))
+            .ok()
+            .and_then(|text| text.parse::<DocumentMut>().ok())
+        else {
+            continue;
+        };
+        // A roster root is excluded from the workspace, so it inherits nothing from it.
+        if !dependency_paths(&doc, None, root, &vendored)
+            .iter()
+            .any(|path| path.starts_with(&target))
+        {
+            continue;
+        }
+        visiting.push(row.dir.to_owned());
+        let consumed = !path_dependants_outside(root, row.dir, visiting).is_empty();
+        visiting.pop();
+        if consumed {
+            out.push(row.dir.to_owned());
+        }
     }
     out.sort();
     out.dedup();
@@ -402,5 +478,43 @@ mod tests {
         )
         .unwrap();
         assert!(path_dependants(root, "vendor/trust-build-cpu").is_empty());
+    }
+
+    #[test]
+    fn a_roster_root_reached_through_a_consumed_one_is_consumed() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let member = root.join("crates/member");
+        let cpu = root.join("vendor/trust-build-cpu");
+        let sha2 = root.join("vendor/trust-sha2");
+        for dir in [&member, &cpu, &sha2] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            cpu.join("Cargo.toml"),
+            "[dependencies]\nsha2 = { package = 'trust-sha2', path = '../trust-sha2' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sha2.join("Cargo.toml"),
+            "[dependencies]\ncpu = { path = '../trust-build-cpu' }\n",
+        )
+        .unwrap();
+        let manifest = member.join("Cargo.toml");
+        // Unconsumed, the two roots reach each other and nothing else: neither is consumed.
+        std::fs::write(&manifest, "[package]\nname = 'member'\n").unwrap();
+        assert!(path_dependants(root, "vendor/trust-sha2").is_empty());
+        assert!(path_dependants(root, "vendor/trust-build-cpu").is_empty());
+        std::fs::write(
+            &manifest,
+            "[dependencies]\ncpu = { path = '../../vendor/trust-build-cpu' }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            path_dependants(root, "vendor/trust-sha2"),
+            ["vendor/trust-build-cpu"]
+        );
+        assert_eq!(path_dependants(root, "vendor/trust-build-cpu"), ["member"]);
     }
 }

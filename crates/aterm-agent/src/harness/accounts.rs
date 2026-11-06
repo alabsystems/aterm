@@ -5250,6 +5250,16 @@ pub struct WindowFig {
     pub epoch_at: Option<i64>,
 }
 
+/// The windows a sample read with no reset named ([`Account::unnamed_windows`]): each a share used
+/// and the latest its window can end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnnamedWindows {
+    /// The five-hour window.
+    pub session: Option<(u32, i64)>,
+    /// The week.
+    pub week: Option<(u32, i64)>,
+}
+
 impl WindowFig {
     /// Returns whether this window reading's reset timestamp is still in the future at `now`.
     #[must_use]
@@ -5589,6 +5599,51 @@ impl Account {
     #[must_use]
     pub fn room_since(&self) -> Option<i64> {
         self.cleared_at.max(self.room_at)
+    }
+
+    /// When its newest wall on record was observed, whether or not it still stands. A lapsed wall
+    /// stays in the record until a read lifts it ([`note_room`]), a clearing or another account's
+    /// reading removes it, or a newer wall takes its place ([`MAX_WALLS`]), so this outlasts the wall.
+    /// A lifted wall ([`Wall::cleared`]) counts for nothing.
+    #[must_use]
+    pub fn walled_at(&self) -> Option<i64> {
+        self.walls
+            .values()
+            .filter(|wall| !wall.cleared)
+            .map(|wall| wall.at)
+            .max()
+    }
+
+    /// What its [`Self::sample`] read of the five-hour window and of the week where that read named
+    /// no reset, each with the latest it can end ([`Sample::session`], [`Sample::week`]). No
+    /// [`WindowFig`] holds such a window ([`sample_fig`]). A word that a reset was used since the
+    /// sample, or a clearing since it, leaves nothing of it.
+    #[must_use]
+    pub fn unnamed_windows(&self, now: i64) -> UnnamedWindows {
+        let Some(sample) = self
+            .sample
+            .as_ref()
+            .filter(|sample| self.cleared_at.is_none_or(|cleared| sample.at > cleared))
+        else {
+            return UnnamedWindows::default();
+        };
+        let unnamed =
+            |reset: Option<i64>, said: Option<&WindowSaid>, figure: Option<(u32, i64)>| {
+                let refilled = said.is_some_and(|w| w.pct.is_none() && w.at >= sample.at);
+                figure.filter(|_| reset.is_none() && !refilled)
+            };
+        UnnamedWindows {
+            session: unnamed(
+                sample.session_reset,
+                self.warned_session.as_ref(),
+                sample.session(now),
+            ),
+            week: unnamed(
+                sample.week_reset,
+                self.warned_week.as_ref(),
+                sample.week(now),
+            ),
+        }
     }
 
     /// Returns the latest timestamp until which a standing wall blocks this account at `now`.
@@ -8220,6 +8275,34 @@ pub fn launch_row<'a>(
         })
 }
 
+/// Whether a Claude Code worker whose starter runs as `who` may leave its starter's row: rotation
+/// is on, and `who` is this machine's own stored login. The launcher asks this before it reads
+/// any record, so a launch under `Off` reads none.
+#[must_use]
+pub fn claude_worker_may_move(mode: Mode, who: &ProcessLogin) -> bool {
+    mode != Mode::Off && who.default_home && who.stored_login
+}
+
+/// The starter's row and the row a Claude Code worker whose starter runs as `who` starts on, where
+/// it moves at all: [`claude_worker_may_move`], the roster lists several, and [`worker_row`] moves
+/// it. This is the one rule the task launcher follows and a survey reports, so what a survey says
+/// a launch would start on cannot drift from what the launch does.
+#[must_use]
+pub fn claude_worker_move<'a>(
+    roster: &'a Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    who: &ProcessLogin,
+    mode: Mode,
+    now: i64,
+) -> Option<(&'a str, &'a Row)> {
+    if !claude_worker_may_move(mode, who) || !roster.several() {
+        return None;
+    }
+    let from = judged_label(roster, who)?;
+    worker_row(roster, state, enrolled, from, mode, now).map(|row| (from, row))
+}
+
 /// The row a Claude Code worker spawned from a tab on the row `from` starts under, where that is
 /// another row: the one the host would move that tab to at its next point, by the host's own
 /// rule ([`advise_past_probe`] under `mode`), at a wall where `from` cannot run now (walled,
@@ -9063,6 +9146,9 @@ pub const READING_HEARTBEAT_S: i64 = 15 * 60;
 /// on the login it held ([`note_reading`], [`Account::keyed_at`]).
 pub const KEY_ADOPT_S: i64 = 60;
 
+/// One window of a sample as a figure. A read that named no reset gives none: a figure's reset is
+/// the vendor's instant, and [`merge_fig`] orders figures by it, so a reset made up here would
+/// outrank a real one. [`Account::unnamed_windows`] reads such a window.
 fn sample_fig(pct: Option<u32>, reset: Option<i64>, at: i64, sample: &Sample) -> Option<WindowFig> {
     Some(WindowFig {
         pct_x10: pct.filter(|p| *p <= PCT_MAX)?.saturating_mul(10),

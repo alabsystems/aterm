@@ -81,8 +81,9 @@ pub struct CodexFacts {
 #[derive(Debug, Clone, Default)]
 pub struct CodexFactsFold {
     prompts: Vec<Prompt>,
-    /// The newest text, cut keeping its head and cut keeping its end.
-    said: Option<(String, String)>,
+    /// The newest text, cut keeping its head and cut keeping its end, and when its row was
+    /// written ([`Excerpts::said_at_ms`]).
+    said: Option<(String, String, Option<i64>)>,
     /// Calls no output answered yet, oldest first: their id and tool.
     pending: Vec<(String, String)>,
     /// The turn in hand is its starter's (no person's), and the message it began with is still
@@ -115,12 +116,16 @@ impl CodexFactsFold {
     /// What the rows folded so far say.
     #[must_use]
     pub fn facts(&self) -> CodexFacts {
-        let (said, said_end) = self.said.clone().unzip();
+        let (said, said_end, said_at_ms) = match self.said.clone() {
+            Some((said, said_end, at)) => (Some(said), Some(said_end), at),
+            None => (None, None, None),
+        };
         CodexFacts {
             excerpts: Excerpts {
                 prompts: self.prompts.clone(),
                 said,
                 said_end,
+                said_at_ms,
                 doing: self.pending.last().map(|(_, tool)| tool.clone()),
             },
             model: self.model.clone(),
@@ -185,7 +190,12 @@ impl CodexFactsFold {
             (Some("response_item"), Some("message")) => {
                 match payload.get("role").and_then(Value::as_str) {
                     Some("user") => self.user(payload),
-                    Some("assistant") => self.assistant(payload),
+                    Some("assistant") => self.assistant(
+                        payload,
+                        row.get("timestamp")
+                            .and_then(Value::as_str)
+                            .and_then(super::codex_rollout::stamp_ms),
+                    ),
                     _ => {}
                 }
             }
@@ -255,12 +265,13 @@ impl CodexFactsFold {
         self.prompts.truncate(PROMPTS_KEPT);
     }
 
-    fn assistant(&mut self, payload: &Value) {
+    /// An assistant message, its row written at `at` (unix ms, where the row says).
+    fn assistant(&mut self, payload: &Value, at: Option<i64>) {
         let text = fold(&without_finished_lines(
             &texts(payload, "output_text").join("\n"),
         ));
         if !text.is_empty() {
-            self.said = Some((cap(&text, EXCERPT_BYTES), cap_end(&text, EXCERPT_BYTES)));
+            self.said = Some((cap(&text, EXCERPT_BYTES), cap_end(&text, EXCERPT_BYTES), at));
         }
     }
 }

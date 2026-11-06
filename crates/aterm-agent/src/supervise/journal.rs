@@ -965,6 +965,8 @@ enum JournalTarget {
 }
 
 /// The journal of one loop (or none), reopened under its path lock for each append.
+/// On failure it attempts one warning and flush. Warning metadata uses visible terminal
+/// escapes; later warnings are suppressed even if delivery failed. Appends can still recover.
 #[derive(Debug)]
 pub struct Journal {
     target: JournalTarget,
@@ -1110,9 +1112,9 @@ impl Journal {
         let path = self
             .path()
             .map_or_else(String::new, |p| p.display().to_string());
-        let _ = writeln!(
+        let _ = aterm_codec::tty::write_line(
             warn,
-            "aterm drive: journal {path}: {why} — the loop goes on without it"
+            format_args!("aterm drive: journal {path}: {why} — the loop goes on without it"),
         );
         let _ = warn.flush();
     }
@@ -1141,6 +1143,10 @@ pub fn read_journal(path: &Path) -> Result<(Vec<JournalRecord>, usize), String> 
     }
     Ok((out, bad))
 }
+
+#[cfg(test)]
+#[path = "journal_warning_tests.rs"]
+mod warning_tests;
 
 #[cfg(test)]
 mod tests {

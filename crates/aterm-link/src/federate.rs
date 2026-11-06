@@ -378,10 +378,13 @@ pub fn posts() -> String {
     format!("/f/{FLEET}/in/*/*/*/*")
 }
 
-/// The group the person carry of this Mac (`me`) follows under: `/f/alab/cur/<me>/node/carry`.
+/// The group the person carry follows under, `/f/alab/cur/n-carry/node/carry`: one name on every
+/// Mac and across its key rotations, which the mesh's retention holds the mail lanes for
+/// ([`crate::broker_rules::CARRY_READER`], §11 C3d), so a post outlives a carry outage as unread
+/// mail outlives a push's.
 #[must_use]
-pub fn carry_group(me: &str) -> String {
-    format!("/f/{FLEET}/cur/{me}/node/carry")
+pub fn carry_group() -> String {
+    format!("/f/{FLEET}/cur/{CARRIER}/node/carry")
 }
 
 /// A person's post this Mac (`me`) holds for another Mac's session, `subject` being
@@ -1027,6 +1030,28 @@ thread_local! {
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
+    /// The negative control of the carried lane's row (`give-back-carried`): [`Routes`] started on
+    /// a thread where it is set gives back each lane the person carry wrote at once, as the carry
+    /// before §11 C3d did ([`Shared::give_back`]), so a watch that starts again before the push
+    /// carried the post never plans that push.
+    pub static GIVE_BACK_CARRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`GIVE_BACK_CARRIED`] is on: set on this thread, or named for this process.
+fn give_back_carried() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        GIVE_BACK_CARRIED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("give-back-carried")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
     /// The negative control of the own-inbox move (`ungated-inbox`): [`Routes`] started on a
     /// thread where it is set opens each [`Lane::Inbox`] at once, while a bridge of the old node
     /// may still deliver, and makes none of the commit that node's last bridge handed over, so a
@@ -1175,8 +1200,9 @@ pub struct RouteStatus {
 pub struct CarryStatus {
     /// It follows its group now.
     pub following: bool,
-    /// The posts it carried: each written once, a retry after a lost answer counted once, and
-    /// counted after the carry gave its lane's charge back.
+    /// The posts it carried, each counted once its write was answered and the carry left its
+    /// lane's charge as it stays. A post the broker took whose answer was lost is not counted:
+    /// the group commit rides on the write, so the carry resumes past it.
     pub carried: u64,
     /// The posts it did not carry, each said in the journal and in the person's inbox.
     pub refused: u64,
@@ -1201,6 +1227,7 @@ struct Shared {
     node_order_olds: bool,
     unsealed_carry: bool,
     ungated_inbox: bool,
+    give_back_carried: bool,
     state: Mutex<State>,
     bell: Condvar,
 }
@@ -1255,7 +1282,8 @@ impl Routes {
     /// Start the watch over the lanes this Mac writes and the person carry, with no member yet:
     /// no push runs, and the carry reads nothing, until [`Routes::set`] names some.
     /// [`FORWARD_ALL`], [`ANOTHER_GROUP`], [`OWN_HALTS_ONLY`], [`ONE_NODE`], [`NODE_ORDER_OLDS`],
-    /// [`UNSEALED_CARRY`] and [`UNGATED_INBOX`] are read on the calling thread.
+    /// [`UNSEALED_CARRY`], [`UNGATED_INBOX`] and [`GIVE_BACK_CARRIED`] are read on the calling
+    /// thread.
     ///
     /// # Errors
     /// Where the watch's or the carry's thread cannot start.
@@ -1269,6 +1297,7 @@ impl Routes {
             node_order_olds: node_order_olds(),
             unsealed_carry: unsealed_carry(),
             ungated_inbox: ungated_inbox(),
+            give_back_carried: give_back_carried(),
             state: Mutex::new(State::default()),
             bell: Condvar::new(),
         });
@@ -1993,7 +2022,7 @@ impl Shared {
     /// once the tail is caught up. `followed` once it follows its group. `Ok` once stopped.
     fn carry_once(self: &Arc<Self>, followed: &mut bool) -> io::Result<()> {
         let me = self.cfg.me.clone();
-        let (filter, group) = (posts(), carry_group(&me));
+        let (filter, group) = (posts(), carry_group());
         let grants = [
             format!("ro:{filter}"),
             format!("rw,p={CARRIER}:{group}"),
@@ -2080,9 +2109,11 @@ impl Shared {
     /// node key; else a notice on the person's lane here says why it was not
     /// ([`NOTICE_REASON`]), and the journal too, as it does for a post this Mac's broker refuses to
     /// carry for good. Either is one write that also commits the carry's group through `off`,
-    /// under [`CARRIER`] numbered by `off`, so a retry after a lost answer, or a carry that a node
-    /// key's rotation started over, writes and says nothing again. The lane a post was carried on
-    /// is given back at once ([`Shared::give_back`]). `false` for any other record, with nothing
+    /// under [`CARRIER`] numbered by `off`, so a retry after a lost answer, or a carry that started
+    /// its group over, writes and says nothing again. The lane a post was carried on keeps its
+    /// last-value row, which a restarted watch reads to plan the push that carries it on
+    /// ([`Shared::watch_once`]), until the cut that gives its records up forgets it (the mesh
+    /// rules' `forget`, §11 C3d). `false` for any other record, with nothing
     /// written, a post to a node this Mac held before a key rotation among them, which the
     /// own-inbox move takes ([`Lane::Inbox`]).
     fn carry_one(
@@ -2133,9 +2164,13 @@ impl Shared {
                 match writer.process_and_produce(pid, off, &lane, &carried.encode(), group, off) {
                     Ok((at, deduped)) => {
                         if !deduped {
-                            // Counted after the give-back ran, so a status that counts this
-                            // post reads its lane's charge back wherever the broker gave it back.
-                            let gave = Self::give_back(writer, &lane, at);
+                            // Counted after any give-back ran, so a status that counts this
+                            // post reads its lane's charge as the carry leaves it.
+                            let gave = if self.give_back_carried {
+                                Self::give_back(writer, &lane, at)
+                            } else {
+                                Ok(())
+                            };
                             self.with_carry(|carry| carry.carried += 1);
                             gave?;
                         }
@@ -2181,11 +2216,9 @@ impl Shared {
         Ok(true)
     }
 
-    /// Give back the charge the carry's write at `at` put on `lane`, so the carry's producer holds
-    /// no subject for the posts it carried (astream's distinct-subject budget, §5.2): the record
-    /// stays in the log for the push, and only the lane's last-value entry goes, unless a newer
-    /// record replaced it. A log that retention cut, a lane another producer opened first, and a
-    /// broker without the verb keep the charge, as they keep the node's own.
+    /// The carry before §11 C3d, under [`GIVE_BACK_CARRIED`]: the charge the carry's write at
+    /// `at` put on `lane` given back at once, the lane's last-value row with it, so a watch that
+    /// starts again before the push carried the post never sees the lane.
     ///
     /// # Errors
     /// The connection failed.

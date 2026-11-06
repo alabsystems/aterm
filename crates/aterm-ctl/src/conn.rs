@@ -10,6 +10,9 @@ use std::process::ExitCode;
 #[path = "resource_run.rs"]
 mod resource_run;
 pub use resource_run::main_entry as resource_run_main_entry;
+#[path = "resource_inspect.rs"]
+mod resource_inspect;
+pub use resource_inspect::main_entry as resource_inspect_main_entry;
 
 /// Subverbs offered by `aterm conn` completion.
 pub(crate) const CONN_SUBVERBS: &str = "ls add set rm spawn show map help";
@@ -177,15 +180,39 @@ fn require_ok(reply: Reply) -> io::Result<Reply> {
     }
 }
 
+fn resource_metadata_reply(parts: &[String], status: &str) -> bool {
+    match parts {
+        [verb, query] if verb == "resource-admission-v3" && query == "capabilities" => {
+            status == "OK resource-admission-v3 capabilities"
+        }
+        [verb, query, session]
+            if verb == "resource-admission-v3"
+                && query == "inspect"
+                && session.starts_with("session=s-") =>
+        {
+            status == "OK resource-admission-v3 inspect"
+        }
+        _ => false,
+    }
+}
+
 impl ConnWire {
     fn request(&self, parts: &[String]) -> io::Result<Reply> {
         super::validate_request_parts(parts)?;
         let mut request = parts.join(" ");
         request.push('\n');
         let path = aterm_uds::latest::resolve(&self.path);
-        super::converse(&path, self.origin, Some(CONN_DEADLINE), |stream, token| {
-            stream.set_read_timeout(Some(CONN_DEADLINE))?;
-            stream.set_write_timeout(Some(CONN_DEADLINE))?;
+        let deadline = if parts
+            .first()
+            .is_some_and(|verb| verb == "resource-admission-v3")
+        {
+            std::time::Duration::from_secs(3)
+        } else {
+            CONN_DEADLINE
+        };
+        super::converse(&path, self.origin, Some(deadline), |stream, token| {
+            stream.set_read_timeout(Some(deadline))?;
+            stream.set_write_timeout(Some(deadline))?;
             super::send_request(&stream, token, &request)?;
             let mut reader = super::reply_on(&stream);
             let mut status = String::new();
@@ -198,7 +225,14 @@ impl ConnWire {
             let status = status.trim_end_matches(['\r', '\n']).to_string();
             let verb = super::forwarded_verb(parts).unwrap_or_default();
             let mut lines = Vec::new();
-            if aterm_types::control_verbs::framing_of(&verb, &request)
+            // This private owner handoff has one bounded JSON fact after
+            // its exact status, rather than the public catalog's count header.
+            if resource_metadata_reply(parts, &status) {
+                lines = super::read_reply_lines(&mut reader, 1)?;
+                if lines.first().is_none_or(|line| line.len() > 8192) {
+                    return Err(io::Error::other("oversized resource admission observation"));
+                }
+            } else if aterm_types::control_verbs::framing_of(&verb, &request)
                 == aterm_types::control_verbs::Framing::Lines
                 && let Some(tail) = status.strip_prefix("OK ")
             {
@@ -1116,3 +1150,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "resource_metadata_tests.rs"]
+mod resource_metadata_tests;

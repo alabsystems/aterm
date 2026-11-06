@@ -59,7 +59,7 @@ impl SpareRig {
     /// Make the spare's mark and open the hold's two ends as its host does ([`spare_fifo::hold_ends`]): the host's end is returned for the test to write, and the shell's waits for the next spawn.
     fn hold(&self) -> std::fs::File {
         self.make_fifo();
-        let ends = spare_fifo::hold_ends(&self.fifo).expect("the hold's ends");
+        let ends = spare_fifo::hold_ends().expect("the hold's ends");
         *self
             .shell_end
             .lock()

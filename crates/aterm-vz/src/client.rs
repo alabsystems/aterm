@@ -248,7 +248,7 @@ impl Session {
             hello: None,
             lost: None,
         };
-        session.send(&Request::Attach(attach.clone()))?;
+        session.send_bytes(Request::encode_attach(attach))?;
         session
             .until("Attach", &mut |_| {}, |reply, _| match reply {
                 Reply::Attached {
@@ -268,7 +268,12 @@ impl Session {
     }
 
     fn send(&self, request: &Request) -> Result<(), ClientError> {
-        self.chan.send_request(request).map_err(|e| match e {
+        self.send_bytes(request.encode())
+    }
+
+    fn send_bytes(&self, encoded: Result<Vec<u8>, ProtoError>) -> Result<(), ClientError> {
+        let bytes = encoded.map_err(|e| ClientError::Io(e.to_string()))?;
+        self.chan.send_request_bytes(&bytes).map_err(|e| match e {
             ProtoError::Io(io) if helper_gone(&io) => ClientError::Closed,
             other => ClientError::Io(other.to_string()),
         })
@@ -288,36 +293,34 @@ impl Session {
                 Ok(None) => return Err(ClientError::Closed),
                 Err(e) => return Err(read_error(e, what, self.span)),
             };
-            match &reply {
+            match reply {
                 Reply::Lost { why, tail } => {
                     self.lost = Some(why.clone());
-                    return Err(ClientError::Lost {
-                        why: why.clone(),
-                        tail: tail.clone(),
-                    });
+                    return Err(ClientError::Lost { why, tail });
                 }
                 Reply::Failed { error, tail } => {
-                    return Err(ClientError::Failed {
-                        error: error.clone(),
-                        tail: tail.clone(),
-                    });
+                    return Err(ClientError::Failed { error, tail });
                 }
-                Reply::Error(why) => return Err(ClientError::Error(why.clone())),
-                Reply::Started => {
-                    if self.phase == Phase::Absent {
-                        self.phase = Phase::Booting;
+                Reply::Error(why) => return Err(ClientError::Error(why)),
+                other => {
+                    match &other {
+                        Reply::Started => {
+                            if self.phase == Phase::Absent {
+                                self.phase = Phase::Booting;
+                            }
+                            progress("the VM started");
+                        }
+                        Reply::Booting(note) => progress(note),
+                        Reply::Ready(hello) => {
+                            self.phase = Phase::Ready;
+                            self.hello = Some(hello.clone());
+                        }
+                        _ => {}
                     }
-                    progress("the VM started");
+                    if let Some(done) = want(other, fd) {
+                        return done;
+                    }
                 }
-                Reply::Booting(note) => progress(note),
-                Reply::Ready(hello) => {
-                    self.phase = Phase::Ready;
-                    self.hello = Some(hello.clone());
-                }
-                _ => {}
-            }
-            if let Some(done) = want(reply, fd) {
-                return done;
             }
         }
     }
@@ -336,7 +339,7 @@ impl Session {
             return Ok(h.clone());
         }
         if self.phase == Phase::Absent {
-            self.send(&Request::Boot(Box::new(plan.clone())))?;
+            self.send_bytes(Request::encode_boot(plan))?;
         }
         self.wait_ready(progress)
     }
@@ -419,7 +422,10 @@ impl Session {
     /// # Errors
     /// The helper could not (its words) or did not answer.
     pub fn share(&mut self, entries: &[ShareEntry]) -> Result<(), ClientError> {
-        self.done(&Request::Share(entries.to_vec()), "Share")
+        self.send_bytes(Request::encode_share(entries))?;
+        self.until("Share", &mut |_| {}, |reply, _| {
+            matches!(reply, Reply::Done).then_some(Ok(()))
+        })
     }
 
     /// Set or clear `keep`.

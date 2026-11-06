@@ -66,6 +66,19 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
         .collect()
 }
 
+/// [`rollouts_by_write`] with each rollout's size: what says it is as a look last found it.
+#[must_use]
+pub fn rollouts_by_write_sized(home: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
+    rollout_walk(home)
+        .listed
+        .into_iter()
+        .map(|l| {
+            let size = l.meta.len();
+            (l.path, l.at, size)
+        })
+        .collect()
+}
+
 /// One rollout a [`rollout_walk`] found.
 struct Listed {
     path: PathBuf,
@@ -1278,6 +1291,19 @@ pub(crate) mod fixtures {
             stamp(ms),
             slot(primary),
             slot(secondary),
+        )
+    }
+
+    /// `line` (a [`rate`]) with each slot given the reset `0` naming none.
+    pub(crate) fn no_reset(line: &str) -> String {
+        line.replace("\"resets_at\":0}", "\"resets_at\":null}")
+    }
+
+    /// `line` (a [`rate`]) with the server's refusal in it.
+    pub(crate) fn refused(line: &str) -> String {
+        line.replace(
+            "\"rate_limit_reached_type\":null",
+            "\"rate_limit_reached_type\":\"workspace_member_usage_limit_reached\"",
         )
     }
 

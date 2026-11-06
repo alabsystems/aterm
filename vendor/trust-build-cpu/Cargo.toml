@@ -1,20 +1,34 @@
 [package]
 name = "trust-build-cpu"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates"]
 description = "Native per-unit CPU leases shared by Trust builds and aterm"
 
-[package.metadata.aterm-origin]
-project = "Trust"
-commit = "2011393128c0e697f57c45ab8e8b034a2c55fac3"
-path = "crates/trust-build-cpu"
+[features]
+observations = ["dep:serde_json"]
+jobserver = ["dep:jobserver"]
+
+[dependencies]
+serde_json = { version = "1", optional = true }
+jobserver = { version = "0.1.35", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+
+
+[[test]]
+name = "recovery_material"
+path = "src/recovery_material/tests.rs"
+
+[package.metadata.aterm-origin]
+project = "Trust"
+commit = "44356f40b6136199962c70933fa77d5012c3a5eb"
+path = "crates/trust-build-cpu"
 
 [workspace]

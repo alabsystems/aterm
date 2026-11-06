@@ -326,15 +326,15 @@ pub const NODE: PinnedTool = PinnedTool {
     archives: &[
         Archive {
             platform: "macos-aarch64",
-            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-arm64.tar.xz",
-            sha256: "037650d0839f457747396f052073fb48333d31bf5abd3c98b74da20d89ebb1ad",
-            bytes: 25_898_024,
+            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-arm64.tar.gz",
+            sha256: "c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428",
+            bytes: 49_996_369,
         },
         Archive {
             platform: "macos-x86_64",
-            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-x64.tar.xz",
-            sha256: "f42abca7aaac61efc57d49fb42ea84fc53bbeba9a749cb03a291ce6e4e7a69c1",
-            bytes: 27_483_128,
+            url: "https://nodejs.org/dist/v{v}/node-v{v}-darwin-x64.tar.gz",
+            sha256: "efcc2b0db6f94bf53eddb038fe2b370277a042bd29e4f19b8f8e23598795b819",
+            bytes: 51_190_214,
         },
     ],
 };

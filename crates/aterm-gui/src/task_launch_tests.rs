@@ -1221,6 +1221,89 @@ fn a_spawn_installs_no_agent_where_a_person_said_no_to_installs() {
     }
 }
 
+/// A DEV-LINKED PROGRAM IS ONE A WORKER CAN RUN, so its launch asks atpkg for nothing: atpkg's
+/// install leaves a link as it stands and says so with success, and a launcher that looked only for
+/// a build then refused a `codex` that runs (m111, 2026-11-06: `stalled why=install`). A link whose
+/// tool is gone runs nothing, nor does one that exposes no tool of that name, since the line types
+/// that word, so the launch asks atpkg and refuses on what that leaves. NEGATIVE CONTROL: a look at
+/// the active build alone reads no link. CONTROL: a store with neither holds no such program, and
+/// another program's link is no link of this one.
+#[cfg(unix)]
+#[test]
+fn a_dev_linked_program_is_one_a_worker_can_run() {
+    use aterm_agent::harness::worker::Readiness;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct LinkStore<'a> {
+        layout: &'a atpkg::store::Layout,
+        installs: std::cell::Cell<u32>,
+    }
+    impl ProgramStore for LinkStore<'_> {
+        fn present(&self, program: &str) -> bool {
+            runnable_in(self.layout, program)
+        }
+        fn held(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn install(&self, _: &str) -> Result<(), String> {
+            self.installs.set(self.installs.get() + 1);
+            Ok(())
+        }
+    }
+
+    let cli = aterm_agent::harness::worker::worker_cli(Program::Claude).unwrap();
+    let program = cli.atpkg_program().unwrap();
+    let d = aterm_tempfile::Builder::new()
+        .prefix("aterm-spawn-dev-link")
+        .tempdir()
+        .unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: d.path().join("pkg"),
+    };
+    std::fs::create_dir(&layout.prefix).unwrap();
+    assert!(!runnable_in(&layout, program), "CONTROL: nothing is laid");
+
+    let checkout = d.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("target/release")).unwrap();
+    let relative = PathBuf::from("target/release").join(program);
+    let tool = checkout.join(&relative);
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    atpkg::link(&layout, program, &checkout, &[relative]).unwrap();
+    assert!(runnable_in(&layout, program));
+    assert!(
+        !runnable_in(&layout, "codex"),
+        "CONTROL: another program's link is no link of this one"
+    );
+
+    let store = LinkStore {
+        layout: &layout,
+        installs: std::cell::Cell::new(0),
+    };
+    let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store).unwrap();
+    assert_eq!(admitted.readiness(), &Readiness::Present);
+    assert_eq!(store.installs.get(), 0, "a link needs no install");
+
+    std::fs::remove_file(&tool).unwrap();
+    assert!(!runnable_in(&layout, program), "its tool is gone");
+    let refused = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store)
+        .map(|_| ())
+        .expect_err("atpkg's install left nothing to run");
+    assert_eq!(store.installs.get(), 1, "it asked atpkg: {refused:?}");
+
+    let other = d.path().join("other");
+    std::fs::create_dir_all(other.join("target/release")).unwrap();
+    let relative = PathBuf::from("target/release/not-the-word");
+    let tool = other.join(&relative);
+    std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    atpkg::link(&layout, "codex", &other, &[relative]).unwrap();
+    assert!(
+        !runnable_in(&layout, "codex"),
+        "a live link of no tool the line can type"
+    );
+}
+
 #[test]
 fn a_spawn_installs_nothing_when_removal_evidence_is_unreadable() {
     use aterm_agent::harness::worker::Readiness;
@@ -2889,6 +2972,79 @@ fn native_google_worker_installs_before_preparing_its_guard() {
     }
 }
 
+/// An admission's reason atpkg keeps a program off this Mac reaches the session's timeline, where
+/// the startup deadline reads it (`harness_host::kept_off_held`). CONTROL: a program that is there
+/// clears what an earlier admission left.
+#[test]
+fn an_admissions_kept_off_reason_reaches_the_timeline() {
+    let agy = aterm_agent::harness::worker::worker_cli(Program::Agy).unwrap();
+    let h = crate::session_store::test_handle(3);
+    let take = |store: &FakeStore| {
+        take_admission(
+            &h.ctx,
+            3,
+            Program::Agy,
+            admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), store, |starter| {
+                Ok((starter, ()))
+            }),
+            || panic!("only a refusal reads the member"),
+        )
+        .expect("admitted");
+    };
+    let kept_off = || {
+        let timeline = h.ctx.timeline.lock().unwrap();
+        timeline.worker_kept_off().map(str::to_owned)
+    };
+    take(&FakeStore {
+        present: std::cell::Cell::new(false),
+        held: Some("explicit package hold"),
+        lays: true,
+        asked: std::cell::RefCell::new(Vec::new()),
+    });
+    assert_eq!(kept_off().as_deref(), Some("explicit package hold"));
+    take(&FakeStore {
+        present: std::cell::Cell::new(true),
+        held: None,
+        lays: true,
+        asked: std::cell::RefCell::new(Vec::new()),
+    });
+    assert_eq!(kept_off(), None, "CONTROL: it is there");
+}
+
+/// A preparation that fails for any other reason is no sign-out: only a login a person must sign
+/// back in reads `why=signin`, so a dispatcher that reads it asks for no sign-in that mends nothing.
+#[test]
+fn a_preparation_that_is_no_sign_out_does_not_read_as_one() {
+    use aterm_agent::harness::worker::Refused;
+    let agy = aterm_agent::harness::worker::worker_cli(Program::Agy).unwrap();
+    let store = FakeStore {
+        present: std::cell::Cell::new(true),
+        held: None,
+        lays: true,
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    let prepared = |refused: Refused| {
+        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &store, |_| {
+            Err::<(_, ()), _>(refused)
+        })
+        .expect_err("its preparation refused")
+    };
+
+    let unavailable = prepared("Native Google pool location is unavailable".into());
+    assert_eq!(
+        unavailable,
+        Refused::Preparation("Native Google pool location is unavailable".to_owned())
+    );
+    assert_eq!(refused_why(&unavailable), "startup");
+
+    let signed_out = prepared(Refused::SignedOut("the login was refused".to_owned()));
+    assert_eq!(
+        refused_why(&signed_out),
+        crate::task_record::WHY_SIGNIN,
+        "CONTROL: a real sign-out"
+    );
+}
+
 #[test]
 fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
     use aterm_agent::harness::worker::Refused;
@@ -2929,7 +3085,7 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
         &|_| {},
         &|| (),
         &store,
-        |_| -> Result<(_, ()), String> { panic!("signed-out starter reached preparation") },
+        |_| -> Result<(_, ()), Refused> { panic!("signed-out starter reached preparation") },
     );
     assert!(matches!(result, Err(Refused::SignedOut(_))));
     assert!(store.asked.borrow().is_empty());

@@ -1619,13 +1619,15 @@ impl Log {
             .iter()
             .filter(|r| r.kind() != Kind::Genesis && r.actor() == actor)
             .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id.cmp(&a.id)));
+        let heads = self.heads();
         let mut parents: Vec<RecordId> = previous.map(|r| r.id).into_iter().collect();
         let room = MAX_PARENTS - parents.len();
         parents.extend(
-            self.heads()
-                .into_iter()
-                .filter(|head| Some(head) != previous.map(|r| &r.id))
-                .take(room),
+            heads
+                .iter()
+                .filter(|&head| Some(head) != previous.map(|r| &r.id))
+                .take(room)
+                .copied(),
         );
         let seat = self
             .membership()
@@ -1652,9 +1654,9 @@ impl Log {
             .chain(follow.iter().copied())
         {
             if self.held.contains_key(&needed) && !self.reaches(&parents, &needed) {
-                let target = self
-                    .heads()
-                    .into_iter()
+                let target = heads
+                    .iter()
+                    .copied()
                     .find(|head| self.reaches(std::slice::from_ref(head), &needed))
                     .unwrap_or(needed);
                 if !parents.contains(&target) {
@@ -1669,10 +1671,14 @@ impl Log {
                     parents.push(target);
                 }
                 pinned.push(target);
-            } else if let Some(&covering) = parents
+            } else if !parents
                 .iter()
-                .find(|&p| self.reaches(std::slice::from_ref(p), &needed))
+                .any(|p| pinned.contains(p) && self.reaches(std::slice::from_ref(p), &needed))
+                && let Some(&covering) = parents
+                    .iter()
+                    .find(|&p| self.reaches(std::slice::from_ref(p), &needed))
             {
+                // A parent already pinned that reaches it keeps it; else the first that does.
                 pinned.push(covering);
             }
         }

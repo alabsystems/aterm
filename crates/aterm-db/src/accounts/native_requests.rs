@@ -126,7 +126,7 @@ impl Requests {
                 let mut writers =
                     std::collections::BTreeMap::from([(session.actor(), Some(local.clone()))]);
                 let mut requests = Vec::new();
-                for (operation, decoded) in log.eligible() {
+                for (operation, decoded) in log.eligible_iter() {
                     if Instant::now() >= self.deadline {
                         return Err(Error::new("native request observation expired"));
                     }

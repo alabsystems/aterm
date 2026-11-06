@@ -13,17 +13,23 @@
 //! behind it`: its need less what it has written). A waiting claim's disk is marked
 //! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: no
 //! claim's end can make room for it, only space freed, so it holds back no claim behind it
-//! (DISK-ADMIT, [`aterm_capacity::Short::unservable`]); a held claim is never marked. Each volume
-//! a claim's disk is on is read, besides the one holding `<path>`, and has a disk line of its own
-//! (and, in `--json`, an entry of `volumes`).
+//! (DISK-ADMIT, [`aterm_capacity::Short::unservable`]); a held claim is never marked. What a tree
+//! holds is the figure its reservation counts, with its footprint whole beside it where the pages
+//! the kernel compressed or swapped make that a tenth of a GiB or more
+//! ([`aterm_capacity::overrun::whole`]), and a held claim whose holder's tree holds more than it
+//! claimed says by how much ([`aterm_capacity::Overrun`]: `14.7 GiB past its 16 GiB claim`).
+//! Each volume a claim's disk is on is read, besides the one holding `<path>`, and has a disk line
+//! of its own (and, in `--json`, an entry of `volumes`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use aterm_capacity::overrun::whole;
 use aterm_capacity::{
-    Accounting, Ledger, Live, Machine as _, Reading, Record, Reserve, TreeUse, Volume, gib, span,
+    Accounting, Ledger, Live, Machine as _, Overrun, Reading, Record, Reserve, TreeUse, Volume,
+    gib, overruns, span,
 };
 use aterm_json::{Map, Value};
 
@@ -205,8 +211,9 @@ fn lines(
                 "claims   {at}: {held} held, {} waiting",
                 claims.len() - held
             ));
+            let overruns = overruns(claims, trees);
             for (c, reserve) in claims.iter().zip(reserves(r, volumes, claims, trees)) {
-                out.push(claim_line(c, reserve, trees, now));
+                out.push(claim_line(c, reserve, trees, overrun(c, &overruns), now));
             }
         }
     }
@@ -215,7 +222,7 @@ fn lines(
 
 /// What the processes `c` is credited with ([`Record::credit`]) use: `None` without a sweep.
 /// Whole and detached accounting never attribute current numeric PIDs to their records.
-fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<u64> {
+fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse> {
     if c.accounting != Accounting::Holder {
         return None;
     }
@@ -223,9 +230,26 @@ fn credited(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<u64> {
         c.credit
             .iter()
             .filter_map(|p| t.get(p))
-            .map(|u| u.footprint)
-            .sum()
+            .fold(TreeUse::default(), |sum, u| TreeUse {
+                footprint: sum.footprint.saturating_add(u.footprint),
+                whole: sum.whole.saturating_add(u.whole),
+                written: sum.written.saturating_add(u.written),
+            })
     })
+}
+
+/// What `c`'s holder holds past its held claims of memory ([`overruns`]), where `c` is one of
+/// them: a waiting claim, one of no memory, or one whose accounting attributes no current
+/// process to it has none of its own.
+fn overrun<'o>(c: &Record, overruns: &'o HashMap<u32, Overrun>) -> Option<&'o Overrun> {
+    overruns
+        .get(&c.pid)
+        .filter(|_| c.accounting == Accounting::Holder && c.held.is_some() && c.need.mem > 0)
+}
+
+/// What a tree holds, as a claim's line says it ([`whole`]).
+fn holds(u: TreeUse) -> String {
+    whole(u.whole, u.footprint)
 }
 
 /// Current accounting and lifetime policy, not a new observation of closure.
@@ -235,6 +259,7 @@ fn accounting(c: &Record) -> (&'static str, &'static str) {
     match c.accounting {
         Accounting::Holder => ("holder", "claim-protocol"),
         Accounting::Whole => ("whole", "cohort-closure"),
+        Accounting::CohortOwned => ("cohort-owned", "cohort-closure"),
         Accounting::Detached => ("detached", "final-guard-close"),
     }
 }
@@ -251,11 +276,14 @@ fn tree_use(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse
 /// its memory where it needs any, and its disk where it needs any, marked [`UNSERVABLE`] only
 /// for a waiter ([`Reserve::unservable`] is a waiter's alone). Only holder accounting uses
 /// the current holder's tree ([`aterm_capacity::Procs::trees`]); the other policies retain an
-/// original record PID without attributing a current process to it.
+/// original record PID without attributing a current process to it. A holder's tree is the same
+/// for every claim that process holds, and so is `overrun`, what that tree holds past its held
+/// claims of memory ([`overrun`]).
 fn claim_line(
     c: &Record,
     reserve: Reserve,
     trees: Option<&HashMap<u32, TreeUse>>,
+    overrun: Option<&Overrun>,
     now: u64,
 ) -> String {
     let (accounting, lifetime) = accounting(c);
@@ -272,19 +300,20 @@ fn claim_line(
     )];
     parts.push(format!("accounting {accounting}, lifetime {lifetime}"));
     if c.need.mem > 0 {
-        let using = tree_use(c, trees).map(|u| u.footprint);
+        let using = tree_use(c, trees);
         let vm = credited(c, trees).filter(|_| !c.credit.is_empty());
+        let past = overrun.map_or_else(String::new, |o| format!(": {}", o.beyond()));
         parts.push(format!(
             "mem {}{}, reserves {}",
             gib(c.need.mem),
             match (using, vm) {
                 (Some(u), Some(v)) => format!(
-                    " (its holder's tree holds {}, the {} processes credited to it {})",
-                    gib(u),
+                    " (its holder's tree holds {}, the {} processes credited to it {}{past})",
+                    holds(u),
                     c.credit.len(),
-                    gib(v)
+                    holds(v)
                 ),
-                (Some(u), None) => format!(" (its holder's tree holds {})", gib(u)),
+                (Some(u), None) => format!(" (its holder's tree holds {}{past})", holds(u)),
                 (None, _) => String::new(),
             },
             gib(reserve.mem)
@@ -357,7 +386,12 @@ fn volume_json(v: &Volume) -> Value {
 /// the floor now (`null` where it needs disk on a volume that could not be read, so it is not
 /// judged). `accounting` and `lifetime` identify the current reservation policy;
 /// `pid_role` distinguishes a holder PID from an original record PID. `tree_held` and
-/// `credited_held` are null unless holder accounting permits those observations.
+/// `credited_held` are what its holder's tree and the processes credited to it hold as its
+/// reservation counts them, `tree_whole` and `credited_whole` their footprints whole, compressed
+/// and swapped pages included: each `null` without a process sweep or unless holder accounting
+/// permits those observations. `past_claims` is what its holder holds past its held claims of
+/// memory ([`Overrun::past`]; `null` for a waiting claim, one of no memory, one of other
+/// accounting, or a holder less than a tenth of a GiB past them).
 fn json_of(
     r: &Reading,
     volumes: &[Volume],
@@ -397,6 +431,7 @@ fn json_of(
             o.insert("unreadable".to_owned(), Value::from(e.as_str()));
         }
         Ok(claims) => {
+            let overruns = overruns(claims, trees);
             let rows = claims
                 .iter()
                 .zip(reserves(r, volumes, claims, trees))
@@ -460,11 +495,24 @@ fn json_of(
                         "tree_held".to_owned(),
                         Value::from(used.map(|u| u.footprint)),
                     );
+                    m.insert("tree_whole".to_owned(), Value::from(used.map(|u| u.whole)));
                     m.insert(
                         "credit".to_owned(),
                         Value::Array(c.credit.iter().map(|p| Value::from(*p)).collect()),
                     );
-                    m.insert("credited_held".to_owned(), Value::from(credited(c, trees)));
+                    let vm = credited(c, trees);
+                    m.insert(
+                        "credited_held".to_owned(),
+                        Value::from(vm.map(|u| u.footprint)),
+                    );
+                    m.insert(
+                        "credited_whole".to_owned(),
+                        Value::from(vm.map(|u| u.whole)),
+                    );
+                    m.insert(
+                        "past_claims".to_owned(),
+                        Value::from(overrun(c, &overruns).map(Overrun::past)),
+                    );
                     Value::Object(m)
                 })
                 .collect::<Vec<_>>();

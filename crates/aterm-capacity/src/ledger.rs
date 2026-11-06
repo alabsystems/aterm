@@ -61,6 +61,9 @@ pub enum Accounting {
     Holder,
     /// Retain the entire budget; a dead or reused holder and closed guards prove no drain.
     Whole,
+    /// An immutable cohort-owned reservation, independent of execution lifetime.
+    /// It never credits numeric creator ancestry, including before the first ARM.
+    CohortOwned,
     /// An ordinary detached memory claim reserves its full peak without numeric holder
     /// credit or ancestry. It ends at the final actual guard close, not a cohort journal.
     Detached,
@@ -999,6 +1002,8 @@ pub struct Turn {
 pub struct Ledger {
     dir: PathBuf,
     mode: Mode,
+    #[cfg(unix)]
+    user_source: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1021,12 +1026,14 @@ impl Ledger {
                 return Ledger {
                     dir: namespace.backend(),
                     mode: Mode::Cohort(namespace),
+                    user_source: None,
                 };
             }
             Err(error) => {
                 return Ledger {
                     dir,
                     mode: Mode::Refused(error.to_string()),
+                    user_source: None,
                 };
             }
             Ok(None) => {}
@@ -1034,10 +1041,24 @@ impl Ledger {
         Ledger {
             dir,
             mode: Mode::Legacy,
+            #[cfg(unix)]
+            user_source: None,
         }
     }
 
     fn check_mode(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(source) = &self.user_source {
+            match (crate::user_namespace::resolve(source)?, &self.mode) {
+                (Some(actual), Mode::Cohort(expected)) if &actual == expected => {}
+                (None, Mode::Legacy) => {}
+                _ => {
+                    return Err(io::Error::other(
+                        "account memory namespace changed; reopen admission",
+                    ));
+                }
+            }
+        }
         #[cfg(unix)]
         match &self.mode {
             Mode::Cohort(namespace) => return namespace.validate(),
@@ -1132,7 +1153,26 @@ impl Ledger {
     /// This user's ledger ([`user_dir`]).
     #[must_use]
     pub fn user() -> Option<Ledger> {
-        user_dir().map(Ledger::at)
+        user_dir().map(Self::account_at)
+    }
+
+    pub(crate) fn account_at(source: PathBuf) -> Self {
+        #[cfg(unix)]
+        {
+            let mut ledger = match crate::user_namespace::resolve(&source) {
+                Ok(Some(namespace)) => Self::at(namespace.fence()),
+                Ok(None) => Self::at(&source),
+                Err(error) => Self {
+                    dir: source.clone(),
+                    mode: Mode::Refused(error.to_string()),
+                    user_source: None,
+                },
+            };
+            ledger.user_source = Some(source);
+            ledger
+        }
+        #[cfg(not(unix))]
+        Self::at(source)
     }
 
     /// Its directory.
@@ -1241,10 +1281,25 @@ impl Ledger {
 
     /// A claim for `need` in the queue: the record laid under a name no reader looks at, locked, then named a waiter.
     pub(crate) fn lay(&self, need: &Need, start_ms: u64) -> io::Result<(Record, Laid)> {
+        self.lay_accounted(need, start_ms, Accounting::Holder)
+    }
+
+    pub(crate) fn lay_accounted(
+        &self,
+        need: &Need,
+        start_ms: u64,
+        accounting: Accounting,
+    ) -> io::Result<(Record, Laid)> {
         self.check_mode()?;
+        if accounting == Accounting::CohortOwned && !self.cohort_aware()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cohort-owned admission requires a private cohort ledger",
+            ));
+        }
         let mut need = need.clone();
         let record = Record {
-            accounting: Accounting::Holder,
+            accounting,
             pid: std::process::id(),
             start_ms,
             seq: next_seq(),

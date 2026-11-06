@@ -2587,7 +2587,7 @@ fn converge(
     } else {
         (
             context_for_selected(sys, WorkstationGroup::All, Selection::none())?,
-            None,
+            KeyboardRead::default(),
         )
     };
     let asked = only.iter().any(|word| crate::init_develop::names(word));
@@ -2640,7 +2640,7 @@ fn converge(
             &ctx,
             mode,
             &Reading {
-                keyboards: keyboards.as_deref(),
+                keyboards: &keyboards,
                 only,
                 picks: options.picks,
             },
@@ -3216,14 +3216,22 @@ pub fn activate_keyboard_attachments(
 ) -> Result<bool, String> {
     let mut selected = Selection::none();
     selected.set(Setting::CapsLock, true);
-    let ctx = context_for_selected(sys, WorkstationGroup::InputActivation, selected)?;
+    let (ctx, unread) = context_reading_with(
+        sys,
+        WorkstationGroup::InputActivation,
+        selected,
+        KeyboardServices::Attachments,
+    )?;
+    if let Some(why) = unread.unread {
+        return Err(why);
+    }
     if ctx.console.is_none() {
         return Err(outside_console_session(sys));
     }
     let items = crate::init_preferences::attachment_items(&ctx, registries)?;
     let mut journal = sys.journal()?;
     let mut ready = true;
-    let mut covered = crate::init_preferences::AttachmentCoverage::default();
+    let mut covered = crate::facts::KeyboardCoverage::default();
     for item in &items {
         if !continues() {
             return Ok(false);
@@ -3679,11 +3687,30 @@ pub fn prepare_workstation_selected(
             held: Vec::new(),
         });
     }
-    let ctx = context_for_selected(sys, group, selected)?;
+    let (ctx, keyboards) = context_reading(sys, group, selected)?;
     if ctx.console.is_none() {
         return Err(outside_console_session(sys));
     }
-    let (settings, items) = workstation_items_selected(&ctx, group, selected)?
+    let mut selected = selected;
+    if keyboards.unread.is_some() {
+        selected.set(Setting::CapsLock, false);
+    }
+    let mut tagged = workstation_items_selected(&ctx, group, selected, &keyboards.cohorts)?;
+    if let Some(why) = keyboards.unread {
+        tagged.insert(
+            0,
+            (
+                Setting::CapsLock,
+                Box::new(Unbuilt {
+                    id: "keyboard.caps-lock".into(),
+                    family: "keyboard",
+                    title: Setting::CapsLock.label(),
+                    why,
+                }),
+            ),
+        );
+    }
+    let (settings, items) = tagged
         .into_iter()
         .map(|(setting, item)| ((item.id(), setting), item))
         .unzip();
@@ -3879,6 +3906,7 @@ fn workstation_items_selected(
     ctx: &Ctx,
     group: WorkstationGroup,
     selected: Selection,
+    cohorts: &crate::facts::KeyboardCohorts,
 ) -> Result<TaggedItems, String> {
     let mut items: TaggedItems = Vec::new();
     let mut add = |setting: Setting, built: Vec<Box<dyn Item>>| {
@@ -3908,7 +3936,9 @@ fn workstation_items_selected(
             // One call for the whole selection, each item tagged as it is built: the
             // widget, desktop and Dock items of a pass share its one relaunch
             // ([`crate::init_preferences::selected_tagged_items`]).
-            for (setting, item) in crate::init_preferences::selected_tagged_items(ctx, selected)? {
+            for (setting, item) in
+                crate::init_preferences::selected_tagged_items(ctx, selected, cohorts)?
+            {
                 add(setting, vec![item]);
             }
             if selected.contains(Setting::NaturalScrolling) {
@@ -3929,7 +3959,7 @@ fn workstation_items_selected(
             if selected.contains(Setting::CapsLock) {
                 add(
                     Setting::CapsLock,
-                    crate::init_preferences::attached_keyboard_items(ctx)?,
+                    crate::init_preferences::attached_keyboard_items(ctx, cohorts)?,
                 );
             }
             if selected.contains(Setting::NaturalScrolling) {
@@ -3956,9 +3986,9 @@ fn signs_out(id: &str) -> bool {
 
 /// What [`converge`] read and was told before the workstation's groups are built.
 struct Reading<'a> {
-    /// Why the keyboard list could not be read ([`local_context`]): only the Caps Lock rows go
-    /// unread.
-    keyboards: Option<&'a str>,
+    /// The captured native assignments, or why the keyboard census could not be read
+    /// ([`local_context`]): only the Caps Lock rows go unread.
+    keyboards: &'a KeyboardRead,
     /// The run's `--only` words.
     only: &'a [String],
     /// What `--profile`, `--sign-out`, `--clone` and their `--no-` forms said.
@@ -4498,7 +4528,7 @@ fn groups(
     projects: crate::init_spotlight::Projects,
     secrets: crate::init_secrets::Secrets,
     github: Vec<Box<dyn Item>>,
-    keyboards: Option<&str>,
+    keyboards: &KeyboardRead,
     runs: Selection,
     only: &[String],
     signs_out: bool,
@@ -4529,14 +4559,21 @@ fn groups(
         ] {
             preferences.set(setting, runs.contains(setting));
         }
-        let unread = keyboards.filter(|_| preferences.contains(Setting::CapsLock));
+        let unread = keyboards
+            .unread
+            .as_deref()
+            .filter(|_| preferences.contains(Setting::CapsLock));
         if unread.is_some() {
             preferences.set(Setting::CapsLock, false);
         }
         let mut items = if preferences.is_empty() {
             Vec::new()
         } else {
-            match crate::init_preferences::selected_tagged_items(ctx, preferences) {
+            match crate::init_preferences::selected_tagged_items(
+                ctx,
+                preferences,
+                &keyboards.cohorts,
+            ) {
                 Ok(built) => built
                     .into_iter()
                     .map(|(setting, item)| tagged(&[setting], vec![item]).remove(0))
@@ -5411,7 +5448,7 @@ fn run_layers(
 /// Collect only what this setup uses, avoiding fleet, TCC database and unrelated app probes,
 /// with why the keyboard list could not be read apart ([`context_reading`]): it leaves only
 /// the Caps Lock rows unread, never the run.
-fn local_context(sys: &dyn System) -> Result<(Ctx, Option<String>), String> {
+fn local_context(sys: &dyn System) -> Result<(Ctx, KeyboardRead), String> {
     context_reading(sys, WorkstationGroup::All, Selection::all())
 }
 
@@ -5421,7 +5458,7 @@ fn context_for_selected(
     selected: Selection,
 ) -> Result<Ctx, String> {
     let (ctx, keyboards) = context_reading(sys, group, selected)?;
-    keyboards.map_or(Ok(ctx), Err)
+    keyboards.unread.map_or(Ok(ctx), Err)
 }
 
 /// [`context_for_selected`]'s reading, with why the keyboard list (`hidutil list`) could not
@@ -5430,7 +5467,36 @@ fn context_reading(
     sys: &dyn System,
     group: WorkstationGroup,
     selected: Selection,
-) -> Result<(Ctx, Option<String>), String> {
+) -> Result<(Ctx, KeyboardRead), String> {
+    context_reading_with(sys, group, selected, KeyboardServices::Native)
+}
+
+/// A normal read covers all native services; attachment activation owns only its captured IDs.
+enum KeyboardServices {
+    Native,
+    Attachments,
+}
+
+#[derive(Debug, Default)]
+struct KeyboardRead {
+    unread: Option<String>,
+    cohorts: crate::facts::KeyboardCohorts,
+}
+
+impl KeyboardRead {
+    #[cfg(test)]
+    const EMPTY: Self = Self {
+        unread: None,
+        cohorts: crate::facts::KeyboardCohorts::EMPTY,
+    };
+}
+
+fn context_reading_with(
+    sys: &dyn System,
+    group: WorkstationGroup,
+    selected: Selection,
+    services: KeyboardServices,
+) -> Result<(Ctx, KeyboardRead), String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
     }
@@ -5471,31 +5537,50 @@ fn context_reading(
                 cache_dir: PathBuf::new(),
                 disrupt: true,
             },
-            None,
+            KeyboardRead::default(),
         ));
     }
-    let keyboards = if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock)
-    {
-        Ok(Vec::new())
-    } else {
-        let command = crate::facts::hidutil_keyboards();
-        sys.run_complete_stdout(&command)
-            .map_err(|e| format!("{}: {e}", command.display()))
-            .and_then(|keyboard_list| {
-                if keyboard_list.success() {
-                    crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())
-                } else {
-                    Err(format!(
-                        "{}: {}",
-                        command.display(),
-                        keyboard_list.describe()
-                    ))
-                }
-            })
-    };
-    let (keyboards, unread) = match keyboards {
-        Ok(keyboards) => (keyboards, None),
-        Err(why) => (Vec::new(), Some(why)),
+    let keyboards =
+        if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock) {
+            Ok((Vec::new(), crate::facts::KeyboardCohorts::default()))
+        } else {
+            let command = crate::facts::hidutil_keyboards();
+            sys.run_complete_stdout(&command)
+                .map_err(|e| format!("{}: {e}", command.display()))
+                .and_then(|keyboard_list| {
+                    if keyboard_list.success() {
+                        crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())
+                            .and_then(|census| {
+                                let native = match services {
+                                    KeyboardServices::Native => Some(sys.keyboard_service_ids()?),
+                                    KeyboardServices::Attachments => None,
+                                };
+                                census.into_parts(native.as_deref())
+                            })
+                    } else {
+                        Err(format!(
+                            "{}: {}",
+                            command.display(),
+                            keyboard_list.describe()
+                        ))
+                    }
+                })
+        };
+    let (keyboards, read) = match keyboards {
+        Ok((keyboards, cohorts)) => (
+            keyboards,
+            KeyboardRead {
+                unread: None,
+                cohorts,
+            },
+        ),
+        Err(why) => (
+            Vec::new(),
+            KeyboardRead {
+                unread: Some(why),
+                ..KeyboardRead::default()
+            },
+        ),
     };
     let facts = HostFacts { keyboards, ..facts };
     Ok((
@@ -5507,7 +5592,7 @@ fn context_reading(
             cache_dir: PathBuf::new(),
             disrupt: true,
         },
-        unread,
+        read,
     ))
 }
 
@@ -5676,8 +5761,9 @@ mod tests {
 
     /// A run with no flag and the `--only` words `only`.
     fn reading(only: &[String]) -> Reading<'_> {
+        static KEYBOARDS: KeyboardRead = KeyboardRead::EMPTY;
         Reading {
-            keyboards: None,
+            keyboards: &KEYBOARDS,
             only,
             picks: Picks::default(),
         }
@@ -5777,8 +5863,13 @@ mod tests {
     fn the_desktop_items_of_one_pass_share_one_activation() {
         let who = user("alice", 501);
         let context = ctx(&[who]);
-        let items =
-            workstation_items_selected(&context, WorkstationGroup::All, Selection::all()).unwrap();
+        let items = workstation_items_selected(
+            &context,
+            WorkstationGroup::All,
+            Selection::all(),
+            &crate::facts::KeyboardCohorts::EMPTY,
+        )
+        .unwrap();
         let mut order: Vec<Setting> = items.iter().map(|(setting, _)| *setting).collect();
         order.dedup();
         assert_eq!(
@@ -5839,9 +5930,13 @@ mod tests {
             (line.contains("/usr/bin/defaults") && line.contains(" export "))
                 .then(|| export("<dict/>"))
         });
-        let items =
-            workstation_items_selected(&context, WorkstationGroup::Preferences, Selection::all())
-                .unwrap();
+        let items = workstation_items_selected(
+            &context,
+            WorkstationGroup::Preferences,
+            Selection::all(),
+            &crate::facts::KeyboardCohorts::EMPTY,
+        )
+        .unwrap();
         let mut named = Vec::new();
         for (setting, item) in &items {
             for (target, _) in item.preference_changes(&sys, &context).unwrap() {
@@ -5887,8 +5982,13 @@ mod tests {
             );
             let mut selected = Selection::none();
             selected.set(Setting::Widgets, true);
-            let items =
-                workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
+            let items = workstation_items_selected(
+                &context,
+                WorkstationGroup::All,
+                selected,
+                &crate::facts::KeyboardCohorts::EMPTY,
+            )
+            .unwrap();
             let ids: Vec<String> = items.iter().map(|(_, item)| item.id()).collect();
             assert_eq!(
                 ids,
@@ -6773,7 +6873,7 @@ mod tests {
                 waited_on: None,
             },
             crate::init_github::items(&sys, &alice, None).unwrap(),
-            None,
+            &KeyboardRead::EMPTY,
             Selection::all(),
             &[],
             true,
@@ -7644,7 +7744,7 @@ mod tests {
                 Mode::Plan,
                 None,
                 &Reading {
-                    keyboards: None,
+                    keyboards: &KeyboardRead::EMPTY,
                     only: &[],
                     picks: options.picks,
                 },
@@ -7722,12 +7822,264 @@ mod tests {
     }
 
     #[test]
+    fn saved_caps_preferences_do_not_verify_an_unseen_native_keyboard() {
+        use aterm_types::macos_setup::{Observation, Standing as SettingStanding, Subject};
+
+        let mut sys = alice_at(501);
+        sys.keyboard_services = Some(Ok(vec![41]));
+        let mapping = crate::items::keyboard::Model {
+            vendor: 0,
+            product: 0,
+        }
+        .key();
+        let saved = crate::plist::document(&PValue::Dict(vec![(
+            mapping,
+            PValue::Array(vec![crate::items::keyboard::caps_to_control()]),
+        )]));
+        sys.on(
+            "alice$ /usr/bin/defaults -currentHost export -g -",
+            Ran::ok(&saved),
+        );
+        sys.on(
+            "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -",
+            export("<dict/>"),
+        );
+        assert_eq!(sys.keyboard_service_ids().unwrap(), [41]);
+        assert!(
+            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true).unwrap_or(false),
+            "attachment activation still owes the service absent from the model census"
+        );
+
+        let mut selected = Selection::none();
+        selected.set(Setting::CapsLock, true);
+        let observed = prepare_workstation_selected(&sys, WorkstationGroup::All, selected)
+            .and_then(|pass| pass.run_tagged(&sys, Mode::Plan))
+            .map_or_else(
+                |_| Observation::unknown(Subject::Setting(Setting::CapsLock)),
+                |rows| {
+                    crate::init_observe::observation(
+                        Setting::CapsLock,
+                        &rows.iter().map(|(_, row)| row).collect::<Vec<_>>(),
+                    )
+                },
+            );
+        assert_ne!(
+            observed.standing,
+            SettingStanding::InPlace,
+            "saved preferences cannot confirm a keyboard its live census did not observe"
+        );
+        assert_ne!(observed.now.as_deref(), Some("Control"));
+        assert!(sys.keyboard_changes().is_empty());
+        assert!(!sys.calls().iter().any(|call| call.contains(" write ")));
+    }
+
+    #[test]
+    fn a_partial_live_mapping_read_cannot_verify_the_whole_keyboard_model() {
+        use crate::items::keyboard::{CAPS_LOCK, LEFT_CONTROL, Model};
+        use crate::port::Cmd;
+        use aterm_types::macos_setup::Standing as SettingStanding;
+
+        let census = format!(
+            "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n{:<12}{:<12}{:<16}{:<24}0\n{:<12}{:<12}{:<16}{:<24}0\n\nDevices:\n",
+            "VendorID",
+            "ProductID",
+            "RegistryID",
+            "Product",
+            "0xfffe",
+            "0xa9",
+            "0x29",
+            "Fixture keyboard",
+            "0xfffe",
+            "0xa9",
+            "0x2a",
+            "Fixture keyboard"
+        );
+        let mut sys = alice_with_keyboard_census(501, &census);
+        sys.keyboard_services = Some(Ok(vec![41, 42]));
+        let who = crate::items::defaults::tests::user("alice", 501);
+        let models = [
+            Model {
+                vendor: 0,
+                product: 0,
+            },
+            Model {
+                vendor: 65534,
+                product: 169,
+            },
+        ];
+        let saved = crate::plist::document(&PValue::Dict(
+            models
+                .into_iter()
+                .map(|model| {
+                    (
+                        model.key(),
+                        PValue::Array(vec![crate::items::keyboard::caps_to_control()]),
+                    )
+                })
+                .collect(),
+        ));
+        sys.on(
+            "alice$ /usr/bin/defaults -currentHost export -g -",
+            Ran::ok(&saved),
+        );
+        sys.on(
+            "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -",
+            export("<dict/>"),
+        );
+        let property = Cmd::new(aterm_uds::os_path!("hidutil"))
+            .args([
+                "property",
+                "--matching",
+                &crate::port::keyboard_usage::matching_model(65534, 169),
+                "--get",
+                "UserKeyMapping",
+            ])
+            .as_user(&who);
+        sys.on(&property.display(), Ran::ok("RegistryID Key Value\n2a UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"));
+        sys.on(&property.display(), Ran::ok("RegistryID Key Value\n29 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n2a UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"));
+        let dump = Cmd::new(aterm_uds::os_path!("hidutil"))
+            .args(["dump", "services", "-f", "xml"])
+            .as_user(&who);
+        sys.on(
+            &dump.display(),
+            Ran::ok(&crate::init_preferences::tests::hid_dump(&[(
+                42,
+                &[],
+                &[(CAPS_LOCK, LEFT_CONTROL)],
+            )])),
+        );
+        sys.on(
+            &dump.display(),
+            Ran::ok(&crate::init_preferences::tests::hid_dump(&[
+                (41, &[], &[(CAPS_LOCK, LEFT_CONTROL)]),
+                (42, &[], &[(CAPS_LOCK, LEFT_CONTROL)]),
+            ])),
+        );
+        let mut selected = Selection::none();
+        selected.set(Setting::CapsLock, true);
+        let rows = prepare_workstation_selected(&sys, WorkstationGroup::All, selected)
+            .unwrap()
+            .run_tagged(&sys, Mode::Plan)
+            .unwrap();
+        let observed = crate::init_observe::observation(
+            Setting::CapsLock,
+            &rows.iter().map(|(_, row)| row).collect::<Vec<_>>(),
+        );
+        assert_ne!(
+            observed.standing,
+            SettingStanding::InPlace,
+            "one mapped service cannot verify its model's other unread native service"
+        );
+        assert_ne!(observed.now.as_deref(), Some("Control"));
+        let recovered = prepare_workstation_selected(&sys, WorkstationGroup::All, selected)
+            .unwrap()
+            .run_tagged(&sys, Mode::Plan)
+            .unwrap();
+        let recovered = crate::init_observe::observation(
+            Setting::CapsLock,
+            &recovered.iter().map(|(_, row)| row).collect::<Vec<_>>(),
+        );
+        assert_eq!(recovered.standing, SettingStanding::InPlace);
+        assert_eq!(recovered.now.as_deref(), Some("Control"));
+        assert!(sys.keyboard_changes().is_empty());
+    }
+
+    #[test]
+    fn an_unconfirmed_keyboard_leaves_other_selected_settings_readable() {
+        use aterm_types::macos_setup::Standing as SettingStanding;
+
+        for native in [
+            Ok(vec![41]),
+            Err("native census is unread".into()),
+            Ok(Vec::new()),
+        ] {
+            let mut sys = alice_at(501);
+            sys.keyboard_services = Some(native.clone());
+            saved_off(&sys);
+            sys.scroll_state(false);
+            let mapping = crate::items::keyboard::Model {
+                vendor: 0,
+                product: 0,
+            }
+            .key();
+            sys.on(
+                "alice$ /usr/bin/defaults -currentHost export -g -",
+                Ran::ok(&crate::plist::document(&PValue::Dict(vec![(
+                    mapping,
+                    PValue::Array(vec![crate::items::keyboard::caps_to_control()]),
+                )]))),
+            );
+            sys.on(
+                "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -",
+                export("<dict/>"),
+            );
+            let mut selected = Selection::none();
+            selected.set(Setting::CapsLock, true);
+            selected.set(Setting::NaturalScrolling, true);
+            let rows = prepare_workstation_selected(&sys, WorkstationGroup::All, selected)
+                .unwrap()
+                .run_tagged(&sys, Mode::Plan)
+                .unwrap();
+            for setting in [Setting::CapsLock, Setting::NaturalScrolling] {
+                let observed = crate::init_observe::observation(
+                    setting,
+                    &rows
+                        .iter()
+                        .filter(|(tag, _)| *tag == setting)
+                        .map(|(_, row)| row)
+                        .collect::<Vec<_>>(),
+                );
+                let confirmed = setting != Setting::CapsLock || native == Ok(Vec::new());
+                assert_eq!(
+                    observed.standing,
+                    if confirmed {
+                        SettingStanding::InPlace
+                    } else {
+                        SettingStanding::Unknown
+                    },
+                    "{setting:?}, {native:?}"
+                );
+            }
+            assert!(sys.keyboard_changes().is_empty());
+            assert!(!sys.calls().iter().any(|call| call.contains(" write ")));
+        }
+
+        let mut sys = alice_at(501);
+        sys.keyboard_services = Some(Err("Caps is not selected; must not read".into()));
+        saved_off(&sys);
+        sys.scroll_state(false);
+        let mut selected = Selection::none();
+        selected.set(Setting::NaturalScrolling, true);
+        prepare_workstation_selected(&sys, WorkstationGroup::All, selected)
+            .unwrap()
+            .run_tagged(&sys, Mode::Plan)
+            .unwrap();
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| { !call.contains("hidutil") && call != "keyboard-service-ids" })
+        );
+    }
+
+    #[test]
     fn held_attachments_cover_only_matching_services_without_probing_preferences() {
         let census = format!(
-            "Services:\n{:<12}{:<12}{:<24}Built-In\n{:<12}{:<12}{:<24}0\n\nDevices:\n",
-            "VendorID", "ProductID", "Product", "0xfffe", "0xa9", "Fixture keyboard"
+            "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n{:<12}{:<12}{:<16}{:<24}0\n{:<12}{:<12}{:<16}{:<24}0\n\nDevices:\n",
+            "VendorID",
+            "ProductID",
+            "RegistryID",
+            "Product",
+            "0xfffe",
+            "0xa9",
+            "0x29",
+            "Fixture keyboard",
+            "0xfffe",
+            "0xa9",
+            "0x2a",
+            "Fixture keyboard"
         );
-        let sys = alice_with_keyboard_census(501, &census);
+        let mut sys = alice_with_keyboard_census(501, &census);
+        sys.keyboard_services = Some(Ok(vec![41, 42, 43]));
         let who = crate::items::defaults::tests::user("alice", 501);
         let get = crate::port::Cmd::new(aterm_uds::os_path!("hidutil"))
             .args([
@@ -8901,7 +9253,11 @@ mod tests {
             let sys = current_user();
             sys.on(&command.display(), Ran::ok(invalid));
             let (ctx, unread) = local_context(&sys).unwrap();
-            let why = unread.expect("the list is not read");
+            let why = unread
+                .unread
+                .as_ref()
+                .expect("the list is not read")
+                .clone();
             assert!(ctx.console.is_some() && ctx.facts.keyboards.is_empty());
             assert!(
                 !sys.calls()
@@ -8917,7 +9273,7 @@ mod tests {
                     waited_on: None,
                 },
                 Vec::new(),
-                Some(&why),
+                &unread,
                 Selection::all(),
                 &[],
                 true,
@@ -8947,11 +9303,11 @@ mod tests {
         let sys = current_user();
         sys.on(&command.display(), Ran::ok("Services:\n\nDevices:\n"));
         let (ctx, unread) = local_context(&sys).unwrap();
-        assert!(unread.is_none() && ctx.facts.keyboards.is_empty());
+        assert!(unread.unread.is_none() && ctx.facts.keyboards.is_empty());
         let sys = current_user();
         sys.on(&command.display(), Ran::ok("Services:\n"));
         sys.refuse_complete_stdout(&command.display(), "incomplete captured service list");
-        assert!(local_context(&sys).unwrap().1.is_some());
+        assert!(local_context(&sys).unwrap().1.unread.is_some());
     }
 
     #[test]
@@ -10169,7 +10525,7 @@ mod tests {
                 Mode::Apply,
                 None,
                 &Reading {
-                    keyboards: None,
+                    keyboards: &KeyboardRead::EMPTY,
                     only: &[],
                     picks,
                 },
@@ -10663,7 +11019,7 @@ mod tests {
                     waited_on: None,
                 },
                 Vec::new(),
-                None,
+                &KeyboardRead::EMPTY,
                 Selection::all(),
                 &only,
                 true,
@@ -10746,7 +11102,7 @@ mod tests {
                 waited_on: None,
             },
             Vec::new(),
-            None,
+            &KeyboardRead::EMPTY,
             Choice {
                 sign_out: true,
                 ..Choice::NONE
@@ -10811,7 +11167,7 @@ mod tests {
                 waited_on: None,
             },
             github,
-            None,
+            &KeyboardRead::EMPTY,
             Selection::all(),
             &[],
             true,
@@ -11831,7 +12187,7 @@ mod tests {
                 Mode::Apply,
                 None,
                 &Reading {
-                    keyboards: None,
+                    keyboards: &KeyboardRead::EMPTY,
                     only: &[],
                     picks: Picks::default(),
                 },
@@ -12722,9 +13078,14 @@ mod tests {
     #[test]
     fn the_way_back_for_each_group_names_only_that_groups_items() {
         let sys = alice_with_checkout(501, None);
-        let (ctx, _) = local_context(&sys).unwrap();
+        let (ctx, keyboards) = local_context(&sys).unwrap();
         let mut items: Vec<(Setting, Box<dyn Item>)> =
-            crate::init_preferences::selected_tagged_items(&ctx, Selection::all()).unwrap();
+            crate::init_preferences::selected_tagged_items(
+                &ctx,
+                Selection::all(),
+                &keyboards.cohorts,
+            )
+            .unwrap();
         items.extend(
             crate::init_trackpad::items(&ctx)
                 .unwrap()

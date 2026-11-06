@@ -99,8 +99,20 @@ fn fleet_of(
             held: Some(held),
         };
     }
-    let reached: Vec<IpAddr> = members.iter().copied().filter(|ip| reaches(*ip)).collect();
-    if reached.is_empty() && !members.is_empty() {
+    let mut any_reached = false;
+    let dial: Vec<String> = members
+        .iter()
+        .copied()
+        .filter(|ip| {
+            let ok = reaches(*ip);
+            any_reached |= ok;
+            ok
+        })
+        .map(|ip| SocketAddr::new(ip, atpkg::peers::DEFAULT_PORT))
+        .filter(|at| guard(*at))
+        .map(|at| at.to_string())
+        .collect();
+    if !any_reached && !members.is_empty() {
         return atpkg::peers::Fleet {
             members: members.len(),
             dial: Vec::new(),
@@ -110,12 +122,6 @@ fn fleet_of(
             ),
         };
     }
-    let dial = reached
-        .iter()
-        .map(|ip| SocketAddr::new(*ip, atpkg::peers::DEFAULT_PORT))
-        .filter(|at| guard(*at))
-        .map(|at| at.to_string())
-        .collect();
     atpkg::peers::Fleet {
         members: members.len(),
         dial,

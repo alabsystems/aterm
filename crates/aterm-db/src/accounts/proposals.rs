@@ -247,14 +247,13 @@ impl Proposals {
             if let Some(id) = log.retry(session.actor(), &command)? {
                 return receipt(session, store, &id);
             }
-            let snapshot = log.snapshot();
-            if !snapshot.history_complete() {
+            if !log.history_complete() {
                 return Err(Error::new(
                     "conditional proposal write needs complete retained history",
                 ));
             }
-            let cell = snapshot.cells.get(&(collection.into(), key.into()));
-            let matches = match (cell, expected) {
+            let cell = log.project_cell(collection, key);
+            let matches = match (cell.as_ref(), expected) {
                 (None, None) => true,
                 (Some(cell), Some(expected)) => {
                     !cell.stopped

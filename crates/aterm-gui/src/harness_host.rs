@@ -12754,10 +12754,13 @@ const HELD_RELOOK: Duration = Duration::from_secs(10);
 /// its size, from 10 minutes up to 6 hours (81 minutes for the 320 MB Claude installed on
 /// 2026-11-05). But atpkg's one long silence is the wait for its store lock, up to
 /// [`crate::ATPKG_WAIT_LOCK_SECS`], before its pass has written anything. Every step of that pass
-/// moves `progress.json` or ends by a bound of its own (curl's
-/// `--speed-limit` or a LAN peer's pace under a transfer, `--max-time` under a document it reads, a
-/// signature check's timeout), so 45 quiet minutes is no slow install. ATERM-KI-1105-2 in
-/// `docs/KNOWN_ISSUES.md` names what a stall leaves behind.
+/// that waits on a machine or another program moves `progress.json` or ends by a bound of its own
+/// (curl's `--speed-limit` or a LAN peer's pace under a transfer, `--max-time` under a document it
+/// reads, a signature check's timeout), and its other steps are local work, so 45 quiet minutes is
+/// no slow install. What the child does after its pass ends, its garbage collection and shell-hook
+/// repair among them, moves nothing on that file and has no bound of its own, so the limit counts
+/// that from the pass's end. ATERM-KI-1105-2 in `docs/KNOWN_ISSUES.md` names what a stall leaves
+/// behind.
 pub(crate) const INSTALL_QUIET_LIMIT: Duration = Duration::from_secs(45 * 60);
 const _: () = assert!(
     INSTALL_QUIET_LIMIT.as_secs() >= crate::ATPKG_WAIT_LOCK_SECS + 10 * 60,
@@ -15532,6 +15535,10 @@ pub(crate) struct Startup {
     /// Its launcher is installing its program or preparing its Google sign-in now
     /// (`task_launch::InstallingMark`), so it has typed no agent's line yet.
     pub(crate) installing: bool,
+    /// Which of its launcher's install marks this is
+    /// ([`crate::session_timeline::SessionTimeline::worker_install_mark`]): each has a quiet limit
+    /// whole, so a clock never passes from an install to the sign-in check after it.
+    pub(crate) install_mark: u64,
     /// What the pass of its launcher's own atpkg child has done, read only for a worker
     /// `installing` and awaited ([`InstallWork::read`]): `None` for any other, for a launcher with
     /// no such child (stuck in the spawn, or at a Google sign-in check), and where the store's
@@ -15570,9 +15577,14 @@ pub(crate) enum StartupSeen {
     Holds(StartupHold),
     /// Not read (another thread held the screen, or the record is not one to judge).
     Unread,
+    /// A codex worker's program stands in front, and codex-alab may not claim the tab now
+    /// ([`unclaimed`]). Only a claim proves a codex start, so this is not judged, and the deadline
+    /// falls a whole one after the last look that found it so.
+    CannotClaim,
 }
 
-/// What holds a worker's screen where its composer should be ([`startup_seen`]), named for a person in [`Self::attention`].
+/// What holds a worker's screen where its composer should be ([`startup_seen`]), named for a person
+/// in [`Self::attention_on`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupHold {
     /// The agent's folder-trust dialog, which no rule answered.
@@ -15586,35 +15598,36 @@ pub(crate) enum StartupHold {
         agent: Program,
         program: Option<String>,
     },
-    /// A shell stands in front and the launcher has not typed the agent's line: on the member `on`,
-    /// what it is doing first, an install of the agent or a Google sign-in check
-    /// (`task_launch::InstallingMark`), has not ended ([`install_held`], [`INSTALL_QUIET_LIMIT`]).
-    Installing { agent: Program, on: Option<String> },
+    /// No such agent, and atpkg keeps its program off this Mac `why`, so the line typed could run
+    /// only a copy of the shell's own ([`kept_off_held`]).
+    KeptOff { agent: Program, why: String },
+    /// A shell stands in front and the launcher has not typed the agent's line: what it is doing
+    /// first, an install of the agent or a Google sign-in check (`task_launch::InstallingMark`), has
+    /// not ended ([`install_held`], [`INSTALL_QUIET_LIMIT`]).
+    Installing { agent: Program },
     /// The launcher never typed the agent's line: it holds the launch for a pool that can take
     /// nothing `because` (`task_launch::PoolHoldMark`), the first of its rows opening at `until`
-    /// (Unix seconds), on the member `on`.
+    /// (Unix seconds).
     LaunchHeld {
         agent: Program,
         until: i64,
         because: &'static str,
-        on: Option<String>,
     },
-    /// The tab's shell never reached the prompt the launcher types its line at, on the member
-    /// `on`: what it has shown of itself ([`ShellStart`]).
+    /// The tab's shell never reached the prompt the launcher types its line at: what it has shown
+    /// of itself ([`ShellStart`]).
     NoPrompt {
         agent: Program,
         program: Option<String>,
         drew: bool,
         idle: bool,
-        on: Option<String>,
     },
-    /// The launcher gave up before it typed the agent's line, on the member `on`: `why`, a refusal
-    /// no wait can end. It stands on the launcher's own mark ([`crate::task_launch`]), not the
-    /// deadline's, which it comes before.
+    /// The launcher gave up before it typed the agent's line: `why`, a refusal no wait can end, and
+    /// `word`, the `why=` of the stall it marks. It stands on the launcher's own mark
+    /// ([`crate::task_launch`]), not the deadline's, which it comes before.
     Refused {
         agent: Program,
         why: String,
-        on: Option<String>,
+        word: &'static str,
     },
     /// A codex-alab startup screen that waits for a person, as codex-alab's own attention says
     /// (`text`, owner [`crate::task_record::SELF_CLAIM_ATTENTION_OWNER`]: a sign-in, a folder
@@ -15623,59 +15636,74 @@ pub(crate) enum StartupHold {
 }
 
 impl StartupHold {
-    /// The supervisor's attention for a worker this holds past its deadline: for
-    /// [`Self::Asked`], codex-alab's own words after [`STARTUP_HEAD`], cut to an entry's
-    /// cap, since the supervisor's newer entry is the one aterm shows.
+    /// The supervisor's attention for a worker this holds past its deadline, naming the member `on`
+    /// where its label is known ([`member_label`]), so a stall read off a board or a log says where
+    /// the worker could not start: for [`Self::Asked`], codex-alab's own words after
+    /// [`STARTUP_HEAD`], cut to an entry's cap, since the supervisor's newer entry is the one aterm
+    /// shows. It always fits an entry.
     #[must_use]
-    pub(crate) fn attention(&self) -> String {
+    pub(crate) fn attention_on(&self, on: Option<&str>) -> String {
+        let named = on_member(on);
+        let at = on.map_or_else(String::new, |label| {
+            format!("on {}, ", cut_to(label, NAME_ROOM))
+        });
+        let mut word = "startup";
         let what = match self {
             Self::Trust { agent } => {
                 format!(
-                    "{}'s folder-trust dialog stands on its screen",
+                    "{at}{}'s folder-trust dialog stands on its screen",
                     agent.product()
                 )
             }
             Self::Box { agent, title } => {
-                let title: String = title.trim().chars().take(60).collect();
+                let title = cut_to(title.trim(), TITLE_ROOM);
                 format!(
-                    "a box {} drew stands on its screen ({title})",
+                    "{at}a box {} drew stands on its screen ({title})",
                     agent.product()
                 )
             }
             Self::NoComposer {
                 agent: Program::Codex,
-            } => "codex-alab never claimed its tab (a login or onboarding screen, or the `codex` \
-                  it ran is not codex-alab)"
-                .to_string(),
+            } => format!(
+                "{at}codex-alab never claimed its tab (a login or onboarding screen, or the \
+                 `codex` it ran is not codex-alab)"
+            ),
             Self::NoComposer { agent } => format!(
-                "{} shows no composer (a login or onboarding screen)",
+                "{at}{} shows no composer (a login or onboarding screen)",
                 agent.product()
             ),
             Self::NoAgent {
                 agent,
                 program: Some(p),
             } => {
-                format!("no {} started; `{p}` holds the tab", agent.product())
+                format!(
+                    "no {} started{named}; `{}` holds the tab",
+                    agent.product(),
+                    cut_to(p, NAME_ROOM)
+                )
             }
             Self::NoAgent {
                 agent,
                 program: None,
-            } => format!("no {} started", agent.product()),
-            Self::Installing { agent, on } => format!(
-                "no {} started{}: its install or sign-in check has made no progress for {} minutes",
+            } => format!("no {} started{named}", agent.product()),
+            Self::KeptOff { agent, why } => format!(
+                "no {} started{named}: {}",
                 agent.product(),
-                on_member(on.as_deref()),
+                cut_to(&format!("atpkg keeps it off: {why}"), REFUSAL_ROOM)
+            ),
+            Self::Installing { agent } => format!(
+                "no {} started{named}: its install or sign-in check has made no progress for {} \
+                 minutes",
+                agent.product(),
                 INSTALL_QUIET_LIMIT.as_secs() / 60
             ),
             Self::LaunchHeld {
                 agent,
                 until,
                 because,
-                on,
             } => format!(
-                "no {} started{}: {because} (the first opens {})",
+                "no {} started{named}: {because} (the first opens {})",
                 agent.product(),
-                on_member(on.as_deref()),
                 aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0))
             ),
             Self::NoPrompt {
@@ -15683,7 +15711,6 @@ impl StartupHold {
                 program,
                 drew,
                 idle,
-                on,
             } => {
                 let shell = cut_to(program.as_deref().unwrap_or("its shell"), NAME_ROOM);
                 let what = match (drew, idle) {
@@ -15694,26 +15721,36 @@ impl StartupHold {
                     (true, _) => format!("`{shell}` drew output"),
                 };
                 format!(
-                    "no {} started{}: no shell prompt: {what}",
+                    "no {} started{named}: no shell prompt: {what}",
                     agent.product(),
-                    on_member(on.as_deref()),
                 )
             }
-            Self::Refused { agent, why, on } => {
+            Self::Refused {
+                agent,
+                why,
+                word: its,
+            } => {
+                word = its;
                 format!(
-                    "no {} started{}: {}",
+                    "no {} started{named}: {}",
                     agent.product(),
-                    on_member(on.as_deref()),
-                    cut_to(&without_addresses(why), REFUSAL_ROOM),
+                    refusal_words(why),
                 )
             }
             Self::Asked { text } => {
-                let head = format!("{STARTUP_HEAD}{ASKS}");
+                let head = format!("{STARTUP_HEAD}{ASKS}{named}: ");
                 let room = crate::session_timeline::META_ATTENTION_KEYED_MAX - head.len();
                 return format!("{head}{}", cut_to(text, room));
             }
         };
-        format!("{STARTUP_HEAD}{what} (its task is marked stalled why=startup)")
+        format!("{STARTUP_HEAD}{what} (its task is marked stalled why={word})")
+    }
+
+    /// [`Self::attention_on`] on a Mac whose label is not known, for the tests that judge the rest
+    /// of a stall's words.
+    #[cfg(test)]
+    pub(crate) fn attention(&self) -> String {
+        self.attention_on(None)
     }
 }
 
@@ -15721,9 +15758,28 @@ impl StartupHold {
 /// [`crate::session_timeline::META_ATTENTION_KEYED_MAX`] whichever they are.
 const NAME_ROOM: usize = 16;
 
+/// The bytes a stall's attention gives the title of a box ([`StartupHold::Box`]).
+const TITLE_ROOM: usize = 60;
+
 /// The bytes a stall's attention gives a launcher's refusal ([`StartupHold::Refused`]), whose whole
-/// words stay in its log line and launch note.
-const REFUSAL_ROOM: usize = 85;
+/// words stay in its log line and launch note ([`refusal_words`]). A refusal's short forms are
+/// written to this same room.
+const REFUSAL_ROOM: usize = aterm_agent::harness::worker::REFUSAL_ROOM;
+
+/// A launcher's refusal within [`REFUSAL_ROOM`]: whole where it fits, else its first clause, the
+/// words before its first `; `, cut where even that does not fit. A refusal that runs long leads
+/// with the cause and what mends it, so the room goes to them and not to its explanation
+/// (`aterm_agent::harness::codex_alab::only_default`, `Refused::short`).
+fn refusal_words(why: &str) -> String {
+    let why = without_addresses(why);
+    if why.len() <= REFUSAL_ROOM {
+        return why;
+    }
+    let first = why
+        .split_once("; ")
+        .map_or(why.as_str(), |(first, _)| first);
+    cut_to(first, REFUSAL_ROOM)
+}
 
 /// `words` with each email address a refusal may name (the account a default login holds) said as
 /// `another account`: an attention travels through every fleet survey and board, where a record's
@@ -15743,15 +15799,15 @@ fn without_addresses(words: &str) -> String {
         .join(" ")
 }
 
-/// ` on <member>`, where this Mac's fleet label is known ([`StartupHold::attention`]), so a stall
-/// read off a board or a log says where the worker could not start.
+/// ` on <member>`, where this Mac's fleet label is known ([`StartupHold::attention_on`]).
 fn on_member(on: Option<&str>) -> String {
     on.map_or_else(String::new, |label| {
         format!(" on {}", cut_to(label, NAME_ROOM))
     })
 }
 
-/// This Mac's fleet label, for a stall to name ([`on_member`]).
+/// This Mac's fleet label, for a stall to name ([`StartupHold::attention_on`]), read where a stall
+/// is marked, so a healthy start costs no read of it.
 pub(crate) fn member_label() -> Option<String> {
     static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     kept_label(&LABEL, aterm_agent::survey_facts::machine_label)
@@ -15797,14 +15853,14 @@ fn shell_reached_prompt(terminal: &aterm_core::terminal::Terminal) -> bool {
 }
 
 /// A worker's [`StartupSeen`] given whether its launcher is `installing`: if it is, a shell in
-/// front, at a prompt or short of one, is that install, on the member `on`, since nothing has been
-/// typed yet. What else the screen says stands, so an agent a person started by hand during the
-/// install reads as started, not as an install.
-pub(crate) fn install_held(seen: StartupSeen, installing: bool, on: Option<String>) -> StartupSeen {
+/// front, at a prompt or short of one, is that install, since nothing has been typed yet. What else
+/// the screen says stands, so an agent a person started by hand during the install reads as
+/// started, not as an install.
+pub(crate) fn install_held(seen: StartupSeen, installing: bool) -> StartupSeen {
     match seen {
         StartupSeen::Holds(
             StartupHold::NoAgent { agent, .. } | StartupHold::NoPrompt { agent, .. },
-        ) if installing => StartupSeen::Holds(StartupHold::Installing { agent, on }),
+        ) if installing => StartupSeen::Holds(StartupHold::Installing { agent }),
         seen => seen,
     }
 }
@@ -15812,11 +15868,7 @@ pub(crate) fn install_held(seen: StartupSeen, installing: bool, on: Option<Strin
 /// A worker's [`StartupSeen`] given what its shell has shown (`shell`, `None` where the read was
 /// not made): a shell in front that never reached a prompt names that instead of "`zsh` holds the
 /// tab", which a dispatcher would read as a launch that typed and failed.
-pub(crate) fn shell_held(
-    seen: StartupSeen,
-    shell: Option<ShellStart>,
-    on: Option<String>,
-) -> StartupSeen {
+pub(crate) fn shell_held(seen: StartupSeen, shell: Option<ShellStart>) -> StartupSeen {
     match (seen, shell) {
         (
             StartupSeen::Holds(StartupHold::NoAgent { agent, program }),
@@ -15830,27 +15882,57 @@ pub(crate) fn shell_held(
             program,
             drew,
             idle,
-            on,
         }),
         (seen, _) => seen,
     }
 }
 
-/// How a startup stall's attention quoting codex-alab begins, after [`STARTUP_HEAD`] ([`StartupHold::Asked`]).
-const ASKS: &str = "codex-alab asks: ";
+/// A worker's [`StartupSeen`] given why atpkg keeps its program off this Mac (`kept_off`, the
+/// launcher's word, `SessionTimeline::worker_kept_off`): a shell in front at its prompt with no
+/// agent, or no program published, is a line that found no copy of the shell's own, and that reason
+/// is what mends it. Any other screen stands: another program in front is what holds the tab, a
+/// copy that did start reads as itself, and a shell short of its prompt was typed nothing.
+pub(crate) fn kept_off_held(seen: StartupSeen, kept_off: Option<String>) -> StartupSeen {
+    match (seen, kept_off) {
+        (StartupSeen::Holds(StartupHold::NoAgent { agent, program }), Some(why))
+            if program
+                .as_deref()
+                .is_none_or(crate::quit_safety::is_shell_name) =>
+        {
+            StartupSeen::Holds(StartupHold::KeptOff { agent, why })
+        }
+        (seen, _) => seen,
+    }
+}
+
+/// How a startup stall's attention quoting codex-alab begins, after [`STARTUP_HEAD`], the member it
+/// may name and `: ` following ([`StartupHold::Asked`]).
+const ASKS: &str = "codex-alab asks";
+
+/// The words of codex-alab's that a startup stall's attention (`standing`) quotes, if it quotes any.
+fn asked_quote(standing: &str) -> Option<&str> {
+    let rest = standing.strip_prefix(STARTUP_HEAD)?.strip_prefix(ASKS)?;
+    rest.split_once(": ").map(|(_, quote)| quote)
+}
 
 /// Whether a startup stall's standing attention (`standing`) is to name `hold` instead: where
 /// codex-alab's own words came or went (an [`StartupHold::Asked`] quote on either side, since
 /// codex-alab takes its attention down once its screen's step is done while the stall stands)
-/// and the words differ. Every other stall keeps the words it was raised with.
+/// or its quote differs, cut as `standing` was for the room its own head left. Every other stall
+/// keeps the words it was raised with, whichever member they name.
 pub(crate) fn restates(standing: Option<&str>, hold: &StartupHold) -> bool {
     let Some(standing) = standing else {
         return false;
     };
-    let quoted = standing
-        .strip_prefix(STARTUP_HEAD)
-        .is_some_and(|rest| rest.starts_with(ASKS));
-    (quoted || matches!(hold, StartupHold::Asked { .. })) && standing != hold.attention()
+    match (asked_quote(standing), hold) {
+        (Some(quote), StartupHold::Asked { text }) => {
+            let head = standing.len() - quote.len();
+            let room = crate::session_timeline::META_ATTENTION_KEYED_MAX.saturating_sub(head);
+            cut_to(text, room) != quote
+        }
+        (Some(_), _) | (None, StartupHold::Asked { .. }) => true,
+        (None, _) => false,
+    }
 }
 
 /// `text` within `max` bytes: its head, ended by `…` where it is longer.
@@ -16015,7 +16097,7 @@ pub(crate) fn deadline_attention_stands(standing: Option<&str>) -> bool {
 /// The deadlines' marks ([`Acts::startup_mark`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StartupMark<'a> {
-    /// `stalled why=startup`, with what holds the screen ([`StartupHold::attention`]) as the
+    /// `stalled why=startup`, with what holds the screen ([`StartupHold::attention_on`]) as the
     /// supervisor's attention.
     Stalled { hold: &'a StartupHold },
     /// `working` again, and the attention the startup stall set taken down.
@@ -16054,9 +16136,10 @@ impl HeldClock {
     }
 }
 
-/// What the books keep of one launcher's install: the work the last look read, and since when it
-/// has read that ([`INSTALL_QUIET_LIMIT`]).
+/// What the books keep of one launcher's install: which of its marks that is, the work the last
+/// look read, and since when it has read that ([`INSTALL_QUIET_LIMIT`]).
 struct InstallClock {
+    mark: u64,
     work: Option<InstallWork>,
     since: Instant,
 }
@@ -16065,6 +16148,9 @@ struct InstallClock {
 struct Startups {
     from: Option<Instant>,
     started: std::collections::HashSet<String>,
+    /// The last look that found each worker outside the startup deadline's judgement, which falls
+    /// a whole one after that: Autopilot off, a codex-alab that may not claim
+    /// ([`StartupSeen::CannotClaim`]), a relaunch in hand, or an install.
     off: HashMap<String, Instant>,
     hands: HashMap<String, Instant>,
     held: HashMap<String, HeldClock>,
@@ -16168,6 +16254,10 @@ fn look_at_startups(
                 }
             }
             (_, StartupSeen::Unread) => soonest(now + STARTUP_UNREAD_LOOK),
+            (_, StartupSeen::CannotClaim) => {
+                books.off.insert(w.sid.clone(), now);
+                soonest(now + STARTUP_UNREAD_LOOK);
+            }
             (StartupState::Working, StartupSeen::Holds(hold)) => {
                 // The harness's own waits count no more here than at the held deadline.
                 // An agent's exit in hand for a relaunch (whose shell a successor that
@@ -16195,10 +16285,12 @@ fn look_at_startups(
                             .installs
                             .entry(w.sid.clone())
                             .or_insert_with(|| InstallClock {
+                                mark: w.install_mark,
                                 work: w.install_work.clone(),
                                 since: now,
                             });
-                    if clock.work != w.install_work {
+                    if clock.mark != w.install_mark || clock.work != w.install_work {
+                        clock.mark = w.install_mark;
                         clock.work.clone_from(&w.install_work);
                         clock.since = now;
                     }
@@ -16313,16 +16405,24 @@ fn look_at_held_stall(
 /// A codex worker starts only when codex-alab claims its tab, so a codex screen that reads as
 /// started is OpenAI's codex or a codex-alab that has not carried it
 /// ([`StartupHold::NoComposer`]). While codex-alab may not claim the tab (`claimable` false: a
-/// halt stands, or the session's Autopilot is off) it is not judged yet
-/// ([`StartupSeen::Unread`]). Where codex-alab's own attention (`asked`, given only where no
-/// other agent is in front) stands over a codex screen, that is what holds it
-/// ([`StartupHold::Asked`]). Any other worker's read is the screen's.
+/// halt stands, or the session's Autopilot is off), a program in front is not judged
+/// ([`StartupSeen::CannotClaim`]): the deadline would be judging the halt, not the worker. A shell
+/// in front is judged as any worker's is, since a halt keeps no shell from its prompt and no
+/// typed line from running. Where codex-alab's own attention (`asked`, given only where no other
+/// agent is in front) stands over a codex screen, that is what holds it
+/// ([`StartupHold::Asked`]). Any other worker's read is the screen's: a halt does not stop the
+/// screen that shows its start.
 pub(crate) fn unclaimed(
     seen: StartupSeen,
     expected: Option<Program>,
     claimable: bool,
     asked: Option<&str>,
 ) -> StartupSeen {
+    let shell_in_front = matches!(
+        &seen,
+        StartupSeen::Holds(StartupHold::NoAgent { program, .. })
+            if program.as_deref().is_none_or(crate::quit_safety::is_shell_name)
+    );
     match (expected, seen) {
         (
             Some(
@@ -16336,7 +16436,7 @@ pub(crate) fn unclaimed(
             | None,
             seen,
         ) => seen,
-        (Some(Program::Codex), _) if !claimable => StartupSeen::Unread,
+        (Some(Program::Codex), _) if !claimable && !shell_in_front => StartupSeen::CannotClaim,
         (
             Some(Program::Codex),
             StartupSeen::Started
@@ -19588,7 +19688,18 @@ fn startups_on(
                 )
             };
             let claimable = !autopilot_off && h.ctx.fabric.hold().is_none();
-            let (record, program, agent, mut held, installing, install_child, pool_hold, unheld) = {
+            let (
+                record,
+                program,
+                agent,
+                mut held,
+                installing,
+                install_mark,
+                install_child,
+                pool_hold,
+                unheld,
+                kept_off,
+            ) = {
                 let tl = h
                     .ctx
                     .timeline
@@ -19596,9 +19707,11 @@ fn startups_on(
                     .unwrap_or_else(PoisonError::into_inner);
                 let record = tl.task()?.clone();
                 let installing = tl.worker_installing();
+                let install_mark = tl.worker_install_mark();
                 let install_child = tl.worker_install_child();
                 let pool_hold = tl.worker_pool_hold().cloned();
                 let unheld = tl.worker_pool_hold_ended();
+                let kept_off = tl.worker_kept_off().map(str::to_string);
                 let publication = tl.agent();
                 let agent = agent_of(publication);
                 let held = HeldRead {
@@ -19625,9 +19738,11 @@ fn startups_on(
                     agent,
                     held,
                     installing,
+                    install_mark,
                     install_child,
                     pool_hold,
                     unheld,
+                    kept_off,
                 )
             };
             held.progress.input = h.ctx.output_echo.input_sent();
@@ -19651,6 +19766,8 @@ fn startups_on(
             let state = match (record.state, record.why) {
                 (TaskState::Stalled, Some("startup")) => StartupState::StalledAtStartup,
                 (TaskState::Stalled, Some("held")) => StartupState::StalledHeld,
+                // Its launcher raised its attention with the mark; it stands while the stall does.
+                (TaskState::Stalled, Some(why)) if refused_stall(why) => StartupState::Other,
                 _ if deadlines => StartupState::StallOver,
                 (TaskState::Working, None) => StartupState::Working,
                 (TaskState::Working, Some("turn" | "moved")) => StartupState::Reopened,
@@ -19701,13 +19818,17 @@ fn startups_on(
                     agent: record.agent.unwrap_or(Program::Claude),
                     until: hold.until,
                     because: hold.because,
-                    on: member_label(),
                 }),
                 (Some(rows), true, None) => {
+                    let screen = startup_seen(rows, program.as_deref(), agent, record.agent);
+                    // A shell short of its first prompt has had no line typed, so what it runs (an
+                    // rc file's child) is no codex-alab a halt keeps from claiming.
+                    let short_of_a_prompt = !prompt
+                        && matches!(screen, StartupSeen::Holds(StartupHold::NoAgent { .. }));
                     let seen = unclaimed(
-                        startup_seen(rows, program.as_deref(), agent, record.agent),
+                        screen,
                         record.agent,
-                        claimable,
+                        claimable || short_of_a_prompt,
                         // codex-alab's words name only a screen codex holds: another agent in
                         // front (OpenAI's codex aside) is that agent's screen.
                         asked
@@ -19715,7 +19836,7 @@ fn startups_on(
                             .filter(|_| agent.is_none_or(codex_alab_names_screen)),
                     );
                     // Only a worker still awaited, whose shell is in front with no prompt yet, is
-                    // read further, so a healthy start costs neither the label nor a process read.
+                    // read further, so a healthy start costs no process read.
                     let shell = (state == StartupState::Working
                         && !prompt
                         && matches!(seen, StartupSeen::Holds(StartupHold::NoAgent { .. })))
@@ -19725,12 +19846,7 @@ fn startups_on(
                         idle: crate::input_stall::fg_cpu(h.master)
                             .is_some_and(|(_, ns)| ns < SHELL_IDLE_NS),
                     });
-                    let on = shell.as_ref().and_then(|_| member_label());
-                    install_held(
-                        shell_held(seen, shell, on),
-                        installing,
-                        installing.then(member_label).flatten(),
-                    )
+                    install_held(kept_off_held(shell_held(seen, shell), kept_off), installing)
                 }
                 _ => StartupSeen::Unread,
             };
@@ -19761,6 +19877,7 @@ fn startups_on(
                 held,
                 standing: standing.filter(|s| s.starts_with(STARTUP_HEAD)),
                 installing,
+                install_mark,
                 install_work,
                 unheld,
             })
@@ -19804,12 +19921,29 @@ fn task_fact_live(
     )
 }
 
+/// Whether a stall's `why=` is one a launcher marks with the attention it raises itself
+/// (`task_launch::take_admission`), which no deadline's stall comes after: nothing is typed, so no
+/// screen says more of it, and only a later mark ends it.
+fn refused_stall(why: &str) -> bool {
+    why == crate::task_record::WHY_SIGNIN || why == crate::task_record::WHY_INSTALL
+}
+
 /// The deadlines' marks, made in-process and conditional on the record still reading what the look
 /// read (`task_record::mark_session_task_with`, read under the locks the mark takes).
 pub(crate) fn startup_mark_with(
     store: &Store,
     sid: &str,
     mark: &StartupMark<'_>,
+) -> Option<(u64, crate::task_record::MarkedWith)> {
+    startup_mark_named(store, sid, mark, member_label)
+}
+
+/// [`startup_mark_with`], its stall naming the member `member` reads.
+fn startup_mark_named(
+    store: &Store,
+    sid: &str,
+    mark: &StartupMark<'_>,
+    member: impl FnOnce() -> Option<String>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
     use crate::task_record::{
         AttentionEdit, TaskMark, TaskRecord, TaskState, mark_session_task_with,
@@ -19820,7 +19954,9 @@ pub(crate) fn startup_mark_with(
         .by_sid(&aterm_session::SessionId::new(sid))
         .cloned()?;
     let said = match mark {
-        StartupMark::Stalled { hold } | StartupMark::Restated { hold } => hold.attention(),
+        StartupMark::Stalled { hold } | StartupMark::Restated { hold } => {
+            hold.attention_on(member().as_deref())
+        }
         StartupMark::Held { read, held_for } => held_attention(read, *held_for),
         StartupMark::Started => "started after all".to_string(),
         StartupMark::Moved => "it moved".to_string(),
@@ -19860,7 +19996,9 @@ pub(crate) fn startup_mark_with(
             |r, _| r.state == TaskState::Stalled && r.why == Some("held"),
         ),
         StartupMark::Over => (None, take_down, |r, _| {
-            !(r.state == TaskState::Stalled && matches!(r.why, Some("startup" | "held")))
+            !(r.state == TaskState::Stalled
+                && r.why
+                    .is_some_and(|why| matches!(why, "startup" | "held") || refused_stall(why)))
         }),
         StartupMark::Restated { .. } => (None, AttentionEdit::Raise(&said), |r, standing| {
             r.state == TaskState::Stalled

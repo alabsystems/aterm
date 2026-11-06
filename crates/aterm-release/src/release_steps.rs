@@ -549,6 +549,40 @@ impl Real {
         Ok(self.configure_child(self.scrubbed_command(cmd), prover))
     }
 
+    fn tap_command(&self, site_tag: &str) -> Result<Command, Refusal> {
+        let version = site_tag.strip_prefix('v').ok_or_else(|| {
+            Refusal::new(
+                "the validated site cohort has no version tag",
+                "read the after-cut log",
+            )
+        })?;
+        crate::publish::release_version_from_workspace(version).map_err(|why| {
+            Refusal::new(
+                format!("invalid site cohort for the tap: {why}"),
+                "read the after-cut log",
+            )
+        })?;
+        let mut command = self.engine_child(&self.engine, None)?;
+        command.args(["tap", "--bump", "--expect-version", version]);
+        Ok(command)
+    }
+
+    fn align_tap(&self, site_tag: &str) -> Result<String, Refusal> {
+        let mut command = self.tap_command(site_tag)?;
+        let ran = self.logged(Step::AfterCut, &mut command);
+        if ran.code != 0 {
+            return Err(Refusal::new(
+                format!(
+                    "canonical tap alignment for {site_tag} did not finish (exit {})",
+                    ran.code
+                ),
+                format!("{RELEASE_COMMAND} again after resolving the after-cut log's refusal"),
+            )
+            .detail(ran.detail));
+        }
+        Ok(format!("the canonical tap is aligned to {site_tag}"))
+    }
+
     /// This cutter again with `args` (the build and cut steps): [`Real::cut_command_of`] this
     /// process's executable.
     fn cut_command(&self, args: &[String], prover: &Prover) -> Result<Command, String> {
@@ -2272,6 +2306,24 @@ fn tail(path: &Path, n: usize) -> Vec<String> {
 /// Each kept audit row put back in time order (the pub-sync pattern).
 #[must_use]
 pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
+    if kept.iter().all(|row| text.lines().any(|line| line == row)) {
+        if !text.is_empty()
+            && !text.contains('\r')
+            && text.ends_with('\n')
+            && !text.ends_with("\n\n")
+        {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len().max(1));
+        for (idx, row) in text.lines().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str(row);
+        }
+        out.push('\n');
+        return out;
+    }
     let at = |row: &str| -> String {
         aterm_json::from_str::<aterm_json::Value>(row)
             .ok()
@@ -2645,7 +2697,7 @@ impl std::fmt::Display for Bootstrap {
     }
 }
 
-/// Start the engine's launcher (`bin/pub --help`) without starting a stage, using the
+/// Check the engine's launcher and guarded tap contract without starting a stage, using the
 /// publication environment every release step runs the engine in ([`publication_command`]).
 ///
 /// # Errors
@@ -2684,7 +2736,7 @@ fn engine_bootstrap_with(
             ))
         })?;
     if out.status.success() {
-        return Ok(());
+        return tap_bootstrap(repo, engine, &held);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     let said = stderr
@@ -2703,6 +2755,42 @@ fn engine_bootstrap_with(
             format!(": {said}")
         }
     )))
+}
+
+/// The exact cohort guard is required before the cold release work or claim.
+/// Argparse help exits before the canonical helper constructs its GitHub client.
+#[cfg(unix)]
+fn tap_bootstrap(
+    repo: &Path,
+    engine: &Path,
+    held: &crate::managed_prerequisites::Tools,
+) -> Result<(), Bootstrap> {
+    let mut command = held
+        .engine_command(&engine.join("bin/pub"))
+        .map_err(Bootstrap::Prerequisites)?;
+    publication_environment(engine, &mut command);
+    command
+        .args(["tap", "--help"])
+        .current_dir(repo)
+        .stdin(Stdio::null());
+    held.apply(&mut command).map_err(Bootstrap::Prerequisites)?;
+    let out = aterm_uds::deadline::output_until_complete_stdout(
+        &mut command,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .map_err(|why| Bootstrap::Failed(format!("publication tap capability cannot run: {why}")))?;
+    if !out.status.success()
+        || !out
+            .stdout
+            .split(u8::is_ascii_whitespace)
+            .any(|word| word == b"--expect-version")
+    {
+        return Err(Bootstrap::Failed(format!(
+            "publication engine {} lacks the guarded tap --expect-version contract; use a current engine before starting a release",
+            engine.display(),
+        )));
+    }
+    Ok(())
 }
 
 /// Where a `verify` the release runs in the clone `repo` builds: the physical target its children
@@ -4136,6 +4224,20 @@ impl Backend for Real {
     }
 
     fn validation_tools(&mut self) -> Result<String, Refusal> {
+        self.prepare_prerequisites()?;
+        let held = self.prerequisites.as_ref().ok_or_else(|| {
+            prerequisite_refusal("publication prerequisites were not acquired".into())
+        })?;
+        #[cfg(unix)]
+        tap_bootstrap(&self.repo, &self.engine, held).map_err(|why| {
+            Refusal::new(
+                why.to_string(),
+                "update the publication engine before starting the release",
+            )
+            .could_not_run()
+        })?;
+        #[cfg(not(unix))]
+        let _ = held;
         let machine = aterm_verify::provision::this_machine(&self.repo).ok_or_else(|| {
             Refusal::new("cannot resolve validation tool cache", "set HOME and retry")
                 .could_not_run()
@@ -4251,13 +4353,9 @@ impl Backend for Real {
             });
         let attestation =
             crate::durable::read_text(&self.repo.join("publish/.out/attestation.json")).ok();
-        let attested = attestation
-            .as_deref()
-            .is_some_and(|t| attestation_promotes(t, &c.commit));
-        let staged_by = attestation
-            .as_deref()
-            .filter(|_| attested)
-            .and_then(attested_engine);
+        let (attested, staged_by) = attestation.as_deref().map_or((false, None), |t| {
+            attestation_promotion_and_engine(t, &c.commit)
+        });
         let fixtures = match crate::fixtures::on_commit(&git, "origin/main", &c.version) {
             Ok(Some(found)) => Answer::yes(format!(
                 "v{}'s handoff fixtures are on main ({} desks)",
@@ -4828,10 +4926,11 @@ impl Backend for Real {
             return Err(shape_refusal(&slug, &tag, problems));
         }
         let site = self.site(&slug)?;
+        let tap = self.align_tap(&site_tag)?;
         Ok(AfterCut {
             note: format!(
-                "{tag} carries the lean shape as GitHub serves it; {}",
-                site.note
+                "{tag} carries the lean shape as GitHub serves it; {}; {tap}",
+                site.note,
             ),
         })
     }
@@ -4938,18 +5037,33 @@ fn attestation_qualifies_in(a: &aterm_json::Value, commit: &str) -> bool {
 }
 
 /// A checked export whose candidate was also attested on the remote staging tier.
+#[cfg(test)]
 #[must_use]
 pub fn attestation_promotes(json: &str, commit: &str) -> bool {
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
         return false;
     };
-    if !attestation_qualifies_in(&a, commit) {
+    attestation_promotes_in(&a, commit)
+}
+
+fn attestation_promotes_in(a: &aterm_json::Value, commit: &str) -> bool {
+    if !attestation_qualifies_in(a, commit) {
         return false;
     }
     let stage = &a["staging"];
     stage["attested_rev"]
         .as_str()
         .is_some_and(|attested| Some(attested) == stage["candidate_rev"].as_str())
+}
+
+pub(crate) fn attestation_promotion_and_engine(json: &str, commit: &str) -> (bool, Option<String>) {
+    let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
+        return (false, None);
+    };
+    if !attestation_promotes_in(&a, commit) {
+        return (false, None);
+    }
+    (true, attested_engine_in(&a).map(str::to_string))
 }
 
 fn attested_engine_in(a: &aterm_json::Value) -> Option<&str> {
@@ -4960,6 +5074,7 @@ fn attested_engine_in(a: &aterm_json::Value) -> Option<&str> {
 }
 
 /// The engine commit an attestation names (`engine.commit`): the engine that staged it.
+#[cfg(test)]
 #[must_use]
 pub fn attested_engine(json: &str) -> Option<String> {
     let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
@@ -5252,12 +5367,25 @@ mod tests {
         std::fs::rename(&launcher, engine.join("bin/unavailable-pub")).unwrap();
         std::fs::write(
             &launcher,
-            "#!/bin/sh\n[ \"$1\" = --help ] || exit 3\nprintf 'engine-help-ready\\n'\n",
+            "#!/bin/sh\ncase \"$*\" in '--help') printf 'engine-help-ready\\n';; 'tap --help') printf '%s\\n' '--expect-version VERSION';; *) exit 3;; esac\n",
         )
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             engine_bootstrap_with(&repo, &engine, crate::managed_prerequisites::simulated).is_ok()
+        );
+        // An old tap may have successful help while lacking the cohort guard.
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> probes\nprintf 'old-help\\n'\n",
+        )
+        .unwrap();
+        let missing =
+            engine_bootstrap_with(&repo, &engine, crate::managed_prerequisites::simulated);
+        assert!(matches!(missing, Err(Bootstrap::Failed(why)) if why.contains("--expect-version")));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("probes")).unwrap(),
+            "--help\ntap --help\n"
         );
         // A healthy-looking engine cannot run when signed admission refuses.
         // No script or PATH interpreter is probed as a replacement.
@@ -5270,6 +5398,71 @@ mod tests {
             matches!(refused, Err(Bootstrap::Prerequisites(why)) if why.contains("unavailable"))
         );
         assert!(!repo.join("child-ran").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_old_tap_refuses_before_validation_tool_provisioning() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(engine.join("bin")).unwrap();
+        let script = engine.join("bin/pub");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-probe\nprintf 'legacy tap help\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
+        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
+        let refused = real.validation_tools().unwrap_err();
+        assert!(refused.why.contains("--expect-version"), "{refused:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tap-probe")).unwrap(),
+            "tap --help\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_after_cut_tap_child_uses_the_validated_cohort_and_propagates_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(engine.join("bin")).unwrap();
+        let script = engine.join("bin/pub");
+        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
+        assert!(
+            real.tap_command("v0.159.0").is_err(),
+            "unheld interpreter cannot run"
+        );
+        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
+        for bad in ["0.159.0", "v0.159.1", "v00.159.0", "v0.159.0 extra"] {
+            assert!(real.tap_command(bad).is_err(), "{bad}");
+        }
+        let command = real.tap_command("v0.159.0").unwrap();
+        assert_eq!(command.get_program(), script.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["tap", "--bump", "--expect-version", "0.159.0"].map(std::ffi::OsStr::new)
+        );
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-invocation\nexit 17\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = real.align_tap("v0.159.0").unwrap_err();
+        assert!(refused.why.contains("exit 17"), "{refused:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tap-invocation")).unwrap(),
+            "tap --bump --expect-version 0.159.0\n"
+        );
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-invocation\nprintf 'canonical verified alignment\\n'\n").unwrap();
+        assert!(real.align_tap("v0.159.0").unwrap().contains("v0.159.0"));
+        let log = std::fs::read_to_string(real.step_log(Step::AfterCut)).unwrap();
+        assert!(log.contains("canonical verified alignment"));
     }
 
     #[test]

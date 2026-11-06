@@ -319,8 +319,10 @@ impl Seen {
         let account = row.get("account").and_then(Value::as_str)?;
         let key = row.get("key").and_then(Value::as_str)?;
         (keys::subaccount_pk(account, key).ok()? == pk.as_str()).then_some(())?;
-        self.sub_of
-            .insert(pk.as_str().to_owned(), account.to_owned());
+        if !self.sub_of.contains_key(pk.as_str()) {
+            self.sub_of
+                .insert(pk.as_str().to_owned(), account.to_owned());
+        }
         Pk::new(account)
     }
 
@@ -393,7 +395,9 @@ impl Seen {
         let sub_pk = match &event.sub {
             Some(sub) => match keys::subaccount_pk(account.as_str(), sub.as_str()) {
                 Ok(pk) => {
-                    self.sub_of.insert(pk.clone(), account.as_str().to_owned());
+                    if !self.sub_of.contains_key(&pk) {
+                        self.sub_of.insert(pk.clone(), account.as_str().to_owned());
+                    }
                     Some(pk)
                 }
                 Err(_) => return,

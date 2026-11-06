@@ -12,6 +12,9 @@ use crate::verdict::CouldNotRun;
 /// The pinned toolchain's drivers and the host it compiles for natively.
 #[derive(Clone, Debug)]
 pub struct Trust {
+    /// Native authoring formatter; an engineering compiler SDK may borrow the
+    /// normal managed Trust formatter without replacing its compiler/runtime.
+    pub formatter: Option<PathBuf>,
     pub targo: PathBuf,
     pub trustc: PathBuf,
     pub trustdoc: PathBuf,
@@ -106,6 +109,17 @@ pub fn discover(root: &Path) -> Result<Trust, CouldNotRun> {
         }
     }
     Ok(Trust {
+        formatter: toolchain.trustfmt.or_else(|| {
+            stage2.as_ref()?;
+            discovery::Toolchain::discover(
+                None,
+                &home,
+                &path,
+                discovery::pinned_channel(root).as_deref(),
+                aterm_toolchain::trust_lock::find(root).as_ref(),
+            )
+            .trustfmt
+        }),
         targo: toolchain.targo,
         trustc,
         trustdoc: toolchain.trustdoc,
@@ -114,10 +128,26 @@ pub fn discover(root: &Path) -> Result<Trust, CouldNotRun> {
 }
 
 impl Trust {
-    /// The formatter beside the pinned `trustc`.
+    /// Whether this exact Trust sysroot contains both target runtime libraries.
+    /// Foreign cells may use Trust const/rustdoc probes without a stock toolchain
+    /// when their matching std/core were actually built in this sysroot.
+    pub fn has_target(&self, triple: &str) -> bool {
+        ask(
+            &self.trustc,
+            &["--print", "target-libdir", "--target", triple],
+        )
+        .is_ok_and(|dir| {
+            let dir = PathBuf::from(dir.trim());
+            has_rlib(&dir, "core") && has_rlib(&dir, "std")
+        })
+    }
+    /// The resolver-selected native Trust formatter, with the sibling path as
+    /// the diagnostic fallback when no authoring formatter is installed.
     #[must_use]
     pub fn trustfmt(&self) -> PathBuf {
-        self.trustc.with_file_name("trustfmt")
+        self.formatter
+            .clone()
+            .unwrap_or_else(|| self.trustc.with_file_name("trustfmt"))
     }
 }
 

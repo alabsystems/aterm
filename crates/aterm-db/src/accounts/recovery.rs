@@ -242,7 +242,7 @@ impl Recovery {
             };
             let log = Log::read_with(&session, &store, scope, decode)?;
             require_time(deadline)?;
-            for (operation, command) in log.eligible() {
+            for (operation, command) in log.eligible_iter() {
                 let actor = operation.header.actor;
                 let Ok((key, account, decision, attempt, record_period)) = body(command) else {
                     continue;

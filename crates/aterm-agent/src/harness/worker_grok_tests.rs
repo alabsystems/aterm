@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use aterm_phase::Program;
 
 use super::super::{
-    Admitted, Dialect, Fresh, Readiness, Refused, Starter, WORKERS, admit, ensure_program,
-    starter_of, worker_cli,
+    Admitted, Dialect, Fresh, REFUSAL_ROOM, Readiness, Refused, Starter, WORKERS, admit,
+    ensure_program, starter_of, worker_cli,
 };
 
 /// [`super::super::line`] for `starter` taken as admitted: these tests check the line's form.
@@ -491,9 +491,10 @@ fn a_spawn_installs_an_absent_program_unless_a_person_keeps_it_off() {
         ] {
             let held = FakeStore::new(false, Some(hold), true, None);
             let readiness = held.ensure(cli).expect("a hold is no refusal");
-            let Readiness::KeptOff(said) = &readiness else {
+            let Readiness::KeptOff { why, said } = &readiness else {
                 panic!("{:?}: {readiness:?}", cli.agent);
             };
+            assert_eq!(why, hold, "a stall quotes the hold's words alone");
             assert!(said.contains(hold), "the hold's words are carried: {said}");
             assert_eq!(
                 held.asked(),
@@ -598,6 +599,7 @@ fn admission_asks_the_sign_in_before_it_installs_anything() {
         matches!(&refused, Refused::Program(why) if why.contains("vendor unreachable: x.ai")),
         "{refused:?}"
     );
+    assert_eq!(refused.short(), "install failed: vendor unreachable: x.ai");
 
     let claude = worker_cli(Program::Claude).expect("claude row");
     let kept = admit(
@@ -610,4 +612,128 @@ fn admission_asks_the_sign_in_before_it_installs_anything() {
     )
     .expect("an installed program");
     assert_eq!(kept.readiness(), &Readiness::Present);
+}
+
+/// A REFUSAL'S SHORT FORM LEADS WITH ITS CAUSE, so a stall's attention can hold it. Of a failed
+/// install it is the last line atpkg said of the failure (its lines come joined by ` | `,
+/// `PassRun::why`), not the lock wait it may have started with. A sign-out is a person's to mend,
+/// and a preparation's words stand as they are. An install that left nothing leads with why.
+/// CONTROL: the whole words stay in [`Refused::why`] for the launch's note and log.
+#[test]
+fn a_refusals_short_form_leads_with_its_cause() {
+    let waited =
+        "atpkg: another atpkg process holds the store lock | atpkg: no space left on device";
+    let cli = worker_cli(Program::Claude).expect("claude row");
+    let failed = ensure_program(cli, |_| false, |_| None, |_| Err(waited.to_owned()))
+        .map(|_| ())
+        .map_err(Refused::Program)
+        .expect_err("a failed install");
+    assert_eq!(
+        failed.short(),
+        "install failed: atpkg: no space left on device"
+    );
+    assert!(failed.why().contains("holds the store lock"), "{failed:?}");
+
+    let empty = ensure_program(cli, |_| false, |_| None, |_| Ok(()))
+        .map(|_| ())
+        .map_err(Refused::Program)
+        .expect_err("nothing laid");
+    assert!(
+        empty
+            .short()
+            .starts_with("no build of claude serves this machine, or its install was refused; "),
+        "{empty:?}"
+    );
+
+    let signed_out = Refused::SignedOut("no sign-in at /home/auth.json".to_owned());
+    assert_eq!(signed_out.short(), "signed out, a person must sign in");
+    assert_eq!(signed_out.why(), "no sign-in at /home/auth.json");
+
+    let why = "Native Google pool location is unavailable";
+    assert_eq!(Refused::from(why), Refused::Preparation(why.to_owned()));
+    assert_eq!(Refused::from(why).short(), why);
+}
+
+/// A FAILED INSTALL'S SHORT FORM SAYS WHAT COULD NOT BE REACHED, not what follows it. These are
+/// atpkg's real stderr lines (`crates/atpkg/src/cli.rs`, its install's two failure arms and
+/// `print_unreachable_followup`, with the vendor's words from `vendor_direct/lane.rs`), joined as
+/// `PassRun::why` joins them. A stall keeps the first clause of the vendor's and the whole of the
+/// index's. NEGATIVE CONTROL: before, the short form was the re-run line, or the GitHub limit's,
+/// with the cause gone. A refusal can hold ` | ` of its own (`vendor.rs`'s payload row), which is
+/// no line of atpkg's. NEGATIVE CONTROL: a split at every ` | ` left `install failed: dmg, got
+/// tar-xz`. CONTROL: the whole words keep every line for the launch's note and log.
+#[test]
+fn a_failed_installs_short_form_skips_atpkgs_follow_up() {
+    let rerun = "atpkg:   when the connection is back, re-run: aterm pkg install claude";
+    let limit = "atpkg:   the anonymous GitHub limit resets within the hour";
+    let cli = worker_cli(Program::Claude).expect("claude row");
+    let refused = |said: String| {
+        ensure_program(cli, |_| false, |_| None, |_| Err(said.clone()))
+            .map(|_| ())
+            .map_err(Refused::Program)
+            .expect_err("a failed install")
+    };
+
+    let vendor = refused(format!(
+        "atpkg: claude — Anthropic's release channel is unreachable; nothing is installed yet \
+         | {rerun}"
+    ));
+    assert_eq!(
+        vendor.short(),
+        "install failed: atpkg: claude — Anthropic's release channel is unreachable; nothing is \
+         installed yet"
+    );
+    let short = vendor.short();
+    let (cause, _) = short.split_once("; ").expect("two clauses");
+    assert!(
+        cause.len() <= REFUSAL_ROOM,
+        "{} bytes: {cause}",
+        cause.len()
+    );
+    assert!(vendor.why().contains(rerun), "CONTROL: {vendor:?}");
+
+    let row = "artifact row refused: payload must be raw-binary | tar-gz-binary | tar-gz | \
+               tar-zst | zip | dmg, got tar-xz";
+    for said in [
+        format!("atpkg: install claude failed: {row}"),
+        format!("atpkg: install claude failed: {row} | {rerun}"),
+        format!("atpkg: fetching the index | atpkg: install claude failed: {row} | {rerun}"),
+    ] {
+        assert_eq!(
+            refused(said.clone()).short(),
+            format!("install failed: {row}"),
+            "{said}"
+        );
+    }
+    let unled =
+        refused("atpkg: install claude failed: disk full | a line of another program's".to_owned());
+    assert_eq!(
+        unled.short(),
+        "install failed: disk full | a line of another program's",
+        "a line with no lead of atpkg's stays with the one before it"
+    );
+    assert_eq!(
+        refused(format!("{rerun} | {limit}")).short(),
+        format!("install failed: {rerun} | {limit}"),
+        "CONTROL: follow-ups alone are all it said"
+    );
+
+    let index = refused(format!(
+        "atpkg: install claude failed: could not reach the toolchain index: HTTP 403: rate limit \
+         exceeded | {rerun} | {limit}"
+    ));
+    let short = index.short();
+    assert_eq!(
+        short,
+        "install failed: could not reach the toolchain index: HTTP 403: rate limit exceeded"
+    );
+    assert!(
+        short.len() <= REFUSAL_ROOM,
+        "{} bytes: {short}",
+        short.len()
+    );
+    assert!(
+        index.why().contains(rerun) && index.why().contains(limit),
+        "CONTROL: {index:?}"
+    );
 }

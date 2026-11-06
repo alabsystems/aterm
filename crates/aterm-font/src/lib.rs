@@ -1401,20 +1401,32 @@ impl<'a> Face<'a> {
     /// Outlines a glyph at the current instance into `sink`, in font units, and returns its tight bounding box.
     #[inline]
     pub fn outline_glyph(&self, glyph_id: GlyphId, sink: &mut dyn OutlineSink) -> Option<Rect> {
+        self.outline_glyph_within(glyph_id, sink, &mut work::OutlineWork::default())
+    }
+
+    /// [`Face::outline_glyph`] under `work`, which the caller reads afterwards.
+    fn outline_glyph_within(
+        &self,
+        glyph_id: GlyphId,
+        sink: &mut dyn OutlineSink,
+        work: &mut work::OutlineWork,
+    ) -> Option<Rect> {
         if let Some(ref gvar) = self.tables.gvar {
-            return gvar.outline(self.tables.glyf?, self.coords(), glyph_id, sink);
+            return gvar.outline_within(self.tables.glyf?, self.coords(), glyph_id, sink, work);
         }
 
         if let Some(table) = self.tables.glyf {
-            return table.outline(glyph_id, sink);
+            return table.outline_within(glyph_id, sink, work);
         }
 
         if let Some(ref cff) = self.tables.cff {
-            return cff.outline(glyph_id, sink).ok();
+            return cff.outline_within(glyph_id, sink, work).ok();
         }
 
         if let Some(ref cff2) = self.tables.cff2 {
-            return cff2.outline(self.coords(), glyph_id, sink).ok();
+            return cff2
+                .outline_within(self.coords(), glyph_id, sink, work)
+                .ok();
         }
 
         None
@@ -1498,6 +1510,9 @@ impl<'a> Face<'a> {
     }
 
     /// Paints a color glyph from the `COLR` table at the current instance.
+    /// `None` when the face has no paint for it, a v0 glyph's layers or
+    /// colours cannot be read, or the walk ran past its work budget, having
+    /// handed `painter` only part of the glyph.
     #[inline]
     pub fn paint_color_glyph(
         &self,
@@ -1506,9 +1521,19 @@ impl<'a> Face<'a> {
         foreground_color: RgbaColor,
         painter: &mut dyn colr::Painter<'a>,
     ) -> Option<()> {
-        self.tables
-            .colr?
-            .paint(glyph_id, palette, painter, self.coords(), foreground_color)
+        let outline_segments = |id: GlyphId, work: &mut work::OutlineWork| {
+            let mut count = sink::SegmentCount::default();
+            let _ = self.outline_glyph_within(id, &mut count, work);
+            count.0
+        };
+        self.tables.colr?.paint(
+            glyph_id,
+            palette,
+            painter,
+            self.coords(),
+            foreground_color,
+            &outline_segments,
+        )
     }
 
     /// Returns the variation axes (`fvar`), empty for a static face.

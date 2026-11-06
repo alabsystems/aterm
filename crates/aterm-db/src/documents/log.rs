@@ -257,6 +257,35 @@ impl Log {
         }
         cells
     }
+    pub(crate) fn history_complete(&self) -> bool {
+        self.revert_refusals.is_empty()
+            && self.opaque_authors.is_empty()
+            && self
+                .records
+                .values()
+                .all(|(op, _)| op.available && op.catalog_eligible && op.refusal.is_none())
+    }
+    pub(crate) fn project_cell(&self, collection: &str, key: &str) -> Option<Cell> {
+        let mut cells = Cells::new();
+        for &id in &self.ordered {
+            if let Some(command) = &self.records[&id].1
+                && !matches!(command, Command::Merge { .. })
+            {
+                for change in command.changes().unwrap() {
+                    if change.collection == collection && change.key == key {
+                        crate::documents::apply(
+                            &self.index,
+                            &mut cells,
+                            id,
+                            std::slice::from_ref(change),
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+        cells.into_values().next()
+    }
     /// The cells without the operations in `skip`, as if they had never been applied: an
     /// ATT/1 reader passes the automatic records past their writer's quota
     /// (`typed::owned::quota`), which stay in history and dependencies but never project.
@@ -297,8 +326,37 @@ impl Log {
     /// Causal-only merges remain in snapshots and dependencies, not this list. An application
     /// whose records are append-only per writer reads these, never the cells, whose causal
     /// replacement would let one writer's record hide another's.
+    pub(crate) fn eligible_iter(&self) -> impl Iterator<Item = (&Operation, &Command)> {
+        self.eligible.iter().filter_map(|id| {
+            let (operation, Some(command)) = self.records.get(id)? else {
+                return None;
+            };
+            (!matches!(command, Command::Merge { .. })).then_some((operation, command))
+        })
+    }
     pub(crate) fn eligible(&self) -> Vec<(&Operation, &Command)> {
-        self.eligible_and_merges().0
+        self.eligible_iter().collect()
+    }
+    /// Count of eligible decoded operations, including structural merges.
+    pub(crate) fn eligible_count(&self) -> usize {
+        self.eligible
+            .iter()
+            .filter(|id| {
+                self.records
+                    .get(*id)
+                    .is_some_and(|(_, command)| command.is_some())
+            })
+            .count()
+    }
+    /// [`Self::eligible`] consuming `self` so callers can move decoded commands without cloning.
+    pub(crate) fn into_eligible(mut self) -> impl Iterator<Item = (Operation, Command)> {
+        self.eligible.into_iter().filter_map(move |id| {
+            let (operation, command) = self.records.remove(&id)?;
+            match command {
+                Some(Command::Merge { .. }) | None => None,
+                Some(command) => Some((operation, command)),
+            }
+        })
     }
     /// [`Self::eligible`], and each eligible causal-only merge as its writer and sequence: the
     /// joins `application::append` writes before a record on a wide frontier, which a typed
@@ -306,12 +364,10 @@ impl Log {
     pub(crate) fn eligible_and_merges(&self) -> (Vec<(&Operation, &Command)>, Merges) {
         let mut records = Vec::new();
         let mut merges = Vec::new();
-        for (operation, command) in self
-            .records
-            .iter()
-            .filter(|(id, _)| self.eligible.contains(*id))
-            .map(|(_, record)| record)
-        {
+        for id in &self.eligible {
+            let Some((operation, command)) = self.records.get(id) else {
+                continue;
+            };
             match command {
                 Some(Command::Merge { .. }) => {
                     merges.push((operation.header.actor, operation.header.sequence));
@@ -321,6 +377,19 @@ impl Log {
             }
         }
         (records, merges)
+    }
+    /// Count eligible causal-only merges by `actor` with sequence greater than `last_business`.
+    pub(crate) fn pending_merges_after(&self, actor: Actor, last_business: u64) -> usize {
+        self.eligible
+            .iter()
+            .filter(|id| {
+                self.records.get(*id).is_some_and(|(operation, command)| {
+                    matches!(command, Some(Command::Merge { .. }))
+                        && operation.header.actor == actor
+                        && operation.header.sequence > last_business
+                })
+            })
+            .count()
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
         let cells = self.project_cells(None, &BTreeSet::new());

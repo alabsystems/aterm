@@ -1517,6 +1517,70 @@ impl CellExtras {
         self.max_row_cache.set_exact_opt(max_row);
     }
 
+    /// Prepare visible restoration, preserving existing per-cell image storage.
+    /// The caller finishes a refill when this returns true, removing unused slots.
+    pub(crate) fn prepare_rows_for_restore(&mut self, rows: core::ops::Range<u16>) -> bool {
+        if !self.any_image() {
+            self.clear_rows_retaining_capacity(rows);
+            return false;
+        }
+        if let Some(ring) = &mut self.rgb_ring {
+            ring.clear_rows(rows.clone());
+        }
+        if let Some(ring) = &mut self.complex_ring {
+            ring.clear_rows(rows.clone());
+        }
+        #[cfg(any(test, debug_assertions))]
+        crate::test_counters::count_extras_clear_ops(self.data.len());
+        let offset = self.row_offset;
+        let mut retained = false;
+        let mut max_row: Option<u16> = None;
+        let mut images = false;
+        self.data.retain(|coord, extra| {
+            if coord.row < offset {
+                return false;
+            }
+            if rows.contains(&(coord.row - offset)) {
+                if !extra.prepare_image_refill() {
+                    return false;
+                }
+                retained = true;
+            }
+            images |= extra.image().is_some();
+            max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+            true
+        });
+        self.max_row_cache.set_exact_opt(max_row);
+        self.image_hint = if images {
+            ImageHint::Possible
+        } else {
+            ImageHint::Absent
+        };
+        retained
+    }
+
+    /// Remove unused refill entries and recover exact image-presence metadata.
+    pub(crate) fn finish_rows_restore(&mut self) {
+        #[cfg(any(test, debug_assertions))]
+        crate::test_counters::count_extras_clear_ops(self.data.len());
+        let mut max_row: Option<u16> = None;
+        let mut images = false;
+        self.data.retain(|coord, extra| {
+            if !extra.finish_image_refill() {
+                return false;
+            }
+            images |= extra.image().is_some();
+            max_row = Some(max_row.map_or(coord.row, |m| m.max(coord.row)));
+            true
+        });
+        self.max_row_cache.set_exact_opt(max_row);
+        self.image_hint = if images {
+            ImageHint::Possible
+        } else {
+            ImageHint::Absent
+        };
+    }
+
     /// Clear extras inside a rectangular area in one pass, including both rings, which the fast write paths fill directly (a DECCRA overwrite must wipe them).
     pub(crate) fn clear_rect(&mut self, rows: core::ops::Range<u16>, cols: core::ops::Range<u16>) {
         if let Some(ring) = &mut self.rgb_ring {
@@ -2016,6 +2080,69 @@ impl CellExtras {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_refill_clears_stale_payloads_and_preserves_outside_rows_at_offsets() {
+        use std::sync::Arc;
+        for offset in [0_u16, 1, 128] {
+            let image = Arc::new(crate::ImageData {
+                bytes: vec![7; 256],
+                format: crate::ImageFormat::Png,
+                cols: 4,
+                rows: 3,
+                z_index: 0,
+                band_lift_px: 0,
+                cell_offset_px: (0, 0),
+                scaling: crate::ImageScaling::Fit,
+                source_rect: None,
+            });
+            let mut extras = CellExtras::new();
+            for row in [offset, offset + 2] {
+                extras.set_image(
+                    CellCoord::new(row, 0),
+                    crate::ImageRef {
+                        image: Arc::clone(&image),
+                        cell_row: 0,
+                        cell_col: 0,
+                        kitty: None,
+                    },
+                );
+            }
+            extras.shift_rows_up_by(offset);
+            assert_eq!(extras.row_offset, offset);
+            let old = extras.get_or_create(CellCoord::new(0, 0));
+            old.set_hyperlink(Some(Arc::from("https://old.example")));
+            old.set_complex_char(Some(Arc::from("old")));
+            old.add_combining('\u{0301}');
+            old.set_fg_rgb(Some([8, 9, 10]));
+            for row in [0, 2] {
+                extras.set_complex_char_ring(row, 0, '\u{1F680}', 3, 4);
+                extras.set_rgb_ring_range(row, 0, 1, Some([1, 2, 3]), Some([4, 5, 6]), 3, 4);
+            }
+            assert!(extras.prepare_rows_for_restore(0..1));
+            let reset = extras.get(CellCoord::new(0, 0)).unwrap();
+            assert!(reset.image().is_none());
+            assert!(reset.hyperlink().is_none());
+            assert!(reset.complex_char().is_none());
+            assert!(reset.combining().is_empty());
+            assert!(reset.fg_rgb().is_none());
+            assert_eq!(extras.fg_rgb_for(0, 0), None);
+            assert_eq!(extras.fg_rgb_for(2, 0), Some([1, 2, 3]));
+            let ring = extras.complex_ring.as_ref().unwrap();
+            assert_eq!(ring.get(0, 0), None);
+            assert_eq!(ring.get(2, 0), Some('\u{1F680}'));
+            extras.finish_rows_restore();
+            assert!(extras.get(CellCoord::new(0, 0)).is_none());
+            assert!(extras.get(CellCoord::new(2, 0)).unwrap().image().is_some());
+            assert!(extras.any_image());
+            assert_eq!(Arc::strong_count(&image), 2);
+            assert!(extras.prepare_rows_for_restore(2..3));
+            extras.finish_rows_restore();
+            assert!(extras.is_empty());
+            assert!(!extras.any_image());
+            assert_eq!(Arc::strong_count(&image), 1);
+        }
+    }
 
     #[test]
     fn ring_columns_past_the_stride_never_alias_the_next_row() {

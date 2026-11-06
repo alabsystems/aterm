@@ -74,15 +74,12 @@ fn parse_raw(path: &str) -> Option<(&str, &str, Endpoint)> {
     Some((owner, name, endpoint))
 }
 
-/// The repository `owner/name` (any `.git` suffix dropped) and the endpoint a path names.
-fn parse(path: &str) -> Option<(String, Endpoint)> {
+/// The repository `(owner, name)` (any `.git` suffix dropped) and the endpoint a path names.
+fn parse(path: &str) -> Option<(String, String, Endpoint)> {
     let (owner, name, endpoint) = parse_raw(path)?;
     Some((
-        format!(
-            "{}/{}",
-            aterm_codec::pct::decode(owner),
-            aterm_codec::pct::decode(name)
-        ),
+        aterm_codec::pct::decode(owner),
+        aterm_codec::pct::decode(name),
         endpoint,
     ))
 }
@@ -177,7 +174,7 @@ fn unauthorized() -> Answer {
 
 /// A git endpoint's answer.
 pub(crate) fn answer(state: &mut State, req: &Request) -> Answer {
-    let Some((slug, endpoint)) = parse(req.path()) else {
+    let Some((owner, name, endpoint)) = parse(req.path()) else {
         return text(404, "Not Found");
     };
     // A credential is judged before the endpoint, as GitHub authenticates first.
@@ -197,7 +194,7 @@ pub(crate) fn answer(state: &mut State, req: &Request) -> Answer {
     if req.method != method {
         return text(405, "Method Not Allowed");
     }
-    let Some(index) = state.repo_index(&slug) else {
+    let Some(index) = state.repo_index_parts(&owner, &name) else {
         return if login.is_some() {
             text(404, "Repository not found.")
         } else {
@@ -222,8 +219,11 @@ pub(crate) fn answer(state: &mut State, req: &Request) -> Answer {
 fn advertise(state: &State, index: usize, service: Service) -> Answer {
     let repo = &state.repos[index];
     let caps = match service {
-        Service::Receive => "report-status delete-refs".to_string(),
-        Service::Upload => format!("symref=HEAD:refs/heads/{}", repo.spec.default_branch),
+        Service::Receive => std::borrow::Cow::Borrowed("report-status delete-refs"),
+        Service::Upload => std::borrow::Cow::Owned(format!(
+            "symref=HEAD:refs/heads/{}",
+            repo.spec.default_branch
+        )),
     };
     let refs = repo.refs();
     let long = |name: &str| name.len() > REF_NAME_MAX;

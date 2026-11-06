@@ -317,13 +317,14 @@ fn resolve(
     })
 }
 
-/// A directory already at its recorded pin needs no mutation, even when the person is
-/// working in it. A different commit moves only if detached, clean and an older recorded pin.
+/// Work at its recorded pin is never checked out again. Missing checkout objects can be
+/// fetched without moving it; a different commit moves only from a clean recorded pin.
 #[derive(PartialEq, Eq)]
 enum State {
     Ready,
     Missing,
     Lagging,
+    ObjectsMissing,
 }
 
 fn directories(
@@ -398,7 +399,11 @@ fn state(
         "cannot read required dependency HEAD",
     )?;
     if head.trim() == dependency.pin {
-        return Ok(State::Ready);
+        return Ok(if checkout_objects(sys, user, &path, &dependency.pin)? {
+            State::Ready
+        } else {
+            State::ObjectsMissing
+        });
     }
     if !repos::oid(head.trim()) {
         return Err("cannot read required dependency commit".into());
@@ -520,12 +525,64 @@ fn complete_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), St
     Ok(())
 }
 
+fn checkout_objects(sys: &dyn System, user: &User, path: &Path, pin: &str) -> Result<bool, String> {
+    // A commit can exist without its tree or blobs. Walk only this snapshot, with no
+    // ancestry or optional gitlinks, and keep object reads unable to start a lazy fetch.
+    sys.run_complete_stdout(&local(sys, user, Some(path)).args([
+        "rev-list",
+        "--objects",
+        "--no-walk",
+        "--quiet",
+        "--missing=error",
+        &format!("{pin}^{{commit}}"),
+        "--",
+    ]))
+    .map(|ran| ran.success())
+    .map_err(|_| "cannot inspect the required dependency's checkout objects".into())
+}
+
+fn fetch_objects(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    dependency: &Dependency,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    let command = network(sys, user, Some(path), dependency)?
+        .budget(BUDGET)
+        .args([
+            "fetch",
+            // Negotiating an already-present commit can leave missing associated objects
+            // missing. A refetch obtains the closure as a fresh download would.
+            "--refetch",
+            "--no-recurse-submodules",
+            "--no-tags",
+            "--",
+            &dependency.url(),
+            &dependency.pin,
+        ]);
+    current()?;
+    read(
+        sys,
+        command,
+        "cannot fetch the required dependency's recorded commit",
+    )?;
+    current()?;
+    if !checkout_objects(sys, user, path, &dependency.pin)? {
+        return Err("required dependency download lacks its checkout objects".into());
+    }
+    Ok(())
+}
+
 fn checkout_pin(
     sys: &dyn System,
     user: &User,
     path: &Path,
     dependency: &Dependency,
 ) -> Result<(), String> {
+    if !checkout_objects(sys, user, path, &dependency.pin)? {
+        return Err("required dependency lacks its checkout objects; left untouched".into());
+    }
     read(
         sys,
         local(sys, user, Some(path))
@@ -599,41 +656,28 @@ pub(super) fn repair(
         current()?;
         match state(sys, user, parent, &dependency)? {
             State::Ready => continue,
+            State::ObjectsMissing => {
+                current()?;
+                let inner = parent.join(path);
+                complete_storage(sys, user, &inner)?;
+                fetch_objects(sys, user, &inner, &dependency, &current)?;
+            }
             State::Lagging => {
                 current()?;
                 let inner = parent.join(path);
                 // Inspect availability only in a complete object store: a partial clone's
                 // read could otherwise fetch implicitly, outside the admitted route.
                 complete_storage(sys, user, &inner)?;
-                let available = sys
-                    .run_complete_stdout(&local(sys, user, Some(&inner)).args([
-                        "cat-file",
-                        "-e",
-                        &format!("{}^{{commit}}", dependency.pin),
-                    ]))
-                    .map_err(|_| "cannot inspect the required dependency's local commit")?;
+                let available = checkout_objects(sys, user, &inner, &dependency.pin)?;
                 current()?;
-                if !available.success() {
-                    read(
-                        sys,
-                        network(sys, user, Some(&inner), &dependency)?
-                            .budget(BUDGET)
-                            .args([
-                                "fetch",
-                                "--no-recurse-submodules",
-                                "--no-tags",
-                                "--",
-                                &dependency.url(),
-                                &dependency.pin,
-                            ]),
-                        "cannot fetch the required dependency's recorded commit",
-                    )?;
+                if !available {
+                    fetch_objects(sys, user, &inner, &dependency, &current)?;
                 }
                 current()?;
                 match state(sys, user, parent, &dependency)? {
                     State::Ready => continue,
                     State::Lagging => {}
-                    State::Missing => {
+                    State::Missing | State::ObjectsMissing => {
                         return Err(
                             "required dependency disappeared before alignment; left untouched"
                                 .into(),
@@ -695,29 +739,8 @@ pub(super) fn repair(
                     &clone,
                 )?;
                 complete_storage(sys, user, &clone)?;
-                let available = sys
-                    .run_complete_stdout(&local(sys, user, Some(&clone)).args([
-                        "cat-file",
-                        "-e",
-                        &format!("{}^{{commit}}", dependency.pin),
-                    ]))
-                    .map_err(|_| "cannot inspect the downloaded dependency commit")?;
-                if !available.success() {
-                    current()?;
-                    read(
-                        sys,
-                        network(sys, user, Some(&clone), &dependency)?
-                            .budget(BUDGET)
-                            .args([
-                                "fetch",
-                                "--no-recurse-submodules",
-                                "--no-tags",
-                                "--",
-                                &dependency.url(),
-                                &dependency.pin,
-                            ]),
-                        "cannot fetch the required dependency's recorded commit",
-                    )?;
+                if !checkout_objects(sys, user, &clone, &dependency.pin)? {
+                    fetch_objects(sys, user, &clone, &dependency, &current)?;
                 }
                 current()?;
                 checkout_pin(sys, user, &clone, &dependency)?;

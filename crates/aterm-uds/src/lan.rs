@@ -20,6 +20,7 @@ use std::time::Duration;
 mod arrivals;
 pub mod broker;
 mod classify;
+pub mod direct;
 pub mod here;
 pub mod wire;
 

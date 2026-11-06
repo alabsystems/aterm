@@ -42,7 +42,11 @@
 //! already uses, so memory in use is not counted twice: a process is counted toward its
 //! nearest claimant ancestor only, and a holder's use is credited once across all its claims.
 //! A claim whose work runs outside its holder's tree (a VM, parented to launchd) is credited
-//! with those processes ([`Claim::credit`]), whose use counts against it alone.
+//! with those processes ([`Claim::credit`]), whose use counts against it alone. What a tree
+//! holds is credited without the pages the kernel compressed or swapped out, so a held claim of
+//! holder accounting whose tree holds more than it claimed, those pages included, is named so,
+//! by how much, on the lines that name its memory (a waiter's and `aterm pkg capacity`'s:
+//! [`Overrun`]); its reservation is the same.
 //! A claim made by a process whose ancestor holds one is that held work going on: it is held to
 //! the other held claims only, never to its ancestors' or to a waiter, so a run that holds a
 //! claim can start a tool that claims for itself. Other sessions' plain builds hold no claim,
@@ -82,12 +86,14 @@ pub mod epoch_recipe;
 pub mod epoch_target;
 #[cfg(unix)]
 mod epoch_wire;
+#[cfg(unix)]
+pub mod host_executable;
 pub mod host_protocol;
 #[cfg(unix)]
 pub mod leadership;
 #[cfg(unix)]
 pub mod retained_cohort;
-pub use cpu_observation::{CpuHolder, CpuObservation};
+pub use cpu_observation::{CpuExternal, CpuHolder, CpuObservation};
 #[cfg(unix)]
 mod retained_claim;
 mod timing;
@@ -118,11 +124,14 @@ pub mod floor;
 pub mod footprint;
 pub mod ledger;
 pub mod machine_footprint;
+pub mod overrun;
 pub mod reading;
 pub mod room;
 /// Each admission's `kind=admission` row in this Mac's telemetry log (Continuum TM-0).
 mod telemetry;
 pub mod tree_meter;
+#[cfg(unix)]
+pub mod user_namespace;
 
 /// Core Trust's native CPU lease pool, shared with toolchain schedulers.
 #[cfg(unix)]
@@ -147,6 +156,7 @@ pub use footprint::{
 pub use ledger::Turn;
 pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
 pub use machine_footprint::{Cover, Kept, MachineFootprints, Selection};
+pub use overrun::{Overrun, overruns};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
 pub use reading::{

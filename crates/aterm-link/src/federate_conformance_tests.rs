@@ -207,6 +207,7 @@ fn shared_of(macs: &[Mac; 3], i: usize, wide: bool) -> Shared {
         node_order_olds: node_order_olds(),
         unsealed_carry: unsealed_carry(),
         ungated_inbox: ungated_inbox(),
+        give_back_carried: false,
         state: Mutex::new(State::default()),
         bell: Condvar::new(),
     }

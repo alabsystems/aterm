@@ -401,6 +401,7 @@ atpkg = { workspace = true }
 # The capacity ledger's records: `sys jobs` reads a waiting build front's claim in it each pass
 # (vitals_jobs.rs). Already in this binary's tree through atpkg.
 aterm-capacity = { workspace = true }
+aterm-resource-host = { workspace = true }
 libc = { workspace = true }
 aterm-window = { workspace = true }
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the

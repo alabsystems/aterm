@@ -61,6 +61,7 @@ aterm-telemetry = { workspace = true }
 # unix the account identity for the window's state/config roots under a
 # scratch home. Workspace crate; aterm-types already links it.
 aterm-uds = { workspace = true }
+aterm-digest = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Physical isolation from readers that reap a free v1 lock before decoding a claim.
@@ -68,6 +69,7 @@ aterm-dirfd = { workspace = true }
 # Shared native CPU unit leases, including their account path and record parser.
 # Kept in the core toolchain so Targo and the resource report cannot diverge.
 trust-build-cpu = { workspace = true }
+trust-resource-provenance = { workspace = true }
 # `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` for bounded regular-file opens, and `kill`/`signal` in
 # interrupt tests: aterm-libc, first-party, which aterm-toolchain already links.
 libc = { workspace = true }

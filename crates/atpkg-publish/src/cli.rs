@@ -25,6 +25,11 @@ pub struct Verb {
 /// Every verb, in `help` order.
 pub const VERBS: &[Verb] = &[
     Verb {
+        name: "toolchain",
+        synopsis: crate::project_toolchain::SYNOPSIS,
+        does: "run a project's controller under one authenticated, leased sealed compiler",
+    },
+    Verb {
         name: "canary",
         synopsis: crate::canary::SYNOPSIS,
         does: "install and execute the signed staged Trust pack; sign integrity evidence and consumer reports without publishing",
@@ -131,6 +136,15 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
 /// (exit 2).
 pub fn main_entry_os(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     let args: Vec<OsString> = args.into_iter().skip(1).collect();
+    // A selected controller uses the same native explicit-target admission hop as installed
+    // atpkg. No shim/cwd selection, host identity, or publisher context belongs in this hop.
+    if args.first().is_some_and(|word| word == "__build_admit") {
+        if let Err(error) = crate::compiler_context::admit_hop(&args[1..]) {
+            eprintln!("atpkg-publish: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+        return atpkg::build_admit::run_hidden(&args[1..]);
+    }
     if let Some(rest) = forwarded(&args) {
         return agh::cli::main_entry(rest);
     }
@@ -260,6 +274,7 @@ fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
 /// The verb's error; Usage for an unknown verb, or for `agh` anywhere but first.
 pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
     match verb {
+        "toolchain" => crate::project_toolchain::run(ctx, rest),
         "canary" => crate::canary::run(ctx, rest),
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),

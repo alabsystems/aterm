@@ -78,7 +78,7 @@ use crate::store::{
     create_like, flush_file, open_sidecar, rename_path, sync_parent_dir, AtRestKey, AtRestRef,
 };
 use astream_wire::{Filter, Frame, HEADER_SIZE};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, Permissions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -509,6 +509,10 @@ pub(crate) struct HeldStore {
     pub(crate) active: bool,
     /// The held records, by offset (every one below the base).
     pub(crate) entries: BTreeMap<u64, Held>,
+    /// How many of `entries` each subject has: what a forget asks of the store
+    /// ([`holds_subject`](Self::holds_subject)). Kept with `entries`, by
+    /// [`insert`](Self::insert) and [`remove_entry`](Self::remove_entry) alone.
+    by_subject: HashMap<String, usize>,
     /// Each subject's floor: the offset after the newest record of it a hold rule gave up.
     pub(crate) floors: BTreeMap<String, u64>,
     floor_bytes: usize,
@@ -799,9 +803,13 @@ impl HeldStore {
                         }
                         recs.push((rec, ms, bt_ms));
                     }
-                    for (rec, ms, bt_ms) in recs {
+                    for (rec, at_ms, bt_ms) in recs {
                         if rec.seq.0 < base {
-                            st.insert(rec, ms, bt_ms);
+                            st.insert(Held {
+                                rec: Arc::new(rec),
+                                at_ms,
+                                bt_ms,
+                            });
                         }
                     }
                 }
@@ -906,30 +914,40 @@ impl HeldStore {
         }
     }
 
-    fn insert(&mut self, rec: BrokerRecord, at_ms: u64, bt_ms: Option<u64>) {
-        let bytes = retention::record_bytes(&rec);
-        let old = self.entries.insert(
-            rec.seq.0,
-            Held {
-                rec: Arc::new(rec),
-                at_ms,
-                bt_ms,
-            },
-        );
-        if let Some(h) = old {
-            self.held_bytes = self
-                .held_bytes
-                .saturating_sub(retention::record_bytes(&h.rec));
+    /// Hold `h` at its offset, in place of what the store held there.
+    fn insert(&mut self, h: Held) {
+        let bytes = retention::record_bytes(&h.rec);
+        let subject = h.rec.subject.clone();
+        if let Some(old) = self.entries.insert(h.rec.seq.0, h) {
+            self.forgo(&old);
         }
         self.held_bytes = self.held_bytes.saturating_add(bytes);
+        let n = self.by_subject.entry(subject).or_insert(0);
+        *n = n.saturating_add(1);
     }
 
     fn remove_entry(&mut self, off: u64) {
         if let Some(h) = self.entries.remove(&off) {
-            self.held_bytes = self
-                .held_bytes
-                .saturating_sub(retention::record_bytes(&h.rec));
+            self.forgo(&h);
         }
+    }
+
+    /// `h`'s bytes and its subject's count, taken back once it left `entries`.
+    fn forgo(&mut self, h: &Held) {
+        self.held_bytes = self
+            .held_bytes
+            .saturating_sub(retention::record_bytes(&h.rec));
+        if let Some(n) = self.by_subject.get_mut(&h.rec.subject) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.by_subject.remove(&h.rec.subject);
+            }
+        }
+    }
+
+    /// Whether the store holds any record of `subject`.
+    pub(crate) fn holds_subject(&self, subject: &str) -> bool {
+        self.by_subject.contains_key(subject)
     }
 
     /// Raise the floors `floors` names, keeping at most [`FLOORS_MAX`] subjects and
@@ -1239,13 +1257,7 @@ impl HeldStore {
             self.remove_entry(*o);
         }
         for h in job.carry {
-            let bytes = retention::record_bytes(&h.rec);
-            if let Some(old) = self.entries.insert(h.rec.seq.0, h) {
-                self.held_bytes = self
-                    .held_bytes
-                    .saturating_sub(retention::record_bytes(&old.rec));
-            }
-            self.held_bytes = self.held_bytes.saturating_add(bytes);
+            self.insert(h);
         }
         self.raise(&job.floors);
     }

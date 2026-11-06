@@ -1005,7 +1005,7 @@ fn plain_read_at(
 /// `off` only with a record retention holds there, and is empty where retention holds none of
 /// the filter from `off`; `None` where its broker does not tell fetches
 /// (`Client::supports_told_fetch`, known once the connection said `Hello`).
-fn told_read_at(
+pub(crate) fn told_read_at(
     reader: &mut transport::Conn,
     off: u64,
     filter: &str,
@@ -4957,6 +4957,9 @@ impl Bridge {
             self.publish_ev_for(None, &format!("undeliverable off={off} reason=observer"));
             return Delivery::Accounted;
         }
+        if let Some(reply) = self.person_reply(subject) {
+            return self.hand_to_person(off, &reply, raw, origin);
+        }
         let addr = match subject::parse_in(&self.cfg.fleet, &self.node, subject) {
             Ok(a) => a,
             Err(reject) => {
@@ -5420,13 +5423,11 @@ impl Bridge {
     }
 
     /// The person another Mac's record speaks for (§11 C3c), as `<person>@<node>`: `None` for a
-    /// record that names none (no [`crate::person_key::BY_TOKEN`]). A Mac's node service carries a
-    /// person's post onto its own lane to this Mac naming the person, its seal intact; it is the
-    /// person's here only once that seal verifies, over the session, person and kind it was
-    /// sealed for ([`crate::person_key::post_address`]), under a certificate of the node key that
-    /// names the Mac whose lane brought it ([`crate::person_key::Signer::Node`]): that Mac alone
-    /// writes that lane here, under a link that proved its whole key. The sender becomes
-    /// `<person>@<node>`, so it reads as a human's ([`trust_of`]) and says which Mac's.
+    /// record that names none (no [`crate::person_key::BY_TOKEN`]). It is the person's here only
+    /// once its seal verifies under a certificate of the node key that names the Mac whose lane
+    /// brought it, at this bridge's clock ([`crate::person_key::carried_by`], which every
+    /// observer view reads it by too). The sender becomes `<person>@<node>`, so it reads as a
+    /// human's ([`trust_of`]) and says which Mac's.
     ///
     /// # Errors
     /// The `reason=` it is refused under: a record that names a person from no Mac's lane or
@@ -5436,28 +5437,215 @@ impl Bridge {
         addr: &subject::InAddr,
         body: &Body,
     ) -> Result<Option<String>, &'static str> {
-        use crate::person_key::{self, Refusal, Signer};
-        let Some(by) = body.unknown.get(person_key::BY_TOKEN) else {
-            return Ok(None);
-        };
+        use crate::person_key::{self, Refusal};
         #[cfg(test)]
         if TRUST_ANY_PERSON.with(std::cell::Cell::get) {
-            return Ok(Some(format!("{by}@{}", addr.src)));
+            if let Some(by) = body.unknown.get(person_key::BY_TOKEN) {
+                return Ok(Some(format!("{by}@{}", addr.src)));
+            }
         }
-        if !(crate::person::is_person_id(by) && crate::federate::is_node(&addr.src)) {
-            return Err(Refusal::Malformed.token());
-        }
-        let kind = addr.kind.as_str();
-        let address = person_key::post_address(&self.cfg.fleet, &addr.sid, by, kind);
-        person_key::verify(
-            Signer::Node(&addr.src),
-            &address,
-            kind,
+        person_key::carried_by(
+            &self.cfg.fleet,
+            &addr.sid,
+            &addr.src,
+            addr.kind.as_str(),
             body,
             self.fx.wall_ms(),
         )
-        .map_err(Refusal::token)?;
-        Ok(Some(format!("{by}@{}", addr.src)))
+        .map_err(Refusal::token)
+    }
+
+    /// Another Mac's record for a person of this Mac (§11 C3d), with the mesh on:
+    /// `/f/<F>/in/<me>/<person>/<src>/<kind>`, the lane back to the person that Mac's bridge
+    /// wrote ([`Bridge::person_route`]) and the push carried here, `src` being that Mac's node,
+    /// as the push's grant forces it. `None` for any other subject.
+    fn person_reply(&self, subject: &str) -> Option<PersonReply> {
+        self.cfg.mesh.as_ref()?;
+        let rest = subject.strip_prefix(&format!("/f/{}/in/{}/", self.cfg.fleet, self.node))?;
+        let mut parts = rest.split('/');
+        let (person, src, kind) = (parts.next()?, parts.next()?, parts.next()?);
+        let fits = parts.next().is_none()
+            && crate::person::is_person_id(person)
+            && src.starts_with("n-")
+            && subject::is_principal(src)
+            && !self.is_my_node(src);
+        fits.then_some(())?;
+        Some(PersonReply {
+            person: person.to_owned(),
+            src: src.to_owned(),
+            kind: WakeClass::parse(kind)?,
+        })
+    }
+
+    /// HAND ANOTHER MAC'S ANSWER TO A PERSON OF THIS MAC TO THEIR INBOX (§11 C3d). The record at
+    /// `off`, on the lane back to `reply.person` ([`Bridge::person_reply`]), is written again on
+    /// the person's lane here, `/f/<F>/in/p/<person>/<me>/<kind>`, which their `inbox` reads: from
+    /// the session that wrote it (`from=<sid>@<src>`), its `re=` the offset the person's own post
+    /// has here ([`Bridge::person_re`]), and with none of [`crate::person_key`]'s tokens, so
+    /// nothing in it speaks as a person. It is published as a notice is
+    /// ([`Bridge::send_notice`]): numbered by `off`, so a replay writes it once, and with the
+    /// commit of the inbox group through `off`. One that names no session, or that a hop this
+    /// bridge does not trust relayed, is refused and journaled; one whose `re=` names no post of
+    /// the person carried from here keeps no `re=`, and the journal says so.
+    ///
+    /// AN ANSWER TO THE COPY NAMES WHAT IT ANSWERS AS THE SENDER'S MAC DOES: the copy carries
+    /// [`crate::person::WIRE_RE_TOKEN`], the offset the record has on its sender's bus and the
+    /// producer that wrote it there, which the push's `origin` stamp says, followed back across
+    /// this Mac's own rotations ([`Bridge::first_of_moves`], as [`Bridge::wire_re`] maps a
+    /// session's answer), and only this bridge's: one the record brought is dropped, and none is
+    /// stamped where the origin says no offset there (a move not followed back, or a sequence a
+    /// receipt is numbered by). A person's answer to the copy carries the offset as its `re=`
+    /// where the producer is the sender's Mac's, by the hand-off it is routed by
+    /// ([`crate::person::wire_re`]), so the session that asked, whose wait is on the offset its
+    /// ask has on its own Mac, reads the person's answer as one. A copy no move put here is
+    /// stamped with no hand-off read. A moved one is followed back by the hand-off's retired
+    /// nodes and the node service's reader's ring; where it cannot be (a hand-off that is stale,
+    /// missing or unreadable, or a ring that does not reach), it is handed with no stamp, and the
+    /// inbox goes on: a bridge of this Mac's old node runs on until aterm relaunches it, and the
+    /// next node's move waits for it, so a copy left unread would hold its inbox that long.
+    fn hand_to_person(
+        &mut self,
+        off: u64,
+        reply: &PersonReply,
+        raw: &[u8],
+        origin: crate::mailbox::Origin,
+    ) -> Delivery {
+        // THE ROWS QUEUED AHEAD GO FIRST, as before a notice ([`Bridge::refuse_locally`]): this
+        // write can commit the group through `off`.
+        self.send_rows();
+        let (mut body, _) = Body::decode(raw);
+        let sid = body
+            .from
+            .clone()
+            .filter(|sid| sid.starts_with("s-") && subject::is_principal(sid));
+        let Some(sid) = sid else {
+            self.record_undeliverable(off, None, Reject::Malformed);
+            return Delivery::Accounted;
+        };
+        if !body.via.as_deref().is_none_or(via_ok) {
+            self.publish_ev(&format!("undeliverable off={off} reason=via"));
+            return Delivery::Accounted;
+        }
+        use crate::person_key::{BY_TOKEN, CERT_TOKEN, SEAL_TOKEN};
+        for token in [
+            BY_TOKEN,
+            CERT_TOKEN,
+            SEAL_TOKEN,
+            crate::person::WIRE_RE_TOKEN,
+        ] {
+            body.unknown.remove(token);
+        }
+        #[cfg(test)]
+        let stamped = !UNSTAMPED_COPY.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let stamped = true;
+        // Its own lane names the person where a session's names the session: a move across
+        // this Mac's own rotation read back on it as on any lane ([`Bridge::first_of_moves`]).
+        let addr = subject::InAddr {
+            node: self.node.clone(),
+            sid: reply.person.clone(),
+            src: reply.src.clone(),
+            kind: reply.kind,
+        };
+        // A move not followed back (a hand-off that is stale, missing or unreadable, or a ring
+        // that does not reach the old lane) is handed with no stamp, and the inbox goes on.
+        let first = match self.first_of_moves(&addr, off, origin) {
+            Ok(Ok(first)) => Some(first),
+            Ok(Err(_)) => None,
+            Err(e) => return self.unread_for_person(off, &reply.person, &e),
+        };
+        // Another Mac's write: under no producer of this Mac's (a move not followed back), and
+        // below the sequences a receipt is numbered by.
+        let mine = |producer: u64| {
+            std::iter::once(&self.node)
+                .chain(&self.old_nodes)
+                .any(|node| astream_cap::producer_id_of(node) == producer)
+        };
+        let pushed = first
+            .and_then(|(_, origin)| origin)
+            .filter(|(producer, seq)| *seq < astream_broker::ACK_SEQ_BASE && !mine(*producer));
+        #[cfg(test)]
+        let pushed = if STAMP_BY_SENDER_SEQ.with(std::cell::Cell::get) {
+            pushed.filter(|origin| self.sender_seq(&reply.src, Some(*origin)).is_some())
+        } else {
+            pushed
+        };
+        if let Some((producer, seq)) = pushed.filter(|_| stamped) {
+            body.unknown.insert(
+                crate::person::WIRE_RE_TOKEN.to_owned(),
+                crate::person::wire_stamp(seq, producer),
+            );
+        }
+        #[cfg(test)]
+        let mapped = body
+            .re
+            .filter(|_| !WIRE_RE_TO_PERSON.with(std::cell::Cell::get));
+        #[cfg(not(test))]
+        let mapped = body.re;
+        if let Some(re) = mapped {
+            body.re = match self.person_re(re, &reply.person, &sid) {
+                Ok(Some(post)) => Some(post),
+                Ok(None) => {
+                    self.publish_ev(&format!(
+                        "unmapped off={off} re={re} person={}",
+                        reply.person
+                    ));
+                    None
+                }
+                Err(e) => return self.unread_for_person(off, &reply.person, &e),
+            };
+        }
+        body.from = Some(format!("{sid}@{}", reply.src));
+        let lane = subject::person_lane(&self.cfg.fleet, &reply.person, &self.node);
+        let subject = format!("{lane}/{}", reply.kind.as_str());
+        self.send_notice(off, subject, body.encode());
+        Delivery::Accounted
+    }
+
+    /// What becomes of the record at `off` for `person` while what it names cannot be read
+    /// ([`Bridge::hand_to_person`]): nothing is written, and the link goes down, so the record is
+    /// offered again once it is back.
+    fn unread_for_person(&mut self, off: u64, person: &str, e: &io::Error) -> Delivery {
+        if self.link.down_wants_report("error") {
+            stderr_line!(
+                "aterm-link: @{off} for {person} is not handed to their inbox while what it \
+                 names cannot be read ({e}); reconnecting to offer it again"
+            );
+        }
+        self.link_down("error");
+        self.conn = None;
+        Delivery::Accounted
+    }
+
+    /// The offset of `person`'s own post that the record at `re` on this bus carried to `sid`
+    /// (§11 C3d): another Mac's answer or receipt names the carried copy by the offset it has
+    /// here ([`Bridge::wire_re`] there), and the person carry wrote that copy on this Mac's lane
+    /// to `sid` under [`crate::federate::CARRIER`], numbered by the post's offset and naming the
+    /// person ([`crate::person_key::BY_TOKEN`]). `None` for a record that is no such copy, or one
+    /// retention gave up.
+    ///
+    /// # Errors
+    /// A broker that cannot be read.
+    fn person_re(&self, re: u64, person: &str, sid: &str) -> io::Result<Option<u64>> {
+        let lanes = format!("/f/{}/in/*/{sid}/{}/*", self.cfg.fleet, self.node);
+        let Some(((_, _, raw), origin)) = self.held_record(re, &lanes, &[])? else {
+            return Ok(None);
+        };
+        let carrier = astream_cap::producer_id_of(crate::federate::CARRIER);
+        let by = Body::decode(&raw)
+            .0
+            .unknown
+            .remove(crate::person_key::BY_TOKEN);
+        Ok(match origin {
+            Some((pid, post))
+                if pid == carrier
+                    && by.as_deref() == Some(person)
+                    && post < astream_broker::ACK_SEQ_BASE =>
+            {
+                Some(post)
+            }
+            _ => None,
+        })
     }
 
     fn accepted(&self, src: &str) -> bool {
@@ -5554,12 +5742,32 @@ impl Bridge {
                 return;
             }
         };
+        // The record it refuses as its sender's bus numbers it, with the mesh on (§11 C3d), as a
+        // receipt names it ([`Bridge::wire_re`]).
+        let re = match self.wire_re(&prefix, off) {
+            Ok(re) => re,
+            Err(e) => {
+                self.publish_ev_for(
+                    Some(&addr.sid),
+                    &format!("unnotified off={off} src={} reason=unreadable", addr.src),
+                );
+                stderr_line!("aterm-link: could not name @{off} for its notice: {e}");
+                return;
+            }
+        };
         let subject = format!("{prefix}/undeliverable");
         let mut notice = Body::new(self.fx.wall_ms());
-        notice.re = Some(off);
+        notice.re = Some(re);
         notice.from = Some(addr.sid.clone());
         notice.text = format!("not delivered: {why}");
-        let encoded = notice.encode();
+        self.send_notice(off, subject, notice.encode());
+    }
+
+    /// Publish `encoded` on `subject`, a record this bridge writes for the inbox record at `off`
+    /// (an `undeliverable` notice, or another Mac's answer to a person handed to their inbox,
+    /// [`Bridge::hand_to_person`]), under this bridge's producer numbered by `off` so a replay
+    /// writes it once: with the commit of the inbox group through `off` where the drain owes it.
+    fn send_notice(&mut self, off: u64, subject: String, encoded: Vec<u8>) {
         let seq = astream_broker::ACK_SEQ_BASE | off;
         let commits = self.group_record == Some(off)
             && self.attachment != Attachment::Observer
@@ -5834,6 +6042,9 @@ impl Bridge {
     fn receipt_lane(&mut self, from: &str) -> io::Result<Result<String, NoLane>> {
         let fleet = self.cfg.fleet.clone();
         if let Some((sid, node)) = from.split_once('@') {
+            if crate::person::is_person_id(sid) {
+                return self.person_answer_lane(sid, node);
+            }
             if !(sid.starts_with("s-")
                 && subject::is_principal(sid)
                 && node.starts_with("n-")
@@ -5870,6 +6081,66 @@ impl Bridge {
             return Ok(Err(NoLane::Undrained));
         }
         Ok(Ok(subject::person_lane(&fleet, from, &self.node)))
+    }
+
+    /// The lane back to `person` on the Mac `node` names (§11 C3d), as a person's post another
+    /// Mac carried here names them (`<person>@<node>`, [`Bridge::carried_person`]): this Mac's own
+    /// node is the person's lane here, and another member, the one `node` is now, takes it on this
+    /// Mac's lane to that member under the person's name, `/f/<F>/in/<member>/<person>/<me>`,
+    /// which the push to that member carries there ([`crate::federate::mail_lanes`]) and its
+    /// bridge hands to the person's inbox ([`Bridge::hand_to_person`]). The member is named
+    /// beside the lane when it is another Mac's.
+    ///
+    /// # Errors
+    /// `Undrained` for a name that is no person on a node, or a node that is no member (any
+    /// other Mac's with the mesh off); `Handoff` where the hand-off cannot say which member
+    /// `node` is ([`Bridge::member_for`]).
+    fn person_route(
+        &mut self,
+        person: &str,
+        node: &str,
+    ) -> Result<(String, Option<String>), NoLane> {
+        #[cfg(test)]
+        if NO_WAY_BACK.with(std::cell::Cell::get) {
+            return Err(NoLane::Undrained);
+        }
+        if !(crate::person::is_person_id(person)
+            && node.starts_with("n-")
+            && subject::is_principal(node))
+        {
+            return Err(NoLane::Undrained);
+        }
+        let member = self
+            .member_for(node)
+            .map_err(NoLane::Handoff)?
+            .ok_or(NoLane::Undrained)?;
+        let fleet = self.cfg.fleet.clone();
+        if member == self.node {
+            return Ok((subject::person_lane(&fleet, person, &self.node), None));
+        }
+        let lane = format!("/f/{fleet}/in/{member}/{person}/{}", self.node);
+        Ok((lane, Some(member)))
+    }
+
+    /// [`Bridge::person_route`] for a receipt or a notice, within the lanes this bridge may open
+    /// on the member's node ([`Bridge::may_answer_on`]).
+    ///
+    /// # Errors
+    /// A broker that cannot be read.
+    fn person_answer_lane(
+        &mut self,
+        person: &str,
+        node: &str,
+    ) -> io::Result<Result<String, NoLane>> {
+        let (lane, member) = match self.person_route(person, node) {
+            Ok(route) => route,
+            Err(no) => return Ok(Err(no)),
+        };
+        let allowed = match member {
+            Some(member) => self.may_answer_on(&member, &lane)?,
+            None => true,
+        };
+        Ok(allowed.then_some(lane).ok_or(NoLane::Capped))
     }
 
     fn answer_fetch(&mut self, sid: &str, off: u64) {
@@ -5976,9 +6247,12 @@ impl Bridge {
     }
 
     fn sender_lane(&mut self, addr: &subject::InAddr, body: &Body) -> Result<String, NoLane> {
-        // A person on another Mac (§11 C3c, [`Bridge::carried_person`]) has no lane back yet.
-        if addr.src.contains('@') {
-            return Err(NoLane::Undrained);
+        // A person on another Mac (§11 C3c, [`Bridge::carried_person`]) is answered on the lane
+        // back to that Mac (§11 C3d).
+        if let Some((person, node)) = addr.src.split_once('@') {
+            return self
+                .person_answer_lane(person, node)
+                .unwrap_or(Err(NoLane::Undrained));
         }
         let fleet = self.cfg.fleet.clone();
         if addr.src.starts_with("s-") {
@@ -6891,8 +7165,19 @@ impl Bridge {
     /// Whether a reply from `src` to the ask at `off` comes from where the ask went: the node it
     /// went to, or the member a key rotation made of that node since, as the hand-off says
     /// (§11 C3b), this Mac's own node for an ask of its sessions' that the node service moved
-    /// across its rotation; `None` where nothing says where the ask went.
+    /// across its rotation; `None` where nothing says where the ask went. A person's post another
+    /// Mac carried names its sender `<person>@<node>` ([`Bridge::carried_person`]), and comes
+    /// from that node, the Mac whose lane brought it, as the deadline sweep reads it off the lane
+    /// (§11 C3d): an ask to a person there is answered by them.
     fn reply_from(&mut self, off: u64, src: &str) -> Option<bool> {
+        #[cfg(test)]
+        let carried = !PERSON_REPLY_AS_SENDER.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let carried = true;
+        let src = match src.split_once('@') {
+            Some((person, node)) if carried && crate::person::is_person_id(person) => node,
+            _ => src,
+        };
         let to = self
             .asked
             .get(&off)
@@ -11206,6 +11491,9 @@ impl Bridge {
                 Some((sid, node)) => (sid.to_string(), Some(node.to_string())),
                 None => (rest.to_string(), None),
             };
+            if let (true, Some(node)) = (crate::person::is_person_id(&sid), node.as_deref()) {
+                return Ok(self.person_post_route(&sid, node));
+            }
             if !subject::is_principal(&sid) || !sid.starts_with("s-") {
                 return Ok(Route::Unroutable);
             }
@@ -11258,11 +11546,29 @@ impl Bridge {
                 self.node
             )));
         }
+        if let Some((person, node)) = to.split_once('@') {
+            if crate::person::is_person_id(person) {
+                return Ok(self.person_post_route(person, node));
+            }
+        }
         Ok(if subject::is_principal(&to) {
             Route::To(subject::person_lane(&fleet, &to, &self.node))
         } else {
             Route::Unroutable
         })
+    }
+
+    /// The route of a post to `person` on the Mac `node` names, `<person>@<node>` as a carried
+    /// post shows them (§11 C3d, [`Bridge::person_route`]).
+    fn person_post_route(&mut self, person: &str, node: &str) -> Route {
+        match self.person_route(person, node) {
+            Ok((lane, _)) => Route::To(lane),
+            Err(NoLane::Handoff(no)) => {
+                self.unrouted = Some(no);
+                Route::Unroutable
+            }
+            Err(_) => Route::Unroutable,
+        }
     }
 
     /// The member `node` names now, with the mesh on (§11 C3): this Mac's own node, a current
@@ -11451,6 +11757,32 @@ impl Bridge {
         let Ok(addr) = subject::parse_in(&fleet, &node, &subject) else {
             return Ok(off);
         };
+        let (off, origin) = match self.first_of_moves(&addr, off, origin)? {
+            Ok(first) => first,
+            Err((at, seq)) => return Ok(if local { seq } else { at }),
+        };
+        if local || self.is_my_node(&addr.src) || !addr.src.starts_with("n-") {
+            return Ok(off);
+        }
+        Ok(self.sender_seq(&addr.src, origin).unwrap_or(off))
+    }
+
+    /// Where the record at `off` on `addr`'s lane here, read with `origin`, was before the node
+    /// service moved it across this Mac's own key rotations (§11 C3b, `federate::Lane::Inbox`):
+    /// followed back one rotation at a time, under the node service's reader's ring
+    /// ([`Bridge::moved_origin`]), to the offset and origin of the record no move put there
+    /// (itself, for one no move put here). `Err((at, seq))` where a hop further back cannot be
+    /// read (a ring that does not reach that node's lane, or more than `RING_OLDS_MAX` moves):
+    /// `at` the earliest offset reached here, `seq` the one its record was moved from.
+    ///
+    /// # Errors
+    /// A broker that cannot be read.
+    fn first_of_moves(
+        &mut self,
+        addr: &subject::InAddr,
+        off: u64,
+        origin: crate::mailbox::Origin,
+    ) -> io::Result<Result<(u64, crate::mailbox::Origin), (u64, u64)>> {
         let (mut off, mut origin) = (off, origin);
         if self.moved_seq(origin).is_some() {
             // The hand-off and the reader's ring as the node service wrote them for the move:
@@ -11470,29 +11802,34 @@ impl Bridge {
             let found = if hops > crate::federate::RING_OLDS_MAX {
                 None
             } else {
-                self.moved_origin(seq, &addr)?
+                self.moved_origin(seq, addr)?
             };
             let Some(was) = found else {
-                return Ok(if local { seq } else { off });
+                return Ok(Err((off, seq)));
             };
             (off, origin) = (seq, was);
         }
-        if local || self.is_my_node(&addr.src) || !addr.src.starts_with("n-") {
-            return Ok(off);
-        }
-        let now = match self.member_for(&addr.src) {
+        Ok(Ok((off, origin)))
+    }
+
+    /// The offset on its sender's bus of a record a push brought here from `src`, read from the
+    /// `origin` its read stamped on it ([`Bridge::wire_re`]): its sequence, where it came under
+    /// `src`'s producer or under the producer of the member a key rotation made of `src` since
+    /// (§11 C3b), below the sequences a receipt is numbered by. `None` for any other origin.
+    fn sender_seq(&mut self, src: &str, origin: crate::mailbox::Origin) -> Option<u64> {
+        let now = match self.member_for(src) {
             Ok(Some(now)) => Some(astream_cap::producer_id_of(&now)),
             _ => None,
         };
-        Ok(match origin {
+        match origin {
             Some((pid, seq))
-                if (pid == astream_cap::producer_id_of(&addr.src) || Some(pid) == now)
+                if (pid == astream_cap::producer_id_of(src) || Some(pid) == now)
                     && seq < astream_broker::ACK_SEQ_BASE =>
             {
-                seq
+                Some(seq)
             }
-            _ => off,
-        })
+            _ => None,
+        }
     }
 
     /// The offset a record whose origin is `origin` was moved from, where the node service moved
@@ -14232,6 +14569,31 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// The negative control of the lane back to a person on another Mac (§11 C3d): a bridge on a
+    /// thread where it is set has none, as before ([`Bridge::person_route`]).
+    static NO_WAY_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of what another Mac's answer to a person names (§11 C3d): a bridge
+    /// on a thread where it is set hands it to the person's inbox with the `re=` that Mac wrote,
+    /// the carried copy's offset here ([`Bridge::hand_to_person`]).
+    static WIRE_RE_TO_PERSON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of what a person's answer to another Mac's session names (§11 C3d):
+    /// a bridge on a thread where it is set hands that session's post to the person's inbox
+    /// unstamped, as before, so the answer names the copy's offset here
+    /// ([`Bridge::hand_to_person`]).
+    static UNSTAMPED_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of who a person's answer from another Mac comes from (§11 C3d): a
+    /// bridge on a thread where it is set judges it by the sender it names, `<person>@<node>`,
+    /// which no ask went to, as before ([`Bridge::reply_from`]).
+    static PERSON_REPLY_AS_SENDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the stamp on a copy from a Mac that rotated its key (§11 C3d): a
+    /// bridge on a thread where it is set stamps only where the hand-off it reads says the
+    /// producer is the sender's ([`Bridge::sender_seq`]), as before, so a copy brought while it
+    /// has no hand-off carries none ([`Bridge::hand_to_person`]).
+    static STAMP_BY_SENDER_SEQ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// The negative control of a record moved across two rotations of this Mac (§11 C3b): a
     /// bridge on a thread where it is set follows a moved record back one rotation alone
     /// ([`Bridge::wire_re`]).
@@ -14435,6 +14797,16 @@ fn ring_refusal(fresh: &[Cap], held: &[Cap], node: &str) -> Option<String> {
     }
     (ring_binds(held).contains(node) && !binds.contains(node))
         .then(|| format!("binds no write for this bridge's node {node}"))
+}
+
+/// Another Mac's record for a person of this Mac (§11 C3d, [`Bridge::person_reply`]).
+struct PersonReply {
+    /// The person it is for.
+    person: String,
+    /// The node of the Mac that wrote it.
+    src: String,
+    /// The `<kind>` segment.
+    kind: WakeClass,
 }
 
 /// Outbound post parsed from an endpoint `outbox` drain frame.

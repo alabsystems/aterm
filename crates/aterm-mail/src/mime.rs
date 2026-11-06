@@ -74,7 +74,7 @@ fn split(bytes: &[u8]) -> (Vec<(&'static str, String)>, &[u8]) {
 fn raw_header<'a>(headers: &'a [(&'static str, String)], name: &str) -> &'a str {
     headers
         .iter()
-        .find(|(key, _)| *key == name || key.eq_ignore_ascii_case(name))
+        .find(|(key, _)| *key == name)
         .map_or("", |(_, value)| value)
 }
 
@@ -252,6 +252,20 @@ fn charset(bytes: std::borrow::Cow<'_, [u8]>, name: &str) -> String {
     }
 }
 
+fn push_charset(output: &mut String, bytes: Vec<u8>, name: &str) {
+    let base = name.split('*').next().unwrap_or(name);
+    if base.eq_ignore_ascii_case("iso-8859-1") || base.eq_ignore_ascii_case("latin1") {
+        output.extend(bytes.into_iter().map(char::from));
+    } else if output.is_empty() {
+        *output = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+    } else {
+        output.push_str(&String::from_utf8_lossy(&bytes));
+    }
+}
+
 fn quoted_printable(bytes: &[u8], word: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -315,7 +329,7 @@ pub fn words(mut input: &str) -> String {
     let mut pending: Option<(&str, Vec<u8>)> = None;
     let flush = |output: &mut String, pending: &mut Option<(&str, Vec<u8>)>| {
         if let Some((enc, bytes)) = pending.take() {
-            output.push_str(&charset(std::borrow::Cow::Owned(bytes), enc));
+            push_charset(output, bytes, enc);
         }
     };
     let mut predecoded: Option<(&str, Vec<u8>, &str)> = None;

@@ -388,8 +388,16 @@ fn native_google_worker_renews_a_signed_out_row_once_in_new_home() {
         );
         assert_eq!(checks.get(), if scenario == 2 { 1 } else { 2 });
         assert_eq!(renewals.get(), 1);
-        if scenario != 0 {
-            assert!(result.is_err());
+        if scenario == 1 {
+            assert!(
+                matches!(result, Err(super::super::worker::Refused::SignedOut(_))),
+                "a renewed row still signed out is a sign-out"
+            );
+        } else if scenario != 0 {
+            assert!(
+                matches!(result, Err(super::super::worker::Refused::Preparation(_))),
+                "CONTROL: an account that changed under the renewal is no sign-out"
+            );
         } else {
             let guard = result.unwrap().unwrap();
             let starter = guard.starter().unwrap();
@@ -501,4 +509,40 @@ fn native_google_worker_launch_on_a_missing_grant_signs_in_without_a_provider_re
         "a signed-out row is the launch's sign-in"
     );
     assert!(probes.is_empty());
+}
+
+/// ONLY A RENEWAL THAT LEAVES THE LOGIN SIGNED OUT READS AS A SIGN-OUT. A sign-in that failed or
+/// wants a person, one onto the wrong account and one that renewed another account are a person's
+/// to mend. One that could not run leaves it signed out too, but a later launch tries the renewal
+/// again, so a dispatcher is not sent to ask a person to sign in. CONTROL: a renewal that took
+/// refuses nothing.
+#[test]
+fn only_a_renewal_that_leaves_the_login_signed_out_reads_as_a_sign_out() {
+    use super::super::cli::Renewal;
+    use super::super::worker::Refused;
+    assert_eq!(renewal_refused(Renewal::Renewed), Ok(()), "CONTROL");
+    for result in [
+        Renewal::AuthFailed,
+        Renewal::WrongAccount,
+        Renewal::OtherRenewed,
+        Renewal::NeedsPerson,
+    ] {
+        let refused = renewal_refused(result);
+        assert!(
+            matches!(&refused, Err(Refused::SignedOut(why)) if why.contains(&format!("{result:?}"))),
+            "{result:?}: {refused:?}"
+        );
+    }
+    for result in [
+        Renewal::Failed,
+        Renewal::SigninHeld,
+        Renewal::Deferred,
+        Renewal::BotCheck,
+    ] {
+        let refused = renewal_refused(result);
+        assert!(
+            matches!(&refused, Err(Refused::Preparation(why)) if why.contains(&format!("{result:?}"))),
+            "{result:?}: {refused:?}"
+        );
+    }
 }

@@ -450,16 +450,16 @@ fn a_kept_wake_closes_once_its_fifo_is_read_or_its_minute_is_up() {
 
 /// The hold's two ends: each close-on-exec, so no other child of the host's gets one; the host's
 /// writes never wait (`O_NONBLOCK`), and the shell's end blocks, as a hold's `read` needs (a
-/// non-blocking read fails at once and spends the retries). What the host writes, the shell's
-/// end reads, and once the host's end closes it reads end-of-file.
+/// non-blocking read fails at once and spends the retries). The shell's end is never close-on-fork,
+/// which the spawn that hands it to the shell would refuse. What the host writes, the shell's end
+/// reads, and once the host's end closes it reads end-of-file.
 #[test]
 fn the_hold_ends_are_close_on_exec_and_only_the_shells_blocks() {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("7-1-s-0a");
-    mkfifo(&path);
-    let HoldEnds { host, shell } = hold_ends(&path).expect("the hold's ends");
+    /// `FD_CLOFORK`, which Apple's libc crate does not name; elsewhere a bit no descriptor sets.
+    const FD_CLOFORK: i32 = 2;
+    let HoldEnds { host, shell } = hold_ends().expect("the hold's ends");
     let flags = |fd: i32| {
         // SAFETY: `F_GETFD` and `F_GETFL` read the flags of `fd`, open here; no memory is touched.
         unsafe {
@@ -474,6 +474,9 @@ fn the_hold_ends_are_close_on_exec_and_only_the_shells_blocks() {
         ((true, true), (true, false)),
         "(close-on-exec, non-blocking) of the host's end, then the shell's"
     );
+    // SAFETY: `F_GETFD` reads the flags of the shell's end, open here; no memory is touched.
+    let shell_fd = unsafe { libc::fcntl(shell.as_raw_fd(), libc::F_GETFD) };
+    assert_eq!(shell_fd & FD_CLOFORK, 0, "the shell's end is forkable");
     (&host).write_all(b"go\n").expect("the host writes");
     drop(host);
     let mut read = String::new();

@@ -736,7 +736,7 @@ fn an_ordinary_ancestors_unlocked_lock_file_cannot_force_admission() {
         until_within(MUST_HAPPEN, "the ancestor's open descriptor", || {
             std::fs::metadata(&ready).ok()
         });
-        let unlocked = aterm_uds::ownerlock::probe(&lock);
+        let unlocked = aterm_uds::ownerlock::probe_any(&lock);
         child
             .stdin
             .as_mut()

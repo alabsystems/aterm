@@ -291,6 +291,17 @@ pub(crate) struct TaskRecord {
     pub(crate) state: TaskState,
     /// Origin of the task (a global session ID or [`FROM_CTL`]).
     pub(crate) from: String,
+    /// THE MAC [`Self::from`] RUNS ON, where that is another Mac: the node of the fleet drive the
+    /// worker was spawned over (`aterm ctl --host <h> spawn`, the driver its node key proved), so
+    /// its mail reaches that manager there (`crate::worker_mail`); `None` for a spawn on this Mac,
+    /// whose manager is a session here, and once a mark names another `from` ([`TaskMark::apply`]).
+    /// A carry row holds it (`manager_node=`).
+    pub(crate) manager_node: Option<String>,
+    /// What the worker's mail has told its manager of this task ([`crate::worker_mail::Told`]):
+    /// each need and the conclusion a send finished with. A carry row holds what was told
+    /// (`told=`, `told_end=1`), never what a send still has in hand, so a successor sends that
+    /// again.
+    pub(crate) told: crate::worker_mail::Told,
     /// Reason the task entered its current state ([`TASK_WHY`]).
     pub(crate) why: Option<&'static str>,
     /// What aterm checked at the landing that marked it done (`checked=`,
@@ -467,6 +478,11 @@ impl TaskRecord {
                 ms(now.saturating_duration_since(self.started))
             ));
         }
+        if let Some(node) = &self.manager_node {
+            out.push_str(" manager_node=");
+            out.push_str(node);
+        }
+        self.told.push_carry(self.entered, &mut out);
         if let Some(agent) = self.agent {
             out.push_str(" agent=");
             out.push_str(agent.name());
@@ -556,6 +572,10 @@ impl TaskRecord {
             rev,
             state: TaskState::parse(field("state")?)?,
             from: Some(field("from")?).filter(|f| valid_from(f))?.to_string(),
+            manager_node: field("manager_node")
+                .filter(|node| crate::fabric::fleet_mail::valid_node(node))
+                .map(str::to_owned),
+            told: crate::worker_mail::Told::of_carry(field("told"), field("told_end"), rev),
             why: match field("why") {
                 Some(word) => Some(why_word(word)?),
                 None => None,
@@ -815,6 +835,8 @@ impl TaskMark {
                 rev: 1,
                 state: self.state,
                 from,
+                manager_node: None,
+                told: crate::worker_mail::Told::default(),
                 why: self.why,
                 checked: self.checked.clone(),
                 left: self.left.clone(),
@@ -880,6 +902,10 @@ impl TaskMark {
             }
         }
         next.state = self.state;
+        // A manager named anew is a session here until its spawn says which Mac it runs on.
+        if next.from != from {
+            next.manager_node = None;
+        }
         next.from = from;
         next.why = why;
         next.checked = checked;

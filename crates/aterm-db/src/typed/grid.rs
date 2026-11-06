@@ -156,27 +156,30 @@ fn compact(value: &Value) -> String {
 /// ([`raw_masked`]): a secret, a phone number or an unasked address never shows.
 pub fn show(ty: &Ty, x: &Value, reveal: bool) -> String {
     let safe = super::secret::mask_type(ty, x);
-    let x = &safe;
-    if !cell::admissible(ty, x) {
-        return match raw_masked(x, reveal) {
+    if !cell::admissible(ty, &safe) {
+        return match raw_masked(&safe, reveal) {
             Value::String(text) => text,
             other => compact(&other),
         };
     }
-    let x = masked(ty, x, reveal);
-    match (&x, ty) {
+    let x = if reveal || !ty.pii() {
+        safe
+    } else {
+        masked(ty, &safe, reveal)
+    };
+    match (x, ty) {
         (Value::Null, _) => String::new(),
-        (Value::String(text), _) if plain(ty) => text.clone(),
-        (Value::Bool(_) | Value::Number(_), _) if plain(ty) => compact(&x),
+        (Value::String(text), _) if plain(ty) => text,
+        (x @ (Value::Bool(_) | Value::Number(_)), _) if plain(ty) => compact(&x),
         (Value::Array(items), Ty::List(inner, _)) if plain(inner) => {
             let parts: Vec<String> = items.iter().map(|item| show(inner, item, true)).collect();
             if parts.iter().any(|p| p.contains(',') || p.starts_with('[')) {
-                compact(&x)
+                compact(&Value::Array(items))
             } else {
                 parts.join(", ")
             }
         }
-        _ => compact(&x),
+        (x, _) => compact(&x),
     }
 }
 
@@ -525,10 +528,10 @@ impl Where {
         })?;
         if let Ty::Set(inner) = column.ty {
             if self.text.trim().is_empty() {
-                return Ok(row
-                    .fields
-                    .get(column.name)
-                    .is_none_or(|set| set.members().is_empty()));
+                return Ok(row.fields.get(column.name).is_none_or(|set| match set {
+                    Field::Set(elements) => !elements.values().any(Field::present),
+                    _ => true,
+                }));
             }
             let wanted = read(inner, &self.text).map_err(|rule| {
                 Error::new(&format!("{}.{}: {rule}", collection.name, column.name))
@@ -539,7 +542,7 @@ impl Where {
             return Ok(row
                 .fields
                 .get(column.name)
-                .is_some_and(|set| set.members().contains(elem)));
+                .is_some_and(|set| set.has_member(elem)));
         }
         let wanted = read(&column.ty, &self.text)
             .map_err(|rule| Error::new(&format!("{}.{}: {rule}", collection.name, column.name)))?;
@@ -637,7 +640,8 @@ pub fn export_opened(
     let columns = layout_with(collection, &projection, opened.is_some());
     let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
     let collection_name = collection.name.to_owned();
-    let mut rows = Vec::new();
+    let mut raw_lookup = (collection_name.clone(), String::new());
+    let mut rows = Vec::with_capacity(projection.rows.len());
     'rows: for (pk, row) in &projection.rows {
         for filter in filters {
             if !filter.matches(collection, pk, row)? {
@@ -672,16 +676,20 @@ pub fn export_opened(
                     }
                 }
                 Source::Pk => pk.clone(),
-                Source::Unknown => show_raw(
-                    cells.get(&(collection_name.clone(), format!("{pk}.{}", column.name))),
-                    row.fields.get(&column.name),
-                    reveal,
-                ),
-                Source::Schema(_) if raw => show_raw(
-                    cells.get(&(collection_name.clone(), format!("{pk}.{}", column.name))),
-                    row.fields.get(&column.name),
-                    reveal,
-                ),
+                Source::Unknown => {
+                    raw_lookup.1.clear();
+                    raw_lookup.1.push_str(pk);
+                    raw_lookup.1.push('.');
+                    raw_lookup.1.push_str(&column.name);
+                    show_raw(cells.get(&raw_lookup), row.fields.get(&column.name), reveal)
+                }
+                Source::Schema(_) if raw => {
+                    raw_lookup.1.clear();
+                    raw_lookup.1.push_str(pk);
+                    raw_lookup.1.push('.');
+                    raw_lookup.1.push_str(&column.name);
+                    show_raw(cells.get(&raw_lookup), row.fields.get(&column.name), reveal)
+                }
                 Source::Schema(schema) => show_field(schema, row.fields.get(&column.name), reveal),
             };
             seen.insert(
@@ -718,7 +726,8 @@ pub fn render(base: &Base) -> String {
         .iter()
         .map(|h| h.trim_start_matches(READ_ONLY))
         .collect();
-    let mut text = String::new();
+    let header_cap: usize = base.header.iter().map(|h| h.len() + 1).sum();
+    let mut text = String::with_capacity(header_cap + base.rows.len() * (names.len() * 8 + 1));
     for (i, h) in base.header.iter().enumerate() {
         if i > 0 {
             text.push('\t');
@@ -835,12 +844,11 @@ struct Reader<'a> {
     problems: Vec<Problem>,
 }
 
-impl Reader<'_> {
-    fn cell(&self, record: usize, column: usize) -> String {
+impl<'a> Reader<'a> {
+    fn cell(&self, record: usize, column: usize) -> std::borrow::Cow<'a, str> {
         self.sheet
             .cell(record, column)
-            .map(|cell| cell.value(self.text).into_owned())
-            .unwrap_or_default()
+            .map_or(std::borrow::Cow::Borrowed(""), |cell| cell.value(self.text))
     }
 
     /// The 1-based line record `record` starts on; 1 for one the file does not hold.
@@ -916,12 +924,12 @@ impl Reader<'_> {
                     },
                     &value,
                 );
-                match (change, key(Some(elem))) {
-                    (Ok(change), Ok(key)) => out.push(Edit {
+                match change {
+                    Ok(change) => out.push(Edit {
                         pk: pk.to_owned(),
                         column: column.name.to_owned(),
                         elem: Some(elem.clone()),
-                        key,
+                        key: change.key,
                         x: Value::Bool(present),
                         value: change.value.unwrap_or_default(),
                         expected: seen
@@ -934,7 +942,7 @@ impl Reader<'_> {
                         line,
                         secret: false,
                     }),
-                    (Err(error), _) | (_, Err(error)) => {
+                    Err(error) => {
                         self.problem(record, at, error.to_string());
                     }
                 }
@@ -953,7 +961,7 @@ impl Reader<'_> {
             // The owner's plaintext, sealed only in the writing session ([`seal`]).
             let x = if text.is_empty() {
                 Value::Null
-            } else if super::secret::flag_like(&super::secret::Secret::new(text.to_owned())) {
+            } else if super::secret::flag_like_str(text) {
                 self.problem(
                     record,
                     at,
@@ -1108,10 +1116,10 @@ pub fn plan(
         .collect();
     let pk_at = width - 1;
     let mut plan = Plan::default();
-    let mut present = BTreeSet::new();
+    let mut present: BTreeSet<&str> = BTreeSet::new();
     let mut born = BTreeSet::new();
     for (record, row) in sheet.records.iter().enumerate().skip(1) {
-        let texts: Vec<String> = (0..row.cells.len().max(width))
+        let texts: Vec<std::borrow::Cow<'_, str>> = (0..row.cells.len().max(width))
             .map(|at| reader.cell(record, at))
             .collect();
         if texts.iter().all(|t| t.trim().is_empty()) {
@@ -1121,14 +1129,14 @@ pub fn plan(
             reader.problem(record, width + extra, "this cell is past the last column");
             continue;
         }
-        let pk = texts[pk_at].trim().to_owned();
+        let pk = texts[pk_at].trim();
         let mut edits = Vec::new();
         if pk.is_empty() {
             // A new row: every typed cell, the lifecycle `live`, one record.
             let mut values = BTreeMap::new();
-            let mut cells = Vec::new();
+            let mut cells: Vec<(usize, &'static Column, &str)> = Vec::new();
             for (at, (name, schema, read_only)) in columns.iter().enumerate().take(pk_at) {
-                let text = &texts[at];
+                let text: &str = &texts[at];
                 if *read_only {
                     if !text.trim().is_empty() {
                         reader.problem(record, at, "this column is read-only (=)");
@@ -1137,7 +1145,7 @@ pub fn plan(
                 }
                 let Some(schema) = schema else { continue };
                 match (schema.ty, text.trim().is_empty()) {
-                    (Ty::Set(_), _) => cells.push((at, *schema, text.clone())),
+                    (Ty::Set(_), _) => cells.push((at, *schema, text)),
                     (_, true) if name == LIFECYCLE => {}
                     (_, true) if !schema.null => {
                         reader.problem(
@@ -1149,11 +1157,11 @@ pub fn plan(
                     (_, true) => {}
                     // A revealed grid's plaintext, sealed as the save writes it: never read as
                     // JSON, and never a birth column.
-                    (Ty::Secret, false) => cells.push((at, *schema, text.clone())),
+                    (Ty::Secret, false) => cells.push((at, *schema, text)),
                     (ty, false) => match read(&ty, text) {
                         Ok(x) => {
                             values.insert(name.clone(), x);
-                            cells.push((at, *schema, text.clone()));
+                            cells.push((at, *schema, text));
                         }
                         Err(rule) => reader.problem(
                             record,
@@ -1183,7 +1191,7 @@ pub fn plan(
                 continue;
             }
             for (at, schema, text) in cells {
-                reader.edits(record, at, &derived, schema, &text, None, &mut edits);
+                reader.edits(record, at, &derived, schema, text, None, &mut edits);
             }
             if !values.contains_key(LIFECYCLE)
                 && let Some(lifecycle) = collection.column(LIFECYCLE)
@@ -1196,7 +1204,7 @@ pub fn plan(
             }
             continue;
         }
-        let Some(seen) = exported.get(pk.as_str()) else {
+        let Some((&exported_pk, &seen)) = exported.get_key_value(pk) else {
             reader.problem(
                 record,
                 pk_at,
@@ -1204,14 +1212,14 @@ pub fn plan(
             );
             continue;
         };
-        if !present.insert(pk.clone()) {
+        if !present.insert(exported_pk) {
             reader.problem(record, pk_at, "this row appears twice");
             continue;
         }
         for (at, (name, schema, read_only)) in columns.iter().enumerate().take(pk_at) {
-            let text = &texts[at];
+            let text: &str = &texts[at];
             let held = seen.get(name);
-            if held.is_some_and(|s| s.shown == *text) || (held.is_none() && text.is_empty()) {
+            if held.is_some_and(|s| s.shown == text) || (held.is_none() && text.is_empty()) {
                 continue;
             }
             if *read_only {
@@ -1246,10 +1254,10 @@ pub fn plan(
                 );
                 continue;
             }
-            reader.edits(record, at, &pk, schema, text, held, &mut edits);
+            reader.edits(record, at, exported_pk, schema, text, held, &mut edits);
         }
         if !edits.is_empty() {
-            plan.rows.push((pk, edits));
+            plan.rows.push((exported_pk.to_owned(), edits));
         }
     }
     // Rows the owner deleted: retired, or ended, so their history stays.
@@ -1260,7 +1268,7 @@ pub fn plan(
     };
     if let Some(lifecycle) = collection.column(LIFECYCLE) {
         for (pk, seen) in &base.rows {
-            if present.contains(pk) {
+            if present.contains(pk.as_str()) {
                 continue;
             }
             let held = seen.get(LIFECYCLE);

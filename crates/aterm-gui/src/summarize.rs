@@ -56,6 +56,7 @@ pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::Ta
         agent: aterm_phase::Program::Claude,
         model: None,
         caller: None,
+        manager_node: None,
         trusted_cwd: None,
         fact_line: false,
         autopilot: aterm_agent::supervise::Autopilot::Land,

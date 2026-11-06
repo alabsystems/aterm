@@ -451,7 +451,8 @@ fn entry_ino(entry: &std::fs::DirEntry) -> Option<u64> {
     }
 }
 
-fn symlink(target: &Path, link: &Path) -> Result<()> {
+/// Create a payload link without replacing an existing entry.
+pub(super) fn symlink(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(target, link)
@@ -1286,6 +1287,10 @@ fn stage_kept(e: Error, stage: &Path) -> Error {
         Error::Refused(m) => Error::Refused(m + &note),
         Error::Usage(m) => Error::Usage(m + &note),
         Error::CannotRun(m) => Error::CannotRun(m + &note),
+        Error::ChildExit { code, message } => Error::ChildExit {
+            code,
+            message: message + &note,
+        },
     }
 }
 

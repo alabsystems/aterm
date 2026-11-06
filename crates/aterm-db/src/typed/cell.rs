@@ -805,10 +805,11 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
                 None => decode_candidate(candidate.operation, &candidate.value),
             }
         }
-        if !projection.rows.contains_key(parsed.pk) {
-            projection.rows.insert(parsed.pk.to_owned(), Row::default());
-        }
-        let row = projection.rows.get_mut(parsed.pk).expect("inserted row");
+        let row = if let Some(row) = projection.rows.get_mut(parsed.pk) {
+            row
+        } else {
+            projection.rows.entry(parsed.pk.to_owned()).or_default()
+        };
         let column = collection.column(parsed.col);
         let rule = column.map_or(OnConflict::Show, |c| c.on_conflict);
         let readable = !unreadable
@@ -828,17 +829,20 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
             continue;
         };
         match parsed.elem {
-            Some(elem) => {
-                if !row.fields.contains_key(parsed.col) {
-                    row.fields
-                        .insert(parsed.col.to_owned(), Field::Set(BTreeMap::new()));
-                }
-                if let Some(Field::Set(elements)) = row.fields.get_mut(parsed.col) {
+            Some(elem) => match row.fields.get_mut(parsed.col) {
+                Some(Field::Set(elements)) => {
                     elements.insert(elem.to_owned(), field);
-                } else {
+                }
+                Some(_) => {
                     row.raw.insert(parsed.col.to_owned());
                 }
-            }
+                None => {
+                    let mut elements = BTreeMap::new();
+                    elements.insert(elem.to_owned(), field);
+                    row.fields
+                        .insert(parsed.col.to_owned(), Field::Set(elements));
+                }
+            },
             None => {
                 if row.fields.insert(parsed.col.to_owned(), field).is_some() {
                     row.raw.insert(parsed.col.to_owned());

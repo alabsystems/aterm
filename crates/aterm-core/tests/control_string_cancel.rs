@@ -16,6 +16,7 @@ fn chunkings(bytes: &[u8]) -> Vec<Vec<&[u8]>> {
 
 fn fed(chunks: &[&[u8]]) -> Terminal {
     let mut term = Terminal::new(24, 80);
+    term.set_osc_event_polling(true);
     term.authorize_clipboard_access(ClipboardAccess::Write);
     for chunk in chunks {
         term.process(chunk);

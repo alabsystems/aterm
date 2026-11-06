@@ -329,6 +329,7 @@ fn given_up(need: Need, _mode: Admit) -> Result<Claim, Error> {
                 order: (0, 4242, 0),
                 stalled: Some(span),
                 credit: Vec::new(),
+                overrun: None,
             }],
         },
     })

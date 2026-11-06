@@ -523,64 +523,90 @@ fn frame(kind: u8, mut out: Vec<u8>) -> Result<Vec<u8>, ProtoError> {
 }
 
 impl Request {
+    /// Encode an `Attach` request without cloning `a`.
+    ///
+    /// # Errors
+    /// Its payload is over [`MAX_MESSAGE`].
+    pub fn encode_attach(a: &Attach) -> Result<Vec<u8>, ProtoError> {
+        let cap = 17
+            + a.helper_sha256.len()
+            + a.agent_sha256.len()
+            + a.shares
+                .iter()
+                .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+                .sum::<usize>();
+        let mut p = Put::new(cap);
+        p.u32(a.proto);
+        p.text(&a.helper_sha256)?;
+        p.text(&a.agent_sha256)?;
+        p.shares(&a.shares)?;
+        p.bool(a.keep);
+        frame(ATTACH, p.0)
+    }
+
+    /// Encode a `Boot` request without cloning or boxing `plan`.
+    ///
+    /// # Errors
+    /// Its payload is over [`MAX_MESSAGE`].
+    pub fn encode_boot(plan: &Plan) -> Result<Vec<u8>, ProtoError> {
+        let cap = 64
+            + plan.name.len()
+            + plan.kernel.as_os_str().len()
+            + plan.initrd.as_os_str().len()
+            + plan.command_line.len()
+            + plan
+                .disks
+                .iter()
+                .map(|d| 5 + d.path.as_os_str().len())
+                .sum::<usize>()
+            + plan.boot_share.as_os_str().len()
+            + plan
+                .shares
+                .iter()
+                .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+                .sum::<usize>()
+            + plan.console_log.as_os_str().len()
+            + plan.agent_sha256.len();
+        let mut p = Put::new(cap);
+        put_plan(&mut p, plan)?;
+        frame(BOOT, p.0)
+    }
+
+    /// Encode a `Share` request without cloning `entries`.
+    ///
+    /// # Errors
+    /// Its payload is over [`MAX_MESSAGE`].
+    pub fn encode_share(entries: &[ShareEntry]) -> Result<Vec<u8>, ProtoError> {
+        let cap = 4 + entries
+            .iter()
+            .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
+            .sum::<usize>();
+        let mut p = Put::new(cap);
+        p.shares(entries)?;
+        frame(SHARE, p.0)
+    }
+
     /// The whole message, header first.
     ///
     /// # Errors
     /// Its payload is over [`MAX_MESSAGE`].
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        match self {
+            Self::Attach(a) => return Self::encode_attach(a),
+            Self::Boot(plan) => return Self::encode_boot(plan),
+            Self::Share(entries) => return Self::encode_share(entries),
+            _ => {}
+        }
         let cap = match self {
             Self::State | Self::Detach => 0,
             Self::Keep(_) => 1,
             Self::Connect { .. } => 4,
             Self::Release { .. } | Self::Stop { .. } => 8,
-            Self::Attach(a) => {
-                17 + a.helper_sha256.len()
-                    + a.agent_sha256.len()
-                    + a.shares
-                        .iter()
-                        .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
-                        .sum::<usize>()
-            }
-            Self::Boot(plan) => {
-                64 + plan.name.len()
-                    + plan.kernel.as_os_str().len()
-                    + plan.initrd.as_os_str().len()
-                    + plan.command_line.len()
-                    + plan
-                        .disks
-                        .iter()
-                        .map(|d| 5 + d.path.as_os_str().len())
-                        .sum::<usize>()
-                    + plan.boot_share.as_os_str().len()
-                    + plan
-                        .shares
-                        .iter()
-                        .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
-                        .sum::<usize>()
-                    + plan.console_log.as_os_str().len()
-                    + plan.agent_sha256.len()
-            }
-            Self::Share(entries) => {
-                4 + entries
-                    .iter()
-                    .map(|s| 8 + s.name.len() + s.path.as_os_str().len())
-                    .sum::<usize>()
-            }
+            Self::Attach(_) | Self::Boot(_) | Self::Share(_) => unreachable!(),
         };
         let mut p = Put::new(cap);
         let kind = match self {
-            Self::Attach(a) => {
-                p.u32(a.proto);
-                p.text(&a.helper_sha256)?;
-                p.text(&a.agent_sha256)?;
-                p.shares(&a.shares)?;
-                p.bool(a.keep);
-                ATTACH
-            }
-            Self::Boot(plan) => {
-                put_plan(&mut p, plan)?;
-                BOOT
-            }
+            Self::Attach(_) | Self::Boot(_) | Self::Share(_) => unreachable!(),
             Self::Connect { port } => {
                 p.u32(*port);
                 CONNECT
@@ -588,10 +614,6 @@ impl Request {
             Self::Release { id } => {
                 p.u64(*id);
                 RELEASE
-            }
-            Self::Share(entries) => {
-                p.shares(entries)?;
-                SHARE
             }
             Self::Keep(keep) => {
                 p.bool(*keep);

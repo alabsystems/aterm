@@ -2706,7 +2706,9 @@ fn a_fleet_survey_carries_each_members_checkouts_and_any_host_places_by_them() {
     let said = String::from_utf8_lossy(&met.stderr);
     assert!(!met.status.success(), "no account to run it on: {met:?}");
     assert!(
-        said.contains("none of the 1 that meet them has an enrolled, unwalled claude account"),
+        said.contains(
+            "none of the 1 that meet them would start it on a claude account with no known wall or sign-out"
+        ),
         "{said}"
     );
 }
@@ -3111,6 +3113,7 @@ mod any_host_walled {
             assert_eq!(word(label, "pct7"), week, "{hosts:?}");
             assert_ne!(word(label, "read_at"), "-", "{hosts:?}");
         }
+        assert_eq!(word(FREE, "launch"), "1", "its one row: {hosts:?}");
 
         let twice = (2 * HANG).as_millis().to_string();
         let any = || {
@@ -3185,9 +3188,11 @@ mod any_host_walled {
         assert!(!refused.status.success(), "{refused:?}");
         assert!(
             said.contains(
-                "--host any: no Mac can take agent=codex: 1 members answered, 1 of them let this \
-                 Mac drive them"
-            ) && said.contains("none of those has an enrolled, unwalled codex account"),
+                "--host any: no Mac can take agent=codex: 1 members answered, 1 of them can be \
+                 driven from this Mac"
+            ) && said.contains(
+                "none of those would start it on a codex account with no known wall or sign-out"
+            ),
             "{said}"
         );
         assert!(

@@ -567,14 +567,9 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
         match (open, unit.link) {
             (None, Some(link)) => open = Some((col, link)),
             (Some((_, previous)), Some(link))
-                if std::sync::Arc::ptr_eq(&previous.url, &link.url) && previous.id == link.id => {}
+                if crate::HyperlinkData::same_scope(&previous.payload, &link.payload) => {}
             (Some((start, previous)), next) => {
-                spans.push(HyperlinkSpan::with_id(
-                    start,
-                    col,
-                    previous.url.clone(),
-                    previous.id.clone(),
-                ));
+                spans.push(previous.with_range(start, col));
                 open = next.map(|link| (col, link));
             }
             (None, None) => {}
@@ -591,12 +586,7 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
         col = col.saturating_add(unit.width);
     }
     if let Some((start, link)) = open {
-        spans.push(HyperlinkSpan::with_id(
-            start,
-            col,
-            link.url.clone(),
-            link.id.clone(),
-        ));
+        spans.push(link.with_range(start, col));
     }
     if let Some((start, color)) = ul_open {
         ul_spans.push(UnderlineColorSpan::new(start, col, color));
@@ -898,8 +888,8 @@ mod tests {
         let output = build_line(&units, false);
         assert_eq!(
             (Arc::strong_count(&url), Arc::strong_count(&id)),
-            (owners.0 + 1, owners.1 + 1),
-            "the output owns one span"
+            owners,
+            "the output shares one payload rather than separately cloning URL and ID"
         );
         drop(units);
         drop(source);

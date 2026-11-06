@@ -1221,7 +1221,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let state = checkpoint
             .restore(&self.schema, &self.live.identity)
             .map_err(PublishRefusal::Restore)?;
-        let restored_digest = state_digest(&self.schema, &state);
+        let restored_digest = checkpoint.state_digest();
         let rev = self.next_revision;
         let rev_after = rev
             .checked_add(1)
@@ -1248,19 +1248,15 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
                     .log_epoch
                     .checked_add(1)
                     .ok_or(PublishRefusal::Exhausted("log epoch"))?;
-                let fresh = Checkpoint::capture(
-                    &self.schema,
-                    &state,
-                    Provenance {
-                        identity: identity.clone(),
-                        log_epoch: epoch,
-                        input_cursor: head.input_cursor,
-                        effect_cursor: head.effect_cursor,
-                        branch: head.branch,
-                        revision: head.revision,
-                        parent: Some(checkpoint.digest()),
-                    },
-                );
+                let fresh = checkpoint.with_provenance(Provenance {
+                    identity: identity.clone(),
+                    log_epoch: epoch,
+                    input_cursor: head.input_cursor,
+                    effect_cursor: head.effect_cursor,
+                    branch: head.branch,
+                    revision: head.revision,
+                    parent: Some(checkpoint.digest()),
+                });
                 let log = EventLog::new(
                     LogHeader {
                         identity: identity.clone(),

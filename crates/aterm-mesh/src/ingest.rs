@@ -495,7 +495,7 @@ impl Ingest {
     fn ingest_tables(&self, mesh: &Mesh, records: Vec<(u64, [u8; 32], Vec<u8>)>) {
         let mut runs: Vec<Run> = Vec::new();
         for (offset, table, payload) in records {
-            let Some((kind, wire)) = stores::read_table_payload(&payload) else {
+            let Some((kind, wire)) = stores::take_table_payload(payload) else {
                 let mut state = self.state.lock_or_recover();
                 state.waiting.remove(&offset);
                 state.busy.remove(&offset);
@@ -504,9 +504,9 @@ impl Ingest {
             };
             match runs.last_mut() {
                 Some((t, k, run)) if *t == table && *k == kind && run.len() < BATCH => {
-                    run.push((offset, wire.to_vec()));
+                    run.push((offset, wire));
                 }
-                _ => runs.push((table, kind, vec![(offset, wire.to_vec())])),
+                _ => runs.push((table, kind, vec![(offset, wire)])),
             }
         }
         for (table, kind, run) in runs {
@@ -516,27 +516,23 @@ impl Ingest {
                 .delivering(&wires, || self.stores.ingest_table(table, kind, &wires));
             let (mut applied, mut waiting, mut refused) = (0, 0, 0);
             let mut state = self.state.lock_or_recover();
-            for ((offset, wire), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
+            for ((offset, mut wire), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
                 state.waiting.remove(&offset);
                 state.busy.remove(&offset);
                 match verdict {
                     Verdict::Applied => applied += 1,
                     Verdict::Waiting(_) => {
                         waiting += 1;
-                        state.waiting.insert(
-                            offset,
-                            (Carries::Table(table), stores::table_payload(kind, &wire)),
-                        );
+                        wire.insert(0, kind.byte());
+                        state.waiting.insert(offset, (Carries::Table(table), wire));
                     }
                     Verdict::Refused(why) => {
                         refused += 1;
                         aterm_log::debug!("mesh: a table record at {offset} is refused: {why}");
                     }
                     Verdict::Busy(_) => {
-                        state.busy.insert(
-                            offset,
-                            (Carries::Table(table), stores::table_payload(kind, &wire)),
-                        );
+                        wire.insert(0, kind.byte());
+                        state.busy.insert(offset, (Carries::Table(table), wire));
                     }
                 }
             }

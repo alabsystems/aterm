@@ -1126,12 +1126,23 @@ impl WindowRecord {
     /// The canonical encoding.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        // A node's origin and a compiled metric name keep the identity far under the reader's
-        // 255 bytes, for every metric (`every_row_reads_back_as_itself_at_its_subject`).
-        let id = self.id().encode();
-        let mut o = Out::with_capacity(KIND_WINDOW, 64 + id.len());
-        o.varint(u64::try_from(id.len()).unwrap_or(u64::MAX));
-        o.0.extend_from_slice(&id);
+        // A node's origin and a compiled metric name keep the identity far under 128 bytes
+        // (`every_row_reads_back_as_itself_at_its_subject`), so its length prefix is 1 byte.
+        let mut o = Out::with_capacity(KIND_WINDOW, 128);
+        o.0.push(0);
+        let id_start = o.0.len();
+        o.0.push(astream_wire::summary::KIND_ID);
+        o.0.push(astream_wire::summary::SUMMARY_ID_VERSION);
+        o.bytes(&self.node.to_ascii_bytes());
+        o.text(self.metric.as_str());
+        o.0.push(match self.window.window_len() {
+            astream_wire::summary::WindowLen::Minute => 1,
+            astream_wire::summary::WindowLen::Hour => 2,
+            astream_wire::summary::WindowLen::Day => 3,
+            astream_wire::summary::WindowLen::Week => 4,
+        });
+        o.varint(self.window.index());
+        o.0[id_start - 1] = u8::try_from(o.0.len() - id_start).unwrap_or(0);
         o.varint(self.revision);
         self.summary.encode_into(&mut o.0);
         o.0

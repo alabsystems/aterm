@@ -191,8 +191,8 @@ impl Scalars {
     }
 }
 
-struct CharStringParserContext<'a> {
-    work: crate::work::OutlineWork,
+struct CharStringParserContext<'a, 'w> {
+    work: &'w mut crate::work::OutlineWork,
     metadata: &'a Table<'a>,
     coordinates: &'a [NormalizedCoordinate],
     scalars: Scalars,
@@ -201,7 +201,7 @@ struct CharStringParserContext<'a> {
     stems_len: u32,
 }
 
-impl CharStringParserContext<'_> {
+impl CharStringParserContext<'_, '_> {
     fn update_scalars(&mut self, index: u16) -> Result<(), CFFError> {
         self.scalars.clear();
 
@@ -230,9 +230,10 @@ fn parse_char_string(
     metadata: &Table,
     coordinates: &[NormalizedCoordinate],
     builder: &mut dyn OutlineSink,
+    work: &mut crate::work::OutlineWork,
 ) -> Result<Rect, CFFError> {
     let mut ctx = CharStringParserContext {
-        work: crate::work::OutlineWork::default(),
+        work,
         metadata,
         coordinates,
         scalars: Scalars::default(),
@@ -274,7 +275,7 @@ fn parse_char_string(
 }
 
 fn _parse_char_string(
-    ctx: &mut CharStringParserContext,
+    ctx: &mut CharStringParserContext<'_, '_>,
     char_string: &[u8],
     depth: u8,
     p: &mut CharStringParser,
@@ -524,11 +525,23 @@ impl<'a> Table<'a> {
         glyph_id: GlyphId,
         builder: &mut dyn OutlineSink,
     ) -> Result<Rect, CFFError> {
+        let mut work = crate::work::OutlineWork::default();
+        self.outline_within(coordinates, glyph_id, builder, &mut work)
+    }
+
+    /// [`Table::outline`] under `work`.
+    pub(crate) fn outline_within(
+        &self,
+        coordinates: &[NormalizedCoordinate],
+        glyph_id: GlyphId,
+        builder: &mut dyn OutlineSink,
+        work: &mut crate::work::OutlineWork,
+    ) -> Result<Rect, CFFError> {
         let data = self
             .char_strings
             .get(u32::from(glyph_id.0))
             .ok_or(CFFError::NoGlyph)?;
-        parse_char_string(data, self, coordinates, builder)
+        parse_char_string(data, self, coordinates, builder, work)
     }
 }
 

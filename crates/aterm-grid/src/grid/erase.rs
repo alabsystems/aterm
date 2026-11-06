@@ -485,20 +485,21 @@ impl Grid {
         }
     }
 
-    /// DECALN (`ESC # 8`): fill the screen with 'E' and reset all margins.
+    /// DECALN (`ESC # 8`): fill the screen with 'E' and reset all margins. Each row is filled
+    /// whole, as ED 2 fills it, and the screen is new from its top, so the resize hand-back
+    /// forgets what it owed as it does after ED 2.
     pub fn screen_alignment_pattern(&mut self) {
         self.storage.clear_pending_wrap();
         self.storage.scroll_region = ScrollRegion::full(self.storage.visible_rows);
         self.storage.reset_horizontal_margins();
+        self.forget_revealed_rows();
+        self.forget_pushed_rows_erased();
+        self.drop_fill_debt();
 
-        let cols = self.storage.cols;
-
+        let glyph = super::Cell::from_ascii_fast(b'E');
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
-                r.clear();
-                for col in 0..cols {
-                    r.write_char(col, 'E');
-                }
+                r.fill_written(glyph);
             }
         }
 
@@ -1245,20 +1246,48 @@ mod tests {
             grid.move_cursor_to(rows - 1, cols - 1);
             grid.set_pending_wrap(true);
 
+            if rows > 1 {
+                grid.row_mut(1).expect("row 1").set_wrapped(true);
+            }
+
             grid.screen_alignment_pattern();
 
             for row in 0..rows {
                 for col in 0..cols {
                     let cell = grid.cell(row, col).expect("cell");
-                    assert_eq!(cell.char(), 'E', "({row}, {col})");
-                    assert!(cell.flags().is_empty(), "({row}, {col})");
+                    assert_eq!(*cell, crate::Cell::from_ascii_fast(b'E'), "({row}, {col})");
                 }
+                let r = grid.row(row).expect("row");
+                assert_eq!(r.len(), cols, "row {row}: every column is written");
+                assert_eq!(r.flags(), crate::row::RowFlags::DIRTY, "row {row}");
             }
             assert_eq!((grid.cursor_row(), grid.cursor_col()), (0, 0));
             let region = grid.scroll_region();
             assert_eq!((region.top, region.bottom), (0, rows - 1));
             assert!(!grid.pending_wrap());
             assert!(!grid.storage.any_double_width);
+        }
+    }
+
+    /// DECALN fills each row whole, as ED 2 does: no cell takes a write of its own, so a screen
+    /// 2000 columns wide costs its 24 row fills, not 48,000 glyph writes, each of which settled
+    /// the row's length (a hang vector: a review in 2026-10 timed repeated DECALN at many times
+    /// ED 2's cost per cell).
+    #[test]
+    fn decaln_writes_no_cell_on_its_own() {
+        let (rows, cols) = (24, 2000);
+        let mut grid = Grid::new(rows, cols);
+        fill_grid(&mut grid, rows, cols);
+        let _ = crate::test_counters::take_row_writes();
+
+        grid.screen_alignment_pattern();
+
+        assert_eq!(crate::test_counters::take_row_writes(), 0);
+        let glyph = crate::Cell::from_ascii_fast(b'E');
+        for row in 0..rows {
+            let r = grid.row(row).expect("row");
+            assert!(r.as_slice().iter().all(|c| *c == glyph), "row {row}");
+            assert_eq!(r.len(), cols, "row {row}");
         }
     }
 

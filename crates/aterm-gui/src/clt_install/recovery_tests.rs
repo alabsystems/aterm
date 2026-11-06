@@ -48,6 +48,7 @@ fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session
     assert!(source.developer_tools_install_active());
     assert!(macos_dialog_up());
     assert!(mark.is_file());
+    assert!(!source.system_state_handoff_pending());
 
     // Move the actual child rather than closing it: the old window's memory goes away,
     // while keeper custody leaves its process, SID, birth and PTY unchanged.
@@ -136,7 +137,7 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
         "a verified live child must recover its installer custody, not just its PTY"
     );
     assert!(step(&mut recovered).is_some());
-    assert!(recovered.system_state_handoff_pending());
+    assert!(!recovered.system_state_handoff_pending());
     assert!(macos_dialog_up(), "other automatic prompts remain held");
     assert!(
         drain(&read).is_empty(),
@@ -163,6 +164,51 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
         .expect("the exact recovered child's exit releases custody");
     drop(available);
     assert!(drain(&read).is_empty(), "exit submits no further command");
+}
+
+#[test]
+fn clt_recovery_only_exact_durable_installer_custody_allows_an_update() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mark = directory.path().join("command-line-tools-tab");
+    let (session, read) = landed_child(&mark);
+    let receipt = receipt_for(&mark, &session);
+    let (mut recovered, _) = recovered_page(&mark);
+    let local = recovered.next_session_id + 30;
+    recovered.pool_insert(adopted(session, local));
+    assert!(recovered.developer_tools_install_active());
+    assert!(!recovered.system_state_handoff_pending());
+    let original = recovered.pool.get(local).unwrap().shell_identity;
+    recovered
+        .pool
+        .sessions
+        .get_mut(&local)
+        .unwrap()
+        .session
+        .shell_identity =
+        aterm_pty::ShellIdentity::from_parts(original.pid, Some(CHILD_BIRTH + 1), false);
+    assert!(recovered.system_state_handoff_pending());
+    recovered
+        .pool
+        .sessions
+        .get_mut(&local)
+        .unwrap()
+        .session
+        .shell_identity = original;
+    assert!(!recovered.system_state_handoff_pending());
+    let child = recovered.pool.get(local).unwrap();
+    let mut successor_receipt = receipt_for(&mark, child);
+    successor_receipt.claim("successor-test-build").unwrap();
+    assert!(!receipt.matches(), "the successor changed the build claim");
+    assert!(!recovered.system_state_handoff_pending());
+    successor_receipt.remove_if_matching();
+    assert!(recovered.system_state_handoff_pending());
+    assert!(
+        drain(&read).is_empty(),
+        "handoff admission types no command"
+    );
 }
 
 /// A launch that adopted live shells takes the shim's mark off with the rest an earlier launch
@@ -549,7 +595,7 @@ fn clt_recovery_each_live_child_keeps_custody_until_its_own_exit() {
         recovered.pool_insert(session);
     }
     assert!(recovered.developer_tools_install_active());
-    assert!(recovered.system_state_handoff_pending());
+    assert!(!recovered.system_state_handoff_pending());
     assert!(macos_dialog_up());
     assert!(drain(&first_read).is_empty());
     assert!(drain(&second_read).is_empty());
@@ -565,7 +611,7 @@ fn clt_recovery_each_live_child_keeps_custody_until_its_own_exit() {
         "the second child still owns custody"
     );
     assert!(step(&mut recovered).is_some());
-    assert!(recovered.system_state_handoff_pending());
+    assert!(!recovered.system_state_handoff_pending());
     assert!(macos_dialog_up());
     recovered.headless = false;
     let duplicate = recovered.press_developer_tools_install();
@@ -615,7 +661,7 @@ fn clt_recovery_receipt_before_command_bytes_restores_custody_without_starting_t
     recovered.pool_insert(child);
     assert!(recovered.developer_tools_install_active());
     assert!(step(&mut recovered).is_some());
-    assert!(recovered.system_state_handoff_pending());
+    assert!(!recovered.system_state_handoff_pending());
     assert!(macos_dialog_up());
     assert!(
         drain(&read).is_empty(),

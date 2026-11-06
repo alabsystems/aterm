@@ -9,11 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
+use aterm_types::MutexExt as _;
 
 use crate::cast::{ByteFanout, ByteSubscription};
 use crate::control::Scope;
 use crate::frame_key::{FrameKey, TextKey};
-use crate::frame_memo::{CellsHold, FrameSlot, ScreenText, Styled, StyledFrame};
+use crate::frame_memo::{
+    CellsHold, FrameSlot, MAX_CELLS_WATCHES, STYLED_FRAME_CAP, ScreenText, Styled, StyledFrame,
+};
 use crate::session_store::Store;
 use crate::session_watch::{Subscription, Watchers};
 use crate::turn_ledger::TurnLedger;
@@ -27,7 +30,7 @@ pub(crate) struct TargetStreams {
     pub cursor: bool,
     /// The lifecycle digest: `EVENT <sid> block-complete <id> exit=<code>` on OSC 133 D, `EVENT <sid> turn <id> submitted=<0|1> status=<..> dur_ms=<..>` per completed turn (the turn ledger), `EVENT <sid> title <pct>` on an OSC 0/2 title change, `EVENT <sid> bell total=<n>` on a BEL, the timeline kinds [`timeline_wire_kind`] carries (`meta field=<f> value=<pct|->`, `agent`, `status`, `human`, `render`, a program's own `program state=<w>[ kind=<k>] rev=<id>` and `act <act> rev=<id>`, the fabric digest), and at retirement `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|harness|->` then `EVENT <sid> exited`.
     pub events: bool,
-    /// Emit `DELTA <sid> seq=<n> cells <nbytes>\n<styled-json>` when the styled frame changes — the LOSSLESS styled-screen frame (Item 1's payload) pushed live, so an outer agent sees the inner TUI's colour/attrs, not plaintext.
+    /// Emit `DELTA <sid> seq=<n> cells <nbytes>\n<styled-json>` when the styled frame changes — the LOSSLESS styled-screen frame (Item 1's payload) pushed live, so an outer agent sees the inner TUI's colour/attrs, not plaintext. A frame past [`STYLED_FRAME_CAP`] is never built or sent: `GAP <sid> cells-too-large=<bytes> cap=<cap>` says so once, until a frame fits again; a session already serving [`MAX_CELLS_WATCHES`] gives a further watch no cells, said once as `GAP <sid> cells-watches=<cap>`.
     pub cells: bool,
     /// Emit `BYTES <sid> <len>\n<raw bytes>` for every program-output burst: live, byte-lossless, never coalesced (the per-subscriber queue holds every burst).
     pub bytes: bool,
@@ -278,7 +281,10 @@ struct Watch {
     last_rows_hash: u64,
     last_cells_etag: u64,
     last_cells_body: Option<(u64, usize)>,
-    _cells_hold: Option<CellsHold>,
+    /// `None` on a `cells` watch the session refused ([`FrameSlot::hold_cells`]).
+    cells_hold: Option<CellsHold>,
+    /// Whether this watch's `cells` refusal `GAP` went out, since the last frame it sent.
+    cells_refusal_said: bool,
     last_block_id: Option<u64>,
     last_turn_id: Option<u64>,
     last_timeline_id: Option<u64>,
@@ -1008,6 +1014,8 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         if !streams.wants_content() {
             break 'content;
         }
+        let cells_on = streams.cells && watch.cells_hold.is_some();
+        let _turn = cells_on.then(|| watch.src.frame.build.lock_or_recover());
         let mut look = watch.src.frame.look_frame();
         let (t_us, seq, alt, gap, advance, cur, text, rows, cells_etag, styled) = {
             let t = crate::term_lock(&watch.term);
@@ -1031,7 +1039,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
                     crate::control::cursor_style_name(t.cursor_style()),
                 )
             });
-            let key = streams.cells.then(|| FrameKey::read(&t));
+            let key = cells_on.then(|| FrameKey::read(&t));
             let text = streams
                 .screen
                 .then(|| key.map_or_else(|| TextKey::read(&t), |k| k.text()));
@@ -1043,15 +1051,39 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
                 .filter(|k| {
                     advance || k.etag() != watch.last_cells_etag || (watch.non_coalesced && woke)
                 })
-                .map(|k| (k, look.styled(&t, &k)));
+                .map(|k| {
+                    let floor = crate::control::styled_frame_floor(
+                        usize::from(t.rows()),
+                        usize::from(t.cols()),
+                    );
+                    let styled = if floor > STYLED_FRAME_CAP {
+                        Err(floor)
+                    } else if let Some(reached) = look.refused(&k) {
+                        Err(reached)
+                    } else {
+                        Ok(look.styled(&t, &k))
+                    };
+                    (k, styled)
+                });
             (
                 t_us, seq, alt, gap, advance, cur, text, rows, cells_etag, styled,
             )
         };
+        let mut cells_refused = None;
         let cells_payload = styled
-            .map(|(key, styled)| match styled {
-                Styled::Hit(frame) => frame,
-                Styled::Miss(snap) => look.publish_styled(key, &snap),
+            .and_then(|(key, styled)| {
+                let built = match styled {
+                    Ok(Styled::Hit(frame)) if frame.body().len() <= STYLED_FRAME_CAP => Ok(frame),
+                    Ok(Styled::Hit(frame)) => Err(frame.body().len()),
+                    Ok(Styled::Miss(snap)) => look.publish_styled_within(key, &snap),
+                    Err(floor) => Err(floor),
+                };
+                built
+                    .map_err(|bytes| {
+                        cells_refused = Some(bytes);
+                        watch.last_cells_body = None;
+                    })
+                    .ok()
             })
             .filter(|frame| {
                 let fresh = advance || watch.last_cells_body != Some(frame.id());
@@ -1090,6 +1122,23 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             let (cr, cc, cv, cs) = cur;
             out.push_str(&frame_cursor(sid, seq, cr, cc, cv, cs));
             watch.last_cursor = cur;
+        }
+        if cells_payload.is_some() {
+            watch.cells_refusal_said = false;
+        } else if !watch.cells_refusal_said {
+            let refusal = match cells_refused {
+                Some(bytes) => Some(format!(
+                    "GAP {sid} cells-too-large={bytes} cap={STYLED_FRAME_CAP}\n"
+                )),
+                None if streams.cells && !cells_on => {
+                    Some(format!("GAP {sid} cells-watches={MAX_CELLS_WATCHES}\n"))
+                }
+                None => None,
+            };
+            if let Some(refusal) = refusal {
+                out.push_str(&refusal);
+                watch.cells_refusal_said = true;
+            }
         }
         watch
             .pace
@@ -1291,7 +1340,11 @@ fn new_watch_at(
         last_rows_hash: engine.rows_hash,
         last_cells_etag: engine.cells_etag,
         last_cells_body: None,
-        _cells_hold: streams.cells.then(|| FrameSlot::hold_cells(&src.frame)),
+        cells_hold: streams
+            .cells
+            .then(|| FrameSlot::hold_cells(&src.frame))
+            .flatten(),
+        cells_refusal_said: false,
         last_block_id: resume_block_watermark(opts.since_block, engine.newest_block),
         byte_sub: streams.bytes.then(|| src.byte_fanout.subscribe()),
         non_coalesced: opts.non_coalesced,
@@ -2466,6 +2519,7 @@ mod tests {
     }
 
     fn watch_on(local_id: u64, term: &Arc<Mutex<Terminal>>) -> Watch {
+        let src = WatchSource::of(&crate::session_store::test_handle(local_id).ctx);
         Watch {
             local_id,
             last_mail_id: 0,
@@ -2475,7 +2529,8 @@ mod tests {
             closing: false,
             timeline_held: false,
             term: term.clone(),
-            src: WatchSource::of(&crate::session_store::test_handle(local_id).ctx),
+            cells_hold: FrameSlot::hold_cells(&src.frame),
+            src,
             last_sent_seq: 0,
             last_alt: false,
             last_cursor: (u16::MAX, u16::MAX, false, ""),
@@ -2483,7 +2538,7 @@ mod tests {
             last_rows_hash: 0,
             last_cells_etag: 0,
             last_cells_body: None,
-            _cells_hold: None,
+            cells_refusal_said: false,
             last_block_id: None,
             last_timeline_id: None,
             acked_meta: None,
@@ -3426,15 +3481,13 @@ mod tests {
             let h = crate::session_store::test_handle(1);
             let target = target_of(&h);
             let watch = || {
-                let w = new_watch(&target, streams, &PushOptions::default());
-                if held {
-                    w
-                } else {
-                    Watch {
-                        _cells_hold: None,
-                        ..w
-                    }
+                let mut w = new_watch(&target, streams, &PushOptions::default());
+                if !held {
+                    let own = Arc::new(FrameSlot::default());
+                    w.cells_hold = FrameSlot::hold_cells(&own);
+                    w.src.frame = own;
                 }
+                w
             };
             let (mut a, mut b) = (watch(), watch());
             crate::term_lock(&h.term).process(b"x");
@@ -3462,7 +3515,124 @@ mod tests {
         assert_eq!(
             readers(false),
             3,
-            "the negative control: each reader gathered"
+            "the negative control: each reader gathered into a slot of its own"
+        );
+    }
+
+    fn cells_only() -> TargetStreams {
+        TargetStreams {
+            cells: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cells_frame_past_the_cap_by_its_floor_is_refused_ungathered() {
+        use crate::work_counts;
+        let streams = cells_only();
+        let h = crate::session_store::test_handle(1);
+        let mut w = new_watch(&target_of(&h), streams, &PushOptions::default());
+        let floor = crate::control::styled_frame_floor(300, 300);
+        assert!(
+            floor > STYLED_FRAME_CAP,
+            "the premise: 300x300 passes the cap"
+        );
+        let refused = format!("GAP 1 cells-too-large={floor} cap={STYLED_FRAME_CAP}\n");
+        crate::term_lock(&h.term).resize(300, 300);
+        work_counts::take_styled_frames_gathered();
+        assert_eq!(wake_text(&mut w, streams, true), refused);
+        crate::term_lock(&h.term).process(b"x");
+        assert_eq!(wake_text(&mut w, streams, true), "", "said once");
+        assert_eq!(work_counts::take_styled_frames_gathered(), 0);
+        crate::term_lock(&h.term).resize(24, 80);
+        assert!(wake_text(&mut w, streams, true).contains(" cells "));
+        crate::term_lock(&h.term).resize(300, 300);
+        assert_eq!(wake_text(&mut w, streams, true), refused, "a new episode");
+    }
+
+    #[test]
+    fn a_cells_frame_the_floor_admits_stops_serializing_at_the_cap() {
+        let streams = cells_only();
+        let h = crate::session_store::test_handle(1);
+        let mut w = new_watch(&target_of(&h), streams, &PushOptions::default());
+        assert!(
+            crate::control::styled_frame_floor(200, 200) <= STYLED_FRAME_CAP,
+            "the premise: the floor admits 200x200"
+        );
+        crate::term_lock(&h.term).resize(200, 200);
+        let f = wake_text(&mut w, streams, true);
+        let reached: usize = f
+            .strip_prefix("GAP 1 cells-too-large=")
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or_else(|| panic!("a refusal, not a frame: {f:.120}"));
+        assert!(
+            (STYLED_FRAME_CAP..STYLED_FRAME_CAP + 200 * 1024).contains(&reached),
+            "the writer stops within a row of the cap: {reached}"
+        );
+        assert!(
+            h.ctx.frame.look_frame().styled_for_test().is_none(),
+            "nothing over the cap is published"
+        );
+    }
+
+    /// Watches of one session that find its styled frame past the cap gather it once between
+    /// them: the first one's refusal is kept for the rest.
+    #[test]
+    fn a_frame_refused_at_the_cap_is_gathered_once_for_every_watch() {
+        use crate::work_counts;
+        let streams = cells_only();
+        let h = crate::session_store::test_handle(1);
+        let target = target_of(&h);
+        let mut watches: Vec<Watch> = (0..3)
+            .map(|_| new_watch(&target, streams, &PushOptions::default()))
+            .collect();
+        crate::term_lock(&h.term).resize(200, 200);
+        work_counts::take_styled_frames_gathered();
+        let said: Vec<String> = watches
+            .iter_mut()
+            .map(|w| wake_text(w, streams, true))
+            .collect();
+        assert!(said[0].starts_with("GAP 1 cells-too-large="), "{said:?}");
+        assert!(said.iter().all(|line| *line == said[0]), "{said:?}");
+        assert_eq!(
+            work_counts::take_styled_frames_gathered(),
+            1,
+            "one gather, shared by every refusal"
+        );
+        crate::term_lock(&h.term).process(b"x");
+        for w in &mut watches {
+            assert_eq!(wake_text(w, streams, true), "", "said once");
+        }
+        assert_eq!(
+            work_counts::take_styled_frames_gathered(),
+            1,
+            "a change is gathered once more"
+        );
+    }
+
+    #[test]
+    fn a_session_serves_a_bounded_number_of_cells_watches() {
+        let streams = cells_only();
+        let h = crate::session_store::test_handle(1);
+        let target = target_of(&h);
+        let watch = || new_watch(&target, streams, &PushOptions::default());
+        let mut held: Vec<Watch> = (0..MAX_CELLS_WATCHES).map(|_| watch()).collect();
+        let mut over = watch();
+        crate::term_lock(&h.term).process(b"x");
+        for w in &mut held {
+            assert!(wake_text(w, streams, true).contains(" cells "));
+        }
+        let refused = format!("GAP 1 cells-watches={MAX_CELLS_WATCHES}\n");
+        assert_eq!(wake_text(&mut over, streams, true), refused);
+        crate::term_lock(&h.term).process(b"y");
+        assert_eq!(wake_text(&mut over, streams, true), "", "said once");
+        held.pop();
+        let mut next = watch();
+        crate::term_lock(&h.term).process(b"z");
+        assert!(
+            wake_text(&mut next, streams, true).contains(" cells "),
+            "a freed place serves the next watch"
         );
     }
 

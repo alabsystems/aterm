@@ -316,6 +316,15 @@ fn spec_xref_closure() {
             aterm_secrets::client::gap_heal_environment as fn(),
         ));
     }
+    // aterm-mesh's `MeshRelay` anchors: one named item in each module that holds them (the
+    // relay, which hosts the waivers, `Inventory`, the egress and the revocation pass).
+    #[cfg(unix)]
+    std::hint::black_box((
+        aterm_mesh::relay::mesh_relay_environment as fn(),
+        aterm_mesh::inventory::Inventory::request as *const (),
+        aterm_mesh::egress::Egress::feed as *const (),
+        aterm_mesh::Mesh::apply as *const (),
+    ));
     #[expect(
         clippy::disallowed_methods,
         reason = "a link root: the window's entry is named, never called"

@@ -1076,8 +1076,7 @@ impl Handle {
                 let log = Log::read_with(session, store, scope, decode)?;
                 let resolve = owned::commons::historical(session);
                 let mut entries: Vec<Entry> = log
-                    .eligible()
-                    .into_iter()
+                    .into_eligible()
                     .filter_map(|(operation, command)| {
                         Some(Entry {
                             operation: operation.header.id,
@@ -1086,7 +1085,7 @@ impl Handle {
                             authored_ms: operation.authored_ms,
                             request: operation.request,
                             reverts: operation.reverts,
-                            changes: command.changes()?.to_vec(),
+                            changes: command.into_changes()?,
                         })
                     })
                     .collect();

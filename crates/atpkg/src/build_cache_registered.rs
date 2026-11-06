@@ -1921,6 +1921,22 @@ fn retire_on(
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
 ) -> Result<Vec<(PathBuf, super::Unused)>, String> {
+    if root.is_absolute()
+        && [
+            super::cache_root(home),
+            super::moved_from(home),
+            super::tooling::root(home),
+        ]
+        .iter()
+        .any(|fixed| root.starts_with(fixed))
+    {
+        return Err(
+            "this is a shared or tooling cache; use `aterm pkg machine cache clean`, \
+                    which rechecks its safety gates; exact retirement accepts only registered \
+                    ordinary cache roots"
+                .into(),
+        );
+    }
     if !root.is_absolute() || !scope(home, root) {
         return Err("retirement needs one exact absolute cache root under this home".into());
     }
@@ -2196,9 +2212,11 @@ fn reclaim_selected_on(
     let candidates = requested.map_or_else(|| roots(home), |wanted| vec![wanted.clone()]);
     for cache in candidates {
         let Some(preliminary) = read(&cache.receipt_path) else {
+            fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         };
         if preliminary.retained || preliminary.creating.is_some() {
+            fence.note(&cache.root, super::KeepReason::Custody);
             continue;
         }
         if selected_cache.is_some_and(|selected| !package::belongs(&preliminary, selected)) {
@@ -2211,18 +2229,23 @@ fn reclaim_selected_on(
         // Take a package's whole-build coordinator BEFORE its receipt gate, including the
         // resume path. Keep it alive until the last staged entry and receipt are settled.
         let Ok(coordination) = package::coordinate(home, &preliminary) else {
+            fence.note(&cache.root, super::KeepReason::CoordinationUnavailable);
             continue;
         };
         let Some(lock_path) = gate_path(&cache.receipt_path) else {
+            fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         };
         let Ok(lock) = crate::metadata_io::open_regular(&lock_path) else {
+            fence.note(&cache.root, super::KeepReason::CoordinationUnavailable);
             continue;
         };
         let Ok(_held_record) = crate::lock::Flock::try_lock(lock) else {
+            fence.note(&cache.root, super::KeepReason::CoordinationUnavailable);
             continue;
         };
         let Some(mut receipt) = read(&cache.receipt_path) else {
+            fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         };
         if receipt.retained
@@ -2230,6 +2253,7 @@ fn reclaim_selected_on(
             || requested.is_some_and(|wanted| !wanted.matches(&receipt))
             || !package::same_declaration(preliminary.package.as_ref(), receipt.package.as_ref())
         {
+            fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         }
         if receipt.root != cache.root || !scope(home, &receipt.root) {
@@ -2242,6 +2266,7 @@ fn reclaim_selected_on(
             && (!coordinator.recover_on(home, &cache.receipt_path, &mut receipt, fence, kernel)
                 || !coordinator.current(home, &receipt))
         {
+            fence.note(&cache.root, super::KeepReason::PackageChanged);
             continue;
         }
         if let Some(mut pending) = receipt.pending.clone() {
@@ -2283,20 +2308,39 @@ fn reclaim_selected_on(
             let pending_locks = match std::fs::symlink_metadata(&payload) {
                 Ok(_) => match super::locks_under(&payload) {
                     Ok(locks) => locks,
-                    Err(_) => continue,
+                    Err(_) => {
+                        fence.note(&pending.directory, super::KeepReason::InventoryUnavailable);
+                        continue;
+                    }
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(_) => continue,
+                Err(_) => {
+                    fence.note(&pending.directory, super::KeepReason::InventoryUnavailable);
+                    continue;
+                }
             };
             let Some(_held_pending) = super::hold(&pending_locks) else {
+                fence.note(&pending.directory, super::KeepReason::CargoLocks);
                 continue;
             };
             if fence.clear(&cache.root, &pending.directory)
-                && read(&cache.receipt_path).as_ref() == Some(&receipt)
-                && coordination
-                    .as_ref()
-                    .is_none_or(|guard| guard.current(home, &receipt))
-                && intents.ask_staged(&pending.directory, super::Unused::Unfinished)
+                && fence.admit(
+                    &pending.directory,
+                    super::KeepReason::RegistrationChanged,
+                    read(&cache.receipt_path).as_ref() == Some(&receipt),
+                )
+                && fence.admit(
+                    &pending.directory,
+                    super::KeepReason::PackageChanged,
+                    coordination
+                        .as_ref()
+                        .is_none_or(|guard| guard.current(home, &receipt)),
+                )
+                && fence.admit(
+                    &pending.directory,
+                    super::KeepReason::IntentDeclined,
+                    intents.ask_staged(&pending.directory, super::Unused::Unfinished),
+                )
             {
                 pending.authorized = true;
                 receipt.pending = Some(pending.clone());
@@ -2350,15 +2394,18 @@ fn reclaim_selected_on(
             continue;
         }
         if !same(home, &receipt) {
+            fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         }
         let Some(seen) = super::look(&cache.root) else {
+            fence.note(&cache.root, super::KeepReason::InventoryUnavailable);
             continue;
         };
         // A missing or deeper lock is uncertainty, not an idle-cache witness.
         if seen.locks.is_empty()
             || super::locks_under(&cache.root).ok().as_ref() != Some(&seen.locks)
         {
+            fence.note(&cache.root, super::KeepReason::InventoryChanged);
             continue;
         }
         let gone = owners_gone(home, &receipt, placing);
@@ -2366,17 +2413,21 @@ fn reclaim_selected_on(
             .as_ref()
             .and_then(|guard| guard.reason_on(home, &receipt, kernel));
         let whole = requested
-            .map(|_| super::unused(&cache.root, &|_| Some(super::Unused::Requested)))
+            .map(|_| super::unused(&cache.root, &|_| Some(super::Unused::Requested), fence))
             .or_else(|| {
                 budget
-                    .map(|why| super::unused(&cache.root, &|_| Some(why)))
+                    .map(|why| super::unused(&cache.root, &|_| Some(why), fence))
                     .or_else(|| {
                         gone.then(|| {
-                            super::unused(&cache.root, &|seen| {
-                                Some(super::Unused::Gone {
-                                    idle: super::age(now, seen.newest),
-                                })
-                            })
+                            super::unused(
+                                &cache.root,
+                                &|seen| {
+                                    Some(super::Unused::Gone {
+                                        idle: super::age(now, seen.newest),
+                                    })
+                                },
+                                fence,
+                            )
                         })
                     })
             });
@@ -2384,28 +2435,40 @@ fn reclaim_selected_on(
             if !takes {
                 continue;
             }
-            if !same(home, &receipt)
-                || read(&cache.receipt_path).as_ref() != Some(&receipt)
-                || coordination
+            if !fence.admit(
+                &cache.root,
+                super::KeepReason::RegistrationChanged,
+                same(home, &receipt),
+            ) || !fence.admit(
+                &cache.root,
+                super::KeepReason::RegistrationChanged,
+                read(&cache.receipt_path).as_ref() == Some(&receipt),
+            ) || !fence.admit(
+                &cache.root,
+                super::KeepReason::PackageChanged,
+                !coordination
                     .as_ref()
-                    .is_some_and(|guard| !guard.current(home, &receipt))
-                || !fence.clear(&cache.root, &cache.root)
+                    .is_some_and(|guard| !guard.current(home, &receipt)),
+            ) || !fence.clear(&cache.root, &cache.root)
                 || !intents.ask(&cache.root, why)
                 || !fence.clear(&cache.root, &cache.root)
             {
                 continue;
             }
             let Some(parent) = cache.root.parent() else {
+                fence.note(&cache.root, super::KeepReason::CannotStage);
                 continue;
             };
             let Ok(stage) = aterm_tempfile::Builder::new()
                 .prefix("atpkg-cache-retiring-")
                 .tempdir_in(parent)
             else {
+                fence.note(&cache.root, super::KeepReason::CannotStage);
                 continue;
             };
             let directory = stage.keep();
             let Some(stage_id) = identity(&directory) else {
+                fence.note(&cache.root, super::KeepReason::RegistrationChanged);
                 continue;
             };
             receipt.pending = Some(Pending {
@@ -2415,6 +2478,7 @@ fn reclaim_selected_on(
             });
             // Keep the private stage and its receipt on every failure, including a crash.
             if write(&cache.receipt_path, &receipt).is_none() {
+                fence.note(&cache.root, super::KeepReason::RegistrationChanged);
                 continue;
             }
             let staged = directory.join(PAYLOAD);
@@ -2986,14 +3050,14 @@ mod tests {
             std::fs::File::open(pending.directory.join(PAYLOAD).join("debug/.cargo-lock")).unwrap(),
         )
         .unwrap();
+        let reporting = super::super::fence::Fence::new(&clear).with_reporting();
+        assert!(retire_on(&world.home, &world.target, &mut |_, _| true, &reporting).is_err());
         assert!(
-            retire_on(
-                &world.home,
-                &world.target,
-                &mut |_, _| true,
-                &super::super::fence::Fence::new(&clear)
-            )
-            .is_err()
+            reporting.retained().contains(&super::super::RetainedCheck {
+                path: pending.directory.clone(),
+                reason: super::super::KeepReason::CargoLocks,
+            }),
+            "a resumed-stage lock refusal must reach the cleanup diagnostic"
         );
         assert!(
             pending

@@ -840,6 +840,7 @@ impl App {
                 if now == was.as_ref() {
                     self.restamp_for_hover(session);
                 }
+                self.mail_worker_news(session);
             }
             crate::HarnessFact::LandHeld => {
                 if self.beside_proven_self_claim(session) {

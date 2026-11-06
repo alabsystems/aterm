@@ -12,8 +12,10 @@ description = "ALab's mesh logs and their relay: tables.log and metrics.log in t
 # The node service that hosts the mesh is unix-only (`crates/aterm-gui/src/node_serve.rs`), and so
 # is every crate this one reads: the root is `#![cfg(unix)]`, and its dependencies are too.
 [target.'cfg(unix)'.dependencies]
-# The anchor attributes that bind the revocation pass to the `FabricRouting` model (std-only):
-# expands in every test and debug build; release strips it.
+# The anchor attributes that bind the revocation pass to the `FabricRouting` model, and the relay,
+# the egress, `Inventory` and the revocation pass to the `MeshRelay` model (`aterm-models-swarm`,
+# checked by `relay_conformance_tests.rs`) (std-only): expands in every test and debug build;
+# release strips it.
 aterm-spec-anchor = { workspace = true }
 # The two logs and their relay: a guarded broker (`cap`) sealed at rest (`at-rest`) whose metrics
 # log is retained (`retention`); `relay` gives the origin-signed envelope (`origin`), the origin
@@ -58,8 +60,11 @@ aterm-durable = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 # Scratch folders for each test Mac.
 aterm-tempfile.workspace = true
-# The one-minute hang detector every wait in a test is.
+# The one-minute hang detector every wait in a test is, and the interpreter the relay's
+# conformance walks `MeshRelay` on.
 aterm-spec.workspace = true
+# The `MeshRelay` model the relay refines (`relay_conformance_tests.rs`).
+aterm-models-swarm.workspace = true
 
 [lints]
 workspace = true

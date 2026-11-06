@@ -68,6 +68,31 @@ impl<'a> ItemVariationStore<'a> {
         })
     }
 
+    /// The region-axis evaluations [`Self::parse_delta`] of an item of the
+    /// `outer_index` set may make at `coordinates`, read from the set's header
+    /// alone: each region it names over every axis, to at most
+    /// [`DELTA_STEPS`]. A set that is not there costs nothing.
+    pub(crate) fn delta_steps(
+        &self,
+        outer_index: u16,
+        coordinates: &[NormalizedCoordinate],
+    ) -> usize {
+        let regions = self
+            .data_offsets
+            .get(outer_index)
+            .and_then(|offset| {
+                let mut s = Stream::new_at(self.data, usize::num_from(offset))?;
+                s.skip::<u16>(); // item_count
+                s.skip::<u16>(); // word_delta_count
+                s.read::<u16>()
+            })
+            .unwrap_or(0);
+        let steps = u32::from(regions)
+            .saturating_mul(per_region(coordinates))
+            .min(DELTA_STEPS);
+        usize::num_from(steps)
+    }
+
     pub fn region_indices(&self, index: u16) -> Option<LazyArray16<'_, u16>> {
         let offset = self.data_offsets.get(index)?;
         let mut s = Stream::new_at(self.data, usize::num_from(offset))?;
@@ -88,10 +113,12 @@ impl<'a> ItemVariationStore<'a> {
         inner_index: u16,
         coordinates: &[NormalizedCoordinate],
     ) -> Option<f32> {
-        let per_region = u32::try_from(coordinates.len()).map_or(u32::MAX, |axes| axes.max(1));
+        let per_region = per_region(coordinates);
         let mut steps = DELTA_STEPS;
         let mut evaluate = |region: u16| {
             steps = steps.checked_sub(per_region)?;
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.delta_steps += u64::from(per_region));
             Some(self.regions.evaluate_region(region, coordinates))
         };
 
@@ -142,6 +169,12 @@ impl<'a> ItemVariationStore<'a> {
 
         Some(delta)
     }
+}
+
+/// What evaluating one region at `coordinates` costs: a step per axis.
+#[inline]
+fn per_region(coordinates: &[NormalizedCoordinate]) -> u32 {
+    u32::try_from(coordinates.len()).map_or(u32::MAX, |axes| axes.max(1))
 }
 
 #[derive(Clone, Copy, Debug)]

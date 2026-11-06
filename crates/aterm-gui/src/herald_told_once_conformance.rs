@@ -24,7 +24,7 @@ pub(super) struct Rig {
     now: Instant,
     /// The owner's last plain Enter, a count each process starts at 0.
     turn: u64,
-    /// The escalation noted last, which the owner's turn and a restart note again.
+    /// The escalation noted last, which the owner's turn notes again.
     last: Option<Escalation>,
     /// Notices naming each need since the last forget, capped at 2.
     named: (i64, i64),
@@ -88,8 +88,10 @@ impl Rig {
     }
 
     /// The model's view of the real herald: what its slot shows (the needs it noted last, under
-    /// an ask's key; 0 for none or the box), the key's set, the told memory, and the rig's own
-    /// counts of what the notices named.
+    /// an ask's key; 0 for none or the box), the key's set, the told memory as it stands at the
+    /// owner's turn now (`Herald::told_ids`: what its next note judges by and a restart carries),
+    /// whether that memory is carried and met no need yet, and the rig's own counts of what the
+    /// notices named.
     pub(super) fn project(&self) -> State {
         let slot = self.herald.slots.get(&0);
         let ask_shown = slot
@@ -105,7 +107,8 @@ impl Rig {
                 .map_or(-1, |i| i as i64 + 1),
             Some(_) => 4,
         };
-        let told = |id: u64| i64::from(slot.is_some_and(|s| s.told.has(id)));
+        let memory = self.herald.told_ids(0, self.turn);
+        let told = |id: u64| i64::from(memory.contains(&id));
         State::from([
             ("shown", shown),
             ("key", key),
@@ -116,6 +119,7 @@ impl Rig {
             ("new_a", self.new.0),
             ("new_b", self.new.1),
             ("fresh", self.fresh),
+            ("carried", i64::from(slot.is_some_and(|s| s.told.carried))),
         ])
     }
 
@@ -144,16 +148,22 @@ impl Rig {
             }
             "Displace" => self.note(Some(boxed(self.turn))),
             "Clear" => {
+                // With a carried memory no need has met yet, nothing standing is the restart's
+                // gap, not a take-down: it forgets nothing.
+                let gap = before["carried"] == 1;
                 self.note(None);
-                self.named = (0, 0);
-                self.fresh = 2;
+                if !gap {
+                    self.named = (0, 0);
+                    self.fresh = 2;
+                }
             }
             "Restart" => {
-                // A quit's cold restore: the leaf carries the told ids alone, a new process
-                // adopts them, notes the gap before the agent raises its need again, then what
-                // stood, at the new process's first turn.
+                // A cold restore: the leaf carries the told ids alone, as the outgoing process
+                // exports them at the owner's turn there, and a new process, whose turns count
+                // from 0 again, adopts them and notes its first publication, before the agent
+                // raises anything again: the restart's gap.
                 let carry = StatusCarry {
-                    told_ids: self.herald.told_ids(0),
+                    told_ids: self.herald.told_ids(0, self.turn),
                     ..StatusCarry::default()
                 };
                 self.herald = Herald {
@@ -162,12 +172,7 @@ impl Rig {
                 };
                 self.turn = 0;
                 self.herald.adopt(0, carry, 0, self.now);
-                let again = self.last.take().map(|mut esc| {
-                    esc.owner_turn = self.turn;
-                    esc
-                });
-                let _ = self.herald.note(0, None, false, true, self.now);
-                self.note(again);
+                self.note(None);
             }
             "OwnerTurn" => {
                 self.turn += 1;
@@ -247,18 +252,39 @@ fn herald_told_once_conforms_to_real_herald() {
     }
     assert_eq!(told.named, (1, 0));
     assert!(model.check_invariant("ToldOnce", &told.project()));
-    // Negative control: a restart that carries nothing tells what stands again.
+    // Negative control: a restart that carries nothing tells a need told before it again.
     let mut forgets = Rig::new(false);
     forgets.step("ShowA");
     forgets.now += NOTIFY_BURST_WINDOW;
     forgets.herald = Herald::default();
     forgets.turn = 0;
-    let again = forgets.last.take();
-    forgets.note(again);
+    forgets.note(None);
+    forgets.step("ShowA");
     assert_eq!(
         forgets.named,
         (2, 0),
         "a restart with no carry tells it twice"
     );
     assert!(!model.check_invariant("ToldOnce", &forgets.project()));
+    // Negative control: a restart's gap read as a take-down (the carried mark off) forgets the
+    // memory, and the need told before it is told again.
+    let mut gap = Rig::new(false);
+    gap.step("ShowA");
+    gap.step("Restart");
+    gap.herald
+        .slots
+        .get_mut(&0)
+        .expect("the restart's carried slot")
+        .told
+        .carried = false;
+    gap.now += NOTIFY_BURST_WINDOW;
+    gap.note(None);
+    gap.step("ShowA");
+    assert_eq!(gap.named, (2, 0), "a gap that forgets tells it twice");
+    assert!(!model.check_invariant("ToldOnce", &gap.project()));
+    let mut kept = Rig::new(false);
+    for action in ["ShowA", "Restart", "Clear", "ShowA"] {
+        kept.step(action);
+    }
+    assert_eq!(kept.named, (1, 0), "the carried memory rides the gap");
 }

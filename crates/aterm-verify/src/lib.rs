@@ -1103,7 +1103,7 @@ impl Ctx {
         if self.cursor_pacing && check == Check::Measure {
             cmd.push_str(" --cursor-pacing");
         }
-        if self.compile_only && matches!(check, Check::Test | Check::Checkers) {
+        if self.compile_only && matches!(check, Check::Test | Check::Checkers | Check::Measure) {
             cmd.push_str(" --compile-only");
         }
         if self.checkers_in_tests && matches!(check, Check::Test | Check::Doc) {

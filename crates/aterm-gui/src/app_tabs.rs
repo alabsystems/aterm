@@ -3198,7 +3198,10 @@ impl App {
             .iter()
             .map(|session| {
                 let id = session.id;
-                let mut carry = self.presence.herald.carry_of(id);
+                let mut carry = self
+                    .presence
+                    .herald
+                    .carry_of(id, session.ctx.human_input.last_plain_enter());
                 let (receipt, banner) = {
                     let terminal = crate::term_lock(&session.term);
                     session.ctx.box_banner.carry(terminal.program_state())
@@ -6646,6 +6649,10 @@ impl App {
                 .task()
                 .is_some()
         });
+        // A worker whose tab closes tells its manager while it is still on this Mac's roster.
+        if tasked && let Some(ctx) = closing.as_ref() {
+            let _ = self.mail_worker_close(ctx);
+        }
         let held = (
             closing.as_ref().map(|ctx| ctx.watchers.hold_rings()),
             instance.hold_rings(),
@@ -10751,7 +10758,7 @@ mod status_glance_tests {
             "PRECONDITION: the adopted box was told before this image"
         );
         assert!(
-            adopted.presence.herald.carry_of(0).told,
+            adopted.presence.herald.carry_of(0, 0).told,
             "PRECONDITION: the successor considers this same need told"
         );
         let terminal = &adopted.pool.get(0).unwrap().term;

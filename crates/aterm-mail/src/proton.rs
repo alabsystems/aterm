@@ -253,11 +253,11 @@ impl Proton {
     }
 
     fn message_headers(&self, folder: &str, limit: usize) -> Result<Vec<Message>, String> {
-        let path = format!(
-            "/mail/v4/messages?LabelID={}&PageSize={}&Sort=Time&Desc=1",
-            crate::oauth::encode(folder),
-            limit.min(100)
-        );
+        let mut path = String::with_capacity(64 + folder.len());
+        path.push_str("/mail/v4/messages?LabelID=");
+        crate::oauth::encode_into(&mut path, folder);
+        use std::fmt::Write as _;
+        let _ = write!(path, "&PageSize={}&Sort=Time&Desc=1", limit.min(100));
         let value = self.call(Method::Get, &path, None)?;
         value["Messages"]
             .as_array()
@@ -772,11 +772,10 @@ impl Proton {
     /// Decrypt a message while retaining its original body and MIME type.
     /// Authentication readers need HTML link targets that a text projection omits.
     pub fn read_source(&mut self, id: &str) -> Result<(Message, String), String> {
-        let value = self.call(
-            Method::Get,
-            &format!("/mail/v4/messages/{}", crate::oauth::encode(id)),
-            None,
-        )?;
+        let mut path = String::with_capacity(18 + id.len());
+        path.push_str("/mail/v4/messages/");
+        crate::oauth::encode_into(&mut path, id);
+        let value = self.call(Method::Get, &path, None)?;
         let mut message = message(&value["Message"])?;
         let body = value["Message"]["Body"]
             .as_str()
@@ -955,27 +954,25 @@ impl Proton {
                 });
             }
             if code == 9001 && self.challenge.borrow().is_none() {
-                let methods = parsed["Details"]["HumanVerificationMethods"]
-                    .as_array()
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .filter(|name| {
-                                matches!(
-                                    *name,
-                                    "captcha"
-                                        | "email"
-                                        | "sms"
-                                        | "ownership-email"
-                                        | "ownership-sms"
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "none supplied".into());
+                let mut methods = String::new();
+                if let Some(values) = parsed["Details"]["HumanVerificationMethods"].as_array() {
+                    for name in values.iter().filter_map(Value::as_str) {
+                        if matches!(
+                            name,
+                            "captcha" | "email" | "sms" | "ownership-email" | "ownership-sms"
+                        ) {
+                            if !methods.is_empty() {
+                                methods.push_str(", ");
+                            }
+                            methods.push_str(name);
+                        }
+                    }
+                }
+                let methods = if methods.is_empty() {
+                    "none supplied"
+                } else {
+                    methods.as_str()
+                };
                 return Err(format!(
                     "{reason}; no supported verification challenge (methods: {methods})"
                 ));
@@ -1090,6 +1087,7 @@ fn project_body(mime: &str, body: String) -> String {
 
 fn message(value: &Value) -> Result<Message, String> {
     let mut recipients = Vec::new();
+    let mut to = String::new();
     for key in ["ToList", "CCList", "BCCList"] {
         for addr in value[key]
             .as_array()
@@ -1102,6 +1100,10 @@ fn message(value: &Value) -> Result<Message, String> {
                 .iter()
                 .any(|seen: &&str| seen.eq_ignore_ascii_case(addr))
             {
+                if !to.is_empty() {
+                    to.push_str(", ");
+                }
+                to.push_str(addr);
                 recipients.push(addr);
             }
         }
@@ -1109,7 +1111,7 @@ fn message(value: &Value) -> Result<Message, String> {
     Ok(Message {
         id: field(value, "ID")?.into(),
         from: value["Sender"]["Address"].as_str().unwrap_or("").into(),
-        to: recipients.join(", "),
+        to,
         subject: value["Subject"].as_str().unwrap_or("").into(),
         date: value["Time"]
             .as_i64()

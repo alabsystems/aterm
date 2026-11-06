@@ -149,6 +149,18 @@ enum Phase {
     SettlementUncertain,
 }
 
+/// Read-only identity of a bound reservation. This supplies no child-control,
+/// CPU acquisition, transfer or settlement authority.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    /// Actual retained memory declaration, in bytes.
+    pub memory_bytes: u64,
+    /// Original durable memory claim epoch and guard.
+    pub memory: crate::CohortClosureRef,
+    /// Validated original CPU debt generations; no ownership is transferred.
+    pub cpu: Vec<crate::build_cpu::RetainedLeaseIdentity>,
+}
+
 /// Original cohort custody and the sole API capabilities for its retained CPU units.
 ///
 /// Binding does not construct a pool or select a machine budget. The caller must
@@ -235,6 +247,33 @@ impl RetainedCohort {
         }
     }
 
+    /// Inspect the actual original bound custody under current leadership.
+    /// Saved observations, unbound launches and partially settled bundles do
+    /// not qualify. The caller separately authenticates the requesting process
+    /// against its original actual child; this method accepts no numeric PID.
+    /// # Errors
+    /// Leadership, physical memory origin, CPU generation or bound phase fails.
+    pub fn observation(&self, fence: &Fence) -> io::Result<Observation> {
+        self.binding.check(fence)?;
+        fence.check_claim(&self.claim)?;
+        if self.phase != Phase::Bound || self.cpu.len() != self.cpu_units {
+            return Err(refused(
+                "inspection requires the complete original bound reservation",
+            ));
+        }
+        let memory = self.claim.cohort_closure_ref()?;
+        let cpu = self
+            .cpu
+            .iter()
+            .map(RetainedLease::identity)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Observation {
+            memory_bytes: self.claim.record().need.mem,
+            memory,
+            cpu,
+        })
+    }
+
     /// Original bundle width, not a count of free or reusable CPU credits.
     #[must_use]
     pub const fn cpu_units(&self) -> usize {
@@ -299,6 +338,80 @@ impl RetainedCohort {
             ));
         }
         self.claim.launch_cohort_member(leader, command)
+    }
+
+    /// Durably register and launch another dedicated group under this unit's
+    /// original root. The existing CPU bundle and memory claim cover the whole
+    /// forest; this grants no additional CPU credit or member entitlement.
+    ///
+    /// # Errors
+    /// Leadership or the bound original root is stale, subgroup admission or
+    /// persistence refuses, or native spawn fails. Unbound errors retain the
+    /// actual suspended child; no-child errors retain the exact cancellation.
+    pub fn launch_subgroup(
+        &mut self,
+        fence: &Fence,
+        root: &mut CohortChild,
+        command: &mut Command,
+    ) -> Result<CohortChild, LaunchError> {
+        self.check_bound(fence).map_err(LaunchError::Refused)?;
+        self.claim.launch_subgroup(root, command)
+    }
+
+    /// Retry subgroup BIND without discarding its actual owned child on error.
+    ///
+    /// # Errors
+    /// Leadership, the bound unit or durable subgroup ARM does not match.
+    pub fn bind_subgroup(
+        &mut self,
+        fence: &Fence,
+        spawned: Spawned,
+    ) -> Result<CohortChild, LaunchError> {
+        if let Err(error) = self.check_bound(fence) {
+            return Err(LaunchError::Unbound {
+                spawned: Box::new(spawned),
+                error,
+            });
+        }
+        self.claim.bind_subgroup(spawned)
+    }
+
+    /// Retire only an actual registered subgroup after its scoped kernel drain.
+    ///
+    /// # Errors
+    /// Leadership, actual receipt or durable subgroup binding is stale, or
+    /// closure and its snapshot cannot be established. Other groups stay held.
+    pub fn retire_subgroup(&mut self, fence: &Fence, subgroup: &CohortChild) -> io::Result<()> {
+        self.check_bound(fence)?;
+        self.claim.retire_subgroup(subgroup)
+    }
+
+    /// Cancel one exact subgroup no-child receipt while keeping the root bound.
+    ///
+    /// # Errors
+    /// Preflight failures return the actual proof. Once accepted, cancellation
+    /// persistence custody stays with the original claim, including on error.
+    pub fn cancel_subgroup(&mut self, fence: &Fence, proof: NotSpawned) -> Result<(), CancelError> {
+        if let Err(error) = self
+            .check_bound(fence)
+            .and_then(|()| self.claim.check_subgroup_cancel(&proof))
+        {
+            return Err(CancelError::Refused {
+                error,
+                proof: Box::new(proof),
+            });
+        }
+        self.claim
+            .cancel_subgroup(proof)
+            .map_err(CancelError::Retained)
+    }
+
+    fn check_bound(&self, fence: &Fence) -> io::Result<()> {
+        self.binding.check(fence)?;
+        if self.phase != Phase::Bound {
+            return Err(refused("retained unit has no bound subgroup authority"));
+        }
+        Ok(())
     }
 
     /// Retry binding the actual child returned by this launch's Unbound error.

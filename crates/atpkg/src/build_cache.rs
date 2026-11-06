@@ -26,6 +26,10 @@ pub mod remove;
 #[path = "build_cache_fence.rs"]
 mod fence;
 
+#[path = "build_cache_report.rs"]
+mod report;
+pub(crate) use report::{KeepReason, RetainedCheck};
+
 #[path = "build_cache_inventory.rs"]
 mod inventory;
 
@@ -1071,9 +1075,19 @@ impl Sweep<'_, '_> {
     /// `stage` ([`Refusal::Staged`]), and `false`: it stays staged as it stood, for the next pass
     /// to finish.
     fn take(&mut self, stage: &Path, went: PathBuf, why: Unused, original: &Path) -> bool {
-        if !(self.permitted)()
-            || !registered::retention::allows_tree(original)
-            || !registered::retention::allows_walk(stage)
+        if !self
+            .fence
+            .admit(stage, KeepReason::PermissionChanged, (self.permitted)())
+            || !self.fence.admit(
+                stage,
+                KeepReason::Custody,
+                registered::retention::allows_tree(original),
+            )
+            || !self.fence.admit(
+                stage,
+                KeepReason::Custody,
+                registered::retention::allows_walk(stage),
+            )
             || !self.fence.clear(original, stage)
         {
             self.intents.stop();
@@ -1121,10 +1135,22 @@ impl Sweep<'_, '_> {
     /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
     /// and removed with the locks let go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
-        if self.declined || !(self.permitted)() || !registered::retention::allows_tree(leaf) {
+        if !self
+            .fence
+            .admit(leaf, KeepReason::IntentDeclined, !self.declined)
+            || !self
+                .fence
+                .admit(leaf, KeepReason::PermissionChanged, (self.permitted)())
+            || !self.fence.admit(
+                leaf,
+                KeepReason::Custody,
+                registered::retention::allows_tree(leaf),
+            )
+        {
             return false;
         }
         let Some(seen) = look(leaf) else {
+            self.fence.note(leaf, KeepReason::InventoryUnavailable);
             return false;
         };
         let profiles = profiles_of(&seen.locks);
@@ -1145,9 +1171,11 @@ impl Sweep<'_, '_> {
             return false;
         }
         let Some(held) = hold(&seen.locks) else {
+            self.fence.note(leaf, KeepReason::CargoLocks);
             return false;
         };
         if look(leaf).is_none_or(|again| again.locks != seen.locks) {
+            self.fence.note(leaf, KeepReason::InventoryChanged);
             return false;
         }
         let doomed = stale::decide(
@@ -1161,18 +1189,28 @@ impl Sweep<'_, '_> {
             self.after.stale,
         );
         if doomed.is_empty() {
+            self.fence.note(leaf, KeepReason::StaleSetChanged);
             return false;
         }
         if !self.fence.clear(leaf, leaf) {
             return false;
         }
         let Ok(stage) = new_stage(dir, OsStr::new(DOOMED)) else {
+            self.fence.note(leaf, KeepReason::CannotStage);
             return false;
         };
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let (mut incremental, mut units, mut superseded) = (0, 0, 0);
         for one in &doomed {
-            if !(self.permitted)() || !registered::retention::allows_tree(leaf) {
+            if !self
+                .fence
+                .admit(leaf, KeepReason::PermissionChanged, (self.permitted)())
+                || !self.fence.admit(
+                    leaf,
+                    KeepReason::Custody,
+                    registered::retention::allows_tree(leaf),
+                )
+            {
                 break;
             }
             let before = moved.len();
@@ -1199,8 +1237,21 @@ impl Sweep<'_, '_> {
         // A rename acts by name: a keep published at the leaf as its parts moved would lose
         // them, so custody is read there again once they moved, and one it keeps moves back.
         staged::at(&stage);
-        let asks = !moved.is_empty() && registered::retention::allows_tree(leaf);
-        if !asks || !self.intents.ask_staged(&stage, why) {
+        let asks = self
+            .fence
+            .admit(leaf, KeepReason::NoPartsStaged, !moved.is_empty())
+            && self.fence.admit(
+                &stage,
+                KeepReason::Custody,
+                registered::retention::allows_tree(leaf),
+            );
+        if !asks
+            || !self.fence.admit(
+                &stage,
+                KeepReason::IntentDeclined,
+                self.intents.ask_staged(&stage, why),
+            )
+        {
             self.declined |= asks;
             // A new process may have started from a staged image while the intent was
             // refused. Keep that stage for a later recorded pass rather than move its image.
@@ -1248,12 +1299,14 @@ impl Sweep<'_, '_> {
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
                 let judged = if self.moved {
-                    unused(&child, &|seen| moved(seen, now))
+                    unused(&child, &|seen| moved(seen, now), self.fence)
                 } else {
                     workspace_of(root, dir).and_then(|ws| {
-                        unused(&child, &|seen| {
-                            whole(&ws, seen, home, now, self.after, self.placing)
-                        })
+                        unused(
+                            &child,
+                            &|seen| whole(&ws, seen, home, now, self.after, self.placing),
+                            self.fence,
+                        )
                     })
                 };
                 let Some((held, why)) = judged else {
@@ -1262,17 +1315,37 @@ impl Sweep<'_, '_> {
                     }
                     continue;
                 };
-                if !(self.permitted)()
-                    || !registered::retention::allows_tree(&child)
-                    || stage_for(&child, dir, OsStr::new(DOOMED)).is_none()
+                if !self
+                    .fence
+                    .admit(&child, KeepReason::PermissionChanged, (self.permitted)())
+                    || !self.fence.admit(
+                        &child,
+                        KeepReason::Custody,
+                        registered::retention::allows_tree(&child),
+                    )
+                    || !self.fence.admit(
+                        &child,
+                        KeepReason::CannotStage,
+                        stage_for(&child, dir, OsStr::new(DOOMED)).is_some(),
+                    )
                     || !self.fence.clear(&child, &child)
-                    || !self.intents.ask(&child, why)
+                    || !self.fence.admit(
+                        &child,
+                        KeepReason::IntentDeclined,
+                        self.intents.ask(&child, why),
+                    )
                 {
                     drop(held);
                     continue;
                 }
-                if !(self.permitted)()
-                    || !registered::retention::allows_tree(&child)
+                if !self
+                    .fence
+                    .admit(&child, KeepReason::PermissionChanged, (self.permitted)())
+                    || !self.fence.admit(
+                        &child,
+                        KeepReason::Custody,
+                        registered::retention::allows_tree(&child),
+                    )
                     || !self.fence.clear(&child, &child)
                 {
                     drop(held);
@@ -1323,12 +1396,37 @@ fn workspace_of(root: &Path, dir: &Path) -> Option<PathBuf> {
 fn unused(
     leaf: &Path,
     judge: &dyn Fn(&Seen) -> Option<Unused>,
+    fence: &fence::Fence<'_>,
 ) -> Option<(Vec<crate::lock::Flock>, Unused)> {
-    let seen = look(leaf)?;
+    let seen = match look(leaf) {
+        Some(seen) => seen,
+        None => {
+            fence.note(leaf, KeepReason::InventoryUnavailable);
+            return None;
+        }
+    };
     let why = judge(&seen)?;
-    let held = hold(&seen.locks)?;
-    let again = look(leaf)?;
-    (again.newest == seen.newest && again.locks == seen.locks).then_some((held, why))
+    let held = match hold(&seen.locks) {
+        Some(held) => held,
+        None => {
+            fence.note(leaf, KeepReason::CargoLocks);
+            return None;
+        }
+    };
+    let again = match look(leaf) {
+        Some(again) => again,
+        None => {
+            fence.note(leaf, KeepReason::InventoryUnavailable);
+            return None;
+        }
+    };
+    fence
+        .admit(
+            leaf,
+            KeepReason::InventoryChanged,
+            again.newest == seen.newest && again.locks == seen.locks,
+        )
+        .then_some((held, why))
 }
 
 /// Why a build directory under the root the cache moved from, as [`look`] `seen` it, goes
@@ -1755,6 +1853,28 @@ pub fn reclaim_beside_sessions(
 #[must_use]
 pub fn reclaim_home() -> Vec<(PathBuf, Unused)> {
     reclaim_home_watched(ReclaimAfter::CALM, None, &mut |_, _| true)
+}
+
+/// The explicit cleanup command keeps observed safety refusals separate from
+/// removal outcomes. Checks that reject before recording an intent still explain
+/// why that step stopped, without becoming a removal outcome or a byte count.
+pub(crate) fn reclaim_home_report() -> (Vec<(PathBuf, Unused)>, Vec<RetainedCheck>) {
+    if !cfg!(target_os = "macos") {
+        return (Vec::new(), Vec::new());
+    }
+    let fence = fence::Fence::default().with_reporting();
+    let removed = aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
+        reclaim_roots(
+            &home,
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            true,
+            &fence,
+            &mut |_, _| true,
+        )
+    });
+    (removed, fence.retained())
 }
 
 /// An advisory cleanup candidate from [`plan`]: a whole build directory, its stale parts,

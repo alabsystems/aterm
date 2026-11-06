@@ -44,6 +44,8 @@ pub(super) struct Custody {
     pending: Option<Pending>,
     unused: Option<NotSpawned>,
     actual_birth: Option<(BirthKey, Cohort)>,
+    subgroup_births: Vec<(BirthKey, Cohort)>,
+    subgroup_unused: Vec<NotSpawned>,
     head: String,
     checkpoint: Anchor,
 }
@@ -102,6 +104,8 @@ impl Custody {
             pending: None,
             unused: None,
             actual_birth: None,
+            subgroup_births: Vec::new(),
+            subgroup_unused: Vec::new(),
             head: record
                 .split_inclusive('\n')
                 .next()
@@ -332,7 +336,11 @@ pub(super) fn lay(namespace: &Namespace, record: Record) -> io::Result<(Record, 
         std::fs::TryLockError::Error(error) => error,
     })?;
     same_file(&lock, &writer)?;
-    let (head, journal) = Journal::head(&record.head_line(), namespace.nonce())?;
+    let (head, journal) = if record.accounting == Accounting::CohortOwned {
+        Journal::head_accounted(&record.head_line(), namespace.nonce(), record.accounting)?
+    } else {
+        Journal::head(&record.head_line(), namespace.nonce())?
+    };
     let custody = Custody {
         namespace: namespace.clone(),
         directory,
@@ -341,6 +349,8 @@ pub(super) fn lay(namespace: &Namespace, record: Record) -> io::Result<(Record, 
         pending: None,
         unused: None,
         actual_birth: None,
+        subgroup_births: Vec::new(),
+        subgroup_unused: Vec::new(),
         head: head.clone(),
         checkpoint,
     };
@@ -496,7 +506,9 @@ fn probe_under(
                 Ok(None)
             } else {
                 let mut record = record;
-                record.accounting = Accounting::Whole;
+                if record.accounting != Accounting::CohortOwned {
+                    record.accounting = Accounting::Whole;
+                }
                 Ok(Some(record))
             }
         }
@@ -689,10 +701,27 @@ impl Laid {
         self.check_locked(&transaction)?;
         let custody = self.custody.as_ref().expect("cohort claim");
         let mut expected = snapshot(&custody.writer)?;
-        let offset = match *at {
-            Some(offset) => offset,
-            None => expected.len() as u64,
-        };
+        // A covered subgroup snapshot can move the measured-write row. Find its current
+        // position instead of trusting a byte offset captured before that compaction.
+        let mut position = 0u64;
+        let mut wrote = None;
+        for row in expected.split_inclusive('\n') {
+            if row.len() == WROTE_LINE
+                && aterm_json::from_str::<aterm_json::Value>(row)
+                    .ok()
+                    .is_some_and(|value| {
+                        value.as_object().is_some_and(|map| map.len() == 1)
+                            && value
+                                .get("wrote")
+                                .and_then(aterm_json::Value::as_u64)
+                                .is_some()
+                    })
+            {
+                wrote = Some(position);
+            }
+            position += row.len() as u64;
+        }
+        let offset = wrote.unwrap_or(expected.len() as u64);
         if offset.saturating_add(WROTE_LINE as u64) > RECORD_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
@@ -983,6 +1012,177 @@ impl Laid {
         Ok(attempt)
     }
 
+    pub(crate) fn require_boot_closure(&mut self) -> io::Result<()> {
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        if self.granted.is_none() {
+            return Err(refused("boot closure requires an admitted claim"));
+        }
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("legacy claim has no boot closure policy"))?;
+        let (line, next) = custody.journal.require_boot_closure()?;
+        self.event(&mut transaction, line, next)
+    }
+
+    fn compact_subgroups(&mut self, transaction: &mut Transaction) -> io::Result<()> {
+        self.check_locked(transaction)?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        let before = snapshot(&custody.writer)?;
+        let after = custody.journal.compact(&before)?;
+        if before != after {
+            let next = custody.journal.clone();
+            self.stage(transaction, after, next, None, None)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn arm_subgroup(&mut self, root: &Cohort) -> io::Result<BirthAttempt> {
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.finish_unused(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        if self.granted.is_none()
+            || !self
+                .custody
+                .as_ref()
+                .is_some_and(|custody| custody.journal.root_bound(&root.record()))
+        {
+            return Err(refused(
+                "subgroup requires this claim's original bound root",
+            ));
+        }
+        self.compact_subgroups(&mut transaction)?;
+        let custody = self.custody.as_mut().expect("cohort claim");
+        custody
+            .subgroup_births
+            .retain(|(key, _)| custody.journal.has_subgroup(key));
+        let attempt = BirthAttempt::new()?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        let (line, next) = custody
+            .journal
+            .arm_subgroup(&root.record(), attempt.key())?;
+        if let Err(error) = self.event(&mut transaction, line, next) {
+            if self
+                .custody
+                .as_ref()
+                .is_some_and(|custody| custody.pending.is_some())
+                && let Ok(proof) = attempt.cancel()
+            {
+                self.custody
+                    .as_mut()
+                    .expect("cohort claim")
+                    .subgroup_unused
+                    .push(proof);
+            }
+            return Err(error);
+        }
+        Ok(attempt)
+    }
+
+    pub(crate) fn bind_subgroup(&mut self, spawned: &mut Spawned) -> io::Result<Cohort> {
+        if !spawned.key().is_current() || !spawned.is_original_child() {
+            return Err(refused(
+                "subgroup binding needs its original current actual child",
+            ));
+        }
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        if let Some((key, cohort)) = custody
+            .subgroup_births
+            .iter()
+            .find(|(key, _)| key == spawned.key())
+            && custody.journal.subgroup_bound(key, &cohort.record())
+        {
+            return Ok(cohort.clone());
+        }
+        let cohort = Cohort::of_spawned(spawned)?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        let (line, next) = custody
+            .journal
+            .bind_subgroup(spawned.key(), &cohort.record())?;
+        let births = &mut self.custody.as_mut().expect("cohort claim").subgroup_births;
+        if let Some((_, actual)) = births.iter_mut().find(|(key, _)| key == spawned.key()) {
+            *actual = cohort.clone();
+        } else {
+            births.push((spawned.key().clone(), cohort.clone()));
+        }
+        self.event(&mut transaction, line, next)?;
+        Ok(cohort)
+    }
+
+    pub(crate) fn check_subgroup_cancel(&self, proof: &NotSpawned) -> io::Result<()> {
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("legacy claim has no subgroups"))?;
+        if custody
+            .subgroup_unused
+            .iter()
+            .any(|unused| unused.key() == proof.key())
+        {
+            return Err(refused("subgroup no-child receipt is already retained"));
+        }
+        custody.journal.cancel_subgroup(proof.key())?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_subgroup(&mut self, proof: NotSpawned) -> io::Result<()> {
+        self.check_subgroup_cancel(&proof)?;
+        self.custody
+            .as_mut()
+            .expect("cohort claim")
+            .subgroup_unused
+            .push(proof);
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.finish_unused(&mut transaction)?;
+        self.compact_subgroups(&mut transaction)
+    }
+
+    pub(crate) fn retire_subgroup(&mut self, key: &BirthKey, cohort: &Cohort) -> io::Result<()> {
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.finish_unused(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        let known_actual = custody
+            .subgroup_births
+            .iter()
+            .any(|(actual, captured)| actual == key && captured == cohort);
+        if !key.is_current()
+            || (!known_actual && !custody.journal.subgroup_bound(key, &cohort.record()))
+        {
+            return Err(refused(
+                "subgroup retirement needs its actual registered child receipt",
+            ));
+        }
+        if !known_actual {
+            self.custody
+                .as_mut()
+                .expect("cohort claim")
+                .subgroup_births
+                .push((key.clone(), cohort.clone()));
+        }
+        self.compact_subgroups(&mut transaction)?;
+        let custody = self.custody.as_ref().expect("cohort claim");
+        if custody.journal.has_subgroup(key) {
+            let (line, next) = custody.journal.retire_subgroup(key, &cohort.record())?;
+            self.event(&mut transaction, line, next)?;
+        }
+        self.compact_subgroups(&mut transaction)?;
+        self.custody
+            .as_mut()
+            .expect("cohort claim")
+            .subgroup_births
+            .retain(|(actual, _)| actual != key);
+        Ok(())
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1071,6 +1271,11 @@ impl Laid {
         if let Some((line, next)) = custody.journal.finish()? {
             self.event(&mut transaction, line, next)?;
         }
+        if let Some(custody) = &mut self.custody
+            && custody.journal.description()
+        {
+            custody.subgroup_births.clear();
+        }
         self.check_locked(&transaction)
     }
 
@@ -1106,7 +1311,11 @@ impl Laid {
         let Ok(mut transaction) = self.transaction() else {
             return;
         };
-        if self.custody.as_ref().is_some_and(|c| c.unused.is_some()) {
+        if self
+            .custody
+            .as_ref()
+            .is_some_and(|c| c.unused.is_some() || !c.subgroup_unused.is_empty())
+        {
             let _ = self
                 .retry_event(&mut transaction)
                 .and_then(|()| self.finish_unused(&mut transaction));
@@ -1155,6 +1364,27 @@ impl Laid {
         )
     )]
     fn finish_unused(&mut self, transaction: &mut Transaction) -> io::Result<()> {
+        loop {
+            let custody = self
+                .custody
+                .as_ref()
+                .ok_or_else(|| refused("legacy claim has no subgroup custody"))?;
+            let Some(proof) = custody.subgroup_unused.last() else {
+                break;
+            };
+            if !proof.key().is_current() {
+                return Err(refused("subgroup no-child owner changed"));
+            }
+            if custody.journal.has_subgroup(proof.key()) {
+                let (line, next) = custody.journal.cancel_subgroup(proof.key())?;
+                self.event(transaction, line, next)?;
+            }
+            self.custody
+                .as_mut()
+                .expect("cohort claim")
+                .subgroup_unused
+                .pop();
+        }
         let custody = self
             .custody
             .as_ref()
@@ -1231,6 +1461,14 @@ pub(super) mod tests {
 
         pub(crate) fn fail_next_event_before_write(&self) {
             FAIL_EVENT_BEFORE_WRITE.with(|failure| failure.set(true));
+        }
+
+        pub(crate) fn fail_next_event_partial_write(&self) {
+            FAIL_EVENT_PARTIAL_WRITE.with(|failure| failure.set(true));
+        }
+
+        pub(crate) fn interrupt_next_checkpoint_publication(&self) {
+            checkpoint::interrupt_next_publication();
         }
     }
 

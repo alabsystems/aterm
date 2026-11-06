@@ -185,7 +185,7 @@ fn live_targo(pid: u32, targo: &Path) -> Option<Identity> {
     let locked = atpkg::build_admit::possible_build_lock(
         &|| vec![pid],
         &|pid| aterm_uds::holders::open_files(pid).unwrap_or_default(),
-        &|path| aterm_uds::ownerlock::probe(path) == aterm_uds::ownerlock::Owner::Live,
+        &|path| aterm_uds::ownerlock::probe_any(path) == aterm_uds::ownerlock::Owner::Live,
     );
     (locked.is_some() && read_identity(raw) == Some(identity)).then_some(identity)
 }

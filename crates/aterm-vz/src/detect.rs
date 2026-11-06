@@ -150,7 +150,8 @@ impl Watch {
                 .collect();
             self.jobs_since = now;
         }
-        self.jobs = jobs.to_vec();
+        self.jobs.clear();
+        self.jobs.extend_from_slice(jobs);
     }
 
     /// The agent said `Ready` at `now`.

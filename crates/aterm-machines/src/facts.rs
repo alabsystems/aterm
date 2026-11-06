@@ -6,6 +6,7 @@
 use crate::hardware;
 use crate::model::{Form, HostFacts, Keyboard, User};
 use crate::port::{Cmd, Ran, System};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The system TCC database.
@@ -152,15 +153,109 @@ pub fn user(sys: &dyn System, name: &str) -> Result<User, String> {
 /// The keyboard-capable services returned by [`hidutil_keyboards`], deduplicated by model.
 #[must_use]
 pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
-    hidutil_keyboards_from(text, false).unwrap_or_default()
+    hidutil_keyboards_from(text, false)
+        .map(|census| census.keyboards)
+        .unwrap_or_default()
 }
 
 /// A service census used to establish every local keyboard obligation.
-pub(crate) fn parse_hidutil_keyboards_complete(text: &str) -> Result<Vec<Keyboard>, String> {
+pub(crate) fn parse_hidutil_keyboards_complete(text: &str) -> Result<KeyboardCensus, String> {
     hidutil_keyboards_from(text, true)
 }
 
-fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, String> {
+/// HID identities actually observed by one census or mapping read.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KeyboardCoverage(BTreeSet<u64>);
+
+impl KeyboardCoverage {
+    pub(crate) fn of(ids: impl IntoIterator<Item = u64>) -> Self {
+        Self(ids.into_iter().collect())
+    }
+
+    /// Include another item's actual observations from this pass.
+    pub(crate) fn include(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// Every requested identity was resolved, including intentional per-device holds.
+    pub(crate) fn covers(&self, registries: &[u64]) -> bool {
+        registries.iter().all(|registry| self.0.contains(registry))
+    }
+
+    pub(crate) fn covers_all(&self, expected: &Self) -> bool {
+        expected.0.is_subset(&self.0)
+    }
+}
+
+/// Each model's native services, bound by one recognized service census.
+#[derive(Debug, Default)]
+pub(crate) struct KeyboardCohorts(BTreeMap<(u32, u32), KeyboardCoverage>);
+
+impl KeyboardCohorts {
+    #[cfg(test)]
+    pub(crate) const EMPTY: Self = Self(BTreeMap::new());
+
+    pub(crate) fn expected(&self, vendor: u32, product: u32) -> Result<KeyboardCoverage, String> {
+        self.0
+            .get(&(vendor, product))
+            .cloned()
+            .ok_or_else(|| "the attached keyboard model has no native service assignment".into())
+    }
+}
+
+/// Models and identities from the same complete `hidutil` service census.
+pub(crate) struct KeyboardCensus {
+    keyboards: Vec<Keyboard>,
+    services: BTreeMap<u64, (u32, u32)>,
+}
+
+impl KeyboardCensus {
+    /// A model list cannot establish readiness for a native service it did not observe.
+    #[cfg(test)]
+    pub(crate) fn into_keyboards(self, native: &[u64]) -> Result<Vec<Keyboard>, String> {
+        self.into_parts(Some(native))
+            .map(|(keyboards, _)| keyboards)
+    }
+
+    /// Assign only the captured native cohort; attachment reads defer to their requested IDs.
+    pub(crate) fn into_parts(
+        self,
+        native: Option<&[u64]>,
+    ) -> Result<(Vec<Keyboard>, KeyboardCohorts), String> {
+        let mut cohorts = KeyboardCohorts(
+            self.keyboards
+                .iter()
+                .map(|keyboard| {
+                    (
+                        (keyboard.vendor, keyboard.product),
+                        KeyboardCoverage::default(),
+                    )
+                })
+                .collect(),
+        );
+        if let Some(native) = native {
+            let mut assigned = BTreeSet::new();
+            for id in native {
+                let model = self.services.get(id).ok_or_else(|| {
+                    "the keyboard model census did not observe every native keyboard service"
+                        .to_owned()
+                })?;
+                if !assigned.insert(*id) {
+                    return Err("the native keyboard census repeats a service identity".into());
+                }
+                cohorts
+                    .0
+                    .get_mut(model)
+                    .ok_or("the native keyboard model is absent")?
+                    .0
+                    .insert(*id);
+            }
+        }
+        Ok((self.keyboards, cohorts))
+    }
+}
+
+fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<KeyboardCensus, String> {
     let invalid =
         || "hidutil did not return a complete, recognized keyboard service list".to_owned();
     let sectioned = text
@@ -169,6 +264,7 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
     let mut in_services = !sectioned;
     let mut columns: Option<Vec<(String, usize)>> = None;
     let mut out: Vec<Keyboard> = Vec::new();
+    let mut service_models = BTreeMap::new();
     let mut services = false;
     for row in text.lines() {
         let trimmed = row.trim_end();
@@ -190,7 +286,7 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
         let Some(cols) = &columns else {
             let header = header_columns(row);
             if complete
-                && ["VendorID", "ProductID", "Product", "Built-In"]
+                && ["VendorID", "ProductID", "RegistryID", "Product", "Built-In"]
                     .iter()
                     .any(|required| {
                         header
@@ -215,6 +311,16 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
             }
             continue;
         };
+        if complete {
+            let registry = field("RegistryID")
+                .and_then(|value| value.strip_prefix("0x").map(str::to_owned))
+                .filter(|value| !value.starts_with('+'))
+                .and_then(|value| u64::from_str_radix(&value, 16).ok())
+                .ok_or_else(invalid)?;
+            if service_models.insert(registry, (vendor, product)).is_some() {
+                return Err(invalid());
+            }
+        }
         let builtin = if complete {
             match trimmed.split_whitespace().last() {
                 Some("1") => true,
@@ -241,7 +347,10 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
     if complete && !services {
         Err(invalid())
     } else {
-        Ok(out)
+        Ok(KeyboardCensus {
+            keyboards: out,
+            services: service_models,
+        })
     }
 }
 
@@ -1264,13 +1373,25 @@ UserShell: /bin/zsh
         );
         let malformed_id = VM_HIDUTIL.replacen("0x5ac", "bogus", 1);
         assert_eq!(parse_hidutil_keyboards(&malformed_id).len(), 1);
-        assert_eq!(parse_hidutil_keyboards_complete(VM_HIDUTIL).unwrap(), k);
         assert_eq!(
-            parse_hidutil_keyboards_complete(LAPTOP_HIDUTIL).unwrap(),
+            parse_hidutil_keyboards_complete(VM_HIDUTIL)
+                .unwrap()
+                .keyboards,
+            k
+        );
+        assert_eq!(
+            parse_hidutil_keyboards_complete(LAPTOP_HIDUTIL)
+                .unwrap()
+                .keyboards,
             parse_hidutil_keyboards(LAPTOP_HIDUTIL)
         );
         for empty in ["Services:\n", "Services:\n\nDevices:\n"] {
-            assert!(parse_hidutil_keyboards_complete(empty).unwrap().is_empty());
+            assert!(
+                parse_hidutil_keyboards_complete(empty)
+                    .unwrap()
+                    .keyboards
+                    .is_empty()
+            );
         }
         let partial = VM_HIDUTIL.replacen("Devices:", "unparsed-service-row\nDevices:", 1);
         for invalid in [
@@ -1285,6 +1406,50 @@ UserShell: /bin/zsh
                 parse_hidutil_keyboards_complete(invalid).is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn a_keyboard_census_covers_native_services_without_adopting_device_rows() {
+        let census = || parse_hidutil_keyboards_complete(VM_HIDUTIL).unwrap();
+        let (_, cohorts) = census().into_parts(Some(&[0x007c_4853_2400_0001])).unwrap();
+        assert!(
+            cohorts
+                .expected(0x5ac, 1)
+                .unwrap()
+                .covers(&[0x007c_4853_2400_0001])
+        );
+        assert!(
+            !cohorts
+                .expected(0x5ac, 0x8105)
+                .unwrap()
+                .covers(&[0x1_0000_0335])
+        );
+        assert!(cohorts.expected(0xffff, 0xffff).is_err());
+        assert!(
+            census()
+                .into_parts(Some(&[0x1_0000_0335, 0x1_0000_0335]))
+                .is_err()
+        );
+        assert_eq!(
+            census()
+                .into_keyboards(&[0x007c_4853_2400_0001, 0x1_0000_0335])
+                .unwrap(),
+            parse_hidutil_keyboards(VM_HIDUTIL)
+        );
+        assert!(census().into_keyboards(&[41]).is_err());
+        assert!(census().into_keyboards(&[0x1_0000_0313]).is_err());
+        assert!(
+            parse_hidutil_keyboards_complete("Services:\n\nDevices:\n")
+                .unwrap()
+                .into_keyboards(&[])
+                .unwrap()
+                .is_empty()
+        );
+        let duplicate = VM_HIDUTIL.replacen("0x100000335", "0x7c485324000001", 1);
+        let unknown = VM_HIDUTIL.replacen("0x100000335", "not-an-id", 1);
+        for invalid in [duplicate, unknown] {
+            assert!(parse_hidutil_keyboards_complete(&invalid).is_err());
         }
     }
 

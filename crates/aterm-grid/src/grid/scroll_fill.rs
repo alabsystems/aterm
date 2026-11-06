@@ -42,12 +42,7 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
             }
             extras
                 .hyperlinks
-                .push(aterm_scrollback::HyperlinkSpan::with_id(
-                    held.start,
-                    held.end,
-                    span.url.clone(),
-                    span.id.clone(),
-                ));
+                .push(span.with_range(held.start, held.end));
         }
     }
     if let Some(spans) = line.images() {
@@ -166,12 +161,11 @@ impl Grid {
                     if budget == 0 {
                         break 'fill;
                     }
-                    let extra = self
-                        .storage
+                    self.storage
                         .extras
-                        .get_or_create(CellCoord::new(row_idx, hcol));
-                    extra.set_hyperlink(Some(span.url.clone()));
-                    extra.set_hyperlink_id(span.id.clone());
+                        .modify(CellCoord::new(row_idx, hcol), |extra| {
+                            extra.set_hyperlink_data(Some(Arc::clone(&span.payload)));
+                        });
                     any_hyperlink = true;
                     budget -= 1;
                 }

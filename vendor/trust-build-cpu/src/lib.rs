@@ -109,6 +109,20 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(feature = "observations")]
+mod observation;
+#[cfg(feature = "observations")]
+pub use observation::Observation;
+
+#[cfg(all(unix, feature = "observations"))]
+mod monitor;
+#[cfg(all(unix, feature = "observations"))]
+pub use monitor::Monitor;
+#[cfg(all(unix, feature = "observations"))]
+mod host_policy;
+#[cfg(all(unix, feature = "observations"))]
+pub use host_policy::HostPolicy;
+
 /// One nonblocking observation. Held-owner metadata can be absent or invalid;
 /// an unreadable identity must never turn a held kernel lease into a free slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,14 +145,57 @@ pub enum SlotState {
 mod unix;
 #[cfg(unix)]
 pub use unix::{Lease, Pool, capacity_dir};
+#[cfg(unix)]
+mod fence;
+#[cfg(unix)]
+pub use fence::LegacyFence;
+#[cfg(unix)]
+mod kernel_memory;
+#[cfg(unix)]
+pub use kernel_memory::{available_memory, default_memory_reserve};
+#[cfg(unix)]
+mod native_usage;
+#[cfg(unix)]
+pub mod process_cpu;
+#[cfg(unix)]
+pub use native_usage::NativeUsage;
+#[cfg(unix)]
+mod protocol;
+#[cfg(unix)]
+pub use protocol::{IMPLICIT_FD_ENV, duplicate_descriptor, duplicate_descriptors};
+
+#[cfg(all(unix, feature = "jobserver"))]
+mod worker;
+#[cfg(all(unix, feature = "jobserver"))]
+pub use worker::{Credit, WorkerClient, WorkerHelper};
 
 #[cfg(unix)]
 mod retained;
 #[cfg(unix)]
-pub use retained::{RETAINED_DIRECTORY_NAME, RetainedLease, RetainedPool, RetainedSlotState};
+pub use retained::{
+    PreparedReservation, RETAINED_DIRECTORY_NAME, RecoveredReservation, RetainedLease,
+    RetainedLeaseIdentity, RetainedPool, RetainedSlotState,
+};
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(all(test, unix))]
 mod retained_tests;
+
+#[cfg(all(test, unix))]
+mod admission_tests;
+#[cfg(unix)]
+mod legacy_retirement;
+#[cfg(unix)]
+pub use legacy_retirement::LegacyRetirement;
+
+#[cfg(unix)]
+mod external_debt;
+#[cfg(unix)]
+pub use external_debt::ExternalDebt;
+
+#[cfg(unix)]
+mod recovery_material;
+#[cfg(unix)]
+pub use recovery_material::{PreparedRecovery, RecoveryAuthority, RecoveryMaterial};

@@ -5,6 +5,9 @@
 //! OSC desktop-notification handlers (OSC 9, OSC 99, and OSC 777).
 
 use super::handler::TerminalHandler;
+use super::notify_auth::NotificationPace;
+use super::policy_gates::PolicyState;
+use super::response_rate_limiter::BatchClock;
 use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};
 
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
@@ -33,8 +36,10 @@ impl TerminalHandler<'_> {
         if message.is_empty() {
             return;
         }
+        let pace = notification_pace(self.policy, self.transient.process_now);
         let sinks = &mut self.notifications.sinks;
-        if let Some(cap) = sinks.try_mint(self.modes.allow_notifications, self.program_state) {
+        if let Some(cap) = sinks.try_mint(self.modes.allow_notifications, self.program_state, pace)
+        {
             sinks.notify(cap, &message);
         }
     }
@@ -105,9 +110,10 @@ impl TerminalHandler<'_> {
 
         if done {
             if entry.has_content() {
+                let pace = notification_pace(self.policy, self.transient.process_now);
                 let sinks = &mut self.notifications.sinks;
                 let allowed = self.modes.allow_notifications;
-                if let Some(cap) = sinks.try_mint_advanced(allowed, self.program_state) {
+                if let Some(cap) = sinks.try_mint_advanced(allowed, self.program_state, pace) {
                     sinks.notify_advanced(cap, entry);
                 }
             }
@@ -144,12 +150,25 @@ impl TerminalHandler<'_> {
             body,
             urgency: NotificationUrgency::Normal,
         };
+        let pace = notification_pace(self.policy, self.transient.process_now);
         let sinks = &mut self.notifications.sinks;
         if let Some(cap) =
-            sinks.try_mint_advanced(self.modes.allow_notifications, self.program_state)
+            sinks.try_mint_advanced(self.modes.allow_notifications, self.program_state, pace)
         {
             sinks.notify_advanced(cap, notification);
         }
+    }
+}
+
+/// The pace a program notification written at the batch's clock `now` is debited against.
+#[inline]
+const fn notification_pace(
+    policy: &mut PolicyState,
+    now: aterm_time::Instant,
+) -> NotificationPace<'_> {
+    NotificationPace {
+        policy,
+        clock: BatchClock(now),
     }
 }
 
@@ -228,6 +247,50 @@ mod tests {
             captured.lock().expect("poisoned").as_deref(),
             Some("Build finished"),
             "OSC 9 must fire the notification callback after authorization"
+        );
+    }
+
+    /// A program's notification flood reaches the host at the terminal's pace, whatever mix of
+    /// OSC 9, 99 and 777 carries it, so one tab cannot fill the process-wide notifier.
+    #[test]
+    fn a_notification_flood_reaches_the_host_at_its_pace() {
+        use crate::terminal::ClockReading;
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut term = Terminal::new(24, 80);
+        let count = Arc::clone(&fired);
+        term.set_notification_callback(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let count = Arc::clone(&fired);
+        term.set_advanced_notification_callback(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        term.authorize_notifications();
+        let mut flood = Vec::new();
+        for _ in 0..10_000 {
+            flood.extend_from_slice(b"\x1b]9;x\x07\x1b]99;;y\x07\x1b]777;notify;t;z\x07");
+        }
+        let t0 = aterm_time::Instant::now();
+        let at = |seconds: u64| ClockReading {
+            monotonic: t0 + std::time::Duration::from_secs(seconds),
+            wall_ms: None,
+        };
+        term.process_at(&flood, at(0));
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            16,
+            "the burst"
+        );
+        term.process_at(&flood, at(4));
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            20,
+            "then one a second"
+        );
+        assert_eq!(
+            term.notify_total(),
+            60_000,
+            "every one asked for is counted"
         );
     }
 

@@ -13,6 +13,368 @@ struct Fixture {
     home: PathBuf,
 }
 
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_each_process_gate_keep_without_a_removal_intent() {
+    use aterm_uds::holders::{PathScan, PathUse};
+    for (scan, reason) in [
+        (
+            Ok(PathScan {
+                users: vec![PathUse {
+                    pid: 29,
+                    how: "exe",
+                    path: PathBuf::from("/fixture/program"),
+                }],
+                ..PathScan::default()
+            }),
+            KeepReason::ProcessUsed {
+                pid: 29,
+                how: "executable",
+                observed: PathBuf::from("/fixture/program"),
+            },
+        ),
+        (
+            Ok(PathScan {
+                unreadable: vec![(31, None)],
+                ..PathScan::default()
+            }),
+            KeepReason::ProcessUnreadable(31),
+        ),
+        (
+            Err(std::io::Error::other("fixture scan unavailable")),
+            KeepReason::ProcessUnavailable,
+        ),
+    ] {
+        let f = Fixture::new("build-cache-reports-process-keep");
+        let root = cache_root(&f.home);
+        let first = lay(&root, &f.home.join("gone-first"), 2 * DAY);
+        let second = lay(&root, &f.home.join("gone-second"), 2 * DAY);
+        let expected = [first.clone(), second.clone()];
+        let processes = |_: &[PathBuf], _: &[u32]| match &scan {
+            Ok(scan) => Ok(scan.clone()),
+            Err(error) => Err(std::io::Error::new(error.kind(), "fixture unavailable")),
+        };
+        let fence = fence::Fence::new(&processes).with_reporting();
+        let mut asked = Vec::new();
+        let before = plan(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+        );
+        assert_eq!(before.len(), 2, "the same entries are advisory candidates");
+        let outcomes = reclaim_watched_on(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            &mut |path, why| {
+                asked.push((path.to_path_buf(), why));
+                true
+            },
+            &fence,
+        );
+        assert!(
+            outcomes.is_empty() && asked.is_empty(),
+            "a safety refusal grants no removal intent"
+        );
+        let retained = fence.retained();
+        assert_eq!(
+            retained.len(),
+            2,
+            "every retained entry is named, not just the first warning"
+        );
+        for path in expected {
+            assert!(retained.contains(&RetainedCheck {
+                path: path.clone(),
+                reason: reason.clone()
+            }));
+            assert!(path.join("debug/deps/x").is_file());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_lock_and_custody_guards_without_weakening_them() {
+    let f = Fixture::new("build-cache-reports-lock-keep");
+    let root = cache_root(&f.home);
+    let leaf = lay(&root, &f.home.join("gone"), 2 * DAY);
+    std::fs::write(leaf.join("debug/.cargo-lock"), b"").unwrap();
+    let lock = crate::metadata_io::open_regular(&leaf.join("debug/.cargo-lock")).unwrap();
+    let held = crate::lock::Flock::try_lock(lock).unwrap();
+    let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+    let fence = fence::Fence::new(&processes).with_reporting();
+    let run = |fence: &fence::Fence<'_>| {
+        reclaim_watched_on(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            &mut |_, _| true,
+            fence,
+        )
+    };
+    assert!(run(&fence).is_empty());
+    assert!(fence.retained().contains(&RetainedCheck {
+        path: leaf.clone(),
+        reason: KeepReason::CargoLocks
+    }));
+    assert!(leaf.join("debug/deps/x").is_file());
+    drop(held);
+    std::fs::write(
+        leaf.join(registered::MARKER),
+        b"unreadable custody declaration",
+    )
+    .unwrap();
+    let fence = fence::Fence::new(&processes).with_reporting();
+    assert!(run(&fence).is_empty());
+    assert!(fence.retained().contains(&RetainedCheck {
+        path: leaf.clone(),
+        reason: KeepReason::Custody
+    }));
+    assert!(leaf.join("debug/deps/x").is_file());
+    std::fs::remove_file(leaf.join(registered::MARKER)).unwrap();
+    let fence = fence::Fence::new(&processes).with_reporting();
+    let removed = run(&fence);
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].0, leaf);
+    assert!(matches!(removed[0].1, Unused::Gone { .. }));
+    assert!(
+        fence.retained().is_empty(),
+        "a clear guard must not fabricate a keep"
+    );
+    assert!(!leaf.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_legacy_retirement_scope_without_reclassifying_the_cache() {
+    let f = Fixture::new("build-cache-reports-legacy-scope");
+    let root = cache_root(&f.home);
+    let leaf = lay(&root, &f.home.join("gone"), 2 * DAY);
+    let mut asked = false;
+    let error = registered::retire(&f.home, &leaf, &mut |_, _| {
+        asked = true;
+        true
+    })
+    .unwrap_err();
+    assert!(
+        error.contains("machine cache clean"),
+        "the refusal must name the applicable cleanup API: {error}"
+    );
+    assert!(error.contains("registered ordinary cache roots"));
+    assert!(!asked);
+    assert!(leaf.join("debug/deps/x").is_file());
+}
+
+#[test]
+fn cleanup_reports_render_the_observed_reason_without_a_freed_space_claim() {
+    let kept = RetainedCheck {
+        path: PathBuf::from("/fixture/cache"),
+        reason: KeepReason::ProcessUnreadable(31),
+    };
+    let words = kept.words();
+    assert!(
+        words.contains("/fixture/cache") && words.contains("process 31 could not be ruled out")
+    );
+    assert!(words.contains("nothing removed by this check"));
+    assert!(!words.contains("freed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_postrename_and_resumed_guard_subjects() {
+    for resumed in [false, true] {
+        for (allowed, reason) in [
+            (false, KeepReason::PermissionChanged),
+            (true, KeepReason::Custody),
+        ] {
+            let f = Fixture::new("build-cache-reports-stage-subject");
+            let root = cache_root(&f.home);
+            let original = lay(&root, &f.home.join("gone"), 2 * DAY);
+            let stage = f.dir("stages").join(DOOMED);
+            std::fs::rename(&original, &stage).unwrap();
+            if allowed {
+                // This original-path policy must still be read after the rename.
+                // The stage's independent parent has no such custody marker.
+                std::fs::write(
+                    original.parent().unwrap().join(registered::MARKER),
+                    b"unknown custody",
+                )
+                .unwrap();
+                assert!(!registered::retention::allows_tree(&original));
+                assert!(registered::retention::allows_walk(&stage));
+            }
+            let scans = std::cell::Cell::new(0);
+            let processes = |_: &[PathBuf], _: &[u32]| {
+                scans.set(scans.get() + 1);
+                Ok(aterm_uds::holders::PathScan::default())
+            };
+            let fence = fence::Fence::new(&processes).with_reporting();
+            let mut record = |_: &Path, _| true;
+            let mut intents = Intents::new(&mut record);
+            let why = if resumed {
+                Unused::Unfinished
+            } else {
+                Unused::Gone { idle: 2 * DAY }
+            };
+            if resumed {
+                assert!(intents.ask_staged(&stage, why));
+            } else {
+                assert!(intents.ask(&original, why));
+                intents.moved(&stage);
+            }
+            let permitted = || allowed;
+            {
+                let mut sweep = Sweep {
+                    root: &root,
+                    home: Some(&f.home),
+                    now: SystemTime::now(),
+                    after: ReclaimAfter::CALM,
+                    placing: None,
+                    moved: false,
+                    compiler_store: None,
+                    intents: &mut intents,
+                    fence: &fence,
+                    permitted: &permitted,
+                    pruning: Vec::new(),
+                    declined: false,
+                };
+                let went = if resumed {
+                    stage.clone()
+                } else {
+                    original.clone()
+                };
+                assert!(!sweep.take(&stage, went, why, &original));
+            }
+            assert_eq!(
+                scans.get(),
+                0,
+                "permission/custody still precede the process scan"
+            );
+            assert_eq!(
+                intents.finish(),
+                [(
+                    stage.clone(),
+                    Unused::Refused {
+                        by: Refusal::Staged
+                    }
+                )]
+            );
+            assert_eq!(
+                fence.retained(),
+                [RetainedCheck {
+                    path: stage.clone(),
+                    reason
+                }]
+            );
+            assert!(!original.exists());
+            assert_eq!(
+                std::fs::read(stage.join("debug/deps/x")).unwrap(),
+                b"0123456789"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_absent_metadata_subjects_as_stopped_checks() {
+    let f = Fixture::new("build-cache-reports-absent-subject");
+    let original = f.home.join("absent-original");
+    let pending = f.home.join("absent-pending");
+    let processes = |_: &[PathBuf], _: &[u32]| -> std::io::Result<aterm_uds::holders::PathScan> {
+        panic!("this is a metadata guard, not a process scan")
+    };
+    let fence = fence::Fence::new(&processes).with_reporting();
+    assert!(!fence.admit(&original, KeepReason::RegistrationChanged, false));
+    let observations = fence.retained();
+    assert_eq!(
+        observations,
+        [RetainedCheck {
+            path: original.clone(),
+            reason: KeepReason::RegistrationChanged
+        }]
+    );
+    assert!(!original.exists() && !pending.exists());
+    let words = observations[0].words();
+    assert!(words.contains("stopped") && !words.starts_with("kept "));
+    assert!(words.contains("nothing removed by this check") && !words.contains("freed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_reports_prune_decline_and_no_staged_parts_without_an_intent() {
+    for prior_decline in [true, false] {
+        let f = Fixture::new("build-cache-reports-prune-stop");
+        let root = cache_root(&f.home);
+        let owner = f.dir("home/live-owner");
+        std::fs::write(owner.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = build_dir(&root, &owner);
+        let profile = leaf.join("debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".cargo-build-lock"), b"").unwrap();
+        let incremental = profile.join("incremental/ws-1k116trr0a0xf");
+        std::fs::create_dir_all(incremental.join("s-hneouhc0uf-1tn8o9j-2awpw")).unwrap();
+        age_tree(&incremental, 4 * DAY);
+        let permission_reads = std::cell::Cell::new(0);
+        let permitted = || {
+            assert!(
+                !prior_decline,
+                "an earlier pass decline still short-circuits this step"
+            );
+            let before = permission_reads.get();
+            permission_reads.set(before + 1);
+            before == 0
+        };
+        let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let fence = fence::Fence::new(&processes).with_reporting();
+        let mut record =
+            |_: &Path, _| -> bool { panic!("no current-leaf removal intent was reached") };
+        let mut intents = Intents::new(&mut record);
+        {
+            let mut sweep = Sweep {
+                root: &root,
+                home: Some(&f.home),
+                now: SystemTime::now(),
+                after: ReclaimAfter::CALM,
+                placing: None,
+                moved: false,
+                compiler_store: None,
+                intents: &mut intents,
+                fence: &fence,
+                permitted: &permitted,
+                pruning: Vec::new(),
+                declined: prior_decline,
+            };
+            assert!(!sweep.prune(leaf.parent().unwrap(), &leaf));
+        }
+        assert!(intents.finish().is_empty());
+        let expected = if prior_decline {
+            KeepReason::IntentDeclined
+        } else {
+            KeepReason::NoPartsStaged
+        };
+        let observations = fence.retained();
+        assert!(observations.contains(&RetainedCheck {
+            path: leaf.clone(),
+            reason: expected
+        }));
+        assert!(
+            observations
+                .iter()
+                .all(|one| one.reason != KeepReason::CannotStage)
+        );
+        assert_eq!(permission_reads.get(), if prior_decline { 0 } else { 2 });
+        assert!(incremental.is_dir());
+        assert!(stages_in(leaf.parent().unwrap(), OsStr::new(DOOMED)).is_empty());
+    }
+}
+
 impl Fixture {
     fn new(label: &str) -> Self {
         // Ordinary placement needs an ordinary workspace even when TMPDIR is a .noindex lane.

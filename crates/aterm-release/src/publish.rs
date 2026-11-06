@@ -78,9 +78,11 @@ fn wrapped(msg: &str, width: usize) -> Vec<String> {
         let lead = seg.len() - seg.trim_start_matches(' ').len();
         let body = &seg[lead..];
         let marker = &body[..bullet_marker(body)];
-        let hang = " ".repeat(lead + marker.chars().count());
+        let hang_chars = lead + marker.chars().count();
+        let hang = " ".repeat(hang_chars);
         let mut line = String::from(&seg[..lead]);
         line.push_str(marker);
+        let mut line_chars = hang_chars;
         let mut filled = false;
         let mut rest = &body[marker.len()..];
         while !rest.is_empty() {
@@ -92,16 +94,20 @@ fn wrapped(msg: &str, width: usize) -> Vec<String> {
             let end = rest.find(' ').unwrap_or(rest.len());
             let (word, tail) = rest.split_at(end);
             rest = tail;
-            if filled && line.chars().count() + gap + word.chars().count() > budget {
+            let word_chars = word.chars().count();
+            if filled && line_chars + gap + word_chars > budget {
                 out.push(std::mem::replace(&mut line, hang.clone()));
+                line_chars = hang_chars;
                 filled = false;
             }
             if filled {
                 for _ in 0..gap {
                     line.push(' ');
                 }
+                line_chars += gap;
             }
             line.push_str(word);
+            line_chars += word_chars;
             filled = true;
         }
         out.push(line);
@@ -630,18 +636,26 @@ fn publisher_fence_self_version() -> Option<String> {
 
 /// Keep each field on one line. Display-width truncation can remove an executable's
 /// basename and make a live publisher look like a reused pid.
-fn fence_field(value: &str) -> String {
+fn fence_field(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        let trimmed = value.trim();
+        return if trimmed.is_empty() {
+            std::borrow::Cow::Borrowed("unknown")
+        } else {
+            std::borrow::Cow::Borrowed(trimmed)
+        };
+    }
     let out: String = value
         .chars()
         .map(|c| if c.is_control() { '_' } else { c })
         .collect();
     let trimmed = out.trim();
     if trimmed.is_empty() {
-        "unknown".to_string()
+        std::borrow::Cow::Borrowed("unknown")
     } else if trimmed.len() == out.len() {
-        out
+        std::borrow::Cow::Owned(out)
     } else {
-        trimmed.to_string()
+        std::borrow::Cow::Owned(trimmed.to_string())
     }
 }
 
@@ -3461,16 +3475,15 @@ pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransfer
         "curl reached no answer",
         "server error",
     ];
-    let bytes = diagnostic.as_bytes();
-    let has = |needle: &str| {
-        bytes
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    let lower: std::borrow::Cow<'_, str> = if diagnostic.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(diagnostic.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(diagnostic)
     };
-    if ANSWERED.iter().any(|m| has(m)) {
+    if ANSWERED.iter().any(|m| lower.contains(m)) {
         return AssetTransferFault::Answered;
     }
-    if TRANSPORT.iter().any(|m| has(m)) {
+    if TRANSPORT.iter().any(|m| lower.contains(m)) {
         return AssetTransferFault::Transport;
     }
     AssetTransferFault::Answered
@@ -3821,7 +3834,7 @@ pub fn copy_bounded_release_asset(
 ) -> Result<(u64, String)> {
     let mut total = 0_u64;
     let mut digest = Sha256::new();
-    let mut chunk = [0_u8; 64 * 1024];
+    let mut chunk = [0_u8; 16 * 1024];
     loop {
         let remaining = limit.saturating_sub(total);
         let wanted = remaining.saturating_add(1).min(chunk.len() as u64) as usize;

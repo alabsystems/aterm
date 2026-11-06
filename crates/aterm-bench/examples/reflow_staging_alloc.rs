@@ -67,6 +67,8 @@ fn instructions() -> Option<u64> {
 }
 
 fn main() {
+    inline_image_rows();
+    restore_links();
     linked_writes();
     image_free_frames();
     floating_frames();
@@ -111,6 +113,146 @@ fn main() {
         println!(
             "reflow_staging rows={rows} cols={cols} next_cols={next_cols} allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} glyphs={expected} history_lines={}",
             term.grid().scrollback_lines()
+        );
+    }
+}
+
+fn inline_image_rows() {
+    use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
+    use std::sync::Arc;
+
+    for (rows, cols, layers) in [(1_u16, 4_u16, 1), (1, 80, 1), (24, 80, 1), (24, 80, 2)] {
+        let mut source = Grid::new(rows, cols);
+        for layer in 0..layers {
+            let image = Arc::new(ImageData {
+                bytes: vec![7; 256],
+                format: ImageFormat::Png,
+                cols,
+                rows,
+                z_index: layer,
+                band_lift_px: 0,
+                cell_offset_px: (0, 0),
+                scaling: ImageScaling::Fit,
+                source_rect: None,
+            });
+            for row in 0..rows {
+                for col in 0..cols {
+                    source.stack_cell_image(
+                        row,
+                        col,
+                        ImageRef {
+                            image: Arc::clone(&image),
+                            cell_row: row,
+                            cell_col: col,
+                            kitty: None,
+                        },
+                    );
+                }
+            }
+        }
+        let lines = source.checkpoint_visible_lines();
+        let mut restored = Grid::new(rows, cols);
+        restored.restore_visible_from_lines(&lines);
+        for phase in ["capture", "restore"] {
+            let before_instructions = instructions();
+            let before_calls = CALLS.load(Ordering::Relaxed);
+            let before_bytes = BYTES.load(Ordering::Relaxed);
+            let began = Instant::now();
+            for _ in 0..64 {
+                if phase == "capture" {
+                    black_box(black_box(&source).checkpoint_visible_lines());
+                } else {
+                    black_box(&mut restored).restore_visible_from_lines(black_box(&lines));
+                }
+            }
+            let ns = began.elapsed().as_nanos();
+            let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+            let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+            let retired = instructions()
+                .zip(before_instructions)
+                .map(|(end, start)| end - start);
+            println!(
+                "inline_images rows={rows} cols={cols} layers={layers} phase={phase} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?}"
+            );
+        }
+        for row in 0..rows {
+            assert_eq!(
+                lines[usize::from(row)].image_count(),
+                usize::try_from(layers).unwrap()
+            );
+            for col in 0..cols {
+                let actual = restored.cell_extra(row, col).unwrap().images();
+                let expected = source.cell_extra(row, col).unwrap().images();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert!(Arc::ptr_eq(&actual.image, &expected.image));
+                    assert_eq!((actual.cell_row, actual.cell_col), (row, col));
+                }
+            }
+        }
+    }
+}
+
+fn restore_links() {
+    for (rows, cols, scopes) in [
+        (1_u16, 4_u16, 1),
+        (1, 80, 1),
+        (1, 256, 1),
+        (24, 80, 1),
+        (1, 80, 2),
+    ] {
+        let mut source = Terminal::new(rows, cols);
+        source.process(b"\x1b]8;id=restore-probe;https://example.com\x1b\\");
+        for row in 0..rows {
+            source.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            if scopes == 1 {
+                source.process("x".repeat(usize::from(cols)).as_bytes());
+            } else {
+                source.process("x".repeat(usize::from(cols / 2)).as_bytes());
+                source.process(b"\x1b]8;id=right;https://example.com\x1b\\");
+                source.process("x".repeat(usize::from(cols - cols / 2)).as_bytes());
+            }
+        }
+        let capture_calls_before = CALLS.load(Ordering::Relaxed);
+        let capture_bytes_before = BYTES.load(Ordering::Relaxed);
+        let lines = source.grid().checkpoint_visible_lines();
+        let capture_calls = CALLS.load(Ordering::Relaxed) - capture_calls_before;
+        let capture_bytes = BYTES.load(Ordering::Relaxed) - capture_bytes_before;
+        let line_charge_bytes = lines.iter().map(|line| line.memory_used()).sum::<usize>();
+        drop(source);
+        let url_owners = std::sync::Arc::strong_count(&lines[0].hyperlinks().unwrap()[0].url);
+        let mut grid = aterm_grid::Grid::new(rows, cols);
+        grid.restore_visible_from_lines(&lines);
+        let before_instructions = instructions();
+        let before_calls = CALLS.load(Ordering::Relaxed);
+        let before_bytes = BYTES.load(Ordering::Relaxed);
+        let began = Instant::now();
+        for _ in 0..64 {
+            black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+        }
+        let ns = began.elapsed().as_nanos();
+        let calls = CALLS.load(Ordering::Relaxed) - before_calls;
+        let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
+        let retired = instructions()
+            .zip(before_instructions)
+            .map(|(end, start)| end - start);
+        for row in 0..rows {
+            for col in 0..cols {
+                let extra = grid.cell_extra(row, col).unwrap();
+                assert_eq!(
+                    extra.hyperlink().map(AsRef::as_ref),
+                    Some("https://example.com")
+                );
+                let id = if scopes == 2 && col >= cols / 2 {
+                    "right"
+                } else {
+                    "restore-probe"
+                };
+                assert_eq!(extra.hyperlink_id().map(AsRef::as_ref), Some(id));
+            }
+        }
+        println!(
+            "restore_links rows={rows} cols={cols} scopes={scopes} iterations=64 allocation_calls={calls} allocated_bytes={bytes} ns={ns} instructions={retired:?} capture_calls={capture_calls} capture_bytes={capture_bytes} line_charge_bytes={line_charge_bytes} url_owners={url_owners}"
         );
     }
 }

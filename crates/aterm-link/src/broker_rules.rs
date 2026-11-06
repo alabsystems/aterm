@@ -28,6 +28,12 @@ pub const PRESENCE_FILTER: &str = "/f/*/pub/*/*/presence";
 pub const MAIL_FILTER: &str = "/f/*/in/>";
 /// The group whose read releases a mail.
 pub const MAIL_READER: &str = "/f/{2}/cur/{4}/node/inbox";
+/// The mesh's mail lanes (§11 C3), the fleet `alab`'s ([`crate::federate::FLEET`]).
+pub const MESH_MAIL_FILTER: &str = "/f/alab/in/>";
+/// The group whose read also releases the mesh's mail on a Mac's `bus.log` ([`mesh_rules`]): the
+/// person carry's ([`crate::federate::carry_group`]), one name on every Mac, since nothing in a
+/// person's post names the Mac that carries it.
+pub const CARRY_READER: &str = "/f/alab/cur/n-carry/node/carry";
 
 /// How long any record is kept.
 pub const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -61,20 +67,82 @@ pub fn rules_scaled(ev: u64, mail: u64, default: u64) -> Retention {
         .unwrap_or_else(|e| unreachable!("the scaled retention rules are refused: {e}"))
 }
 
+/// The rules a Mac's mesh `bus.log` (§11 C3, which the node service hosts) retains its log by:
+/// [`default_rules`], with the mesh's mail ([`MESH_MAIL_FILTER`]) under a rule of its own ahead of
+/// the mail rule, held until the person carry read it too ([`CARRY_READER`]), so a person's post
+/// outlives a carry outage across a cut as unread mail outlives a push's (§11 C3d). The rule
+/// forgets ([`Rule::forgetting`]): a lane whose every record retention gave up leaves the
+/// last-value index, and the subject it was charged to its producer goes back to that producer's
+/// budget, so the carry, which opens a lane per session and kind it carries to and gives none
+/// back itself, never fills its budget with lanes nothing of which is left. Any other fleet's
+/// mail, which no carry reads, keeps the mail rule.
+///
+/// # Panics
+/// Never: every filter and template here is a constant astream's grammar takes.
+#[must_use]
+pub fn mesh_rules() -> Retention {
+    mesh_rules_with(EV_BYTES, MAIL_BYTES, DEFAULT_BYTES, true)
+        .unwrap_or_else(|e| unreachable!("the mesh retention rules are refused: {e}"))
+}
+
+/// [`mesh_rules`] with its bytes scaled, as [`rules_scaled`] scales [`default_rules`].
+///
+/// # Panics
+/// Never, as [`rules_scaled`].
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn mesh_rules_scaled(ev: u64, mail: u64, default: u64) -> Retention {
+    mesh_rules_with(ev, mail, default, true)
+        .unwrap_or_else(|e| unreachable!("the scaled mesh retention rules are refused: {e}"))
+}
+
+/// [`mesh_rules_scaled`] whose mesh rule does not forget: a lane retention gave up whole keeps
+/// its last-value row and its charge, the rules before §11 C3d's release of them (a negative
+/// control).
+///
+/// # Panics
+/// Never, as [`rules_scaled`].
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn mesh_rules_scaled_unforgetting(ev: u64, mail: u64, default: u64) -> Retention {
+    mesh_rules_with(ev, mail, default, false)
+        .unwrap_or_else(|e| unreachable!("the scaled mesh retention rules are refused: {e}"))
+}
+
 fn rules() -> io::Result<Retention> {
     rules_with(EV_BYTES, MAIL_BYTES, DEFAULT_BYTES)
 }
 
 fn rules_with(ev: u64, mail: u64, default: u64) -> io::Result<Retention> {
+    rules_holding(ev, None, mail, default)
+}
+
+/// The mesh rules, whose mesh rule forgets where `forget` says so.
+fn mesh_rules_with(ev: u64, mail: u64, default: u64, forget: bool) -> io::Result<Retention> {
+    let mesh = Rule::hold(MESH_MAIL_FILTER)?
+        .until_read(MAIL_READER)?
+        .until_read(CARRY_READER)?
+        .max_age(MAX_AGE)
+        .max_bytes(mail);
+    let mesh = if forget { mesh.forgetting() } else { mesh };
+    rules_holding(ev, Some(mesh), mail, default)
+}
+
+/// The rules, with `mesh` ahead of the mail rule where given.
+fn rules_holding(ev: u64, mesh: Option<Rule>, mail: u64, default: u64) -> io::Result<Retention> {
+    let mut rules = vec![
+        Rule::prefix(EV_FILTER)?.max_age(MAX_AGE).max_bytes(ev),
+        Rule::hold(PRESENCE_FILTER)?.last_only(),
+    ];
+    rules.extend(mesh);
+    rules.push(
+        Rule::hold(MAIL_FILTER)?
+            .until_read(MAIL_READER)?
+            .max_age(MAX_AGE)
+            .max_bytes(mail),
+    );
     Retention::new(
-        vec![
-            Rule::prefix(EV_FILTER)?.max_age(MAX_AGE).max_bytes(ev),
-            Rule::hold(PRESENCE_FILTER)?.last_only(),
-            Rule::hold(MAIL_FILTER)?
-                .until_read(MAIL_READER)?
-                .max_age(MAX_AGE)
-                .max_bytes(mail),
-        ],
+        rules,
         Rule::default_keeping_all()
             .max_age(MAX_AGE)
             .max_bytes(default),
@@ -118,6 +186,14 @@ pub fn summary() -> String {
 /// Astream's refusal: a poisoned log, or a held store that cannot be written.
 pub fn retain(broker: &astream_broker::Broker) -> io::Result<()> {
     broker.set_retention(default_rules())
+}
+
+/// Retain a Mac's mesh `bus.log` (`broker`) by [`mesh_rules`], from this open, as [`retain`].
+///
+/// # Errors
+/// As [`retain`].
+pub fn retain_mesh(broker: &astream_broker::Broker) -> io::Result<()> {
+    broker.set_retention(mesh_rules())
 }
 
 /// THE BROKER'S RATE LIMIT (critic item E06): astream's per-producer token bucket
@@ -312,6 +388,80 @@ mod tests {
         let segs: Vec<&str> = mail.split('/').skip(1).collect();
         let group = MAIL_READER.replace("{2}", segs[1]).replace("{4}", segs[3]);
         assert_eq!(group, crate::subject::inbox_group(f, n));
+    }
+
+    /// THE MESH RULES ARE THE DEFAULT RULES, THE MESH'S MAIL HELD FOR THE CARRY TOO
+    /// ([`mesh_rules`], §11 C3d): every rule [`default_rules`] has, and ahead of the mail rule
+    /// one of the fleet `alab`'s mail lanes that names the person carry's group beside the push's
+    /// and forgets a lane retention gave up whole, for every subject the carry follows; another
+    /// fleet's mail falls under the mail rule still, which forgets nothing.
+    #[test]
+    fn the_mesh_rules_hold_the_meshs_mail_for_the_carry_too() {
+        let (mesh, plain) = (mesh_rules(), default_rules());
+        let mut without: Vec<Rule> = mesh.rules().to_vec();
+        let carried = without.remove(2);
+        assert_eq!(
+            without,
+            plain.rules(),
+            "every other rule as the default rules have it"
+        );
+        assert_eq!(mesh.default_rule(), plain.default_rule());
+        assert_eq!(
+            (
+                carried.filter(),
+                carried.class(),
+                carried.keep(),
+                carried.age(),
+                carried.bytes()
+            ),
+            (
+                Some(MESH_MAIL_FILTER),
+                Class::Hold,
+                Keep::All,
+                Some(MAX_AGE),
+                Some(MAIL_BYTES)
+            )
+        );
+        assert_eq!(
+            carried.readers(),
+            [MAIL_READER.to_string(), CARRY_READER.to_string()]
+        );
+        assert!(carried.forgets(), "the mesh rule forgets");
+        assert!(
+            plain.rules().iter().all(|rule| !rule.forgets()),
+            "no default rule forgets"
+        );
+        assert_eq!(CARRY_READER, crate::federate::carry_group());
+        assert_eq!(
+            MESH_MAIL_FILTER,
+            format!("/f/{}/in/>", crate::federate::FLEET)
+        );
+        let rule_of = |subject: &str| -> Option<&str> {
+            mesh.rules()
+                .iter()
+                .find(|rule| {
+                    rule.filter().is_some_and(|f| {
+                        astream_wire::Filter::new(f).is_ok_and(|f| f.matches_str(subject))
+                    })
+                })
+                .and_then(Rule::filter)
+        };
+        let n = "n-0123456789abcdef";
+        let fleet = crate::federate::FLEET;
+        let follows = astream_wire::Filter::new(crate::federate::posts()).expect("a filter");
+        for mail in [
+            crate::subject::post_lane(fleet, n, "s-q", "h-andrew", "ask"),
+            crate::subject::post_lane(fleet, n, "s-q", "n-fedcba9876543210", "note"),
+            format!(
+                "{}/answer",
+                crate::subject::person_lane(fleet, "h-andrew", n)
+            ),
+        ] {
+            assert!(follows.matches_str(&mail), "the carry follows {mail}");
+            assert_eq!(rule_of(&mail), Some(MESH_MAIL_FILTER), "{mail}");
+        }
+        let elsewhere = crate::subject::post_lane("f1", n, "s-a", "n-fedcba9876543210", "note");
+        assert_eq!(rule_of(&elsewhere), Some(MAIL_FILTER), "{elsewhere}");
     }
 
     /// THE RULES ARE SET PAST A BATCH IN FLIGHT ([`retain`]): a batch held in

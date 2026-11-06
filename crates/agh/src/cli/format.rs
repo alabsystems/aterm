@@ -61,32 +61,45 @@ pub fn render(
             out
         }
         Format::Text => {
-            let mut rows: Vec<Vec<String>> = Vec::with_capacity(values.len() + 1);
-            rows.push(columns.iter().map(|c| for_person(&c.text())).collect());
-            for value in values {
-                rows.push(
-                    columns
-                        .iter()
-                        .map(|c| for_person(&cell(&value_at(value, c))))
-                        .collect(),
-                );
-            }
             let mut widths = vec![0usize; columns.len()];
-            for row in &rows {
-                for (width, text) in widths.iter_mut().zip(row) {
-                    *width = (*width).max(text.chars().count());
-                }
+            let mut rows: Vec<Vec<(String, usize)>> = Vec::with_capacity(values.len() + 1);
+            let mut scratch = String::new();
+            let header_row: Vec<(String, usize)> = columns
+                .iter()
+                .zip(&mut widths)
+                .map(|(c, width)| {
+                    let text = for_person(&c.text());
+                    let count = text.chars().count();
+                    *width = count;
+                    (text, count)
+                })
+                .collect();
+            rows.push(header_row);
+            for value in values {
+                let row: Vec<(String, usize)> = columns
+                    .iter()
+                    .zip(&mut widths)
+                    .map(|(c, width)| {
+                        scratch.clear();
+                        cell_into(&mut scratch, &value_at(value, c));
+                        let text = for_person(&scratch);
+                        let count = text.chars().count();
+                        *width = (*width).max(count);
+                        (text, count)
+                    })
+                    .collect();
+                rows.push(row);
             }
             let mut out = String::new();
             let mut line = String::new();
             for row in &rows {
                 line.clear();
-                for (i, (text, width)) in row.iter().zip(&widths).enumerate() {
+                for (i, ((text, count), width)) in row.iter().zip(&widths).enumerate() {
                     if i > 0 {
                         line.push_str("  ");
                     }
                     line.push_str(text);
-                    let pad = width.saturating_sub(text.chars().count());
+                    let pad = width.saturating_sub(*count);
                     line.extend(std::iter::repeat_n(' ', pad));
                 }
                 out.push_str(line.trim_end_matches(' '));
@@ -95,13 +108,6 @@ pub fn render(
             out
         }
     }
-}
-
-/// Formats a single cell value as an unescaped string.
-pub(crate) fn cell(value: &Value) -> String {
-    let mut out = String::new();
-    cell_into(&mut out, value);
-    out
 }
 
 /// Appends a single cell value as an unescaped string to `out`.

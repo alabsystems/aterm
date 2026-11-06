@@ -23,7 +23,9 @@
 //!   offset, in the held store (`held.rs`): one that keeps ALL ([`Keep::All`]) wants every
 //!   record within its `max_age` that its readers have not read ([`Rule::until_read`]); one
 //!   that keeps the LAST value only ([`Keep::Last`]) wants nothing beyond each subject's
-//!   `Last` row, which every compaction carries in `<log>.state` whatever the rules.
+//!   `Last` row. Every compaction carries every quiet subject's `Last` row and its charge in
+//!   `<log>.state`, whatever its rule, until the subject is retired or a rule that forgets
+//!   lets it go ("Forgetting", below).
 //!
 //! # Every class bounded
 //!
@@ -75,6 +77,46 @@
 //! `from`, the notice ahead of the page; `retained-from=` is the answer when it holds none of
 //! them, and to a reader that did not ask.
 //!
+//! # Forgetting
+//!
+//! A subject's `Last` row outlives its records: a cut carries every quiet subject's newest
+//! record in `<log>.state` (`carried_last`) and the producer it is charged to
+//! (`carried_charges`), so `Last` answers a presence row or a halt long after the record's
+//! own rule gave it up, and the subject keeps its place in its producer's budget
+//! ([`MAX_SUBJECTS_PER_PRODUCER`](crate::store::MAX_SUBJECTS_PER_PRODUCER)). That is right
+//! for a subject whose last value is read, and wrong for a lane whose records go once read
+//! (a fabric's mail): its producer's budget fills with lanes no record of which survives,
+//! until it can open no new one (`ERR_SUBJECT_BOUND`). A rule that FORGETS
+//! ([`Rule::forgetting`], `forget` in a rules file) lets such a subject go: once retention
+//! has given up every record of it, it leaves `Last` and its charged producer's count goes
+//! down by one. Off by default; a rule that keeps the last value only cannot forget.
+//!
+//! A tick, after its retention lands (and a tick that changes nothing too), forgets each
+//! subject of a forgetting rule that every guard of a `Retire` allows, the same guards a
+//! subject retire takes: its newest record (its `Last` offset) lies below the base, no
+//! record of it is left in the held store, no will that can still append targets it (a live
+//! will, a durable one, and one a cut carried), it is no broker-internal subject, the log is
+//! not a replica, and no uncarried cut has tainted the charges. A subject a guard keeps is
+//! carried as before and looked at again at the next tick. At most [`FORGET_MAX`] subjects a
+//! tick; a tick that reaches it asks for another.
+//!
+//! A forget IS A RETIRE, made by the broker: one marked `/a/retire` record per subject
+//! (`BrokerRecord::marked_retire`, under the producer the subject is charged to), staged by
+//! the broker's writer like every other op, which judges the guards again against its
+//! batch (a record of the subject staged or landed since the tick looked keeps it). So
+//! everything a retire already does follows: the `Last` view's history (a page read
+//! against a head below the record still answers the row), the replay at an open (which
+//! applies the record to the rows `<log>.state` carried), the next cut's carried charges
+//! (which drop the subject once the record is below it), replication (a follower applies
+//! the leader's record and forgets nothing of its own), and every count. Dropping the
+//! subject from the carried state at the cut itself was the alternative, and it is worse:
+//! the forget would have no offset, so a `Last` page pinned below it could not be answered
+//! consistently, a follower or a reopen that judged it again could judge it otherwise
+//! (a will a connection holds is not in the log), and a forget at a tick that cuts nothing
+//! (the read that releases the last held record) would wait for the next compaction, since
+//! only a compaction writes `<log>.state`. [`RetentionTick::forgotten`](crate::RetentionTick)
+//! counts the subjects a tick forgot.
+//!
 //! # Record times
 //!
 //! The log's records carry no time. The retention tick STAMPS what it has not seen yet with
@@ -105,6 +147,11 @@ const MAX_CLASSES: usize = MAX_RULES + 1;
 
 /// The most reader templates one rule names ([`Rule::until_read`]).
 pub const MAX_READERS: usize = 8;
+
+/// The most subjects one retention tick forgets ([`Rule::forgetting`]): the writer stages
+/// them as one op, so a tick's forgets stay within one batch the size of the writer's own
+/// bound, and a tick that reaches it asks for another.
+pub const FORGET_MAX: usize = 4096;
 
 /// The highest segment a reader template can name (`{N}`).
 const MAX_TEMPLATE_SEGMENT: usize = 64;
@@ -179,6 +226,7 @@ pub struct Rule {
     max_age_ms: Option<u64>,
     max_bytes: Option<u64>,
     read_by: Vec<String>,
+    forget: bool,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -202,6 +250,7 @@ impl Rule {
             max_age_ms: None,
             max_bytes: None,
             read_by: Vec::new(),
+            forget: false,
         })
     }
 
@@ -226,6 +275,7 @@ impl Rule {
             max_age_ms: None,
             max_bytes: None,
             read_by: Vec::new(),
+            forget: false,
         }
     }
 
@@ -239,6 +289,7 @@ impl Rule {
             max_age_ms: None,
             max_bytes: None,
             read_by: Vec::new(),
+            forget: false,
         }
     }
 
@@ -260,6 +311,20 @@ impl Rule {
     #[must_use]
     pub const fn last_only(mut self) -> Rule {
         self.keep = Keep::Last;
+        self
+    }
+
+    /// A rule that FORGETS its subjects (see the module docs, "Forgetting"): once retention
+    /// has given up every record of a subject this rule governs, the subject leaves the
+    /// last-value index and the producer it is charged to gets that subject of its budget
+    /// back ([`MAX_SUBJECTS_PER_PRODUCER`](crate::store::MAX_SUBJECTS_PER_PRODUCER)), live
+    /// and across a reopen. For a lane whose records go once read (a fabric's mail), whose
+    /// `Last` row no reader wants once the records are gone. Only a rule that keeps every
+    /// record ([`Keep::All`]) forgets: [`Retention::new`] refuses one that keeps the last
+    /// value only, whose `Last` row is what it keeps.
+    #[must_use]
+    pub const fn forgetting(mut self) -> Rule {
+        self.forget = true;
         self
     }
 
@@ -329,6 +394,29 @@ impl Rule {
     #[must_use]
     pub fn readers(&self) -> &[String] {
         &self.read_by
+    }
+
+    /// Whether the rule forgets its subjects once it has given up all of their records
+    /// ([`forgetting`](Self::forgetting)).
+    #[must_use]
+    pub const fn forgets(&self) -> bool {
+        self.forget
+    }
+
+    /// Refused for a rule that keeps the last value only and forgets: its subjects' `Last`
+    /// rows are what it keeps, so only a rule that keeps every record forgets.
+    fn check_forget(&self) -> Result<(), String> {
+        if self.forget && self.keep == Keep::Last {
+            let which = match self.filter() {
+                Some(f) => format!("the rule over {f:?}"),
+                None => "the default rule".to_string(),
+            };
+            return Err(format!(
+                "retention: {which} keeps the last value only and forgets: a subject's `Last` \
+                 row is what it keeps, so only a rule that keeps every record forgets"
+            ));
+        }
+        Ok(())
     }
 
     /// Whether the rule keeps every record below the cut in the held store.
@@ -438,8 +526,9 @@ pub struct Retention {
 
 impl Retention {
     /// The rules, checked: at most [`MAX_RULES`], each with a filter, exactly one of them
-    /// [`Class::Prefix`] (keeping all, naming no reader), and `default` with no filter and
-    /// [`Class::Hold`]. What Hello advertises must fit its entry.
+    /// [`Class::Prefix`] (keeping all, naming no reader), `default` with no filter and
+    /// [`Class::Hold`], and none that both keeps the last value only and forgets
+    /// ([`Rule::forgetting`]). What Hello advertises must fit its entry.
     pub fn new(rules: Vec<Rule>, default: Rule) -> io::Result<Retention> {
         if rules.len() > MAX_RULES {
             return Err(invalid(format!(
@@ -472,6 +561,9 @@ impl Retention {
             return Err(invalid(
                 "retention: the default rule is a hold rule with no filter".to_string(),
             ));
+        }
+        for r in rules.iter().chain(std::iter::once(&default)) {
+            r.check_forget().map_err(invalid)?;
         }
         let r = Retention { rules, default };
         if r.encode().len() > usize::from(u16::MAX) {
@@ -531,6 +623,16 @@ impl Retention {
         rule.class() == Class::Hold && rule.keep() == Keep::Last
     }
 
+    /// Whether `subject` falls to a rule that forgets ([`Rule::forgetting`]).
+    pub(crate) fn forgets(&self, subject: &str) -> bool {
+        self.rule(self.class_of(subject)).forget
+    }
+
+    /// Whether any rule, the default one included, forgets.
+    pub(crate) fn forgets_any(&self) -> bool {
+        self.default.forget || self.rules.iter().any(|r| r.forget)
+    }
+
     /// The class of `subject`: the first rule whose filter matches it, else the default one,
     /// which every hidden subject is.
     pub(crate) fn class_of(&self, subject: &str) -> usize {
@@ -582,10 +684,14 @@ impl Retention {
         out
     }
 
-    /// Hello's entry for the rules (`proto` tag 0x05): `n u8`, then per rule, the default one
-    /// last, `class u8, keep u8, max_age_ms u64 LE, max_bytes u64 LE` (`u64::MAX`: none),
-    /// `filter len u16 LE` and its bytes (none for the default rule), `readers u8` and each
-    /// `len u16 LE` and its bytes.
+    /// Hello's entry for the rules (`proto` tag 0x05), and the held store's `R` frame's: `n
+    /// u8`, then per rule, the default one last, `class u8, keep u8, max_age_ms u64 LE,
+    /// max_bytes u64 LE` (`u64::MAX`: none), `filter len u16 LE` and its bytes (none for the
+    /// default rule), `readers u8` and each `len u16 LE` and its bytes. `keep` is bits: bit 0
+    /// for [`Keep::Last`] (clear: [`Keep::All`]), bit 1 for a rule that forgets
+    /// ([`Rule::forgetting`]); no other bit is set, so rules that forget nothing encode as
+    /// they did before the bit, and an older decoder refuses rules that forget rather than
+    /// read them as rules that do not.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -616,6 +722,12 @@ impl Retention {
     }
 }
 
+/// The `keep` byte's bit for [`Keep::Last`] ([`Retention::encode`]).
+const KEEP_LAST: u8 = 1;
+
+/// The `keep` byte's bit for a rule that forgets ([`Retention::encode`]).
+const KEEP_FORGET: u8 = 2;
+
 fn put_u16_str(out: &mut Vec<u8>, s: &str) {
     let len = u16::try_from(s.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_le_bytes());
@@ -627,10 +739,11 @@ fn put_rule(out: &mut Vec<u8>, r: &Rule) {
         Class::Prefix => 0,
         Class::Hold => 1,
     });
-    out.push(match r.keep {
+    let keep = match r.keep {
         Keep::All => 0,
-        Keep::Last => 1,
-    });
+        Keep::Last => KEEP_LAST,
+    };
+    out.push(if r.forget { keep | KEEP_FORGET } else { keep });
     out.extend_from_slice(&r.max_age_ms.unwrap_or(u64::MAX).to_le_bytes());
     out.extend_from_slice(&r.max_bytes.unwrap_or(u64::MAX).to_le_bytes());
     put_u16_str(out, r.filter().unwrap_or(""));
@@ -670,11 +783,15 @@ fn take_rule(b: &[u8]) -> Option<(Rule, &[u8])> {
         Rule::with(filter, class).ok()?
     };
     r.class = class;
-    r.keep = match keep {
-        0 => Keep::All,
-        1 => Keep::Last,
-        _ => return None,
+    if keep & !(KEEP_LAST | KEEP_FORGET) != 0 {
+        return None;
+    }
+    r.keep = if keep & KEEP_LAST == 0 {
+        Keep::All
+    } else {
+        Keep::Last
     };
+    r.forget = keep & KEEP_FORGET != 0;
     r.max_age_ms = if age == u64::MAX { None } else { Some(age) };
     r.max_bytes = if bytes == u64::MAX { None } else { Some(bytes) };
     for _ in 0..readers {
@@ -687,8 +804,9 @@ fn take_rule(b: &[u8]) -> Option<(Rule, &[u8])> {
 
 /// One rule as a line of a rules file (`asb serve --retain-file`): `<prefix|hold|default>`,
 /// then its options, then its filter (none for `default`), split on spaces. The options are
-/// `age=<n><ms|s|m|h|d>`, `bytes=<n>[KiB|MiB|GiB]`, `last` and `read=<template>`. A filter
-/// with a space in it cannot be written here. Returns whether the line is the default rule.
+/// `age=<n><ms|s|m|h|d>`, `bytes=<n>[KiB|MiB|GiB]`, `last`, `forget` ([`Rule::forgetting`])
+/// and `read=<template>`. A filter with a space in it cannot be written here. Returns whether
+/// the line is the default rule.
 pub fn parse_rule_line(line: &str) -> Result<(bool, Rule), String> {
     let mut words = line.split_ascii_whitespace();
     let Some(head) = words.next() else {
@@ -711,6 +829,8 @@ pub fn parse_rule_line(line: &str) -> Result<(bool, Rule), String> {
     for opt in opts {
         if *opt == "last" {
             rule = rule.last_only();
+        } else if *opt == "forget" {
+            rule = rule.forgetting();
         } else if let Some(v) = opt.strip_prefix("age=") {
             rule = rule.max_age(parse_age(v)?);
         } else if let Some(v) = opt.strip_prefix("bytes=") {
@@ -718,9 +838,12 @@ pub fn parse_rule_line(line: &str) -> Result<(bool, Rule), String> {
         } else if let Some(v) = opt.strip_prefix("read=") {
             rule = rule.until_read(v).map_err(|e| e.to_string())?;
         } else {
-            return Err(format!("{opt:?}: expected age=, bytes=, last or read="));
+            return Err(format!(
+                "{opt:?}: expected age=, bytes=, last, forget or read="
+            ));
         }
     }
+    rule.check_forget()?;
     Ok((head == "default", rule))
 }
 

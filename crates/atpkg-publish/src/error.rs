@@ -14,6 +14,8 @@ pub enum Error {
     Usage(String),
     /// Something this run needs is missing or did not answer.
     CannotRun(String),
+    /// A scoped controller's own status, retained rather than relabeled as a gate failure.
+    ChildExit { code: u8, message: String },
 }
 
 impl Error {
@@ -44,6 +46,7 @@ impl Error {
             Self::Refused(_) => 1,
             Self::Usage(_) => 2,
             Self::CannotRun(_) => 3,
+            Self::ChildExit { code, .. } => *code,
         }
     }
 }
@@ -54,6 +57,7 @@ impl fmt::Display for Error {
             Self::Refused(m) => write!(f, "REFUSED — {m}"),
             Self::Usage(m) => write!(f, "usage: {m}"),
             Self::CannotRun(m) => write!(f, "could not run — {m}"),
+            Self::ChildExit { message, .. } => write!(f, "{message}"),
         }
     }
 }

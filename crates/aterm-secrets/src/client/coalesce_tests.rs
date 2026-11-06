@@ -76,6 +76,7 @@ fn coalesce(mut log: Log, paths: &Paths, active: &BTreeSet<Recipient>) -> (Log, 
     let opened = log.open_audience_entries(&identity).unwrap().unwrap();
     let (bootstrap, actor, incarnation) = member_key(paths);
     let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
+    let denies = log_entries::Denies::read(paths, &log, &opened, None).unwrap();
     let mut minted = Vec::new();
     bootstrap
         .device()
@@ -91,6 +92,7 @@ fn coalesce(mut log: Log, paths: &Paths, active: &BTreeSet<Recipient>) -> (Log, 
                     authored_ms: 2000,
                 },
                 active,
+                &denies,
                 &mut minted,
                 &[EpochAudience::Everyone, EpochAudience::Commons],
             )
@@ -440,4 +442,100 @@ fn an_incomplete_commons_batch_cannot_shrink_88_recipients_to_three() {
         "an incomplete batch dominated the current epochs"
     );
     assert_eq!(after.heads(), before.heads());
+}
+
+/// A due only P1's gate makes (one-mesh proofs P1b): m22 seats X, whose recipient no epoch wraps,
+/// and takes it out again with no rotation. The newest `[everyone]` epoch wraps no removed
+/// recipient, and m22 holds every newest key, but the `Remove` is not in its causal past, so its
+/// gate is shut and every writer waits on it. The tender's coalesce rotates it: a fresh epoch that
+/// follows the `Remove`, after which nothing is due.
+///
+/// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=coalesce-gateless` judges staleness by twins and
+/// held `Wrap`s alone, as before P1b: nothing is minted, and the due stays.
+#[test]
+fn coalesce_rotates_a_due_only_the_gate_makes() {
+    use crate::age::Identity;
+    use crate::commons::binding::Request;
+    use crate::membership_log::{Entrant, Evidence};
+
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"value")]);
+    let identity = read_identity(&macs.m22).unwrap().unwrap();
+    let (bootstrap, actor, incarnation) = member_key(&macs.m22);
+    let trust = bootstrap.trust();
+    let x = Identity::from_secret_bytes([0x5a; 32]);
+    let mut log = load_records(&macs.m22).unwrap().log().unwrap().clone();
+    bootstrap
+        .device()
+        .with_seed(|seed| -> crate::Result<()> {
+            let entrant = Entrant {
+                request: Request::create(
+                    trust.network,
+                    trust.authority,
+                    [0x5a; 16],
+                    [0x5a; 16],
+                    &x,
+                    &[0x5a; 32],
+                )?,
+                node_key: [0x5a; 32],
+                name: "m90".to_owned(),
+                label: "m90".to_owned(),
+            };
+            let member = entrant.member();
+            let admit = log
+                .draft(
+                    &actor,
+                    1000,
+                    Body::Admit {
+                        entrant,
+                        evidence: Evidence::Phrase,
+                    },
+                )
+                .sign(seed, incarnation)?;
+            log.insert(admit.clone())?;
+            let remove = log
+                .draft(
+                    &actor,
+                    1001,
+                    Body::Remove {
+                        member,
+                        cutoff: *admit.id(),
+                    },
+                )
+                .sign(seed, incarnation)?;
+            log.insert(remove)?;
+            Ok(())
+        })
+        .unwrap();
+    let removed = log.removed_recipients();
+    assert!(removed.contains(&x.recipient()));
+    let opened = log.open_audience_entries(&identity).unwrap().unwrap();
+    let newest = &opened.maximal_epochs[&EpochAudience::Everyone];
+    assert!(!log_entries::wraps_removed(&opened, newest, &removed));
+    assert!(log_entries::heads_due(&log, &opened, newest, &removed));
+
+    let active = log.current_recipients(&EpochAudience::Everyone);
+    let (after, minted) = coalesce(log, &macs.m22, &active);
+    let fresh = minted
+        .iter()
+        .find(|record| {
+            matches!(
+                record.body(),
+                Body::Epoch {
+                    audience: EpochAudience::Everyone,
+                    ..
+                }
+            )
+        })
+        .expect("the tender rotates the due");
+    let opened = after.open_audience_entries(&identity).unwrap().unwrap();
+    let newest = &opened.maximal_epochs[&EpochAudience::Everyone];
+    assert_eq!(newest, &vec![*fresh.id()]);
+    assert!(!log_entries::heads_due(
+        &after,
+        &opened,
+        newest,
+        &after.removed_recipients()
+    ));
+    macs.server.stop();
 }

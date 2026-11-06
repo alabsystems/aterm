@@ -520,7 +520,7 @@ fn path_text(path: &Path) -> io::Result<&str> {
         .ok_or_else(|| refused("namespace path is not UTF-8"))
 }
 
-fn directory(path: &Path) -> io::Result<File> {
+pub(crate) fn directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(refused("cohort namespace path must be absolute"));
     }

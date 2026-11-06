@@ -27,6 +27,9 @@ pub type Digest = [u8; 32];
 /// first 48 bytes, then whether it proves a fork (byte 48), then the proof's own digest.
 pub type ProofKey = [u8; 81];
 
+/// One table's digest, operation digests, and conflict proof keys.
+pub type TableSummary = (Digest, BTreeSet<Digest>, BTreeSet<ProofKey>);
+
 /// The subject segment of the membership log on `tables.log`.
 pub const MEMBERSHIP: &str = "membership";
 
@@ -113,6 +116,32 @@ pub trait Stores: Send + Sync {
     /// Where the stores cannot be read.
     fn table_lengths(&self) -> io::Result<Vec<(TableKey, u64)>>;
 
+    /// The length of `key`'s store (its journal's record count), `None` where this Mac does not
+    /// hold it.
+    /// # Errors
+    /// Where the store cannot be read.
+    fn table_length(&self, key: TableKey) -> io::Result<Option<u64>> {
+        Ok(self
+            .table_lengths()?
+            .into_iter()
+            .find_map(|(k, length)| (k == key).then_some(length)))
+    }
+
+    /// Each table this Mac holds for `Inventory`, with its operation digests and conflict proof
+    /// keys, in sorted table order.
+    /// # Errors
+    /// Where the stores cannot be read.
+    fn tables_summary(&self) -> io::Result<Vec<TableSummary>> {
+        let tables = self.tables()?;
+        let mut out = Vec::with_capacity(tables.len());
+        for table in tables {
+            let ids = self.table_inventory(table)?.unwrap_or_default();
+            let proofs = self.table_proofs(table)?.unwrap_or_default();
+            out.push((table, ids, proofs));
+        }
+        Ok(out)
+    }
+
     /// The records `key`'s store holds at offsets `from..upto`, never past what it acknowledged.
     /// # Errors
     /// Where the store cannot be read.
@@ -128,6 +157,13 @@ pub trait Stores: Send + Sync {
     /// # Errors
     /// Where the stores cannot be read.
     fn tables(&self) -> io::Result<BTreeSet<Digest>>;
+
+    /// Whether these stores take `table`'s records now, held or not: an `Inventory` gives a
+    /// neighbour only the tables its stores take, and the other's records of such a table
+    /// ([`crate::inventory`]).
+    /// # Errors
+    /// Where the stores cannot be read.
+    fn takes(&self, table: Digest) -> io::Result<bool>;
 
     /// The digests of the operations `table`'s store holds, `None` where this Mac holds none.
     /// # Errors
@@ -223,6 +259,14 @@ pub fn table_payload(kind: Kind, wire: &[u8]) -> Vec<u8> {
 pub fn read_table_payload(payload: &[u8]) -> Option<(Kind, &[u8])> {
     let (&byte, wire) = payload.split_first()?;
     Some((Kind::of(byte)?, wire))
+}
+
+/// Take the kind and wire out of an owned table record payload without allocating a new buffer.
+#[must_use]
+pub fn take_table_payload(mut payload: Vec<u8>) -> Option<(Kind, Vec<u8>)> {
+    let kind = Kind::of(*payload.first()?)?;
+    payload.remove(0);
+    Some((kind, payload))
 }
 
 /// The SHA-256 of `bytes`: a membership record's id is the digest of its signed bytes.

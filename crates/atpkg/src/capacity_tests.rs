@@ -269,7 +269,11 @@ fn a_reservation_is_the_need_less_what_is_written() {
     vm.need = Need::new("lab windows exec").mem(16 * GIB);
     vm.credit = vec![52_100];
     let claims = [claim(41_000, 1, 20 * GIB, DATA, true), far, wrote, vm];
-    let use_of = |footprint: u64, written: u64| TreeUse { footprint, written };
+    let use_of = |footprint: u64, written: u64| TreeUse {
+        footprint,
+        whole: footprint,
+        written,
+    };
     let trees = HashMap::from([
         (41_000, use_of(0, 5 * GIB)),
         (52_000, use_of(2 * GIB, 0)),
@@ -315,6 +319,86 @@ fn a_reservation_is_the_need_less_what_is_written() {
     );
 }
 
+/// OVERRUN ON THE LISTING (the live stall of 2026-10-30, where a Trust lane check held a 16 GiB
+/// claim while its trustc's footprint was 33 GB): a held 16 GiB claim whose holder's tree holds
+/// 31 GiB in 9 GiB of memory reserves 7 GiB as before, and its line says what the tree holds whole
+/// and how far past its claim, its JSON `tree_whole` 31 GiB and `past_claims` 15 GiB. A waiting
+/// claim of the same holder shows the same tree and is past nothing of its own. A held claim
+/// within its claim through compressed pages (a tree of 14 GiB in 9) shows the whole and is past
+/// nothing (`past_claims` null), and one with nothing compressed keeps the old line. NEGATIVE
+/// CONTROL: the old listing showed only the 9 GiB the reservation counts, so the first line's
+/// assertion fails on it.
+#[test]
+fn a_held_claim_over_its_claim_through_compressed_pages_is_named_so() {
+    let (r, _) = data();
+    let mem = |pid: u32, start_ms: u64, gibs: u64, held: bool| {
+        let mut c = claim(pid, start_ms, 0, DATA, held);
+        c.need = Need::new(format!("trust check {pid}")).mem(gibs * GIB);
+        c
+    };
+    let claims = [
+        mem(18_032, 1, 16, true),
+        mem(18_032, 2, 4, false),
+        mem(18_040, 3, 16, true),
+        mem(18_050, 4, 16, true),
+    ];
+    let use_of = |counted: u64, whole: u64| TreeUse {
+        footprint: counted * GIB,
+        whole: whole * GIB,
+        written: 0,
+    };
+    let trees = HashMap::from([
+        (18_032, use_of(9, 31)),
+        (18_040, use_of(9, 14)),
+        (18_050, use_of(9, 9)),
+    ]);
+    let out = report(&r, &[], &claims, Some(&trees));
+    let shown = &out[out.len() - claims.len()..];
+    assert!(
+        shown[0].contains(
+            "mem 16 GiB (its holder's tree holds 31 GiB, 22 GiB of it compressed or swapped and \
+             9 GiB in memory: 15 GiB past its 16 GiB claim), reserves 7 GiB"
+        ),
+        "{shown:#?}"
+    );
+    assert!(
+        shown[1].contains(
+            "mem 4 GiB (its holder's tree holds 31 GiB, 22 GiB of it compressed or swapped and \
+             9 GiB in memory), reserves 4 GiB"
+        ),
+        "{shown:#?}"
+    );
+    assert!(
+        shown[2].contains(
+            "mem 16 GiB (its holder's tree holds 14 GiB, 5 GiB of it compressed or swapped and \
+             9 GiB in memory), reserves 7 GiB"
+        ),
+        "{shown:#?}"
+    );
+    assert!(
+        shown[3].contains("mem 16 GiB (its holder's tree holds 9 GiB), reserves 7 GiB"),
+        "{shown:#?}"
+    );
+    assert_eq!(
+        shown.iter().filter(|l| l.contains("past")).count(),
+        1,
+        "{shown:#?}"
+    );
+    let json = json_report(&r, &[], &claims, Some(&trees));
+    assert_eq!(
+        json_claims(&json, "past_claims"),
+        [Value::from(15 * GIB), Value::Null, Value::Null, Value::Null]
+    );
+    assert_eq!(
+        json_claims(&json, "tree_whole"),
+        [31, 31, 14, 9].map(|g: u64| Value::from(g * GIB))
+    );
+    assert_eq!(
+        json_claims(&json, "tree_held"),
+        [9; 4].map(|g: u64| Value::from(g * GIB))
+    );
+}
+
 /// A detached record's numeric PID and credit list cannot attribute a reused process tree.
 /// Whole cohort accounting has the same credit restriction but a different closure policy;
 /// ordinary holder accounting continues to report and subtract the actual observed trees.
@@ -331,6 +415,7 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
             original.pid,
             TreeUse {
                 footprint: 2 * GIB,
+                whole: 2 * GIB,
                 written: 0,
             },
         ),
@@ -338,6 +423,7 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
             original.credit[0],
             TreeUse {
                 footprint: 6 * GIB,
+                whole: 6 * GIB,
                 written: 0,
             },
         ),
@@ -353,6 +439,13 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
         (
             Accounting::Whole,
             "whole",
+            "cohort-closure",
+            "original-record",
+            16 * GIB,
+        ),
+        (
+            Accounting::CohortOwned,
+            "cohort-owned",
             "cohort-closure",
             "original-record",
             16 * GIB,
@@ -383,6 +476,7 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
             &claims[0],
             reserved(&claims, Some(&trees), r.volume.as_slice())[0],
             Some(&trees),
+            None,
             1_000,
         );
         assert!(shown.contains(&format!("accounting {mode}, lifetime {lifetime}")));
@@ -393,11 +487,17 @@ fn claim_accounting_reports_lifetime_without_attributing_reused_pids() {
                 json_claims(&report, "credited_held"),
                 [Value::from(6 * GIB)]
             );
+            assert_eq!(json_claims(&report, "tree_whole"), [Value::from(2 * GIB)]);
+            assert_eq!(
+                json_claims(&report, "credited_whole"),
+                [Value::from(6 * GIB)]
+            );
             assert!(shown.contains("its holder's tree holds"));
             assert!(!shown.contains("original pid"));
         } else {
-            assert_eq!(json_claims(&report, "tree_held"), [Value::Null]);
-            assert_eq!(json_claims(&report, "credited_held"), [Value::Null]);
+            for key in ["tree_held", "credited_held", "tree_whole", "credited_whole"] {
+                assert_eq!(json_claims(&report, key), [Value::Null], "{mode}: {key}");
+            }
             assert!(shown.contains(&format!("original pid {}", original.pid)));
             assert!(!shown.contains("tree holds"));
             assert!(!shown.contains("processes credited"));

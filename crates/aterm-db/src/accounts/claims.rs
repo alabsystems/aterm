@@ -259,7 +259,6 @@ use crate::table::binding_denied_in_roster;
 
 /// A writer's latest row and the table it was read from.
 struct Latest {
-    rank: (u64, u64, u32, u64),
     source: Source,
     machine: [u8; 16],
     body: Value,
@@ -268,10 +267,16 @@ struct Latest {
 /// Each writer's latest row whose key is that writer's own machine, ranked by table, then
 /// counter, then sequence.
 fn latest(logs: &[(Source, Log)], machines: &BTreeMap<Actor, [u8; 16]>) -> BTreeMap<Actor, Latest> {
-    let mut latest: BTreeMap<Actor, Latest> = BTreeMap::new();
+    struct Held<'a> {
+        rank: (u64, u64, u32, u64),
+        source: Source,
+        machine: [u8; 16],
+        body: &'a Value,
+    }
+    let mut latest: BTreeMap<Actor, Held<'_>> = BTreeMap::new();
     for (source, log) in logs {
         let (tier, generation) = source.tier();
-        for (operation, command) in log.eligible() {
+        for (operation, command) in log.eligible_iter() {
             let actor = operation.header.actor;
             let Some(&expected_machine) = machines.get(&actor) else {
                 continue;
@@ -287,17 +292,29 @@ fn latest(logs: &[(Source, Log)], machines: &BTreeMap<Actor, [u8; 16]>) -> BTree
             if latest.get(&actor).is_none_or(|held| held.rank < rank) {
                 latest.insert(
                     actor,
-                    Latest {
+                    Held {
                         rank,
                         source: *source,
                         machine,
-                        body: body.clone(),
+                        body,
                     },
                 );
             }
         }
     }
     latest
+        .into_iter()
+        .map(|(actor, held)| {
+            (
+                actor,
+                Latest {
+                    source: held.source,
+                    machine: held.machine,
+                    body: held.body.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn me(session: &Session<'_>, machines: &BTreeMap<Actor, [u8; 16]>) -> Result<[u8; 16]> {

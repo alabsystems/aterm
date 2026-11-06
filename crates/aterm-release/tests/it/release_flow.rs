@@ -3425,6 +3425,52 @@ fn the_release_waits_for_a_deployed_and_verified_website_without_rebuilding() {
 }
 
 #[test]
+fn an_old_site_fact_cannot_skip_tap_alignment_on_resume() {
+    let mut w = World::new();
+    assert_eq!(w.run(bump()).0, 0);
+    let mut journal = w.journal().unwrap();
+    assert!(journal.has("tap-aligned"));
+    journal.done.retain(|fact| fact != "tap-aligned");
+    assert!(journal.has("after-cut") && journal.has("check"));
+    assert!(
+        !journal.finished(),
+        "a historical website/check fact cannot prove tap delivery"
+    );
+    journal.save(&w.release_dir().join(JOURNAL_FILE)).unwrap();
+    w.after_cut = Err(Refusal::new(
+        "tap cohort changed; nothing changed",
+        "retry after-cut",
+    ));
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 1);
+    assert_eq!(w.count("after-cut 0.6.0"), 1);
+    assert!(!w.journal().unwrap().has("tap-aligned"));
+    for work in [
+        "reserve",
+        "build",
+        "verify",
+        "publish",
+        "cut",
+        "land-fixtures",
+    ] {
+        assert_eq!(w.count(work), 0, "{work}: {:?}", w.calls);
+    }
+    w.after_cut = Ok("site and guarded tap align".into());
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0);
+    assert_eq!(w.count("after-cut 0.6.0"), 1);
+    assert!(w.journal().unwrap().has("tap-aligned"));
+    assert!(w.journal().unwrap().finished());
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0);
+    assert_eq!(
+        w.count("after-cut 0.6.0"),
+        0,
+        "completed alignment is resumable"
+    );
+}
+
+#[test]
 fn an_old_deferred_website_is_repaired_before_the_release_is_complete() {
     let mut w = World::new();
     assert_eq!(w.run(bump()).0, 0);

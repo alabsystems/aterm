@@ -489,7 +489,9 @@ REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
   condition (`not-enrolled`, `signed-out`, `limited until <time>`, `low`, `usable`, or
   `unseen`), its mark (`active`, `active:unproven`, `pinned`, or `-`), `offer:`, `credits:`
   and `warned:` where they apply, `on:` (its sessions, or `-`), and `login:` where it
-  applies; then `next:` and `not next:`.
+  applies; then `next:` and `not next:`. For Claude Code `next:` is the row a rotation moves a
+  session to, so one more line says what a worker aterm starts takes: a row, or no row where
+  no row lists this machine's own login (`--json`: `next.worker`).
   - Under `early` (default), the supervisor rotates sessions at turn end off a limited or
     `low` account (>=90% 5h or >=98% week with >15m to reset, or carried by usage credits),
     and probes `/usage` on idle full-screen sessions (at most once per 3m per account).
@@ -5489,11 +5491,16 @@ const DISK_WHY_ROWS: usize = 24;
 /// scan, whose `disk-free` rows are not the rule's own; `--json` prints the lease, then the rows
 /// verbatim.
 fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    use aterm_codec::tty::write_line;
+
     let path = env.disk_ledger();
     let ledger = match tail_lines(&path, DISK_WHY_SCAN) {
         Ok(rows) => rows,
         Err(e) => {
-            let _ = writeln!(err, "aterm harness disk why: {}: {e}", path.display());
+            let _ = write_line(
+                err,
+                format_args!("aterm harness disk why: {}: {e}", path.display()),
+            );
             return ExitCode::from(1);
         }
     };
@@ -5507,7 +5514,10 @@ fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write)
         Ok(lease) => lease,
         Err(e) => {
             let path = env.state.join(disk::ask::LEASE_FILE);
-            let _ = writeln!(err, "aterm harness disk why: {}: {e}", path.display());
+            let _ = write_line(
+                err,
+                format_args!("aterm harness disk why: {}: {e}", path.display()),
+            );
             return ExitCode::from(1);
         }
     };
@@ -5519,15 +5529,15 @@ fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write)
             }
         } else {
             for line in disk::ask::why_lines(&lease, &rows, &ledger, env.now.saturating_mul(1000)) {
-                writeln!(out, "{line}")?;
+                write_line(out, format_args!("{line}"))?;
             }
         }
         out.flush()
     })();
     if let Err(error) = written {
-        let _ = writeln!(
+        let _ = write_line(
             err,
-            "aterm harness disk why: could not write results: {error}"
+            format_args!("aterm harness disk why: could not write results: {error}"),
         );
         return ExitCode::from(1);
     }
@@ -5577,17 +5587,21 @@ fn run_disk_free_with(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    use aterm_codec::tty::write_line;
+
     let Some(home) = env.home.as_deref() else {
-        let _ = writeln!(
+        let _ = write_line(
             err,
-            "aterm harness disk free: the home folder is unknown, so no cache root is placed and \
-             nothing is removed"
+            format_args!(
+                "aterm harness disk free: the home folder is unknown, so no cache root is placed and \
+                 nothing is removed"
+            ),
         );
         return ExitCode::from(1);
     };
     let reading = disk_config(env);
     for note in &reading.notes {
-        let _ = writeln!(err, "aterm harness disk free: {note}");
+        let _ = write_line(err, format_args!("aterm harness disk free: {note}"));
     }
     let world = disk::free::World {
         home,
@@ -5598,10 +5612,12 @@ fn run_disk_free_with(
         sid: &env.sid,
     };
     if ask.dry_run && !world.grant() {
-        let _ = writeln!(
+        let _ = write_line(
             err,
-            "aterm harness disk free: {}; without --dry-run every path is refused",
-            disk::free::GRANT_OFF
+            format_args!(
+                "aterm harness disk free: {}; without --dry-run every path is refused",
+                disk::free::GRANT_OFF
+            ),
         );
     }
     let mut sink = io::sink();
@@ -5631,18 +5647,18 @@ fn run_disk_free_with(
                 let json = aterm_json::to_string(&value).map_err(io::Error::other)?;
                 writeln!(out, "{json}")?;
             } else {
-                writeln!(out, "{}", o.line())?;
+                write_line(out, format_args!("{}", o.line()))?;
             }
         }
         if !ask.json {
-            writeln!(out, "{}", summary.line(ask.dry_run))?;
+            write_line(out, format_args!("{}", summary.line(ask.dry_run)))?;
         }
         out.flush()
     })();
     if let Err(error) = written {
-        let _ = writeln!(
+        let _ = write_line(
             err,
-            "aterm harness disk free: could not write results: {error}"
+            format_args!("aterm harness disk free: could not write results: {error}"),
         );
         return ExitCode::from(1);
     }
@@ -5920,6 +5936,9 @@ thread_local! {
 #[path = "cli_disk_output.rs"]
 mod disk_output;
 
+#[path = "cli_disk_diagnostics.rs"]
+mod disk_diagnostics;
+
 fn run_disk(
     env: &Env,
     targets: &[PathBuf],
@@ -5941,7 +5960,7 @@ fn run_disk(
         ..
     } = disk_config(env);
     for note in &notes {
-        let _ = writeln!(err, "aterm harness disk: {note}");
+        disk_diagnostics::config_note(note, err);
     }
     let table = aterm_sysprobe::volumes::table();
     let reading = roots
@@ -5964,11 +5983,7 @@ fn run_disk(
         let _ = std::fs::create_dir_all(dir);
     }
     if let Err(e) = bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS) {
-        let _ = writeln!(
-            err,
-            "aterm harness disk: cannot cut {} back: {e}",
-            path.display()
-        );
+        disk_diagnostics::ledger_cut_error(&path, &e, err);
     }
     let mut journal = Journal::open(Some(&path), sid, err);
     journal.append_raw(&disk::report_row(env.now, &env.sid, &rep), err);
@@ -9038,23 +9053,38 @@ pub struct SurveyAccount {
     pub label: String,
     /// Its order here: preferred on this Mac, or the pool (an order, never a limit).
     pub class: Class,
-    /// Its login is made on this machine.
+    /// Its login counts as made on this machine, as a launch judges it ([`accounts::enrolled_in`]).
+    /// A row with a directory of its own needs its login there. With none, another CLI's row needs
+    /// the login file of the CLI's default home, or a login the OS keyring holds, which counts as
+    /// made without being read, and Claude Code's counts with no look at a login, as
+    /// [`accounts::enrolled`] says, so this is no proof of one (`ATERM-KI-1105-9`).
     pub enrolled: bool,
     /// Its condition now; [`accounts::Condition::Limited`] names when its wall ends.
     pub condition: accounts::Condition,
     /// The five-hour window used, in percent, while it runs.
     pub five_hour_pct: Option<u32>,
-    /// When the five-hour window resets, while it runs, Unix seconds.
+    /// When the five-hour window resets, while it runs, Unix seconds. Where its read named no reset,
+    /// the latest it can: five hours from that read.
     pub five_hour_reset: Option<i64>,
+    /// A read named [`Self::five_hour_reset`]. One no read named is a bound for judging a wall, and
+    /// no reset to tell anyone else.
+    pub five_hour_reset_named: bool,
     /// The week used, in percent, while it runs.
     pub seven_day_pct: Option<u32>,
-    /// When the week resets, while it runs, Unix seconds.
+    /// When the week resets, while it runs, Unix seconds. Where its read named no reset, the latest
+    /// it can: a week from that read.
     pub week_reset: Option<i64>,
+    /// A read named [`Self::week_reset`], as [`Self::five_hour_reset_named`] says.
+    pub week_reset_named: bool,
     /// When a session here was last read running on it ([`accounts::Account::ran_at`]), Unix
     /// seconds.
     pub used_at: Option<i64>,
     /// When its figures were last read, Unix seconds ([`RowReading::read_at`]).
     pub read_at: Option<i64>,
+    /// A worker with no starter of its kind would start on it here
+    /// ([`super::accounts_pool::unstarted_launch_row`]). No row of a pool says so where that launch
+    /// is refused, runs on a login no row lists, or is Codex's on one no read here can show a wall on.
+    pub launch: bool,
     /// The lab registry's key for the account (`ac-<16 hex>`): the key the journal names it by
     /// ([`accounts::Account::pk`]), else its row's claims key ([`super::journal::account_key`]).
     /// `None` for a row with no claims email to key, such as the own login an empty roster lists.
@@ -9078,8 +9108,18 @@ struct RowReading {
     five_hour: Option<(u32, i64)>,
     /// The week that runs now.
     week: Option<(u32, i64)>,
+    /// A read named the end [`Self::five_hour`] holds, which is otherwise the latest it can be.
+    five_hour_named: bool,
+    /// A read named the end [`Self::week`] holds, which is otherwise the latest it can be.
+    week_named: bool,
     /// When the newest of these figures was read, Unix seconds.
     read_at: Option<i64>,
+    /// When the row's newest wall was seen, whether or not it still stands, Unix seconds. Only a
+    /// read after this says anything of room.
+    walled_at: Option<i64>,
+    /// When a wall its rollouts show ends, which may have passed, Unix seconds
+    /// ([`crate::ai::codex_limits::LoginWall`]).
+    wall_until: Option<i64>,
 }
 
 /// The newer of two read times.
@@ -9089,18 +9129,35 @@ fn newest_read(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 
 impl RowReading {
     /// `self` with what `sample` read, where that is newer: each window `sample` names replaces
-    /// the one held, and one it names no figure for stays (a weekly-only plan has no session).
+    /// the one held, and one it names no figure for stays (a weekly-only plan has no session). A
+    /// window read with no reset named runs at most its length from that read
+    /// ([`accounts::Sample::session`], [`accounts::Sample::week`]).
     fn with_newer(self, sample: &accounts::Sample, now: i64) -> Self {
         if self.read_at.is_some_and(|at| sample.at <= at) {
             return self;
         }
-        let window = |pct: Option<u32>, reset: Option<i64>, held: Option<(u32, i64)>| {
-            pct.zip(reset).filter(|(_, reset)| *reset > now).or(held)
-        };
+        let (session, week) = (sample.session(now), sample.week(now));
         Self {
-            five_hour: window(sample.session_pct, sample.session_reset, self.five_hour),
-            week: window(sample.week_pct, sample.week_reset, self.week),
+            five_hour_named: session
+                .map_or(self.five_hour_named, |_| sample.session_reset.is_some()),
+            week_named: week.map_or(self.week_named, |_| sample.week_reset.is_some()),
+            five_hour: session.or(self.five_hour),
+            week: week.or(self.week),
             read_at: Some(sample.at),
+            ..self
+        }
+    }
+
+    /// `self` with what the row's own rollouts hold, where that is newer ([`Self::with_newer`]), and
+    /// the wall they show.
+    fn with_rollouts(self, read: &crate::ai::codex_limits::LoginSample, now: i64) -> Self {
+        let wall = read
+            .wall
+            .filter(|_| self.read_at.is_none_or(|at| read.sample.at > at));
+        Self {
+            walled_at: newest_read(self.walled_at, wall.map(|wall| wall.at)),
+            wall_until: wall.map(|wall| wall.until),
+            ..self.with_newer(&read.sample, now)
         }
     }
 }
@@ -9108,12 +9165,13 @@ impl RowReading {
 /// A row's condition as a survey tells a dispatcher, from the harness's own (`base`) and what the
 /// row's figures say (`reading`) at `now`. The harness's word serves its own launches, which read
 /// the row they start on; a survey reads none ([`super::provider_read`]), so it says how far its
-/// figures can be trusted. A window read full with its reset ahead is a wall, whether or not a
-/// wall was written: a worker sent there stops at once, so it stays `limited` however old the
-/// reading. A row called `usable` on no reading, or on
-/// one older than [`SURVEY_READ_FRESH_S`], is `unseen`, since what it says of the row may have
-/// stopped being true at any point since. Not enrolled, signed out and a written wall stand, and
-/// so does `low`, which a read showed. A row its own rollouts read lately is `usable`.
+/// figures can be trusted. A window read full is a wall whether or not a wall was written, and so
+/// is one its rollouts show of any other kind, or a refusal: a worker sent there stops at once, so
+/// it stays `limited` until that wall ends, however old the reading. A row called `usable` on no
+/// reading, on one older than [`SURVEY_READ_FRESH_S`], or on one no newer than its newest wall,
+/// lapsed or not, is `unseen`, since no read says what became of that wall. Not enrolled, signed out
+/// and a written wall stand, and so does `low`, which a read showed. A row its own rollouts read
+/// lately, since any wall, is `usable`.
 fn survey_condition(
     base: accounts::Condition,
     reading: &RowReading,
@@ -9131,15 +9189,17 @@ fn survey_condition(
         .flatten()
         .filter(|&(pct, reset)| pct >= 100 && reset > now)
         .map(|(_, reset)| reset)
+        .chain(reading.wall_until.filter(|until| *until > now))
         .max();
     if let Some(reset) = spent {
         return Condition::Limited {
             until: reset.saturating_add(accounts::RESET_GRACE_S),
         };
     }
-    let fresh = reading
-        .read_at
-        .is_some_and(|at| now.saturating_sub(at) <= SURVEY_READ_FRESH_S);
+    let fresh = reading.read_at.is_some_and(|at| {
+        now.saturating_sub(at) <= SURVEY_READ_FRESH_S
+            && reading.walled_at.is_none_or(|walled| at > walled)
+    });
     match (base, fresh) {
         (Condition::Usable, false) => Condition::Unseen,
         (Condition::Unseen, true) => Condition::Usable,
@@ -9163,7 +9223,7 @@ fn row_rollout_sample(
     alone: bool,
     since: Option<i64>,
     now: i64,
-) -> Option<accounts::Sample> {
+) -> Option<crate::ai::codex_limits::LoginSample> {
     if !alone {
         return None;
     }
@@ -9242,9 +9302,10 @@ impl PoolMoves {
 /// beside `config` (`accounts.toml`, `accounts-<cli>.toml`) bound to its logins, the store under
 /// `harness` (another CLI's keeps its logins under `home`), the own login alone where Claude Code's
 /// roster lists none and its tap read it, and each row's condition ([`survey_condition`]), windows
-/// and last use at `now`. Reads no provider's usage: what it holds beside the records is what the
-/// sessions of the one login enrolled here wrote ([`row_rollout_sample`]). Each row's plan is
-/// the one the report names, from the stats series and the logins beside the records.
+/// and last use at `now`, and which row a launch would start on under `[harness] accounts`, the
+/// owner's pin and the program a launch runs. Reads no provider's usage: what it holds beside the
+/// records is what the sessions of the one login enrolled here wrote ([`row_rollout_sample`]). Each
+/// row's plan is the one the report names, from the stats series and the logins beside the records.
 /// # Errors
 /// The roster path is unknown, another CLI's `home` is, or the roster or account records could
 /// not be read.
@@ -9284,9 +9345,27 @@ pub fn survey_accounts(
         .tail(accounts::LEDGER_KEEP_ROWS)
         .ok()
         .map(|events| PoolMoves::of(&events));
-    let enrolled = accounts::enrolled_for(cli, &roster);
-    let is_here = |row: &accounts::Row| row.dir.is_none() || enrolled.contains(&row.label);
+    // A launch judges a row by `enrolled_in`. A login the OS keyring holds is in no file it could
+    // find, and that launch takes no row and judges none, so it counts as made.
+    let keyring = home.is_some_and(|home| super::accounts_pool::keyring_held_in(cli, home));
+    let enrolled = if keyring {
+        accounts::enrolled_for(cli, &roster)
+    } else {
+        enrolled_under(cli, &roster, home)
+    };
+    let is_here = |row: &accounts::Row| enrolled.contains(&row.label);
     let alone = roster.rows.iter().filter(|row| is_here(row)).count() == 1;
+    let (policy, _) = SupervisorConfig::from_path(Some(config));
+    let program = (cli == Cli::Codex).then(super::worker::codex_launch_program);
+    let launch = super::accounts_pool::unstarted_launch_row(
+        (cli, keyring, policy.accounts_for(cli.program())),
+        &roster,
+        &state,
+        &enrolled,
+        program.as_deref(),
+        now,
+    )
+    .map(|row| row.label.as_str());
     // The stats series is Claude Code's alone (its footer writes the `plan` rows), and its files
     // are named by label, which another CLI's roster may share.
     let series = if cli == Cli::Claude {
@@ -9317,9 +9396,27 @@ pub fn survey_accounts(
                 .filter(|f| since_pin(f.at));
             let week = current_account_window(&windows, accounts::WEEK_LIMIT, now)
                 .filter(|f| since_pin(f.at));
+            let unnamed = account.unnamed_windows(now);
+            // Whichever was read last speaks for a window: a sample that named no reset, or a
+            // figure, which names one.
+            let held_window = |unnamed: Option<(u32, i64)>, fig: Option<&accounts::WindowFig>| {
+                let figure = fig.map(|f| (f.whole(), f.reset));
+                let since_sample = fig
+                    .zip(account.sample.as_ref())
+                    .is_some_and(|(f, sample)| f.at > sample.at);
+                if since_sample || unnamed.is_none() {
+                    (figure, figure.is_some())
+                } else {
+                    (unnamed, false)
+                }
+            };
+            let (five_hour, five_hour_named) = held_window(unnamed.session, session);
+            let (held_week, week_named) = held_window(unnamed.week, week);
             let held = RowReading {
-                five_hour: session.map(|f| (f.whole(), f.reset)),
-                week: week.map(|f| (f.whole(), f.reset)),
+                five_hour,
+                week: held_week,
+                five_hour_named,
+                week_named,
                 read_at: newest_read(
                     newest_read(session.map(|f| f.at), week.map(|f| f.at)),
                     account
@@ -9328,13 +9425,15 @@ pub fn survey_accounts(
                         .map(|sample| sample.at)
                         .filter(|at| since_pin(*at)),
                 ),
+                walled_at: account.walled_at().filter(|at| since_pin(*at)),
+                wall_until: None,
             };
             let rollouts = here
                 .then(|| row_rollout_sample(cli, row, home, alone, account.room_since(), now))
                 .flatten();
             let reading = rollouts
                 .as_ref()
-                .map_or(held, |sample| held.with_newer(sample, now));
+                .map_or(held, |read| held.with_rollouts(read, now));
             let base = accounts::condition(row, &state, here, now);
             let plan = plans.get(&row.label);
             SurveyAccount {
@@ -9344,10 +9443,13 @@ pub fn survey_accounts(
                 condition: survey_condition(base, &reading, now),
                 five_hour_pct: reading.five_hour.map(|(pct, _)| pct),
                 five_hour_reset: reading.five_hour.map(|(_, reset)| reset),
+                five_hour_reset_named: reading.five_hour_named,
                 seven_day_pct: reading.week.map(|(pct, _)| pct),
                 week_reset: reading.week.map(|(_, reset)| reset),
+                week_reset_named: reading.week_named,
                 used_at: account.ran_at,
                 read_at: reading.read_at,
+                launch: launch == Some(row.label.as_str()),
                 pk: account.pk.clone().or_else(|| {
                     super::journal::account_key(cli, row).map(|key| key.as_str().to_owned())
                 }),
@@ -9435,6 +9537,10 @@ struct AccountsNext {
     /// Why no row is next, where a rule above narrows the pick and leaves none, and none waits
     /// for a wall to end.
     none: Option<String>,
+    /// What a Claude Code worker aterm starts takes, in the report's words
+    /// ([`claude_worker_words`]): `to` there is the row a rotation moves a session to, which a
+    /// launch need not take.
+    worker: Option<String>,
     /// For Codex, each row a session can run on and the row its weekly limit moves such a session
     /// to ([`wall_moves`]), which is not `to`: `to` is a new launch's.
     wall_moves: Vec<(String, String)>,
@@ -9716,7 +9822,8 @@ fn active_header_line(roster: &Roster, state: &accounts::State) -> String {
 /// known program, so none is not next for what the build it names would run (no `this Codex
 /// build:` line either). A live Codex session moves past its row at its weekly limit, which
 /// `next:` does not say: [`wall_moves`] does. A known identity contradiction in Codex's
-/// selected file-backed login withholds a launch on that login.
+/// selected file-backed login withholds a launch on that login. For Claude Code, whose `next:` is
+/// no launch's, it also says what a worker aterm starts takes ([`claude_worker_words`]).
 fn accounts_next(
     (cli, launch): (Cli, Launch<'_>),
     rotation: &Rotation,
@@ -9734,6 +9841,8 @@ fn accounts_next(
         next.to_note = None;
         next.wait_until = None;
         next.none = Some(not_installed_words(cli));
+    } else if cli == Cli::Claude {
+        next.worker = Some(claude_worker_words(rotation.mode, roster, state, now));
     }
     next.wall_moves = wall_moves((cli, launch), rotation, roster, state, enrolled, now);
     let login = rotation.default_login.as_deref();
@@ -10057,8 +10166,49 @@ fn own_login_words(roster: &Roster) -> String {
     }
 }
 
-/// A launch aterm makes of `cli`, in the report's words: Codex's are its workers; Grok Build and
-/// Kimi Code CLI start in no worker yet.
+/// What a Claude Code worker started plainly takes, in the report's words: what a survey says as
+/// `launch=` ([`super::accounts_pool::unstarted_launch_row`]), judged on the rows such a launch
+/// counts as enrolled ([`accounts::enrolled_for`]), which are not the report's
+/// ([`reported_enrolled`]). `next:` cannot say this: for Claude Code it names the row a rotation
+/// moves a session to. A launch of Claude Code is never refused for its pool.
+fn claude_worker_words(
+    mode: accounts::Mode,
+    roster: &Roster,
+    state: &accounts::State,
+    now: i64,
+) -> String {
+    let cli = Cli::Claude;
+    let a_launch = launch_words(cli);
+    let enrolled = accounts::enrolled_for(cli, roster);
+    let own_login = accounts::ProcessLogin::of_env(std::iter::empty());
+    let own = accounts::judged_label(roster, &own_login);
+    let row = super::accounts_pool::unstarted_launch_row(
+        (cli, false, mode),
+        roster,
+        state,
+        &enrolled,
+        None,
+        now,
+    );
+    match (row, own) {
+        (Some(row), Some(own)) if row.label != own => format!(
+            "{a_launch} takes `{}` for a plain start: rotation moves it off `{own}`, the row this \
+             machine's own login counts as",
+            row.label
+        ),
+        (Some(row), _) => format!(
+            "{a_launch} takes `{}`, the row this machine's own login counts as, for a plain start",
+            row.label
+        ),
+        (None, _) => format!(
+            "{a_launch} takes no row: it runs on the login its starter carries, {} for a plain one",
+            own_login_words(roster)
+        ),
+    }
+}
+
+/// A launch aterm makes of `cli`, in the report's words: Claude Code's and Codex's are their
+/// workers; Grok Build and Kimi Code CLI start in no worker yet.
 fn launch_words(cli: Cli) -> String {
     format!("a {}", launch_noun(cli))
 }
@@ -10066,7 +10216,7 @@ fn launch_words(cli: Cli) -> String {
 /// [`launch_words`] with no article, for "every …".
 fn launch_noun(cli: Cli) -> String {
     let product = cli.connector().product;
-    if cli == Cli::Codex {
+    if matches!(cli, Cli::Claude | Cli::Codex) {
         format!("{product} worker aterm starts")
     } else {
         format!("{product} launch aterm makes")
@@ -10991,6 +11141,9 @@ fn accounts_text(
             .collect();
         text.push_str(&format!("not next: {}\n", reasons.join("; ")));
     }
+    if let Some(worker) = &next.worker {
+        text.push_str(&format!("{worker}\n"));
+    }
     if let Some(why) = &next.only_default {
         text.push_str(&format!("this Codex build: {why}\n"));
     }
@@ -11337,6 +11490,9 @@ fn accounts_json(
                 .collect(),
         ),
     );
+    if let Some(worker) = &next.worker {
+        n.insert("worker".to_owned(), Value::from(worker.clone()));
+    }
     // A Codex build that runs only this machine's own login: why. Rotation off: what it leaves
     // a launch. Either, or a launch that takes no row of the pool: why no row is next, where none
     // is.

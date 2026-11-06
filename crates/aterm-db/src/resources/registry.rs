@@ -140,17 +140,17 @@ impl RequestRegistry {
                     }
                 } else if pin.is_none()
                     && directory
-                        .observe_table_if_exists(session, directory.catalog_scope())?
-                        .is_some()
-                    && directory
-                        .snapshot_existing(session)?
-                        .entries
-                        .get(&descriptor.scope.digest())
-                        .is_some_and(|entry| {
-                            entry
-                                .declarations
-                                .iter()
-                                .any(|d| d.actor == session.actor())
+                        .snapshot_existing_if_exists(session)?
+                        .is_some_and(|snapshot| {
+                            snapshot
+                                .entries
+                                .get(&descriptor.scope.digest())
+                                .is_some_and(|entry| {
+                                    entry
+                                        .declarations
+                                        .iter()
+                                        .any(|d| d.actor == session.actor())
+                                })
                         })
                 {
                     return Err(Error::new(

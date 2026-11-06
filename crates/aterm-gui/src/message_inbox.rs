@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aterm_messages::{Message, WallStamp};
 
-/// Maximum messages buffered per lane between event-loop parks.
+/// Maximum messages buffered per lane between event-loop parks. A lane's latest restored-agents
+/// row is never dropped for it ([`queue_restored_row`]), so that row can sit one above it.
 pub(crate) const INBOX_CAP: usize = 32;
 
 /// Queued message paired with its ingress wall-clock timestamp.
@@ -167,24 +168,33 @@ pub(crate) fn queue_message_in(lane: u64, message: Message) {
     }
 }
 
-/// Queue a restored-agent summary row in `lane` for the next event-loop park.
+/// Queue a restored-agent summary row in `lane` for the next event-loop park. At [`INBOX_CAP`] the
+/// lane's latest row is still kept: a row with a later `seq` names every tab still missed
+/// ([`crate::harness_host::RestoredRow`]), so the lane's earlier rows give way to it, and only a
+/// row older than one already queued is dropped.
 pub(crate) fn queue_restored_row(lane: u64, row: crate::harness_host::RestoredRow) {
     let message = row.message().normalized();
     let Ok(mut q) = INBOX.lock() else {
         return; // a poisoned inbox must never take the app down
     };
-    let held = q.iter().filter(|(at, _)| *at == lane).count();
-    if held < INBOX_CAP {
-        q.push((
-            lane,
-            InboxMessage {
-                message,
-                stamp: crate::messages_host::wall_stamp_now(),
-                restored: Some(row),
-            },
-        ));
-        INBOX_PENDING.store(true, Ordering::Release);
+    if q.iter().filter(|(at, _)| *at == lane).count() >= INBOX_CAP {
+        let later = q.iter().any(|(at, m)| {
+            *at == lane && m.restored.as_ref().is_some_and(|held| held.seq > row.seq)
+        });
+        if later {
+            return;
+        }
+        q.retain(|(at, m)| *at != lane || m.restored.is_none());
     }
+    q.push((
+        lane,
+        InboxMessage {
+            message,
+            stamp: crate::messages_host::wall_stamp_now(),
+            restored: Some(row),
+        },
+    ));
+    INBOX_PENDING.store(true, Ordering::Release);
 }
 
 /// Drain all queued messages for the calling thread's lane.
@@ -374,5 +384,53 @@ mod tests {
             ["before the poison", "after the poison"],
             "what the poison stranded comes out ahead of what followed it"
         );
+    }
+
+    fn row(seq: u64) -> crate::harness_host::RestoredRow {
+        crate::harness_host::RestoredRow {
+            seq,
+            lines: Vec::new(),
+            log: None,
+        }
+    }
+
+    fn rows_in(taken: &[InboxMessage]) -> Vec<u64> {
+        taken
+            .iter()
+            .filter_map(|m| m.restored.as_ref().map(|r| r.seq))
+            .collect()
+    }
+
+    /// However many rows are said between two parks, and however full the lane is, the window
+    /// gets the latest, the one that names every tab, and no other message gives way to it.
+    #[test]
+    fn the_latest_restored_row_always_reaches_the_window() {
+        let _lane = own_lane_for_test();
+        let lane = current_lane();
+        let many = u64::try_from(INBOX_CAP * 2).expect("small");
+        for seq in 1..=many {
+            queue_restored_row(lane, row(seq));
+        }
+        let taken = take_queued();
+        assert_eq!(
+            rows_in(&taken).last(),
+            Some(&many),
+            "more rows than the cap"
+        );
+        assert!(taken.len() <= INBOX_CAP, "the cap holds: {}", taken.len());
+
+        for i in 0..INBOX_CAP {
+            queue_message(msg(&format!("warning {i}")));
+        }
+        queue_restored_row(lane, row(20));
+        queue_restored_row(lane, row(22));
+        queue_restored_row(lane, row(21));
+        let taken = take_queued();
+        assert_eq!(
+            rows_in(&taken),
+            [22],
+            "a lane full of other messages keeps only the latest, whichever was said last"
+        );
+        assert_eq!(taken.len(), INBOX_CAP + 1, "no message gave way to the row");
     }
 }

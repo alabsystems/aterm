@@ -296,28 +296,118 @@ fn excerpt_token(text: Option<&str>) -> String {
     excerpt_plain(text).map_or_else(|| "-".to_string(), |text| pct_encode(&text))
 }
 
-/// The last words of the session behind `h`, read here in the process and redacted and capped as a
-/// `survey` row's are: what its agent said (at the end, once `finished`, as `said=` does), else
-/// what it is doing, else a shell's bottom rows.
+/// The words of `excerpts` a step reads ([`last_words`]), in [`Word`]'s order: what the agent
+/// said, as it goes and at the end, and what it is doing.
+pub(crate) fn excerpt_words(excerpts: &Excerpts) -> [Option<&str>; 3] {
+    [
+        excerpts.said.as_deref(),
+        excerpts.said_end.as_deref(),
+        excerpts.doing.as_deref(),
+    ]
+}
+
+/// One of the words of [`excerpt_words`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Word {
+    Said = 0,
+    SaidEnd = 1,
+    Doing = 2,
+}
+
+/// WHEN EACH OF AN AGENT'S WORDS ([`excerpt_words`]) LAST CHANGED AS ATERM READ THEM, on the wall
+/// clock ([`aterm_gui_timing::wall_ms`]), each word apart: what a step's words are as new as
+/// where their row carries no time of its own ([`Excerpts::said_at_ms`]). A word that stayed
+/// keeps its stamp while another moves, so a tool call that ends moves `doing` and leaves `said`
+/// as old as it was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WordsRead([u64; 3]);
+
+impl WordsRead {
+    /// Stamp `now` on each word of `read` that is not what `held` had for it (`None`: nothing
+    /// held, or what another process said).
+    pub(crate) fn note(
+        &mut self,
+        held: Option<[Option<&str>; 3]>,
+        read: Option<[Option<&str>; 3]>,
+        now: u64,
+    ) {
+        let [held, read] = [held, read].map(|words| words.unwrap_or_default());
+        for ((at, held), read) in self.0.iter_mut().zip(held).zip(read) {
+            if held != read {
+                *at = now;
+            }
+        }
+    }
+
+    /// When `word` last changed as read (`0`: never).
+    pub(crate) const fn at(&self, word: Word) -> u64 {
+        self.0[word as usize]
+    }
+}
+
+/// THE STEP OF THE SESSION BEHIND `h`, what a worker's row and a survey row's `step=` show
+/// (`docs/DESIGN-workers-subagents-2026-11-04.md` §8, Fabric): its last topic post
+/// ([`crate::fabric::SessionFabric::last_topic_post`]) where that is newer than its screen's
+/// words, else those words ([`screen_words`]); redacted and capped as a `survey` row's are.
 pub(crate) fn last_words(h: &SessionHandle, finished: bool) -> Option<String> {
-    let excerpts = {
+    step_of(
+        screen_words(h, finished),
+        h.ctx.fabric.last_topic_post().as_ref(),
+    )
+}
+
+/// [`last_words`] of what was read: `words` with when they were written, on the wall clock
+/// ([`aterm_gui_timing::wall_ms`]), and the session's last topic post. The post wins only where
+/// it is newer than the words, or there are none; a tie is the screen's.
+pub(crate) fn step_of(
+    words: Option<(String, u64)>,
+    topic: Option<&crate::fabric::TopicPost>,
+) -> Option<String> {
+    let posted = topic
+        .filter(|post| words.as_ref().is_none_or(|(_, at)| post.at_ms > *at))
+        .and_then(|post| excerpt_plain(Some(&excerpt::fold(&post.text))));
+    posted.or_else(|| words.map(|(words, _)| words))
+}
+
+/// The last words of the session behind `h` on its screen, read here in the process and redacted
+/// and capped as a `survey` row's are, with when they were written: what its agent said (at the
+/// end, once `finished`, as `said=` does), as of the row its transcript or rollout stamped it
+/// with, else as of the read that first saw those words; else what it is doing, as of that read;
+/// else a shell's bottom rows, as of the feed that last moved the screen.
+fn screen_words(h: &SessionHandle, finished: bool) -> Option<(String, u64)> {
+    let (excerpts, read) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        timeline
-            .claude_excerpts()
-            .cloned()
-            .or_else(|| timeline.codex_survey().map(CodexSurvey::excerpts))
+        (
+            timeline
+                .claude_excerpts()
+                .map(|e| e.excerpts.clone())
+                .or_else(|| timeline.codex_survey().map(|s| s.facts.excerpts.clone())),
+            timeline.words_read(),
+        )
     };
     if let Some(excerpts) = &excerpts {
         let said = if finished {
-            excerpts.excerpts.said_end.as_deref()
+            (excerpts.said_end.as_deref(), Word::SaidEnd)
         } else {
-            excerpts.excerpts.said.as_deref()
+            (excerpts.said.as_deref(), Word::Said)
         };
-        if let Some(words) = excerpt_plain(said.or(excerpts.excerpts.doing.as_deref())) {
-            return Some(words);
+        let written = |word: Word| match word {
+            Word::Said | Word::SaidEnd => excerpts
+                .said_at_ms
+                .and_then(|at| u64::try_from(at).ok())
+                .unwrap_or_else(|| read.at(word)),
+            Word::Doing => read.at(word),
+        };
+        let (words, word) = match said {
+            (Some(said), word) => (Some(said), word),
+            (None, _) => (excerpts.doing.as_deref(), Word::Doing),
+        };
+        if let Some(words) = excerpt_plain(words) {
+            return Some((words, written(word)));
         }
     }
     excerpt_plain(engine_read(h, true).rows.as_deref())
+        .map(|rows| (rows, h.ctx.screen_moves.moved_ms()))
 }
 
 fn branch_token(text: Option<&str>) -> String {
@@ -884,9 +974,11 @@ fn session_row(
                 e.excerpts.said.as_deref()
             }
         });
+        // A worker's step, as its Workers row shows it: none for a session with no task.
+        let step = task.as_ref().and_then(|_| last_words(h, finished));
         let _ = write!(
             row,
-            " user_title={} title={} cwd={} branch={} prompt={} said={} cmd={} rows={} need_ids={}",
+            " user_title={} title={} cwd={} branch={} prompt={} said={} cmd={} rows={} need_ids={} step={}",
             excerpt_token(user_title.as_deref()),
             excerpt_token(engine.title.as_deref()),
             excerpt_token(cwd.as_deref()),
@@ -901,6 +993,7 @@ fn session_row(
             excerpt_token(engine.command.as_deref()),
             excerpt_token(engine.rows.as_deref()),
             need_ids.as_deref().unwrap_or("-"),
+            word_token(step.as_deref()),
         );
         if let Some(work) = &work {
             row.push(' ');

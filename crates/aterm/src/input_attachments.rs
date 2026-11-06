@@ -3,6 +3,7 @@
 
 //! Activate accepted keyboard defaults when this login gets a new HID service.
 
+use aterm_cli::macos_doctor::{InputServiceSet, InputSetupScope};
 use aterm_secrets::converge::{Last, RunnerRetry};
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -14,7 +15,86 @@ struct Keeper {
     retry: RunnerRetry,
 }
 
+#[derive(Default)]
+struct Inputs {
+    keeper: Keeper,
+    pending: Option<(u64, InputServiceSet)>,
+}
+
+impl Inputs {
+    fn round(
+        &mut self,
+        at_console: bool,
+        now_ms: u64,
+        scope: impl FnOnce() -> Result<InputSetupScope, String>,
+        services: impl FnOnce() -> Result<Vec<u64>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+        pending_changed: Option<&dyn Fn()>,
+    ) -> Result<bool, String> {
+        if !at_console {
+            *self = Self::default();
+            return Ok(false);
+        }
+        match scope()? {
+            InputSetupScope::Inactive => {
+                *self = Self::default();
+                Ok(false)
+            }
+            InputSetupScope::Applied(revision) => {
+                self.pending = None;
+                self.keeper
+                    .round(now_ms, Some(revision), services, activate)
+            }
+            InputSetupScope::Pending(revision) => {
+                self.keeper = Keeper::default();
+                let Some(changed) = pending_changed else {
+                    self.pending = None;
+                    return Ok(false);
+                };
+                let current = (revision, InputServiceSet::new(services()?)?);
+                if self.pending.as_ref() != Some(&current) {
+                    self.pending = Some(current);
+                    // The first sample also nudges: a device can arrive after the parked pass
+                    // read its mark but before this observer saw its pending scope. Only the
+                    // worker's before/current facts may turn this nudge into another pass.
+                    changed();
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConsoleReturn {
+    away: bool,
+    pending: bool,
+}
+
+impl ConsoleReturn {
+    fn recover(
+        &mut self,
+        at_console: bool,
+        wake: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !at_console {
+            self.away = true;
+            self.pending = false;
+            return Ok(());
+        }
+        self.pending |= std::mem::take(&mut self.away);
+        if self.pending {
+            // A setup pass can hold its records as the console returns. Keep this one
+            // observation until its current scope can be read, rather than lose the return.
+            wake()?;
+            self.pending = false;
+        }
+        Ok(())
+    }
+}
+
 impl Keeper {
+    #[cfg(test)]
     fn round_at_console(
         &mut self,
         sys: &dyn aterm_machines::port::System,
@@ -23,7 +103,25 @@ impl Keeper {
         services: impl FnOnce() -> Result<Vec<u64>, String>,
         activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
     ) -> Result<bool, String> {
-        if sys.euid() == 0 || aterm_machines::console::remote(sys) {
+        self.round_with_console(
+            sys.euid() != 0 && !aterm_machines::console::remote(sys),
+            now_ms,
+            revision,
+            services,
+            activate,
+        )
+    }
+
+    #[cfg(test)]
+    fn round_with_console(
+        &mut self,
+        at_console: bool,
+        now_ms: u64,
+        revision: impl FnOnce() -> Result<Option<u64>, String>,
+        services: impl FnOnce() -> Result<Vec<u64>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+    ) -> Result<bool, String> {
+        if !at_console {
             *self = Self::default();
             return Ok(false);
         }
@@ -41,26 +139,17 @@ impl Keeper {
             *self = Self::default();
             return Ok(false);
         };
-        let mut services = services()?;
-        services.sort_unstable();
-        if services.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err("duplicate keyboard service identity".into());
-        }
+        let services = InputServiceSet::new(services()?)?.into_vec();
         let current = (revision, services);
         if self.settled.as_ref() == Some(&current) {
             return Ok(false);
         }
-        let new: Vec<_> = current
-            .1
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.settled.as_ref().is_none_or(|(before, ids)| {
-                    *before != revision || ids.binary_search(id).is_err()
-                })
-            })
-            .collect();
-        if new.is_empty() {
+        let is_new = |id: &u64| {
+            self.settled
+                .as_ref()
+                .is_none_or(|(before, ids)| *before != revision || ids.binary_search(id).is_err())
+        };
+        if !current.1.iter().any(&is_new) {
             self.settled = Some(current);
             return Ok(false);
         }
@@ -74,6 +163,7 @@ impl Keeper {
         {
             return Ok(false);
         }
+        let new: Vec<_> = current.1.iter().copied().filter(is_new).collect();
         self.retry.started();
         let result = activate(revision, &new);
         self.retry.reaped(
@@ -127,7 +217,9 @@ fn node_serve_with<'a, R>(
 }
 
 fn spawn_background() {
-    start_background_with(&aterm_machines::port::Live::new(), || spawn_with(|| {}));
+    start_background_with(&aterm_machines::port::Live::new(), || {
+        spawn_with(|| {}, None, None)
+    });
 }
 
 fn start_background_with(sys: &dyn aterm_machines::port::System, start: impl FnOnce()) {
@@ -139,38 +231,65 @@ fn start_background_with(sys: &dyn aterm_machines::port::System, start: impl FnO
 }
 
 pub(super) fn spawn() {
-    spawn_with(|| {
-        super::request_observation(
-            None,
-            vec![aterm_types::macos_setup::Subject::Setting(
-                aterm_types::macos_setup::Setting::CapsLock,
-            )],
-            false,
-        );
-    });
+    spawn_with(
+        || {
+            super::request_observation(
+                None,
+                vec![aterm_types::macos_setup::Subject::Setting(
+                    aterm_types::macos_setup::Setting::CapsLock,
+                )],
+                false,
+            );
+        },
+        Some(super::wake_setup_for_console),
+        Some(super::wake_setup_facts),
+    );
 }
 
-fn spawn_with(changed: fn()) {
+fn spawn_with(
+    changed: fn(),
+    console_return: Option<fn() -> Result<(), String>>,
+    pending_changed: Option<fn()>,
+) {
     if aterm_types::dirs::runs_under_private_state_root() || std::env::var_os("CI").is_some() {
         return;
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| spawn_worker(changed));
+    STARTED.call_once(|| spawn_worker(changed, console_return, pending_changed));
 }
 
-fn spawn_worker(changed: fn()) {
+fn spawn_worker(
+    changed: fn(),
+    console_return: Option<fn() -> Result<(), String>>,
+    pending_changed: Option<fn()>,
+) {
     let worker = move || {
         use aterm_machines::port::System as _;
         let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
         let clock = std::time::Instant::now();
         let sys = aterm_machines::port::Live::new();
-        let mut keeper = Keeper::default();
+        let mut inputs = Inputs::default();
+        let mut console = ConsoleReturn::default();
         let mut said = None;
         loop {
-            let result = keeper.round_at_console(
-                &sys,
+            // One current console sample and one canonical input-scope read select accepted
+            // activation or the GUI's narrowly scoped observation of still-owed Caps work.
+            let at_console = sys.euid() != 0 && !aterm_machines::console::remote(&sys);
+            if let Some(wake) = console_return {
+                let _ = console.recover(at_console, wake);
+            }
+            let result = inputs.round(
+                at_console,
                 u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
-                aterm_cli::macos_doctor::input_activation_revision,
+                || {
+                    if pending_changed.is_some() {
+                        aterm_cli::macos_doctor::input_setup_scope()
+                    } else {
+                        aterm_cli::macos_doctor::input_activation_revision().map(|revision| {
+                            revision.map_or(InputSetupScope::Inactive, InputSetupScope::Applied)
+                        })
+                    }
+                },
                 || sys.keyboard_service_ids(),
                 |revision, ids| {
                     aterm_cli::macos_doctor::activate_input_attachments(
@@ -179,6 +298,7 @@ fn spawn_worker(changed: fn()) {
                         super::setup_stop_requested,
                     )
                 },
+                pending_changed.as_ref().map(|wake| wake as &dyn Fn()),
             );
             match result {
                 Ok(true) => {
@@ -208,6 +328,150 @@ fn spawn_worker(changed: fn()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_first_caps_nudges_only_facts_for_its_actual_admitted_scope() {
+        use aterm_cli::macos_doctor::{
+            InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, input_setup_scope_at,
+        };
+        use aterm_types::macos_setup::{Plan, Selection, Setting};
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut selected = Selection::none();
+        selected.set(Setting::CapsLock, true);
+        let mut setup = InitialSetupAdmissionStopTest::startup(dir.path())
+            .unwrap()
+            .with_plan(Plan::from(selected));
+        let revision = setup
+            .persist(InitialSetupAdmissionFault::None)
+            .unwrap()
+            .unwrap();
+        let scope = || input_setup_scope_at(dir.path());
+        assert_eq!(scope().unwrap(), InputSetupScope::Pending(revision));
+        let wakes = crate::SetupWakes::new();
+        let changed = || wakes.raise_facts();
+        let mut inputs = Inputs::default();
+        let observe = |inputs: &mut Inputs, ids| {
+            inputs.round(
+                true,
+                0,
+                scope,
+                || Ok(ids),
+                |_, _| panic!("pending observation has no setter authority"),
+                Some(&changed),
+            )
+        };
+        let before = wakes.marks();
+        assert!(!observe(&mut inputs, vec![41]).unwrap());
+        let seeded = wakes.marks();
+        assert_ne!(
+            seeded.facts, before.facts,
+            "the first sample closes the pass/observer gap"
+        );
+        assert!(!seeded.refreshed_since(before));
+        assert!(!seeded.checked_since(before));
+        assert!(!observe(&mut inputs, vec![41]).unwrap());
+        assert_eq!(wakes.marks(), seeded, "unchanged samples owe no nudge");
+        assert!(!observe(&mut inputs, vec![42, 41]).unwrap());
+        let attached = wakes.marks();
+        assert_ne!(attached.facts, seeded.facts);
+        assert!(!attached.refreshed_since(before));
+        assert!(!observe(&mut inputs, vec![41, 42]).unwrap());
+        assert_eq!(
+            wakes.marks(),
+            attached,
+            "a different enumeration order is no new device"
+        );
+        assert!(observe(&mut inputs, vec![41, 41]).is_err());
+        assert_eq!(wakes.marks(), attached, "ambiguous IDs supply no fact");
+
+        // A new keyboard can already be present when this observer first sees pending setup.
+        let mut late = Inputs::default();
+        assert!(!observe(&mut late, vec![41, 42]).unwrap());
+        let first_after_attach = wakes.marks();
+        assert_ne!(first_after_attach.facts, attached.facts);
+        assert!(!first_after_attach.refreshed_since(before));
+        assert!(!first_after_attach.checked_since(before));
+
+        let mut headless = Inputs::default();
+        assert!(
+            !headless
+                .round(
+                    true,
+                    0,
+                    scope,
+                    || panic!("headless accepted-setting keeper polls no pending hardware"),
+                    |_, _| panic!("pending headless setup does not activate"),
+                    None
+                )
+                .unwrap()
+        );
+        assert!(
+            !inputs
+                .round(
+                    false,
+                    0,
+                    || panic!("another console reads no setup scope"),
+                    || panic!("another console reads no hardware"),
+                    |_, _| panic!("another console activates nothing"),
+                    Some(&changed)
+                )
+                .unwrap()
+        );
+        setup.stop_revision(revision).unwrap();
+        assert_eq!(scope().unwrap(), InputSetupScope::Inactive);
+        assert!(
+            !inputs
+                .round(
+                    true,
+                    0,
+                    scope,
+                    || panic!("Stop withdraws even pending hardware observation"),
+                    |_, _| panic!("Stop withdraws activation"),
+                    Some(&changed)
+                )
+                .unwrap()
+        );
+        assert_eq!(wakes.marks(), first_after_attach);
+    }
+
+    #[test]
+    fn a_console_return_reads_pending_setup_once_and_retains_only_an_unread_return() {
+        use std::cell::Cell;
+        let mut console = ConsoleReturn::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(())
+        };
+        console
+            .recover(true, || panic!("initial console ownership is no return"))
+            .unwrap();
+        console
+            .recover(false, || panic!("another console reads no setup scope"))
+            .unwrap();
+        assert!(
+            console
+                .recover(true, || Err("records held".into()))
+                .is_err()
+        );
+        console.recover(true, read).unwrap();
+        console
+            .recover(true, || panic!("stable ownership polls no setup records"))
+            .unwrap();
+        assert_eq!(reads.get(), 1);
+        console
+            .recover(false, || panic!("no console reads no setup scope"))
+            .unwrap();
+        console
+            .recover(false, || panic!("still no console"))
+            .unwrap();
+        console.recover(true, read).unwrap();
+        assert_eq!(reads.get(), 2);
+        console
+            .recover(true, || panic!("a handled return is spent"))
+            .unwrap();
+    }
 
     #[test]
     fn subscriber_start_keeps_inputs_before_watch_but_other_commands_only_dispatch() {
@@ -600,15 +864,18 @@ mod tests {
             },
         );
         let census = format!(
-            "Services:\n{:<12}{:<12}{:<24}Built-In\n{:<12}{:<12}{:<24}0\n{:<12}{:<12}{:<24}0\n\nDevices:\n",
+            "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n{:<12}{:<12}{:<16}{:<24}0\n{:<12}{:<12}{:<16}{:<24}0\n\nDevices:\n",
             "VendorID",
             "ProductID",
+            "RegistryID",
             "Product",
             "0x5ac",
             "0x378",
+            "0x2a",
             "Other keyboard",
             "0xfffe",
             "0xa9",
+            "0x29",
             "Fixture keyboard"
         );
         let available = Arc::new(AtomicBool::new(false));

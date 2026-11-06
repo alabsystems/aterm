@@ -687,6 +687,152 @@ fn a_told_fetch_whose_scan_runs_out_below_the_oldest_reads_on_to_the_held_mail()
 /// mail held below the base reads at its offset, the floor still refuses a read below it,
 /// `Last` answers, and the same rules set again keep the store whole and tick on. NC: a cut
 /// that carries nothing leaves no mail to read back.
+/// `r` with its mail rule (`/f/F/in/>`) forgetting (`Rule::forgetting`), the rest as they are.
+fn forgetting_mail(r: &Retention) -> Retention {
+    let rules = r
+        .rules()
+        .iter()
+        .map(|rule| match rule.filter() {
+            Some("/f/F/in/>") => rule.clone().forgetting(),
+            _ => rule.clone(),
+        })
+        .collect();
+    Retention::new(rules, r.default_rule().clone()).unwrap()
+}
+
+/// The subjects `Last` answers of `f`, in its order.
+fn last_subjects(log: &mut BrokerLog, f: &str) -> Vec<String> {
+    last_of(log, &filter(f), 64, 1_000)
+        .iter()
+        .map(|r| r.subject.clone())
+        .collect()
+}
+
+/// A FORGETTING RULE LETS A LANE GO once retention has given up every record of it, live and
+/// across reopens, on a log's own tick (`BrokerLog::retain_by_rules`, no writer thread, so
+/// every count is the tick's). Four mail lanes and a presence row, all producer 1's, then the
+/// bulk stream past its bytes, so the tick's cut passes every one: n1's mail its inbox read
+/// (given up at the cut), n2's unread (held), n3's read but the target of producer 7's
+/// pending will (registered before the cut, carried by it), n4's read once and then
+/// written again above the cut. The tick forgets n1's lane alone: `RetentionTick::forgotten`
+/// is 1, `Last` of the mail no longer answers it, producer 1's distinct subjects are one
+/// fewer. Once n2's inbox reads its mail, the next tick gives it up and forgets that lane too.
+/// The will's lane, the rewritten lane and the presence row stay, charged. A reopen reads
+/// the same `Last` and the same count (the marked retires replay over the rows the cut
+/// carried), and so does one after a later cut that passes the retire records themselves
+/// (the carried charges drop the forgotten lanes), where a tick forgets nothing more.
+///
+/// LIVE CONTROL (the same run, the rule not forgetting): every tick forgets nothing, every
+/// lane stays in `Last` and the count never falls, across both reopens.
+#[test]
+fn a_forgetting_rule_lets_a_lane_go_once_retention_gave_up_all_its_records() {
+    const MAIL3: &str = "/f/F/in/n3/from/a";
+    const MAIL4: &str = "/f/F/in/n4/from/a";
+    for forget in [true, false] {
+        let what = format!("forget {forget}");
+        let mut fx = Fx::new("held-forget", false);
+        let mut log = fx.create();
+        let plain = rules(Some(4 * rb(EV)), None, None, 7 * DAY, true);
+        let r = if forget {
+            forgetting_mail(&plain)
+        } else {
+            plain
+        };
+        log.set_retention(r).unwrap();
+        fx.batch(&mut log, &[MAIL, MAIL2, MAIL3, MAIL4, PRESENCE]);
+        let will = crate::store::WillRecord {
+            producer_id: 7,
+            producer_seq: crate::store::will_seq(1).unwrap(),
+            subject: MAIL3.to_string(),
+            body: b"gone".to_vec(),
+        };
+        log.stage_will_register(&will).unwrap();
+        log.commit_batch().unwrap();
+        for (group, upto) in [
+            (INBOX, 0),
+            ("/f/F/cur/n3/node/inbox", 2),
+            ("/f/F/cur/n4/node/inbox", 3),
+        ] {
+            log.commit(group.into(), upto).unwrap();
+        }
+        fx.batch(&mut log, &[EV; 8]);
+        let mail4_again = fx.batch(&mut log, &[MAIL4])[0];
+        let all = log.subjects_per_producer(1);
+        assert_eq!(all, 6, "{what}: four lanes, presence and the stream");
+        let tick = log.retain_by_rules(T0).unwrap();
+        assert!(tick.base > 9, "{what}: the cut passes every lane: {tick:?}");
+        assert!(tick.base <= mail4_again, "{what}: {tick:?}");
+        assert_eq!(
+            read(&log, "/f/F/in/n2/>"),
+            vec![1],
+            "{what}: n2's unread is held"
+        );
+        let lanes = |log: &mut BrokerLog| last_subjects(log, "/f/F/in/>");
+        let every = vec![MAIL, MAIL2, MAIL3, MAIL4];
+        let (want, count) = if forget {
+            assert_eq!(tick.forgotten, 1, "{what}: n1's lane alone: {tick:?}");
+            (vec![MAIL2, MAIL3, MAIL4], all - 1)
+        } else {
+            assert_eq!(tick.forgotten, 0, "{what}: {tick:?}");
+            (every.clone(), all)
+        };
+        assert_eq!(lanes(&mut log), want, "{what}");
+        assert_eq!(log.subjects_per_producer(1), count, "{what}");
+
+        log.commit("/f/F/cur/n2/node/inbox".into(), 1).unwrap();
+        let tick = log.retain_by_rules(T0 + MINUTE).unwrap();
+        assert_eq!(tick.released, 1, "{what}: n2's inbox read its mail");
+        let (want, count) = if forget {
+            assert_eq!(tick.forgotten, 1, "{what}: n2's lane, once its mail went");
+            (vec![MAIL3, MAIL4], all - 2)
+        } else {
+            assert_eq!(tick.forgotten, 0, "{what}");
+            (every, all)
+        };
+        assert_eq!(lanes(&mut log), want, "{what}");
+        assert_eq!(log.subjects_per_producer(1), count, "{what}");
+        assert_eq!(
+            last_subjects(&mut log, "/f/F/pub/*/*/presence"),
+            vec![PRESENCE],
+            "{what}: the presence row stays"
+        );
+
+        drop(log);
+        let mut log = fx.open();
+        let back = log.retention().unwrap().clone();
+        assert_eq!(
+            back.rules()[1].forgets(),
+            forget,
+            "{what}: the held store's rules frame reads the rule back"
+        );
+        log.set_retention(back).unwrap();
+        assert_eq!(lanes(&mut log), want, "{what}: after a reopen");
+        assert_eq!(
+            log.subjects_per_producer(1),
+            count,
+            "{what}: after a reopen"
+        );
+        // A later cut past the retire records the forgets appended, then a reopen: the
+        // carried charges no longer hold the forgotten lanes.
+        let head = log.head().0;
+        fx.batch(&mut log, &[EV; 8]);
+        let tick = log.retain_by_rules(T0 + 2 * MINUTE).unwrap();
+        assert!(tick.base > head, "{what}: past the retires: {tick:?}");
+        assert_eq!(
+            tick.forgotten, 0,
+            "{what}: nothing more to forget: {tick:?}"
+        );
+        drop(log);
+        let mut log = fx.open();
+        assert_eq!(
+            lanes(&mut log),
+            want,
+            "{what}: after a cut past the retires"
+        );
+        assert_eq!(log.subjects_per_producer(1), count, "{what}: and its count");
+    }
+}
+
 #[test]
 fn a_restart_reads_the_held_store_the_floors_and_the_rules_back() {
     let mut fx = Fx::new("held-restart", false);

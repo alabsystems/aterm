@@ -120,37 +120,37 @@ impl History {
         )
     )]
     pub fn status(&self, account: Digest) -> State {
-        let nodes: BTreeMap<_, _> = self
+        let nodes: Vec<_> = self
             .records
             .iter()
             .filter(|(_, r)| r.request().account == account)
             .collect();
-        self.status_nodes(account, nodes)
+        self.status_nodes(account, &nodes)
     }
 
     pub fn statuses(&self) -> BTreeMap<Digest, State> {
-        let mut accounts: BTreeMap<Digest, BTreeMap<&Digest, &Record>> = BTreeMap::new();
+        let mut accounts: BTreeMap<Digest, Vec<(&Digest, &Record)>> = BTreeMap::new();
         for (id, record) in &self.records {
             accounts
                 .entry(record.request().account)
                 .or_default()
-                .insert(id, record);
+                .push((id, record));
         }
         accounts
             .into_iter()
-            .map(|(account, nodes)| (account, self.status_nodes(account, nodes)))
+            .map(|(account, nodes)| (account, self.status_nodes(account, &nodes)))
             .collect()
     }
 
-    fn status_nodes(&self, account: Digest, nodes: BTreeMap<&Digest, &Record>) -> State {
+    fn status_nodes(&self, account: Digest, nodes: &[(&Digest, &Record)]) -> State {
         if self.unavailable > 0 {
             return State::Pending;
         }
         if nodes.is_empty() {
             return State::Empty;
         }
-        let mut heads: BTreeSet<_> = nodes.keys().map(|id| **id).collect();
-        for record in nodes.values() {
+        let mut heads: BTreeSet<_> = nodes.iter().map(|(id, _)| **id).collect();
+        for (_, record) in nodes {
             let request = record.request();
             let mut maximum = 0u64;
             for parent in &request.parents {

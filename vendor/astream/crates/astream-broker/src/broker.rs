@@ -493,6 +493,15 @@ enum WriteKind {
         offset: u64,
         log: crate::LogIdentity,
     },
+    /// The retention tick's FORGETS (`retention.rs`, "Forgetting"): each subject, with the
+    /// offset of the `Last` row the tick found, that a forgetting rule lets go, staged as a
+    /// marked retire if every guard still holds against the batch
+    /// ([`BrokerLog::stage_forgets`]). Answered on the local commit alone, with how many
+    /// were staged in the offset's place.
+    #[cfg(feature = "retention")]
+    Forget {
+        subjects: Vec<(String, Offset)>,
+    },
     /// Flush the log in full ([`Broker::flush_durable`]): stages nothing; the writer
     /// issues the flush outside the log lock once this batch is committed (skipped when a
     /// full flush already covers the head) and answers with the durable head.
@@ -10957,6 +10966,16 @@ fn stage_batch_ops(
                 let count = std::mem::take(&mut rejoined_left);
                 Ok((Offset(u64::try_from(count).unwrap_or(u64::MAX)), false))
             }
+            // The tick's own bookkeeping, which it waits for: answered on the local commit,
+            // as a will registration is, never on a quorum or a held head's flush.
+            #[cfg(feature = "retention")]
+            WriteKind::Forget { subjects } => {
+                is_local = true;
+                match guard.stage_forgets(subjects) {
+                    Ok(n) => Ok((Offset(n), n == 0)),
+                    Err(e) => Err(e),
+                }
+            }
         };
         local_only.push(is_local);
         // The code says whether the same op can EVER land (`proto::ERR_*`): the
@@ -11412,15 +11431,23 @@ fn retention_tick_run(shared: &Shared, now_ms: u64) -> io::Result<crate::Retenti
         // The planning reset each class's room whatever it began, a tick that changes
         // nothing too: the writer asks by it from here.
         publish_retention(shared, &log);
-        begun?
+        match begun? {
+            Some(job) => Ok(job),
+            // A tick that changes nothing still forgets what the last one could not.
+            None => Err(log.forgettable()),
+        }
     };
-    let Some(mut job) = begun else {
-        let base = shared.base.load(Ordering::Acquire);
-        return Ok(crate::RetentionTick {
-            base_before: base,
-            base,
-            ..crate::RetentionTick::default()
-        });
+    let mut job = match begun {
+        Ok(job) => job,
+        Err(forget) => {
+            let base = shared.base.load(Ordering::Acquire);
+            return Ok(crate::RetentionTick {
+                base_before: base,
+                base,
+                forgotten: forget_by_writer(shared, forget),
+                ..crate::RetentionTick::default()
+            });
+        }
     };
     // The held store's frames and the bulk of the copy: no lock held, so no publish's
     // ack waits for them.
@@ -11450,9 +11477,43 @@ fn retention_tick_run(shared: &Shared, now_ms: u64) -> io::Result<crate::Retenti
         .log
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let tick = log.retention_finish(job);
+    let mut tick = log.retention_finish(job)?;
     publish_retention(shared, &log);
-    tick
+    let forget = log.forgettable();
+    // The writer stages the forgets: neither lock is held while the tick waits for it.
+    drop(log);
+    drop(_batch);
+    tick.forgotten = forget_by_writer(shared, forget);
+    Ok(tick)
+}
+
+/// THE TICK'S FORGETS, staged by the writer as one op ([`WriteKind::Forget`]) and waited
+/// for, the compaction lock held so no other retention moves the base meanwhile: how many
+/// it forgot. `0` for none asked, and for a writer that is stopping (the next open's tick
+/// finds the same subjects). A tick that forgot as many as it may
+/// ([`FORGET_MAX`](crate::retention::FORGET_MAX)) asks for another, for the rest.
+#[cfg(feature = "retention")]
+fn forget_by_writer(shared: &Shared, subjects: Vec<(String, Offset)>) -> u64 {
+    if subjects.is_empty() {
+        return 0;
+    }
+    let (tx, rx) = mpsc::channel();
+    let op = WriteOp {
+        kind: WriteKind::Forget { subjects },
+        ack: tx,
+        conn_id: None,
+    };
+    if shared.writes.send(Queued::Op(op)).is_err() {
+        return 0;
+    }
+    let forgotten = match rx.recv() {
+        Ok(Ok((n, _))) => n,
+        Ok(Err(_)) | Err(mpsc::RecvError) => 0,
+    };
+    if usize::try_from(forgotten).is_ok_and(|n| n >= crate::retention::FORGET_MAX) {
+        ask_tick(shared);
+    }
+    forgotten
 }
 
 /// THE RETENTION TICK's thread: a tick whenever one is asked for (`ask_tick`) or the

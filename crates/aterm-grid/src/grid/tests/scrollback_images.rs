@@ -38,9 +38,179 @@ fn stamp(grid: &mut Grid, row_idx: u16, image: &Arc<ImageData>, image_row: u16, 
     }
 }
 
+#[test]
+fn fragmented_layer_runs_keep_order_at_full_layer_capacity() {
+    let mut source = Grid::new(1, 32);
+    // Every column replaces a full layer stack, so capture temporarily holds
+    // both the previous and current column's runs before expiring the former.
+    for layer in 0..16 {
+        for parity in 0..2 {
+            let mut image = placement(1, 32);
+            Arc::get_mut(&mut image).unwrap().z_index = layer;
+            for col in 0..32 {
+                if col % 2 != parity {
+                    continue;
+                }
+                source.stack_cell_image(
+                    0,
+                    col,
+                    ImageRef {
+                        image: Arc::clone(&image),
+                        cell_row: 0,
+                        cell_col: col,
+                        kitty: None,
+                    },
+                );
+            }
+        }
+    }
+    let lines = source.checkpoint_visible_lines();
+    assert_eq!(lines[0].image_count(), 16 * 32);
+    let mut restored = Grid::new(1, 32);
+    restored.restore_visible_from_lines(&lines);
+    for col in 0..32 {
+        let expected = source
+            .cell_extra(0, col)
+            .map_or(&[][..], |extra| extra.images());
+        let actual = restored
+            .cell_extra(0, col)
+            .map_or(&[][..], |extra| extra.images());
+        assert_eq!(actual.len(), expected.len(), "column {col}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(Arc::ptr_eq(&actual.image, &expected.image), "column {col}");
+            assert_eq!((actual.cell_row, actual.cell_col), (0, col));
+        }
+    }
+}
+
+fn assert_image_stack_roundtrip(source: &Grid) -> Vec<aterm_scrollback::Line> {
+    let lines = source.checkpoint_visible_lines();
+    let mut restored = Grid::new(source.rows(), source.cols());
+    restored.restore_visible_from_lines(&lines);
+    for row in 0..source.rows() {
+        for col in 0..source.cols() {
+            let expected = source
+                .cell_extra(row, col)
+                .map_or(&[][..], CellExtra::images);
+            let actual = restored
+                .cell_extra(row, col)
+                .map_or(&[][..], CellExtra::images);
+            assert_eq!(actual.len(), expected.len(), "cell {row},{col}");
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    Arc::ptr_eq(&actual.image, &expected.image),
+                    "cell {row},{col}"
+                );
+                assert_eq!(actual, expected, "cell {row},{col}");
+            }
+        }
+    }
+    lines
+}
+
+#[test]
+fn equal_key_image_layers_keep_precedence_across_staggered_gaps() {
+    let mut source = Grid::new(1, 32);
+    for layer in 0..4 {
+        let image = placement(1, 32);
+        for col in 0..32 {
+            if (col + layer) % 7 != 0 {
+                source.stack_cell_image(
+                    0,
+                    col,
+                    ImageRef {
+                        image: Arc::clone(&image),
+                        cell_row: 0,
+                        cell_col: col,
+                        kitty: None,
+                    },
+                );
+            }
+        }
+    }
+    assert_image_stack_roundtrip(&source);
+}
+
+#[test]
+fn equal_key_image_layers_keep_per_cell_order_reversals() {
+    let mut source = Grid::new(1, 32);
+    let images = [placement(1, 32), placement(1, 32)];
+    for col in 0..32 {
+        for layer in 0..2 {
+            let index = (usize::from(col) + layer) % 2;
+            source.stack_cell_image(
+                0,
+                col,
+                ImageRef {
+                    image: Arc::clone(&images[index]),
+                    cell_row: 0,
+                    cell_col: col,
+                    kitty: None,
+                },
+            );
+        }
+    }
+    assert_image_stack_roundtrip(&source);
+}
+
+#[test]
+fn new_lower_draw_key_keeps_unrelated_upper_run_contiguous() {
+    let mut source = Grid::new(1, 32);
+    let under = placement(1, 32);
+    let mut over = placement(1, 32);
+    Arc::get_mut(&mut over).unwrap().z_index = 1;
+    for col in 0..32 {
+        if col > 0 {
+            source.stack_cell_image(
+                0,
+                col,
+                ImageRef {
+                    image: Arc::clone(&under),
+                    cell_row: 0,
+                    cell_col: col,
+                    kitty: None,
+                },
+            );
+        }
+        source.stack_cell_image(
+            0,
+            col,
+            ImageRef {
+                image: Arc::clone(&over),
+                cell_row: 0,
+                cell_col: col,
+                kitty: None,
+            },
+        );
+    }
+    assert_eq!(assert_image_stack_roundtrip(&source)[0].image_count(), 2);
+}
+
 fn scrolled_extras(grid: &Grid, row_idx: u16) -> ScrolledRowExtras {
     let row = grid.row(row_idx).expect("row exists");
     Grid::extract_row_extras(row, grid.extras(), row_idx)
+}
+
+#[test]
+fn restoring_a_smaller_image_footprint_releases_unused_cell_storage() {
+    let mut grid = Grid::new(1, 4);
+    let image = placement(1, 4);
+    stamp(&mut grid, 0, &image, 0, 4);
+    let mut line = grid.checkpoint_visible_lines().remove(0);
+    let mut spans = line.images().unwrap().to_vec();
+    spans[0].end_col = 2;
+    line.set_images(spans);
+    grid.restore_visible_from_lines(&[line]);
+    assert_eq!(grid.extras().len(), 2);
+    for col in 0..4 {
+        assert_eq!(grid.cell_extra(0, col).is_some(), col < 2);
+        assert_eq!(grid.row(0).unwrap().get(col).unwrap().has_extras(), col < 2);
+    }
+    assert_eq!(Arc::strong_count(&image), 3);
+    grid.restore_visible_from_lines(&[]);
+    assert!(grid.extras().is_empty());
+    assert!(!grid.extras().any_image());
+    assert_eq!(Arc::strong_count(&image), 1);
 }
 
 #[test]

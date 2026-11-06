@@ -258,7 +258,7 @@ fn fingerprints(
         // Only the selected account's display label is known to be inert here.
         // Keep every other field, including source details and machine routing,
         // until a provider adapter defines a narrower authenticated schema.
-        if key == root {
+        if key == root && candidate.value.get("label").is_some() {
             let mut value = candidate.value.clone();
             value.as_object_mut().unwrap().remove("label");
             let bytes = aterm_json::to_vec(&value)

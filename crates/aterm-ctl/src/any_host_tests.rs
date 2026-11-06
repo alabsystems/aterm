@@ -19,6 +19,7 @@ fn row(program: &str, label: &str, seven_day: Option<u64>, five_hour: Option<u64
         week_reset_ms: None,
         walled_until_ms: None,
         read_at: Some(READ_AT),
+        launch: None,
     }
 }
 
@@ -125,6 +126,191 @@ fn a_macs_best_row_is_the_one_a_worker_would_run_on() {
     assert_eq!(chosen.row.label, "fresh");
 }
 
+/// A LAUNCH ON A LOGIN NO ROW LISTS LEAVES ITS MEMBER REFUSED, since no row can show what stands on
+/// that login: a Codex login the keyring holds, or `accounts = "off"` with no pin, on a roster of
+/// directories alone, and Claude Code's default login no row lists. So does one a row lists and no
+/// read can show a wall on: the keyring's on a row with no directory, or rotation off with a second
+/// row enrolled, pinned or not (`a_row_no_read_can_show_a_wall_on_takes_no_launch`). Every row says
+/// `launch=0`, and
+/// the refusal names no cause it cannot show, says where to read which and why, and that
+/// `--host <node>` still starts a worker there. CONTROL: a row the launch starts on is chosen.
+#[test]
+fn a_launch_on_a_login_no_row_lists_leaves_its_member_refused() {
+    for (program, report) in [
+        ("codex", "aterm harness accounts --cli codex"),
+        ("claude", "aterm harness accounts"),
+    ] {
+        let listed = |launch| Row {
+            launch: Some(launch),
+            ..row(program, "work", Some(1), Some(1))
+        };
+        let members = [member("m1", vec![listed(false)])];
+        let counts = pick(program, &[], &members).expect_err("its launch takes no row it lists");
+        assert_eq!(counts.passed_over, 1, "{counts:?}");
+        let words = none_able(program, &[], &counts, None);
+        assert!(
+            words.contains(&format!(
+                "(1 of those holding such an account, where a launch would start on another row, \
+                 on a login no row lists or none can show a wall on, or be refused: `{report}` \
+                 there says where it would run or why it is refused, and \
+                 `--host <node>` still starts a worker there unless that launch is refused)"
+            )),
+            "{words}"
+        );
+        for not_shown in ["mode", "pin", "build", "signed-in"] {
+            assert!(!words.contains(not_shown), "{not_shown}: {words}");
+        }
+        let members = [member("m1", vec![listed(true)])];
+        let chosen = pick(program, &[], &members).expect("CONTROL: the row it starts on");
+        assert_eq!(chosen.row.label, "work");
+    }
+}
+
+/// A MEMBER IS WEIGHED BY THE ROW ITS LAUNCH WOULD START ON, not by the best row it lists. Under
+/// `accounts = "off"` a launch runs on the default login, here at its wall, so a free row beside it
+/// helps nothing, and the refusal says which cause that is. CONTROLS: the same rows with the free
+/// one named take the worker and name it; a member older than the field is judged as before.
+#[test]
+fn a_member_is_weighed_by_the_row_its_launch_would_start_on() {
+    let walled_default = Row {
+        condition: "limited".to_owned(),
+        launch: Some(true),
+        ..row("codex", "main", Some(100), None)
+    };
+    let free_row = Row {
+        launch: Some(false),
+        ..row("codex", "work", Some(1), Some(1))
+    };
+    let off = member("m1", vec![walled_default.clone(), free_row.clone()]);
+    let counts = pick("codex", &[], std::slice::from_ref(&off)).expect_err("its launch is walled");
+    assert_eq!(
+        *counts,
+        Counts {
+            answered: 1,
+            drivable: 1,
+            passed_over: 1,
+            ..Counts::default()
+        }
+    );
+    assert_eq!(
+        none_able("codex", &[], &counts, None),
+        "--host any: no Mac can take agent=codex: 1 members answered, 1 of them can be driven \
+         from this Mac, and none of those would start it on a codex account with no known wall \
+         or sign-out (1 of those holding such an account, where a launch would start on another \
+         row, on a login no row lists or none can show a wall on, or be refused: `aterm harness \
+         accounts --cli codex` there says where it would run or why it is refused, and `--host \
+         <node>` still starts a worker there unless that launch is refused)"
+    );
+
+    // A worse member whose launch can run goes first, though `off` lists the least used row.
+    let worse = member(
+        "m2",
+        vec![Row {
+            launch: Some(true),
+            ..row("codex", "only", Some(90), Some(90))
+        }],
+    );
+    let members = [off.clone(), worse];
+    let picked = pick("codex", &[], &members).expect("m2's launch can run");
+    assert_eq!(
+        (picked.member.host(), picked.row.label.as_str()),
+        ("m2.local", "only")
+    );
+
+    // A launch refused names no row: nothing there takes a worker.
+    let refused = member(
+        "m3",
+        vec![Row {
+            launch: Some(false),
+            ..row("codex", "work", Some(1), Some(1))
+        }],
+    );
+    assert!(pick("codex", &[], std::slice::from_ref(&refused)).is_err());
+
+    let rotating = member(
+        "m4",
+        vec![
+            Row {
+                launch: Some(false),
+                ..walled_default.clone()
+            },
+            Row {
+                launch: Some(true),
+                ..free_row.clone()
+            },
+        ],
+    );
+    let members = [rotating];
+    let picked = pick("codex", &[], &members).expect("CONTROL: its launch starts on the free row");
+    assert_eq!(picked.row.label, "work");
+
+    let older = member(
+        "m5",
+        vec![
+            Row {
+                launch: None,
+                ..walled_default
+            },
+            Row {
+                launch: None,
+                ..free_row
+            },
+        ],
+    );
+    let members = [older];
+    let picked = pick("codex", &[], &members).expect("CONTROL: an older member says nothing");
+    assert_eq!(picked.row.label, "work");
+
+    // Naming a row does not date it: the undated rule still holds of the row a launch starts on.
+    let undated = member(
+        "m7",
+        vec![Row {
+            read_at: None,
+            launch: Some(true),
+            ..row("codex", "only", Some(1), Some(1))
+        }],
+    );
+    let counts = pick("codex", &[], &[undated]).expect_err("its word cannot be dated");
+    assert_eq!((counts.undated, counts.passed_over), (1, 0));
+
+    // On the wire: `launch=1`, `launch=0`, and nothing or `-` from an aterm older than the field.
+    let peer = |launch: &str| PeerSurvey {
+        label: "m6.local".to_owned(),
+        answer: Ok(vec![
+            "instance pid=9 host=m6.local version=0.148.0 sessions=0 level=facts \
+             at_ms=1793130000000 accounts=1 accounts_unread=- drive=1"
+                .to_owned(),
+            format!(
+                "account pool=codex id=main condition=usable enrolled=1 pct5=- pct7=1 \
+                 week_reset=- walled_until=- last_used=- read_at=1793129900{launch}"
+            ),
+        ]),
+        fault: survey::PeerFault::Other,
+        unproven: false,
+        node: Some("ab".repeat(16)),
+        addr: Some("192.168.1.6".to_owned()),
+    };
+    for (word, want) in [
+        (" launch=1", Some(true)),
+        (" launch=0", Some(false)),
+        (" launch=?", Some(false)),
+        (" launch=-", None),
+        ("", None),
+    ] {
+        let members = members_of(&[peer(word)]);
+        assert_eq!(
+            members[0].accounts.as_ref().expect("its rows")[0].launch,
+            want,
+            "{word}"
+        );
+        assert_eq!(
+            pick("codex", &[], &members).is_ok(),
+            want != Some(false),
+            "{word}"
+        );
+    }
+}
+
 /// A member sends no figure for a window that reset or was never read: it ranks as unused.
 #[test]
 fn a_window_with_no_figure_ranks_as_unused() {
@@ -195,19 +381,69 @@ fn only_an_enrolled_unwalled_row_of_the_program_takes_the_worker() {
     let members = [member("m7", refused.to_vec())];
     assert_eq!(
         pick("claude", &[], &members),
-        Err(Counts {
+        Err(Box::new(Counts {
             answered: 1,
             drivable: 1,
-            silent: 0,
-            unread: 0,
+            signed_out: 1,
             ..Counts::default()
-        })
+        }))
     );
     assert_eq!(
         chosen("codex", &members),
         "m7.local",
         "its codex row takes codex"
     );
+}
+
+/// A SIGNED-OUT ROW IS NAMED AS SIGNED OUT, since it is enrolled and unwalled and only a sign-in
+/// mends it. So is a launch's row with no login made there. CONTROLS: a wall adds no such words,
+/// and a signed-out row a launch would not start on is no cause while the launch has its own row.
+#[test]
+fn a_signed_out_row_is_named_as_signed_out_with_what_mends_it() {
+    let signed_out = |launch| Row {
+        condition: "signed-out".to_owned(),
+        launch,
+        ..row("codex", "main", None, None)
+    };
+    let refusal = |rows: Vec<Row>| {
+        let members = [member("m1", rows)];
+        let counts = pick("codex", &[], &members).expect_err("none takes it");
+        (counts.signed_out, none_able("codex", &[], &counts, None))
+    };
+    let said = "1 of those signed out of codex: `aterm harness accounts --cli codex` there names \
+                the sign-in";
+
+    for rows in [
+        vec![signed_out(None)],
+        vec![signed_out(Some(true))],
+        vec![signed_out(Some(false))],
+        vec![Row {
+            enrolled: false,
+            condition: "not-enrolled".to_owned(),
+            launch: Some(true),
+            ..row("codex", "main", None, None)
+        }],
+    ] {
+        let (count, words) = refusal(rows.clone());
+        assert_eq!(count, 1, "{rows:?}");
+        assert!(words.contains(said), "{rows:?}: {words}");
+        assert!(
+            words.contains("a codex account with no known wall or sign-out"),
+            "{words}"
+        );
+        assert!(!words.contains("enrolled"), "{words}");
+    }
+    let walled = Row {
+        condition: "limited".to_owned(),
+        launch: Some(true),
+        ..row("codex", "main", Some(100), None)
+    };
+    let (count, words) = refusal(vec![walled.clone()]);
+    assert_eq!(count, 0, "CONTROL: a wall");
+    assert!(!words.contains("signed out"), "{words}");
+    let (count, words) = refusal(vec![walled, signed_out(Some(false))]);
+    assert_eq!(count, 0, "CONTROL: its launch would not start on that row");
+    assert!(!words.contains("signed out"), "{words}");
 }
 
 #[test]
@@ -228,17 +464,46 @@ fn a_mac_that_does_not_let_this_one_drive_it_is_never_chosen() {
     let worse = member("m40", vec![row("claude", "worse", Some(90), Some(90))]);
     let members = [ungranted.clone(), unproven.clone(), nodeless.clone(), worse];
     assert_eq!(chosen("claude", &members), "m40.local");
-    let members = [ungranted, unproven, nodeless];
+    let members = [ungranted.clone(), unproven.clone(), nodeless.clone()];
+    let counts = pick("claude", &[], &members).expect_err("none can be driven");
     assert_eq!(
-        pick("claude", &[], &members),
-        Err(Counts {
+        *counts,
+        Counts {
             answered: 3,
+            nodeless: 1,
+            unproven: 1,
+            ungranted: 1,
             drivable: 0,
-            silent: 0,
-            unread: 0,
             ..Counts::default()
-        })
+        }
     );
+    assert_eq!(
+        none_able("claude", &[], &counts, None),
+        "--host any: no Mac can take agent=claude: 3 members answered, 0 of them can be driven \
+         from this Mac (of the others, 1 with no grant: `aterm fleet allow drive --from <this \
+         Mac>` there; 1 with no proof of the node key this Mac's book binds, which no grant \
+         mends: `aterm fleet peers` here reads the issuer's book, else update aterm there or join \
+         it again; 1 named by hand, with no node a drive can go to: `aterm fleet join` there)"
+    );
+    // The grant's remedy is named only where a grant is what it lacks: these two let it already.
+    let counts = pick("claude", &[], &[unproven, nodeless.clone()]).expect_err("none");
+    let said = none_able("claude", &[], &counts, None);
+    assert!(!said.contains("allow drive"), "{said}");
+    // Nor is a proof asked of a member that gave one, nor a node of one with one.
+    let counts = pick("claude", &[], &[ungranted]).expect_err("none");
+    let said = none_able("claude", &[], &counts, None);
+    assert!(said.contains("allow drive"), "{said}");
+    assert!(
+        !said.contains("proof") && !said.contains("by hand"),
+        "{said}"
+    );
+    // A member with neither a node nor a proof is one by hand: a proof alone would not mend it.
+    let both = Member {
+        proven: false,
+        ..nodeless
+    };
+    let counts = pick("claude", &[], &[both]).expect_err("none");
+    assert_eq!((counts.nodeless, counts.unproven), (1, 0));
 }
 
 #[test]
@@ -265,9 +530,10 @@ fn a_refusal_counts_how_far_the_members_got() {
     let counts =
         pick("claude", &[], &[silent, unread, walled, ungranted]).expect_err("none qualifies");
     assert_eq!(
-        counts,
+        *counts,
         Counts {
             answered: 4,
+            ungranted: 1,
             drivable: 3,
             silent: 1,
             unread: 1,
@@ -276,10 +542,12 @@ fn a_refusal_counts_how_far_the_members_got() {
     );
     assert_eq!(
         none_able("claude", &[], &counts, None),
-        "--host any: no Mac can take agent=claude: 4 members answered, 3 of them let this Mac \
-         drive them (`aterm fleet allow drive --from <this Mac>` there), and none of those has \
-         an enrolled, unwalled claude account (1 of those run an aterm too old to say its \
-         accounts; 1 of those could not read their claude account records)"
+        "--host any: no Mac can take agent=claude: 4 members answered, 3 of them can be driven \
+         from this Mac (of the others, 1 with no grant: `aterm fleet allow drive --from <this \
+         Mac>` there), and none of those would start it on a claude account with no known wall \
+         or sign-out (1 of those say nothing of their accounts, from an aterm too old to or a reply cut \
+         short: update it, or name it with `--host <node>`; 1 of those could not read their \
+         claude account records: `aterm harness accounts` there says why)"
     );
     let unread_codex = Member {
         unread: vec!["codex".to_owned()],
@@ -510,7 +778,7 @@ fn a_usable_row_that_names_no_read_takes_no_worker() {
 
     let counts = pick("codex", &[], std::slice::from_ref(&m21)).expect_err("m21 alone");
     assert_eq!(
-        counts,
+        *counts,
         Counts {
             answered: 1,
             drivable: 1,
@@ -520,10 +788,10 @@ fn a_usable_row_that_names_no_read_takes_no_worker() {
     );
     assert_eq!(
         none_able("codex", &[], &counts, None),
-        "--host any: no Mac can take agent=codex: 1 members answered, 1 of them let this Mac \
-         drive them (`aterm fleet allow drive --from <this Mac>` there), and none of those has \
-         an enrolled, unwalled codex account (1 of those run an aterm too old to say when it read \
-         its codex account: update it, or name it with `--host <node>`)"
+        "--host any: no Mac can take agent=codex: 1 members answered, 1 of them can be driven \
+         from this Mac, and none of those would start it on a codex account with no known wall \
+         or sign-out (1 of those run an aterm too old to say when it read its codex account: update it, or \
+         name it with `--host <node>`)"
     );
     let needs = [Need::Home];
     let homed_m21 = Member {
@@ -750,10 +1018,14 @@ fn a_need_is_met_only_by_facts_that_say_so() {
     assert_eq!(fresh.judge(&Need::Repo("aterm".to_owned())), Judged::Lacks);
 
     let stale = homed("m1", Vec::new(), &["trust"], REPOS_FRESH_MS + 1, 149);
-    assert_eq!(stale.judge(&trust), Judged::Unknown, "a read too old");
+    assert_eq!(
+        stale.judge(&trust),
+        Judged::Unknown(Unsure::Stale),
+        "a read too old"
+    );
     assert_eq!(
         stale.judge(&Need::Repo("aterm".to_owned())),
-        Judged::Unknown
+        Judged::Unknown(Unsure::Stale)
     );
     assert_eq!(stale.judge(&room), Judged::Lacks, "149 GiB");
 
@@ -761,18 +1033,30 @@ fn a_need_is_met_only_by_facts_that_say_so() {
     if let Some(repos) = ahead.repos.as_mut() {
         repos.read_ms = Some(AT + 1);
     }
-    assert_eq!(ahead.judge(&trust), Judged::Unknown, "a read dated after");
+    assert_eq!(
+        ahead.judge(&trust),
+        Judged::Unknown(Unsure::Stale),
+        "a read dated after"
+    );
     let undated = Member {
         at_ms: None,
         ..homed("m1", Vec::new(), &["trust"], 0, 1)
     };
-    assert_eq!(undated.judge(&trust), Judged::Unknown, "no clock");
+    assert_eq!(
+        undated.judge(&trust),
+        Judged::Unknown(Unsure::Stale),
+        "no clock"
+    );
 
     let mut headless = homed("m1", Vec::new(), &["trust"], 0, 1);
     if let Some(repos) = headless.repos.as_mut() {
         repos.rows[0].head = None;
     }
-    assert_eq!(headless.judge(&trust), Judged::Unknown, "no HEAD read");
+    assert_eq!(
+        headless.judge(&trust),
+        Judged::Unknown(Unsure::NoHead),
+        "no HEAD read"
+    );
 
     let mut cut = homed("m1", Vec::new(), &["aterm"], 0, 1);
     if let Some(repos) = cut.repos.as_mut() {
@@ -780,15 +1064,115 @@ fn a_need_is_met_only_by_facts_that_say_so() {
     }
     assert_eq!(
         cut.judge(&trust),
-        Judged::Unknown,
+        Judged::Unknown(Unsure::Cut),
         "among the clones not read"
     );
     assert_eq!(cut.judge(&Need::Repo("aterm".to_owned())), Judged::Met);
 
     let older = member("m1", Vec::new());
     for need in [&trust, &room, &Need::Home] {
-        assert_eq!(older.judge(need), Judged::Unknown, "{need:?}");
+        assert_eq!(
+            older.judge(need),
+            Judged::Unknown(Unsure::Unsaid),
+            "{need:?}"
+        );
     }
+}
+
+/// EVERY CAUSE OF A MEMBER THAT CANNOT SAY IS NAMED, AND ONLY ITS OWN. A current member with a fresh
+/// read can still not say: its read stopped short of every clone, or lists the checkout with no
+/// `HEAD`. Neither is an aterm too old or a read too old, and no such words reach it. Each clause
+/// says what mends it, and the count over them all stays honest.
+#[test]
+fn every_cause_of_a_member_that_cannot_say_is_named() {
+    let trust = Need::Repo("trust".to_owned());
+    let needs = [trust];
+    let refusal = |member: Member| {
+        let members = [member];
+        let counts = pick("claude", &needs, &members).expect_err("none");
+        (counts.unknown(), none_able("claude", &needs, &counts, None))
+    };
+    let rows = || vec![row("claude", "a", Some(1), None)];
+    let lead = "1 cannot say whether they meet its needs (1 ";
+
+    let mut cut = homed("m1", rows(), &["aterm"], 60_000, 1);
+    if let Some(repos) = cut.repos.as_mut() {
+        repos.cut = 3;
+    }
+    let (count, said) = refusal(cut);
+    assert_eq!(count, 1);
+    assert!(
+        said.contains(&format!(
+            "{lead}not listing the checkout, in a read that stopped short of every clone: name \
+             that Mac with `--host <node>`)"
+        )),
+        "{said}"
+    );
+    assert!(
+        !said.contains("too old") && !said.contains("30 min"),
+        "{said}"
+    );
+
+    let mut headless = homed("m1", rows(), &["trust"], 60_000, 1);
+    if let Some(repos) = headless.repos.as_mut() {
+        repos.rows[0].head = None;
+    }
+    let (count, said) = refusal(headless);
+    assert_eq!(count, 1);
+    assert!(
+        said.contains(&format!(
+            "{lead}listing the checkout with no HEAD read: mend that checkout there)"
+        )),
+        "{said}"
+    );
+    assert!(
+        !said.contains("too old") && !said.contains("30 min"),
+        "{said}"
+    );
+
+    let (count, said) = refusal(homed("m1", rows(), &["trust"], REPOS_FRESH_MS + 1, 1));
+    assert_eq!(count, 1);
+    assert!(
+        said.contains(&format!(
+            "{lead}with no read of its checkouts dated within 30 min on its clock: ask again, \
+             which starts one)"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("too old"), "{said}");
+
+    let (count, said) = refusal(member("m1", rows()));
+    assert_eq!(count, 1);
+    assert!(
+        said.contains(&format!(
+            "{lead}saying nothing of their home, checkouts or disk, from an aterm too old to, no \
+             read of its checkouts yet or a reply cut short: update it, or ask again)"
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("30 min"), "{said}");
+
+    // Each counts apart, and together they are the one count.
+    let mut cut = homed("m1", rows(), &["aterm"], 60_000, 1);
+    if let Some(repos) = cut.repos.as_mut() {
+        repos.cut = 3;
+    }
+    let members = [
+        cut,
+        member("m2", rows()),
+        homed("m3", rows(), &["trust"], REPOS_FRESH_MS + 1, 1),
+    ];
+    let counts = pick("claude", &needs, &members).expect_err("none");
+    assert_eq!(
+        (counts.cut, counts.unsaid, counts.stale, counts.no_head),
+        (1, 1, 1, 0)
+    );
+    let said = none_able("claude", &needs, &counts, None);
+    assert!(
+        said.contains("3 cannot say whether they meet its needs (1 saying")
+            && said.contains("so none meets them"),
+        "{said}"
+    );
 }
 
 /// THE ACCEPT: a package that needs a trust checkout and 150 GiB free is never placed on a Mac
@@ -828,29 +1212,30 @@ fn a_package_that_needs_trust_and_150g_is_never_placed_on_a_mac_without_them() {
     let members = [no_trust, small, older, stale];
     let counts = pick("claude", &needs, &members).expect_err("none fits");
     assert_eq!(
-        counts,
+        *counts,
         Counts {
             answered: 4,
             drivable: 4,
             no_repo: 1,
             no_room: 1,
-            unknown: 2,
-            silent: 0,
-            unread: 0,
-            undated: 0,
+            unsaid: 1,
+            stale: 1,
+            ..Counts::default()
         }
     );
     assert_eq!(
         none_able("claude", &needs, &counts, None),
         "--host any: no Mac can take agent=claude need=repo:trust,free:150g: 4 members answered, \
-         4 of them let this Mac drive them (`aterm fleet allow drive --from <this Mac>` there); \
-         of those, 1 lack a checkout it needs (repo:trust), 1 have less free disk than it needs \
-         (free:150g), 2 cannot say whether they meet its needs (an aterm too old to report its \
-         home, checkouts and disk, or no read of its checkouts within 30 min), so none meets them"
+         4 of them can be driven from this Mac; of those, 1 lack a checkout it needs (repo:trust), \
+         1 have less free disk than it needs (free:150g), 2 cannot say whether they meet its \
+         needs (1 saying nothing of their home, checkouts or disk, from an aterm too old to, no \
+         read of its checkouts yet or a reply cut short: update it, or ask again; 1 with no read \
+         of its checkouts dated within 30 min on its clock: ask again, which starts one), so none \
+         meets them"
     );
 }
 
-fn chosen_of(picked: Result<Chosen<'_>, Counts>) -> &str {
+fn chosen_of(picked: Result<Chosen<'_>, Box<Counts>>) -> &str {
     picked.expect("a member qualifies").member.host()
 }
 
@@ -883,25 +1268,22 @@ fn a_refusal_with_needs_counts_those_that_meet_them_apart() {
     let both_short = homed("m3", vec![row("claude", "a", Some(1), None)], &[], 0, 0);
     let counts = pick("claude", &needs, &[walled, silent, both_short]).expect_err("none");
     assert_eq!(
-        counts,
+        *counts,
         Counts {
             answered: 3,
             drivable: 3,
             no_repo: 1,
-            no_room: 0,
-            unknown: 0,
             silent: 1,
-            unread: 0,
-            undated: 0,
+            ..Counts::default()
         }
     );
     assert_eq!(
         none_able("claude", &needs, &counts, None),
         "--host any: no Mac can take agent=claude need=repo:trust,free:1g cwd=~/\u{2026}: 3 \
-         members answered, 3 of them let this Mac drive them (`aterm fleet allow drive --from \
-         <this Mac>` there); of those, 1 lack a checkout it needs (repo:trust), and none of the 2 \
-         that meet them has an enrolled, unwalled claude account (1 of those run an aterm too old \
-         to say its accounts)"
+         members answered, 3 of them can be driven from this Mac; of those, 1 lack a checkout it \
+         needs (repo:trust), and none of the 2 that meet them would start it on a claude \
+         account with no known wall or sign-out (1 of those say nothing of their accounts, from an aterm too old \
+         to or a reply cut short: update it, or name it with `--host <node>`)"
     );
     assert_eq!(
         none_able(
@@ -984,7 +1366,7 @@ fn a_survey_reply_carries_the_members_home_and_checkouts() {
     assert_eq!(undated[0].repos.as_ref().map(|r| r.read_ms), Some(None));
     assert_eq!(
         undated[0].judge(&Need::Repo("trust".to_owned())),
-        Judged::Unknown,
+        Judged::Unknown(Unsure::Stale),
         "a read that does not say when it ran"
     );
     let uncut = members_of(&[peer(&[
@@ -998,6 +1380,6 @@ fn a_survey_reply_carries_the_members_home_and_checkouts() {
     );
     assert_eq!(
         uncut[0].judge(&Need::Repo("aterm".to_owned())),
-        Judged::Unknown
+        Judged::Unknown(Unsure::Cut)
     );
 }

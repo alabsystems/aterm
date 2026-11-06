@@ -1168,6 +1168,16 @@ pub(in crate::commons) fn admission_held() {
     });
 }
 
+/// Run `run` with `on_hold` called each time this thread's local custody or vault admission
+/// finds a lock held ([`HELD`]), for a test outside `commons` that lets a lock go on the
+/// waiter's own first blocked try, so no scheduling races the wait's bound.
+pub(crate) fn while_held<T>(on_hold: impl FnMut() + 'static, run: impl FnOnce() -> T) -> T {
+    HELD.with(|held| *held.borrow_mut() = Some(Box::new(on_hold)));
+    let ran = run();
+    HELD.with(|held| held.borrow_mut().take());
+    ran
+}
+
 #[test]
 fn an_observation_waits_out_a_short_custody_hold_and_refuses_a_long_one_as_busy() {
     let (_home, paths) = fixture();

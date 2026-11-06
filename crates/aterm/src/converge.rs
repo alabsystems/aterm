@@ -987,8 +987,12 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     }
     let paths = vault_paths()?;
     let roster = read_name_roster(&paths)?;
-    let own = own_names();
-    let hostnames = local_hostnames(&own);
+    let mut own = None;
+    let hostnames = if roster.is_some() {
+        Vec::new()
+    } else {
+        local_hostnames(own.insert(own_names()))
+    };
     let roster_label = name_label(&paths, roster.as_ref(), &hostnames)?;
     let label = projected_machine_label(
         aterm_types::dirs::account_state_dir().as_deref(),
@@ -1001,8 +1005,10 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
         roster_gives(roster.as_ref(), roster_label.as_deref(), word)
     })?;
-    let pending = own_name_pending(&target, label.as_deref(), &own)
-        .filter(|_| cfg!(target_os = "macos"))
+    let pending = label
+        .as_deref()
+        .filter(|label| cfg!(target_os = "macos") && *label == target)
+        .and_then(|label| own_name_pending(&target, Some(label), own.get_or_insert_with(own_names)))
         .map(|why| {
             MacNamePending::with_rule(
                 why,
@@ -1131,6 +1137,7 @@ fn identity_owed_at(
     Ok(identity_owed_from(config_path, None, record, paths, hostnames, roster.as_ref())?.0)
 }
 
+#[cfg(test)]
 fn identity_owed_from(
     config_path: &Path,
     state: Option<&Path>,
@@ -1151,12 +1158,23 @@ fn identity_owed_from(
     };
     let snapshot =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let Some(mut config) = read_enabled_identity_snapshot(&snapshot)? else {
+    let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(off("off: [swarm] enabled = false"));
     };
     if config.name == NameChoice::Off {
         return Ok(off("off: [identity] name = false"));
     }
+    identity_owed_from_config(config, state, record, paths, hostnames, roster)
+}
+
+fn identity_owed_from_config(
+    mut config: IdentityConfig,
+    state: Option<&Path>,
+    record: &Path,
+    paths: &aterm_secrets::client::Paths,
+    hostnames: &[String],
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+) -> Result<(IdentityOwed, Option<IdentityTarget>, Option<String>), String> {
     let roster_label = name_label(paths, roster, hostnames)?;
     let label = projected_machine_label(state, &mut config.name, roster_label.clone())?;
     let owed = identity_owed_for_config(&config, record, label.as_deref(), &|pair| {
@@ -1234,14 +1252,14 @@ fn identity_owed_for_config(
     let history = read_history(record)?;
     let unrecorded = history.is_none() && unrecorded_label(&config.machines, ours);
     let written = history.unwrap_or_default();
-    let mut owed = Vec::new();
+    let mut owed: Vec<(&'static str, &str)> = Vec::new();
     let mut kept = Vec::new();
     for ((key, now), wrote) in MACHINE_KEYS.into_iter().zip(&config.machines).zip(&written) {
         match now.as_deref() {
             Some(now) if now == target => {}
-            None => owed.push((key, "unset".to_owned())),
+            None => owed.push((key, "unset")),
             Some(now) if unrecorded || wrote.iter().any(|value| value == now) => {
-                owed.push((key, now.to_owned()));
+                owed.push((key, now));
             }
             Some(now) => kept.push(format!("[{key}] machine = {now}")),
         }
@@ -1627,14 +1645,30 @@ impl Ports for Live {
     }
 
     fn identity(&self) -> Result<IdentityRead, String> {
-        let config = aterm_types::dirs::aterm_config_path()
+        let config_path = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
+        let snapshot =
+            aterm_uds::atomic_file::ConfigFile::open(&config_path).map_err(|e| e.to_string())?;
+        let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
+            return Ok(IdentityRead::NotApplicable(
+                "off: [swarm] enabled = false".to_owned(),
+            ));
+        };
+        if config.name == NameChoice::Off {
+            return Ok(IdentityRead::NotApplicable(
+                "off: [identity] name = false".to_owned(),
+            ));
+        }
         let paths = vault_paths()?;
         let roster = read_name_roster(&paths)?;
-        let names = own_names();
-        let hostnames = local_hostnames(&names);
-        let (owed, target, roster_label) = identity_owed_from(
-            &config,
+        let mut names = None;
+        let hostnames = if roster.is_some() {
+            Vec::new()
+        } else {
+            local_hostnames(names.insert(own_names()))
+        };
+        let (owed, target, roster_label) = identity_owed_from_config(
+            config,
             self.state_dir().as_deref(),
             &identity_record()?,
             &paths,
@@ -1651,10 +1685,15 @@ impl Ports for Live {
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
         let own = label.as_deref().filter(|_| cfg!(target_os = "macos"));
-        let read = with_fleet_name(read, &target, own, &fleet, &names);
+        let names = if own == Some(target.as_str()) {
+            names.get_or_insert_with(own_names)
+        } else {
+            names.get_or_insert_with(OwnNames::default)
+        };
+        let read = with_fleet_name(read, &target, own, &fleet, names);
         // An admission after setup's one password: the rule it left names the Mac, so the
         // pass is due while the Mac's own names are not yet the label.
-        let pending = own_name_pending(&target, own, &names).and(own);
+        let pending = own_name_pending(&target, own, names).and(own);
         #[cfg(target_os = "macos")]
         let by_rule = pending.is_some()
             && aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new())
@@ -1677,8 +1716,12 @@ impl Ports for Live {
         }
         let paths = vault_paths()?;
         let roster = read_name_roster(&paths)?;
-        let names = own_names();
-        let hostnames = local_hostnames(&names);
+        let mut names = None;
+        let hostnames = if roster.is_some() {
+            Vec::new()
+        } else {
+            local_hostnames(names.insert(own_names()))
+        };
         let roster_label = name_label(&paths, roster.as_ref(), &hostnames)?;
         let label = projected_machine_label(
             self.state_dir().as_deref(),
@@ -1701,13 +1744,18 @@ impl Ports for Live {
             return Ok(keys);
         };
         #[cfg(not(target_os = "macos"))]
-        let _ = os_label;
+        let _ = (&mut names, os_label);
         let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
             roster_gives(roster.as_ref(), roster_label.as_deref(), word)
         })?;
         #[cfg(target_os = "macos")]
-        if let Some(label) =
-            own_name_pending(&target, os_label.as_deref(), &names).and(os_label.as_deref())
+        if let Some(label) = os_label
+            .as_deref()
+            .filter(|label| *label == target)
+            .and_then(|label| {
+                own_name_pending(&target, Some(label), names.get_or_insert_with(own_names))
+                    .and(Some(label))
+            })
             && let Some(named) = own_name_by_rule(label)
         {
             return Ok(format!("{keys}; {fleet}; {named}"));
@@ -2149,8 +2197,8 @@ impl Ports for Live {
         use aterm_acaffeine::cli::Kept;
         use aterm_acaffeine::held::Held;
         let kept = aterm_acaffeine::cli::keep_installed_awake();
-        match &kept {
-            Kept::NotHere(why) | Kept::Failed(why) => return Err(why.clone()),
+        match kept {
+            Kept::NotHere(why) | Kept::Failed(why) => return Err(why),
             Kept::Off => return Ok(kept.line()),
             Kept::Running(_) => {}
         }

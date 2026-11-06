@@ -97,6 +97,16 @@ fn window_presented(
     }
 }
 
+/// A frame that failed after its blit pass, as one whose tap read-back or
+/// present failed leaves it: the chain's frame waited for, buffer 0 bound to
+/// the context as its render target, and no present, the one thing that
+/// unbinds it.
+fn fail_after_the_blit(surf: &mut GpuSurface) {
+    let chain = surf.d3d11.as_mut().expect("a D3D11 window").chain_mut();
+    assert!(chain.wait_for_frame(60_000), "the failed frame's wait");
+    crate::d3d11::surface::tests::clear(chain, [0.0, 0.0, 0.0, 1.0]);
+}
+
 /// Every fixture presented to a real window (three frames each, the second
 /// and third over the resident frame), plain and inverted: byte-identical to
 /// the headless present of the same input. Controls: the inversion and a
@@ -184,6 +194,111 @@ fn the_window_chain_follows_resize_surface() {
         Some((crop, (dw, dh))),
     );
     assert_frames_identical("resized window", &want, &got);
+}
+
+/// A frame that failed after its blit pass, then a resize: the next present
+/// resizes the chain and draws at the new size what the headless present
+/// draws there, as after a shown frame. `ResizeBuffers`' remarks ask that no
+/// view of the buffers be bound, and the failed frame leaves buffer 0 bound;
+/// the runtime resizes all the same (SPECS.md §5.19), and a refusal here would
+/// leave the window on its last frame until it returned to the old size.
+#[test]
+fn a_frame_that_failed_after_its_blit_does_not_stop_the_window_resizing() {
+    desktop_or_could_not_run();
+    let mut gpu = renderer();
+    let window = Window::new(0);
+    let (fw, fh) = gpu.frame_size(ROWS, COLS);
+    let (fw, fh) = (fw as u32, fh as u32);
+    let mut surf = gpu
+        .create_window_surface(Target(window.0 as isize), fw, fh)
+        .expect("a D3D11 swap chain on the window");
+    let mut on_glass = WindowGpu::new();
+    let mut headless = WindowGpu::new();
+    let (_, input, _) = fixtures(&gpu, false).swap_remove(0);
+    let first = window_presented(&mut gpu, &mut on_glass, &mut surf, &input, false);
+    assert_eq!((first.width, first.height), (fw as usize, fh as usize));
+    window.pump();
+    fail_after_the_blit(&mut surf);
+    let (dw, dh) = (fw + 37, fh + 11);
+    gpu.resize_surface(&mut on_glass, &mut surf, dw, dh);
+    let got = window_presented(&mut gpu, &mut on_glass, &mut surf, &input, false);
+    assert!(!gpu.device_lost());
+    let crop = PresentCrop {
+        source_y: 0,
+        height: fh,
+    };
+    let want = presented(
+        &mut gpu,
+        &mut headless,
+        &input,
+        false,
+        None,
+        None,
+        Some((crop, (dw, dh))),
+    );
+    assert_frames_identical("resized after a failed frame", &want, &got);
+}
+
+/// The HDR switch's remake (`d3d11_remake_chain`, which the 250 ms probe
+/// runs when Windows HDR is switched on or off under a window), on a chain
+/// whose last frame failed after its blit pass: with `hdr_glow` on it drops
+/// the used 8-bit chain and makes an f16 one on the same window (dropped in
+/// turn where the output is SDR, as the lane's is, for the 8-bit one after
+/// it), and the window presents on the GPU what its headless present draws.
+/// Then `hdr_glow` off, after a shown frame. A remake that fails latches the
+/// device lost, which sends every window to the CPU renderer: a window takes
+/// one flip-model chain at a time, and without the dropped chain's forced
+/// destruction it is refused the new one.
+#[test]
+fn an_hdr_remake_keeps_the_window_on_the_gpu() {
+    desktop_or_could_not_run();
+    let mut gpu = renderer();
+    let window = Window::new(0);
+    let (fw, fh) = gpu.frame_size(ROWS, COLS);
+    let mut surf = gpu
+        .create_window_surface(Target(window.0 as isize), fw as u32, fh as u32)
+        .expect("a D3D11 swap chain on the window");
+    assert!(!surf.is_hdr(), "an SDR attach is 8-bit");
+    let mut on_glass = WindowGpu::new();
+    let mut headless = WindowGpu::new();
+    let (name, input, _) = fixtures(&gpu, false).swap_remove(0);
+    let want = presented(&mut gpu, &mut headless, &input, false, None, None, None);
+    let got = window_presented(&mut gpu, &mut on_glass, &mut surf, &input, false);
+    assert_frames_identical(name, &want, &got);
+    window.pump();
+    for (hdr_glow, failed_frame) in [(true, true), (false, false)] {
+        if failed_frame {
+            fail_after_the_blit(&mut surf);
+        }
+        gpu.set_hdr_glow(hdr_glow);
+        let remade = gpu.d3d11_remake_chain(&mut surf, "the test's HDR switch");
+        assert_eq!(
+            remade,
+            Ok(()),
+            "hdr_glow {hdr_glow}: the remake: {:?}",
+            gpu.device_loss_reason()
+        );
+        assert!(!gpu.device_lost(), "hdr_glow {hdr_glow}: no loss latched");
+        let output_hdr = surf.d3d11.as_ref().is_some_and(|dw| dw.output_hdr());
+        assert_eq!(
+            surf.is_hdr(),
+            hdr_glow && output_hdr,
+            "hdr_glow {hdr_glow}: f16 exactly on an HDR output"
+        );
+        crate::stderr_line!(
+            "d3d11 window: remade with hdr_glow {hdr_glow} after a failed frame \
+             {failed_frame}: output HDR {output_hdr}, chain f16 {}",
+            surf.is_hdr()
+        );
+        let want = presented(&mut gpu, &mut headless, &input, false, None, None, None);
+        let got = window_presented(&mut gpu, &mut on_glass, &mut surf, &input, false);
+        if surf.is_hdr() {
+            assert_eq!((got.width, got.height), (fw, fh));
+        } else {
+            assert_frames_identical(&format!("{name}, remade"), &want, &got);
+        }
+        window.pump();
+    }
 }
 
 /// A visual instance (Mica and Acrylic) attaches a DirectComposition chain on

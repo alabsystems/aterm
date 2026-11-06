@@ -195,18 +195,14 @@ pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result
 }
 
 /// [`scan_listener_holders`] whose connection to `path` (macOS) or whole scan (Linux) is waited
-/// for at most `hang` in place of [`SCAN_DEADLINE`]: a test whose own broker serves `path`
-/// passes the one-minute hang detector, and a debug `aterm fabric` the bound its seam names,
-/// since a loaded machine can keep the spawn lock's holder and the broker, or Linux's table
-/// reads, from finishing within the scan's 10 s.
+/// for at most `hang` in place of [`SCAN_DEADLINE`]. Native owner validation uses its
+/// shorter custody bound; a test whose own broker serves `path` passes the one-minute
+/// hang detector. A loaded machine can keep the spawn lock's holder and the broker,
+/// or Linux's table reads, from finishing within the default scan's 10 s.
 ///
 /// # Errors
 /// [`scan_listener_holders`]'s, with `TimedOut` once `hang` is up.
-#[cfg(all(
-    any(target_vendor = "apple", target_os = "linux"),
-    any(test, debug_assertions)
-))]
-#[doc(hidden)]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub fn scan_listener_holders_within(
     path: &std::path::Path,
     skip: &[u32],
@@ -735,6 +731,19 @@ pub fn scan_listener_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Resu
         io::ErrorKind::Unsupported,
         "the listener scan reads libproc (macOS) or /proc (Linux)",
     ))
+}
+
+/// [`scan_listener_holders`] with a caller's wait bound, unsupported on this platform too.
+///
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn scan_listener_holders_within(
+    path: &std::path::Path,
+    skip: &[u32],
+    _hang: std::time::Duration,
+) -> io::Result<HolderScan> {
+    scan_listener_holders(path, skip)
 }
 
 /// A socket path, as a path a socket was bound at is compared with it ([`Self::names`]).

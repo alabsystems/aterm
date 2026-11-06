@@ -7,7 +7,46 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]";
+const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
+
+#[cfg(unix)]
+#[path = "resource_run_admission.rs"]
+mod admission;
+
+#[cfg(any(unix, test))]
+struct Resources {
+    cpu_units: u32,
+    memory_bytes: u64,
+    timeout_ms: Option<u64>,
+    status_fd: Option<i32>,
+}
+
+#[cfg(not(any(unix, test)))]
+struct Resources;
+
+impl Resources {
+    #[cfg(any(unix, test))]
+    fn validated(
+        cpu_units: u32,
+        memory_bytes: u64,
+        timeout_ms: Option<u64>,
+        status_fd: Option<i32>,
+    ) -> Self {
+        Self {
+            cpu_units,
+            memory_bytes,
+            timeout_ms,
+            status_fd,
+        }
+    }
+
+    // Unsupported platforms retain successful argument validation, not a request
+    // payload that no native admission transport can consume.
+    #[cfg(not(any(unix, test)))]
+    fn validated(_: u32, _: u64, _: Option<u64>, _: Option<i32>) -> Self {
+        Self
+    }
+}
 
 const ABOUT: &str = "Registers this process with the session's aterm as job LABEL, then execs PROGRAM in its\n\
                      place (same pid, descriptors and process group): its CPU and memory are charged to\n\
@@ -20,11 +59,15 @@ struct Args {
     ai: Option<String>,
     job: String,
     command: Vec<OsString>,
+    resources: Option<Resources>,
+    capabilities: bool,
 }
 
 fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
     let mut args = argv.into_iter();
     let (mut sock, mut session, mut ai, mut job) = (None, None, None, None);
+    let (mut cpus, mut memory, mut timeout, mut status) = (None, None, None, None);
+    let mut capabilities = false;
     while let Some(arg) = args.next() {
         let Some(word) = arg.to_str() else {
             return Err(super::usage(USAGE));
@@ -32,17 +75,31 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
         if word == "--help" || word == "-h" {
             return Ok(None);
         }
+        if word == "--capabilities" {
+            if capabilities {
+                return Err(super::usage(USAGE));
+            }
+            capabilities = true;
+            continue;
+        }
         if word == "--" {
+            let resources = resources(cpus, memory, timeout, status)?;
             let command: Vec<_> = args.collect();
-            if command.is_empty() {
+            if command.is_empty() || capabilities || (resources.is_some() && ai.is_some()) {
                 return Err(super::usage(USAGE));
             }
             return Ok(Some(Args {
                 sock,
-                session: session.ok_or_else(|| super::usage(USAGE))?,
+                session: match session {
+                    Some(session) => session,
+                    None if resources.is_some() => "@self".into(),
+                    None => return Err(super::usage(USAGE)),
+                },
                 ai,
                 job: job.ok_or_else(|| super::usage(USAGE))?,
                 command,
+                resources,
+                capabilities: false,
             }));
         }
         let slot = match word {
@@ -50,6 +107,10 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
             "--session" => &mut session,
             "--ai" => &mut ai,
             "--job" => &mut job,
+            "--cpu-units" => &mut cpus,
+            "--memory-bytes" => &mut memory,
+            "--timeout-ms" => &mut timeout,
+            "--status-fd" => &mut status,
             _ => return Err(super::usage(USAGE)),
         };
         if slot.is_some() {
@@ -61,16 +122,88 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
                 .ok_or_else(|| super::usage(USAGE))?,
         );
     }
+    if capabilities
+        && ai.is_none()
+        && job.is_none()
+        && cpus.is_none()
+        && memory.is_none()
+        && timeout.is_none()
+        && status.is_none()
+    {
+        return Ok(Some(Args {
+            sock,
+            session: session.unwrap_or_else(|| "@self".into()),
+            ai,
+            job: String::new(),
+            command: Vec::new(),
+            resources: None,
+            capabilities: true,
+        }));
+    }
     Err(super::usage(USAGE))
+}
+
+fn resources(
+    cpus: Option<String>,
+    memory: Option<String>,
+    timeout: Option<String>,
+    status: Option<String>,
+) -> io::Result<Option<Resources>> {
+    fn positive(value: &str) -> io::Result<u64> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(super::usage(USAGE));
+        }
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| super::usage(USAGE))
+    }
+    match (cpus, memory) {
+        (None, None) if timeout.is_none() && status.is_none() => Ok(None),
+        (Some(cpus), Some(memory)) => Ok(Some(Resources::validated(
+            u32::try_from(positive(&cpus)?).map_err(|_| super::usage(USAGE))?,
+            positive(&memory)?,
+            timeout.as_deref().map(positive).transpose()?,
+            status
+                .as_deref()
+                .map(positive)
+                .transpose()?
+                .map(|fd| {
+                    i32::try_from(fd)
+                        .ok()
+                        .filter(|fd| *fd > 2)
+                        .ok_or_else(|| super::usage(USAGE))
+                })
+                .transpose()?,
+        ))),
+        _ => Err(super::usage(USAGE)),
+    }
 }
 
 /// Register this process, then become the exact requested command.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
+    let admitted = argv.iter().any(|word| {
+        matches!(
+            word.to_str(),
+            Some(
+                "--cpu-units"
+                    | "--memory-bytes"
+                    | "--timeout-ms"
+                    | "--status-fd"
+                    | "--capabilities"
+            )
+        )
+    });
     match run_registered_command(argv) {
         Ok(code) => code,
         Err(error) => {
             let _ = crate::stderr_prefixed("aterm resource-run: ", &error.to_string());
-            ExitCode::FAILURE
+            if admitted {
+                ExitCode::from(75)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -90,13 +223,22 @@ fn run_registered_command(argv: Vec<OsString>) -> io::Result<ExitCode> {
         super::SelTok::Sid(sid) => Some(sid.to_string()),
         _ => self_sid.clone(),
     };
-    let (path, origin) = crate::resolve_target(args.sock, None, target_sid)?;
+    let (path, origin) = crate::resolve_target(args.sock.clone(), None, target_sid)?;
     let wire = super::ConnWire { path, origin };
     let sid = super::resolve_selector(
         &args.session,
         self_sid.as_deref(),
         &mut super::LazySessions::new(&wire),
     )?;
+    if args.capabilities || args.resources.is_some() {
+        #[cfg(unix)]
+        return admission::run(&wire, &sid, &args);
+        #[cfg(not(unix))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "retained resource admission requires Unix",
+        ));
+    }
     let own = std::process::id();
     let start = aterm_uds::process::read_process_start(i32::try_from(own).unwrap_or(-1))
         .ok_or_else(|| io::Error::other("kernel process identity unavailable"))?
@@ -200,6 +342,82 @@ mod tests {
             ["tool", "", "--ai", "private words"].map(OsString::from)
         );
         assert!(parsed.ai.is_none());
+    }
+
+    #[test]
+    fn retained_admission_requires_both_positive_resources_and_defaults_self() {
+        let args = [
+            "--cpu-units",
+            "4",
+            "--memory-bytes",
+            "1024",
+            "--timeout-ms",
+            "90",
+            "--status-fd",
+            "7",
+            "--job",
+            "solve",
+            "--",
+            "ay",
+            "input",
+        ];
+        let parsed = parse(args.map(OsString::from).to_vec()).unwrap().unwrap();
+        assert_eq!(parsed.session, "@self");
+        let resources = parsed.resources.unwrap();
+        assert_eq!(
+            (
+                resources.cpu_units,
+                resources.memory_bytes,
+                resources.timeout_ms,
+                resources.status_fd
+            ),
+            (4, 1024, Some(90), Some(7))
+        );
+        for prefix in [
+            vec!["--cpu-units", "4"],
+            vec!["--memory-bytes", "1024"],
+            vec!["--timeout-ms", "90"],
+            vec!["--cpu-units", "0", "--memory-bytes", "1024"],
+            vec!["--cpu-units", "4", "--memory-bytes", "-1"],
+            vec![
+                "--cpu-units",
+                "4",
+                "--memory-bytes",
+                "1024",
+                "--ai",
+                "ignored",
+            ],
+            vec![
+                "--cpu-units",
+                "4",
+                "--memory-bytes",
+                "1024",
+                "--status-fd",
+                "1",
+            ],
+        ] {
+            let mut args = prefix;
+            args.extend(["--job", "solve", "--", "ay"]);
+            assert!(parse(args.into_iter().map(OsString::from).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn capability_query_accepts_no_execution_or_resource_arguments() {
+        assert!(
+            parse(vec!["--capabilities".into()])
+                .unwrap()
+                .unwrap()
+                .capabilities
+        );
+        for args in [
+            vec!["--capabilities", "--capabilities"],
+            vec!["--capabilities", "--job", "job"],
+            vec!["--capabilities", "--", "ay"],
+            vec!["--capabilities", "--cpu-units", "2"],
+        ] {
+            assert!(parse(args.into_iter().map(OsString::from).collect()).is_err());
+        }
     }
 
     #[test]

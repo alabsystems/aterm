@@ -452,7 +452,12 @@ impl Runtime {
                 .map(|(node, _)| node.clone())
                 .collect();
             let hinted = (self.hints)();
-            let reachable: BTreeSet<String> = hinted.iter().map(|(node, _)| node.clone()).collect();
+            let mut reachable = BTreeSet::new();
+            for (node, _) in &hinted {
+                if !reachable.contains(node) {
+                    reachable.insert(node.clone());
+                }
+            }
             let dialing = self.dials.lock_or_recover().dialing.clone();
             let plan = overlay.step(&Sight {
                 now,

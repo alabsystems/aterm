@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use aterm_codec::tty::write_line;
 use aterm_json::{Map, Value};
 
 use super::DiskWatchStatus;
@@ -25,7 +26,10 @@ pub(super) struct DiskOutput<'a> {
 impl DiskOutput<'_> {
     pub(super) fn print(&self, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         if let Err(error) = self.write(out) {
-            let _ = writeln!(err, "aterm harness disk: could not write results: {error}");
+            let _ = write_line(
+                err,
+                format_args!("aterm harness disk: could not write results: {error}"),
+            );
             return ExitCode::from(1);
         }
         ExitCode::SUCCESS
@@ -118,31 +122,33 @@ impl DiskOutput<'_> {
             return out.flush();
         }
 
-        writeln!(out, "{}", rep.headline())?;
-        writeln!(out, "  {}", watch.line)?;
+        write_line(out, format_args!("{}", rep.headline()))?;
+        write_line(out, format_args!("  {}", watch.line))?;
         for row in &rep.rows {
-            writeln!(out, "  {}", row.line())?;
+            write_line(out, format_args!("  {}", row.line()))?;
         }
         if rep
             .rows
             .iter()
             .any(|r| matches!(r.witness, disk::Witness::LeastRecentlyUsed { .. }))
         {
-            writeln!(
+            write_line(
                 out,
-                "  under pressure: the least-recently-used rows go in the order listed, until free space is back or what they freed covers the shortfall; under_pressure_up_to= is the most they would free"
+                format_args!(
+                    "  under pressure: the least-recently-used rows go in the order listed, until free space is back or what they freed covers the shortfall; under_pressure_up_to= is the most they would free"
+                ),
             )?;
         }
         for note in &rep.notes {
-            writeln!(out, "  note: {}", disk::shown(note))?;
+            write_line(out, format_args!("  note: {}", disk::shown(note)))?;
         }
         if rep.rows.is_empty() {
-            writeln!(out, "  nothing to reclaim")?;
+            write_line(out, format_args!("  nothing to reclaim"))?;
         }
         if !rep.hogs.is_empty() {
-            writeln!(out, "  the largest it cannot reclaim:")?;
+            write_line(out, format_args!("  the largest it cannot reclaim:"))?;
             for hog in &rep.hogs {
-                writeln!(out, "    {}", hog.line(rep.home.as_deref()))?;
+                write_line(out, format_args!("    {}", hog.line(rep.home.as_deref())))?;
             }
         }
         let config_file = self
@@ -166,15 +172,17 @@ impl DiskOutput<'_> {
                     } else {
                         format!("; also {remedy}")
                     };
-                    writeln!(
+                    write_line(
                         out,
-                        "report only: to remove, add --apply <class> ({}){config}",
-                        classes.join(", ")
+                        format_args!(
+                            "report only: to remove, add --apply <class> ({}){config}",
+                            classes.join(", ")
+                        ),
                     )?;
                 }
             }
             Some(done) => {
-                writeln!(out, "{}", done.headline())?;
+                write_line(out, format_args!("{}", done.headline()))?;
                 for (row, removed) in &done.removed {
                     let line = format!(
                         "  removed {} — {}; counted {} of file allocation",
@@ -182,20 +190,19 @@ impl DiskOutput<'_> {
                         row.witness.describe(),
                         disk::human_bytes(removed.bytes)
                     );
-                    writeln!(out, "{}", disk::shown(&line))?;
+                    write_line(out, format_args!("{}", disk::shown(&line)))?;
                     for unit in &removed.units {
-                        writeln!(
+                        write_line(
                             out,
-                            "    went: {}",
-                            disk::shown(&unit.display().to_string())
+                            format_args!("    went: {}", disk::shown(&unit.display().to_string())),
                         )?;
                     }
                     for (unit, why) in &removed.skipped {
                         let line = format!("    kept: {} — {why}", unit.display());
-                        writeln!(out, "{}", disk::shown(&line))?;
+                        write_line(out, format_args!("{}", disk::shown(&line)))?;
                     }
                     for trouble in &removed.trouble {
-                        writeln!(out, "    trouble: {}", disk::shown(trouble))?;
+                        write_line(out, format_args!("    trouble: {}", disk::shown(trouble)))?;
                     }
                 }
                 for refusal in &done.denials {
@@ -204,10 +211,16 @@ impl DiskOutput<'_> {
                     } else {
                         String::new()
                     };
-                    writeln!(out, "  denied: {}{fix}", disk::shown(&refusal.describe()))?;
+                    write_line(
+                        out,
+                        format_args!("  denied: {}{fix}", disk::shown(&refusal.describe())),
+                    )?;
                 }
                 if let Some(stop) = &done.stopped {
-                    writeln!(out, "  stopped: {}", disk::shown(&stop.describe()))?;
+                    write_line(
+                        out,
+                        format_args!("  stopped: {}", disk::shown(&stop.describe())),
+                    )?;
                 }
             }
         }

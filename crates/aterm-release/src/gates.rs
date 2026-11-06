@@ -2296,14 +2296,16 @@ impl GateTree<'_> {
                     return Ok(None);
                 }
                 let prefix = format!("{dir}/");
-                let desks: std::collections::BTreeSet<String> = listed
+                let mut desks: Vec<String> = listed
                     .split('\0')
                     .filter_map(|path| path.strip_prefix(prefix.as_str()))
                     .filter_map(|rest| rest.strip_suffix("/parent.toml"))
                     .filter(|desk| !desk.is_empty() && !desk.contains('/'))
                     .map(str::to_string)
                     .collect();
-                Ok(Some(desks.into_iter().collect()))
+                desks.sort_unstable();
+                desks.dedup();
+                Ok(Some(desks))
             }
         }
     }

@@ -1,0 +1,19 @@
+[package]
+name = "trust-sha2"
+version = "0.13.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates"]
+publish = false
+description = "Trust-owned SHA-2 per FIPS PUB 180-4; zero dependencies, no_std"
+
+[features]
+default = ["std"]
+std = []
+
+[package.metadata.aterm-origin]
+project = "Trust"
+commit = "21a4afd96990dac728b69cd3e6c25e1ea72e180e"
+path = "crates/trust-sha2"
+
+[workspace]

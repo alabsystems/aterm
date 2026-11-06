@@ -281,18 +281,20 @@ pub fn check(mounted: &[Mounted], shares: &[Share]) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt as _;
     for s in shares {
         let path = Path::new(std::ffi::OsStr::from_bytes(&s.path));
-        let want = Path::new("/").join(&s.name);
         match mounted.iter().rev().find(|m| m.point == path) {
-            Some(m) if m.fstype == FSTYPE && m.source == TAG && m.root == want => {}
+            Some(m)
+                if m.fstype == FSTYPE
+                    && m.source == TAG
+                    && m.root.strip_prefix("/") == Ok(Path::new(&s.name)) => {}
             Some(m) => {
                 return Err(format!(
-                    "share `{}` at {}: the mount there shows {} of {} `{}`, not {}",
+                    "share `{}` at {}: the mount there shows {} of {} `{}`, not /{}",
                     s.name,
                     path.display(),
                     m.root.display(),
                     m.fstype,
                     m.source,
-                    want.display()
+                    s.name
                 ));
             }
             None => {

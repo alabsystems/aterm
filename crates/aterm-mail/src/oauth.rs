@@ -95,7 +95,7 @@ fn encoded_len(value: &str) -> usize {
         .sum()
 }
 
-fn encode_into(result: &mut String, value: &str) {
+pub(crate) fn encode_into(result: &mut String, value: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {

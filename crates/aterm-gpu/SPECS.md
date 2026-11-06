@@ -648,6 +648,15 @@ tests/tray_present_scissor.rs	tray_present_scissors_and_stays_byte_identical_to_
 18. **Resolved (`t_us` microsecond timestamps):** `d3d11_window_tests::window_presented` and
     `tray_present_scissor::harvest` now pass microsecond timestamps (`1_000`, `(i as u64 + 1) * 1_000`) to
     `presented_snapshot_after_present` and `video_after_present`, matching `metal/mod.rs` and `frame_record_tests.rs`.
+19. **Not changed: a failed frame's binding does not stop a D3D11 resize.** A frame that fails after its blit
+    pass (a tap's read-back, a non-removal `Present` error) leaves the window chain's buffer 0 bound to the
+    immediate context, and `ResizeBuffers`' remarks ask that no view of the buffers be bound; the hostile review
+    of 2026-10-29 read that as every later resize answering `DXGI_ERROR_INVALID_CALL`. Measured in the Windows
+    lane on 2026-10-30 and 2026-11-06 (Windows 11 26H2, WARP, lane's desktop session, aarch64 and x86_64 under
+    Prism), `ResizeBuffers` succeeds with that view bound: `d3d11_window_tests::a_frame_that_failed_after_its_blit_does_not_stop_the_window_resizing` passes on
+    the code without an unbind, so `D3dWindowSurface::resize` unbinds nothing. The same binding does keep a
+    dropped chain alive, and its window then refuses the next chain (`E_ACCESSDENIED`); the drop clears that
+    (`Current::clear_state_and_flush`, `surface::tests::a_dropped_chain_leaves_its_window_to_the_next_one`).
 
 ## 6. Proof order (easiest high-value first)
 

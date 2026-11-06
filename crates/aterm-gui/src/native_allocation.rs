@@ -304,23 +304,44 @@ impl AllocationApp {
                 "lease-state".into(),
                 "CPU leases: initializing; occupancy unavailable".into(),
             )),
+            Some(CpuObservation::Busy) => rows.push((
+                "lease-state".into(),
+                "CPU leases: admission snapshot busy; occupancy unavailable".into(),
+            )),
             Some(CpuObservation::Unreadable(error)) => rows.push((
                 "lease-state".into(),
                 format!("CPU leases: unreadable ({error})"),
             )),
-            Some(CpuObservation::Ready { total, holders }) => {
+            Some(
+                value @ CpuObservation::Ready {
+                    total,
+                    holders,
+                    external,
+                },
+            ) => {
                 rows.push((
                     "lease-state".into(),
                     format!(
                         "CPU leases: {} held · {} available · {total} total",
-                        holders.len(),
-                        total.saturating_sub(holders.len())
+                        value.occupied().unwrap_or(0),
+                        value.available().unwrap_or(0)
                     ),
                 ));
                 rows.push((
                     "lease-basis".into(),
                     "A held lease is not measured CPU use or proof of process identity.".into(),
                 ));
+                if let Some(external) = external {
+                    rows.push((
+                        "lease-external".into(),
+                        format!(
+                            "Shared backing: {} native · {} external held · {} crash-retained",
+                            holders.len(),
+                            external.holders.len(),
+                            external.retained.len()
+                        ),
+                    ));
+                }
                 for holder in holders {
                     rows.push((
                         format!("slot/{}", holder.slot),
@@ -825,6 +846,7 @@ mod tests {
             at: now,
             value: CpuObservation::Ready {
                 total: 2,
+                external: None,
                 holders: vec![aterm_capacity::CpuHolder {
                     slot: 1,
                     reported_pid: None,

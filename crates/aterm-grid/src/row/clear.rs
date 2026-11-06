@@ -41,6 +41,17 @@ impl Row {
         self.flags = RowFlags::DIRTY;
     }
 
+    /// Writes `glyph`, a narrow cell, to every column in a single pass (DECALN), leaving the
+    /// row's flags at DIRTY alone (no wrap, line attribute or wide-glyph mark): each cell is
+    /// output written, so the row's length is its width, as a glyph written to each column in
+    /// turn after [`Self::clear`] leaves it.
+    #[inline]
+    pub(crate) fn fill_written(&mut self, glyph: Cell) {
+        self.cells.fill(glyph);
+        self.len = super::u16_from_usize(self.cells.len());
+        self.flags = RowFlags::DIRTY;
+    }
+
     /// Fills `start..end` with `fill`, blanking any orphaned wide-char half to `Cell::EMPTY`.
     #[inline]
     pub(crate) fn clear_range_with(&mut self, start: u16, end: u16, fill: Cell) {

@@ -788,14 +788,14 @@ impl App {
             .is_some_and(Request::pending)
     }
 
-    /// Queued setup and Restore still belong to this worker; a live installer also
-    /// keeps its prompt guard here until exit or final detachment.
+    /// Queued setup and Restore still belong to this worker. A live installer with no
+    /// recoverable custody receipt keeps its prompt guard here until exit or detachment.
     pub(crate) fn system_state_handoff_pending(&self) -> bool {
         let host = &self.system_state_host;
         host.pending_apply.is_some()
             || host.operation == Some(SetupOperation::Restore)
             || host.latest_status.queued
-            || self.developer_tools_install_active()
+            || self.developer_tools_install_holds_handoff()
     }
 
     /// An update's handoff is about to end this process: what a Stop still

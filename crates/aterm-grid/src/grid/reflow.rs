@@ -3,6 +3,8 @@
 
 //! Grid reflow (`O(rows × cols)` line rewrapping when terminal column count changes).
 
+use std::sync::Arc;
+
 #[path = "reflow_map.rs"]
 mod reflow_map;
 
@@ -1254,8 +1256,7 @@ impl Grid {
         for span in &e.hyperlinks {
             for col in span.start_col..span.end_col {
                 let cell = self.storage.cell_extra_mut(row_idx, col);
-                cell.set_hyperlink(Some(span.url.clone()));
-                cell.set_hyperlink_id(span.id.clone());
+                cell.set_hyperlink_data(Some(Arc::clone(&span.payload)));
             }
         }
         for (col, s) in &e.complex_chars {

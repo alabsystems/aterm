@@ -799,7 +799,14 @@ pub fn scan_table(view: &View, logical_table: &str) -> Result<BTreeMap<String, V
 pub fn get_row(view: &View, logical_table: &str, key: &str) -> Result<Option<Value>> {
     let (_, collection) = resolve_table(logical_table)?;
     let skey = storage_key(logical_table, key)?;
-    if let Some(cell) = view.cells.get(&(collection.to_owned(), skey))
+    if let Some(cell) = view.cells.get(&(collection.to_owned(), skey.clone()))
+        && let Some(projected) = project_cell(logical_table, cell)
+    {
+        return Ok(Some(projected));
+    }
+    let trimmed = key.trim();
+    if trimmed != skey
+        && let Some(cell) = view.cells.get(&(collection.to_owned(), trimmed.to_owned()))
         && let Some(projected) = project_cell(logical_table, cell)
     {
         return Ok(Some(projected));
@@ -920,7 +927,11 @@ pub fn put_row(
     }
     let normalized = normalize_row(logical, key, value)?;
     let nat_key = natural_key_of(logical, key, &normalized);
-    let skey = storage_key(logical, &nat_key)?;
+    let skey = if nat_key.eq_ignore_ascii_case(key.trim()) {
+        prelim_skey
+    } else {
+        storage_key(logical, &nat_key)?
+    };
     let request = crypto::random::<16>()?;
     let op = db.commit(Command::Write {
         request,
@@ -1330,9 +1341,9 @@ fn plan_rows(view: &View, doc: &Value, existing: Existing) -> Result<Plan> {
                 Existing::Keep => cell.is_some(),
                 // A dump of exactly this state changes nothing, a conflict it shows included.
                 Existing::Replace => cell.is_some_and(|cell| {
-                    project_cell(logical, cell).as_ref() == Some(item)
-                        || (!cell.candidates.is_empty()
-                            && cell.candidates.iter().all(|c| c.value == normalized))
+                    (!cell.candidates.is_empty()
+                        && cell.candidates.iter().all(|c| c.value == normalized))
+                        || project_cell(logical, cell).as_ref() == Some(item)
                 }),
             };
             if settled {

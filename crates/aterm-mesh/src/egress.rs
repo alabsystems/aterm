@@ -328,6 +328,8 @@ struct TableHoldings {
     operations: BTreeMap<Digest, Holding>,
     /// Each table's conflict records, by its digest.
     conflicts: BTreeMap<Digest, Holding>,
+    /// The combined summary over `operations` and `conflicts`, until any table's set changes.
+    summary: Option<crate::presence::Held>,
     /// Whether the first catch-up read every store's records.
     seeded: bool,
 }
@@ -355,6 +357,7 @@ impl TableHoldings {
             let holding = kind.entry(key.table).or_default();
             if holding.ids.insert(stores::digest(&record.wire)) {
                 holding.summary = None;
+                self.summary = None;
             }
         }
     }
@@ -437,9 +440,9 @@ impl Egress {
         state.cursors.tables.extend(lengths);
         state.cursors.members = Some(members);
         state.had_file = true;
-        let cursors = state.cursors.clone();
+        let encoded = state.cursors.encode();
         drop(state);
-        self.write_cursors(&cursors);
+        self.write_cursors(&encoded);
         Ok(())
     }
 
@@ -563,11 +566,16 @@ impl Egress {
         if !holdings.seeded {
             return None;
         }
+        if let Some(summary) = holdings.summary {
+            return Some(summary);
+        }
         let operations =
             TableHoldings::summaries(&mut holdings.operations, crate::presence::Held::table);
         let conflicts =
             TableHoldings::summaries(&mut holdings.conflicts, crate::presence::Held::conflicts);
-        Some(crate::presence::Held::tables(&operations, &conflicts))
+        let summary = crate::presence::Held::tables(&operations, &conflicts);
+        holdings.summary = Some(summary);
+        Some(summary)
     }
 
     /// Note records `key`'s store holds ([`Self::tables_held`]).
@@ -678,12 +686,10 @@ impl Egress {
         self.stop.load(Ordering::Acquire)
     }
 
-    fn write_cursors(&self, cursors: &Cursors) {
-        if let Err(e) = aterm_uds::private_file::write_private(
-            &self.dir,
-            CURSORS_FILE,
-            cursors.encode().as_bytes(),
-        ) {
+    fn write_cursors(&self, encoded: &str) {
+        if let Err(e) =
+            aterm_uds::private_file::write_private(&self.dir, CURSORS_FILE, encoded.as_bytes())
+        {
             aterm_log::warn!("mesh: the egress's {CURSORS_FILE} could not be written: {e}");
         }
         // The ids stepped past go after the cursors that passed them ([`Self::take_arrived`]).
@@ -753,9 +759,9 @@ impl Egress {
         {
             let mut state = self.state.lock_or_recover();
             state.cursors.members = Some(length.max(state.cursors.members.unwrap_or(0)));
-            let cursors = state.cursors.clone();
+            let encoded = state.cursors.encode();
             drop(state);
-            self.write_cursors(&cursors);
+            self.write_cursors(&encoded);
         }
         self.moved.notify_all();
         Ok(())
@@ -867,6 +873,14 @@ impl Egress {
         }
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Publish",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
     fn publish_one(&self, mesh: &Mesh, key: TableKey, held: &Held) -> io::Result<()> {
         let subject = stores::table_subject(&key.table, mesh.principal());
         let published = mesh.publish(
@@ -887,9 +901,9 @@ impl Egress {
             return;
         }
         *cursor = to;
-        let cursors = state.cursors.clone();
+        let encoded = state.cursors.encode();
         drop(state);
-        self.write_cursors(&cursors);
+        self.write_cursors(&encoded);
         self.moved.notify_all();
     }
 
@@ -904,15 +918,18 @@ impl Egress {
             }
             let id = stores::digest(record);
             let delivered = self.take_arrived(&id);
-            if !delivered || self.republishes() {
+            let published = !delivered || self.republishes();
+            if published {
                 mesh.publish(MeshLog::Tables, &subject, record)?;
-                self.state.lock_or_recover().published += 1;
             }
             let mut state = self.state.lock_or_recover();
+            if published {
+                state.published += 1;
+            }
             state.cursors.members = Some(index + 1);
-            let cursors = state.cursors.clone();
+            let encoded = state.cursors.encode();
             drop(state);
-            self.write_cursors(&cursors);
+            self.write_cursors(&encoded);
         }
         self.moved.notify_all();
         Ok(())

@@ -2149,4 +2149,4 @@ pub(crate) fn retains_control(paths: &Paths) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;

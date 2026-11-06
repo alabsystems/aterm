@@ -11,6 +11,7 @@ use super::accounts::Cli;
 use super::accounts_step::Step;
 use super::codex_rollout::is_thread_id;
 use super::upgrade::{ArgvRefusal, Version};
+use super::worker::REFUSAL_ROOM;
 
 /// The manifest every Codex package carries at its root (layoutVersion 1).
 pub const PACKAGE_JSON: &str = "codex-package.json";
@@ -706,7 +707,7 @@ fn only_default_in(
     };
     let lead = match row {
         Some(label) => format!(
-            "Codex account `{label}` is a row of its own, but {why}: its turns would run on this \
+            "the account `{label}` is a row of its own, but {why}: its turns would run on this \
              machine's default login while the pool counts them as `{label}`'s"
         ),
         None => format!(
@@ -715,6 +716,7 @@ fn only_default_in(
         ),
     };
     let served_by = why.served_by();
+    let short = only_default_short(default, pinned, &served_by);
     let build_served = || build_served_by(&served_by);
     let then = match default {
         DefaultRow::Unlisted => format!(
@@ -791,7 +793,98 @@ fn only_default_in(
             build_served()
         ),
     };
-    format!("{lead}; {then}")
+    format!("{short}; {lead}; {then}")
+}
+
+/// [`only_default_in`]'s first clause: which row blocks the launch and what mends it, in few enough
+/// bytes for a stall's attention, which keeps a long refusal's first clause alone
+/// (`harness_host::StartupHold::Refused`). `pinned` is the owner's pin on a row of its own, which
+/// no row's condition ends while it stands. A long label is what gets cut, never a command or a
+/// wall's end ([`clause_with_label`]), and a wall's window goes unnamed where its word leaves no
+/// room for that end. A row's pin must name its whole label, so where that does not fit the clause
+/// gives the report instead, which lists the row ([`Step::Report`]); the whole words after this
+/// clause keep the pin.
+fn only_default_short(default: &DefaultRow, pinned: Option<&str>, served_by: &Step) -> String {
+    if let Some(own) = pinned {
+        return clause_with_label("pinned `", own, &format!("` cannot run: `{}`", unpin_fix()));
+    }
+    match default {
+        DefaultRow::Unlisted | DefaultRow::Moved(_) => {
+            format!("no row is on the one login this Codex runs: `{served_by}`")
+        }
+        DefaultRow::Serves(label) => {
+            let pin = format!(
+                "only `{label}` runs this Codex: `{}`",
+                unread_fix(Some(label))
+            );
+            if pin.len() <= REFUSAL_ROOM {
+                pin
+            } else {
+                clause_with_label(
+                    "only `",
+                    label,
+                    &format!("` runs this Codex: `{}` lists it", Step::Report(Cli::Codex)),
+                )
+            }
+        }
+        DefaultRow::Walled {
+            label,
+            window,
+            until,
+            ..
+        } => {
+            let end = super::usage::rfc3339_utc(*until);
+            let named = clause_with_label(
+                "only `",
+                label,
+                &format!("` runs this Codex, at its `{window}` limit until {end}"),
+            );
+            if named.len() <= REFUSAL_ROOM {
+                named
+            } else {
+                clause_with_label(
+                    "only `",
+                    label,
+                    &format!("` runs this Codex, at a limit until {end}"),
+                )
+            }
+        }
+        DefaultRow::SignedOut { label, stored } => clause_with_label(
+            "only `",
+            label,
+            &format!(
+                "` runs this Codex, {}: `{}`",
+                if *stored {
+                    "signed out"
+                } else {
+                    "not signed in here"
+                },
+                default_sign_in()
+            ),
+        ),
+        DefaultRow::Other { label, why } => {
+            clause_with_label("only `", label, &format!("` runs this Codex: {why}"))
+        }
+    }
+}
+
+/// The fewest bytes [`clause_with_label`] leaves a label, so a row stays named beside long words.
+const LABEL_FLOOR: usize = 8;
+
+/// `before`, `label` and `after` as one clause within [`REFUSAL_ROOM`], the end of `label` cut
+/// where the whole does not fit. Past [`LABEL_FLOOR`] nothing more of the label goes, so the clause
+/// can run over: a wall's long window does that, and [`only_default_short`] then leaves it unnamed,
+/// and so do the longest of [`DefaultRow::Other`]'s words, which name no command.
+fn clause_with_label(before: &str, label: &str, after: &str) -> String {
+    let room = REFUSAL_ROOM
+        .saturating_sub(before.len() + after.len())
+        .max(LABEL_FLOOR);
+    if label.len() <= room {
+        return format!("{before}{label}{after}");
+    }
+    let mark = '…';
+    let kept = super::truncate_bytes(label, room - mark.len_utf8());
+    format!("{before}{kept}{mark}{after}")
 }
 
 /// The owner's pin's end, which hands the Codex pool its pick again.

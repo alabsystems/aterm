@@ -175,6 +175,8 @@ fn a_root_run_execs_itself_as_the_account_or_says_why_not() {
     assert_eq!(
         kept,
         [
+            // Every batch's own (support.rs's zsh_ask), an ATERM_* setting like any other.
+            "ATERM_INSTALL_ZSH_ASK_SECS",
             "ATERM_REPO_SLUG",
             "CARGO_HOME",
             "CURL_CA_BUNDLE",

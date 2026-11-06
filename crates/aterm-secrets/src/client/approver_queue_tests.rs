@@ -664,6 +664,13 @@ fn fresh_readers_visit_every_busy_queue_across_multiple_batches() {
     )
     .unwrap();
     admin_publish(&paths, &admin, &doc).unwrap();
+    // A mirror takes no admin publish: seed every mirror with what was published, as
+    // `mirror_vault` seeds its own, rather than wait on the servers' replication to reach each
+    // before its queue is posted to.
+    let published = std::fs::read(paths.cache_file()).unwrap();
+    for url in &urls {
+        transport::publish(&Source::Url(url.clone()), &published).unwrap();
+    }
     let config = config(&paths).unwrap().unwrap();
     let Source::Url(primary_url) = &config.source else {
         unreachable!()

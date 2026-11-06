@@ -380,12 +380,23 @@ impl Endpoints {
     /// Build `base() + path_and_query` for the role's origin.
     #[must_use]
     pub fn url(&self, role: OriginRole, path_and_query: &str) -> String {
-        let slash = if path_and_query.starts_with('/') {
-            ""
-        } else {
-            "/"
-        };
-        format!("{}{slash}{path_and_query}", self.origin(role).base())
+        use std::fmt::Write as _;
+        let origin = self.origin(role);
+        let slash = usize::from(!path_and_query.starts_with('/'));
+        let mut out = String::with_capacity(
+            origin.scheme.len() + 3 + origin.host.len() + 6 + slash + path_and_query.len(),
+        );
+        out.push_str(origin.scheme);
+        out.push_str("://");
+        out.push_str(&origin.host);
+        if origin.port != default_port(origin.scheme) {
+            let _ = write!(out, ":{}", origin.port);
+        }
+        if slash == 1 {
+            out.push('/');
+        }
+        out.push_str(path_and_query);
+        out
     }
 }
 

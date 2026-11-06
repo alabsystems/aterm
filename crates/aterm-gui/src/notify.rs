@@ -6,10 +6,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::SyncSender;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
 /// Revocable permission to deliver a queued notice. Only its condition's owner
 /// keeps the strong reference; queue copies cannot keep an ended intent alive.
@@ -46,11 +44,12 @@ pub(crate) struct NotifyMsg {
     /// Notification body.
     pub body: String,
     /// `true` for aterm's own notice, governed by `desktop_alerts`; `false` for a program's ([`Self::program`]), which `allow_notifications` admitted.
-    #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub own: bool,
     /// A standing condition's permission; event notifications have none.
     #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     validity: Option<NoticeValidity>,
+    /// A program notice's slot in the queue ([`Notifier::try_send`]), given back when the delivery thread drops the notice.
+    slot: Option<ProgramSlot>,
 }
 
 impl NotifyMsg {
@@ -94,18 +93,80 @@ impl NotifyMsg {
         validity: Option<NoticeValidity>,
     ) -> Self {
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux", test)))]
-        let _ = (session, title, own, validity);
+        let _ = (session, title, validity);
         Self {
             #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             session,
             #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             title,
             body,
-            #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             own,
             #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
             validity,
+            slot: None,
         }
+    }
+}
+
+/// Program notices the queue holds at once, counting the one being delivered.
+const PROGRAM_SLOTS: usize = 16;
+
+/// Queue slots no program notice may take: aterm's own (the herald's, a consent prompt's) always
+/// find room, whatever a tab floods.
+const OWN_SLOTS: usize = 8;
+
+const NOTIFY_QUEUE_CAP: usize = PROGRAM_SLOTS + OWN_SLOTS;
+
+/// The sending side of the process-wide notification queue: every tab's engine callbacks and
+/// aterm's own notices post through clones of it.
+#[derive(Clone)]
+pub(crate) struct Notifier {
+    tx: SyncSender<NotifyMsg>,
+    /// Program notices queued or being delivered ([`ProgramSlot`]).
+    program: Arc<AtomicUsize>,
+}
+
+impl Notifier {
+    /// A notifier and the receiving end its delivery thread drains.
+    pub(crate) fn channel() -> (Notifier, Receiver<NotifyMsg>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
+        let notifier = Notifier {
+            tx,
+            program: Arc::default(),
+        };
+        (notifier, rx)
+    }
+
+    /// Queue `msg` without blocking. A program's notice is refused as `Full` once
+    /// [`PROGRAM_SLOTS`] are taken, so the last [`OWN_SLOTS`] are aterm's own.
+    pub(crate) fn try_send(&self, mut msg: NotifyMsg) -> Result<(), TrySendError<NotifyMsg>> {
+        if !msg.own {
+            match ProgramSlot::take(&self.program) {
+                Some(slot) => msg.slot = Some(slot),
+                None => return Err(TrySendError::Full(msg)),
+            }
+        }
+        self.tx.try_send(msg)
+    }
+}
+
+/// One of [`PROGRAM_SLOTS`], held by a program's notice from its queueing until the delivery
+/// thread (or a refused send) drops it.
+struct ProgramSlot(Arc<AtomicUsize>);
+
+impl ProgramSlot {
+    fn take(held: &Arc<AtomicUsize>) -> Option<ProgramSlot> {
+        held.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < PROGRAM_SLOTS).then_some(n + 1)
+        })
+        .ok()?;
+        Some(ProgramSlot(Arc::clone(held)))
+    }
+}
+
+impl Drop for ProgramSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -169,25 +230,23 @@ fn admit_delivery(msg: NotifyMsg, policy: &DeliveryPolicy) -> Option<AdmittedDel
     })
 }
 
-const NOTIFY_QUEUE_CAP: usize = 16;
-
 /// Whether this build has a host that can turn a queued notification into an operating-system notification.
 #[must_use]
 pub(crate) const fn delivery_available() -> bool {
     cfg!(any(target_os = "macos", windows, target_os = "linux"))
 }
 
-/// Spawn the single, process-wide notification delivery thread and return the `SyncSender` each tab clones into its engine callbacks.
+/// Spawn the single, process-wide notification delivery thread and return the [`Notifier`] each tab clones into its engine callbacks.
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub(crate) fn spawn_delivery(
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
     own_alerts: Arc<AtomicBool>,
     center: crate::notice_center::NoticeCenter,
-) -> SyncSender<NotifyMsg> {
+) -> Notifier {
     #[cfg(not(target_os = "macos"))]
     let _ = center;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
+    let (tx, rx) = Notifier::channel();
     let policy = DeliveryPolicy {
         suppress,
         silent,
@@ -232,8 +291,8 @@ pub(crate) fn spawn_delivery(
     _silent: Arc<AtomicBool>,
     _own_alerts: Arc<AtomicBool>,
     _center: crate::notice_center::NoticeCenter,
-) -> SyncSender<NotifyMsg> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
+) -> Notifier {
+    let (tx, rx) = Notifier::channel();
     std::thread::spawn(move || while rx.recv().is_ok() {});
     tx
 }
@@ -1372,10 +1431,39 @@ mod live_policy_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        NotifyMsg, applescript_escape, balloon_clicked, balloon_text, delivers, fold_controls,
-        fold_to_utf16, markup_escape, windows_info_flags,
+        Notifier, NotifyMsg, OWN_SLOTS, PROGRAM_SLOTS, applescript_escape, balloon_clicked,
+        balloon_text, delivers, fold_controls, fold_to_utf16, markup_escape, windows_info_flags,
     };
     use std::collections::HashSet;
+
+    /// Programs' notices, from any number of tabs, take at most their slots; aterm's own find
+    /// the rest free, and a delivered program notice gives its slot back.
+    #[test]
+    fn a_program_flood_leaves_the_own_slots_free() {
+        let (notifier, queue) = Notifier::channel();
+        let program = |tab| NotifyMsg::program(tab, None, "flood".into());
+        let queued = (0..1_000)
+            .filter(|i| notifier.try_send(program(i % 3)).is_ok())
+            .count();
+        assert_eq!(queued, PROGRAM_SLOTS);
+        for _ in 0..OWN_SLOTS {
+            notifier
+                .try_send(NotifyMsg::own(0, Some("aterm".into()), "needs you".into()))
+                .expect("an own notice finds its slot");
+        }
+        assert!(
+            notifier.try_send(program(0)).is_err(),
+            "the program slots stay taken"
+        );
+        let delivered = queue.recv().expect("the first program notice");
+        assert!(!delivered.own);
+        assert!(
+            notifier.try_send(program(0)).is_err(),
+            "still held while it is delivered"
+        );
+        drop(delivered);
+        notifier.try_send(program(0)).expect("its slot came back");
+    }
 
     #[test]
     fn a_bundled_aterm_posts_only_as_itself() {

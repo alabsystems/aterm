@@ -485,12 +485,17 @@ impl State {
             .find(|o| o.login.eq_ignore_ascii_case(login))
     }
 
-    /// The repository now named `slug`.
-    pub(crate) fn repo_index(&self, slug: &str) -> Option<usize> {
-        let (owner, name) = slug.split_once('/')?;
+    /// The repository now named `owner/name`.
+    pub(crate) fn repo_index_parts(&self, owner: &str, name: &str) -> Option<usize> {
         self.repos
             .iter()
             .position(|r| r.owner.eq_ignore_ascii_case(owner) && r.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The repository now named `slug`.
+    pub(crate) fn repo_index(&self, slug: &str) -> Option<usize> {
+        let (owner, name) = slug.split_once('/')?;
+        self.repo_index_parts(owner, name)
     }
 
     /// The repository with `id`.

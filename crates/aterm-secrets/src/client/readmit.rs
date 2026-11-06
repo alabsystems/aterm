@@ -553,6 +553,10 @@ thread_local! {
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the seat move's view, signer, seat, entrant and the one deny (one-mesh proofs P2) are separate reads every caller already holds"
+)]
 pub(super) fn sign_seat_move(
     log: &mut Log,
     opened: &OpenedAudienceEntries,
@@ -560,6 +564,7 @@ pub(super) fn sign_seat_move(
     signer: &Signer<'_>,
     (seat, cutoff): (MemberId, RecordId),
     entrant: Entrant,
+    denies: &log_entries::Denies,
     now_ms: u64,
 ) -> crate::Result<Vec<Record>> {
     let old = log
@@ -610,6 +615,7 @@ pub(super) fn sign_seat_move(
             // rotates Commons as before the fold (B11's note to B12).
             fold: false,
         },
+        denies,
         &mut signed,
     )?;
     Ok(signed)
@@ -1208,6 +1214,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         label,
     };
     let (taken, counted) = labels_taken(&opened.by_audience);
+    let denies = log_entries::Denies::read(paths, &log, &opened, Some(&lock))?;
     let (signed, how) = device.with_seed(|seed| -> crate::Result<(Vec<Record>, How)> {
         let signer = Signer {
             actor: &me,
@@ -1231,6 +1238,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
                     &signer,
                     (seat, cutoff),
                     entrant(label.clone()),
+                    &denies,
                     now_ms,
                 )?,
                 How::Seat { label },

@@ -29,8 +29,9 @@ pub struct Instance {
 impl Drop for Instance {
     fn drop(&mut self) {
         // Emptied first while this description still holds it, so a lock nobody holds names
-        // no pid: a probe holding it for an instant must not make this exited mug's pid read
-        // as a running one. (A mug killed outright leaves its pid; `running_mug` checks it.)
+        // no pid: another mug taking it, before it writes its own, must not make this exited
+        // mug's pid read as a running one. (A mug killed outright leaves its pid; `running_mug`
+        // checks it.)
         if !self.leave_named && matches!(take(&self.file), Ok(true)) {
             let _ = self.file.set_len(0);
         }
@@ -274,7 +275,7 @@ impl Holder {
     }
 }
 
-/// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug killed outright leaves its pid behind, which a probe holding the lock for an instant then reads as live; [`running_mug`] checks it).
+/// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug killed outright leaves its pid behind, which reads as live while another mug takes the lock, before it writes its own; [`running_mug`] checks it).
 #[must_use]
 pub fn running_holder(path: &Path) -> Option<Holder> {
     if !crate::paths::parent_is_real_dir(path)

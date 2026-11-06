@@ -222,15 +222,8 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
         let address = o
             .get("address")
             .and_then(Value::as_str)
-            .filter(|s| {
-                s.len() <= 254
-                    && !s.chars().any(|c| c.is_control() || c.is_whitespace())
-                    && s.split('@').count() == 2
-            })
             .ok_or_else(|| Error::new("invalid email address"))?;
-        if address.starts_with('@') || address.ends_with('@') {
-            return Err(Error::new("invalid email address"));
-        }
+        validate_email_address(address)?;
         for k in ["mailbox_id", "alias_of"] {
             if let Some(v) = o.get(k)
                 && !v.as_str().is_some_and(name)
@@ -279,6 +272,21 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
     }
     if let Some(details) = o.get("details") {
         validate_details(details)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_email_address(address: &str) -> Result<()> {
+    let Some((local, domain)) = address.split_once('@') else {
+        return Err(Error::new("invalid email address"));
+    };
+    if address.len() > 254
+        || local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || address.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(Error::new("invalid email address"));
     }
     Ok(())
 }

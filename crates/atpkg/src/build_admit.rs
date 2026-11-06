@@ -67,6 +67,10 @@ pub const VERB: &str = aterm_uds::build_front::ADMIT_VERB;
 /// in its hop ([`crate::build_cache::registered::helper_speaks_hop`]).
 pub const HOP_CAPABILITY: &str = "aterm-build-admit-hop-v2";
 
+#[path = "build_admit_controller.rs"]
+mod controller;
+pub use controller::{ControllerOutcome, supervise_controller};
+
 /// The variable that admits a build at once (`now`) instead of waiting (`wait`, the default).
 pub const ADMIT_ENV: &str = "ATERM_ADMIT";
 
@@ -2150,7 +2154,7 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
                     in_session(line, session_of(me), &session_of)
                 },
                 &|pid| aterm_uds::holders::open_files(pid).unwrap_or_default(),
-                &|file| aterm_uds::ownerlock::probe(file) == aterm_uds::ownerlock::Owner::Live,
+                &|file| aterm_uds::ownerlock::probe_any(file) == aterm_uds::ownerlock::Owner::Live,
             )
         };
         return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock);

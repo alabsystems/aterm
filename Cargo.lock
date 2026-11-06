@@ -146,7 +146,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.159.0"
+version = "0.160.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -180,6 +180,7 @@ dependencies = [
  "aterm-netplace",
  "aterm-primer",
  "aterm-pty",
+ "aterm-resource-host",
  "aterm-secrets",
  "aterm-session",
  "aterm-shell-integration",
@@ -392,6 +393,7 @@ dependencies = [
 name = "aterm-capacity"
 version = "0.0.0"
 dependencies = [
+ "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
  "aterm-json",
@@ -410,6 +412,7 @@ dependencies = [
  "aterm-vitals",
  "libc",
  "trust-build-cpu",
+ "trust-resource-provenance",
 ]
 
 [[package]]
@@ -579,6 +582,7 @@ dependencies = [
  "aterm-codec",
  "aterm-digest",
  "aterm-durable",
+ "aterm-json",
  "aterm-netplace",
  "aterm-pty",
  "aterm-stamp",
@@ -889,6 +893,7 @@ dependencies = [
  "aterm-provenance",
  "aterm-pty",
  "aterm-render",
+ "aterm-resource-host",
  "aterm-restore",
  "aterm-sandbox",
  "aterm-scrollback",
@@ -1112,6 +1117,7 @@ dependencies = [
 name = "aterm-lan"
 version = "0.0.0"
 dependencies = [
+ "aterm-containment",
  "aterm-keeper",
  "aterm-tempfile",
  "aterm-uds",
@@ -1260,6 +1266,7 @@ dependencies = [
  "aterm-log",
  "aterm-mesh-core",
  "aterm-metrics",
+ "aterm-models-swarm",
  "aterm-net",
  "aterm-secrets",
  "aterm-spec",
@@ -1315,6 +1322,7 @@ dependencies = [
  "aterm-grid",
  "aterm-gui",
  "aterm-keeper",
+ "aterm-mesh",
  "aterm-models-agh",
  "aterm-models-aos",
  "aterm-models-atpkg",
@@ -1612,6 +1620,7 @@ version = "0.0.0"
 name = "aterm-release"
 version = "0.0.0"
 dependencies = [
+ "agh",
  "agh-fake",
  "astream-aead",
  "astream-sys",
@@ -1669,6 +1678,27 @@ dependencies = [
  "aterm-types",
  "aterm-uds",
  "libc",
+]
+
+[[package]]
+name = "aterm-resource-host"
+version = "0.0.0"
+dependencies = [
+ "aterm-capacity",
+ "aterm-codec",
+ "aterm-ctl",
+ "aterm-digest",
+ "aterm-durable",
+ "aterm-json",
+ "aterm-sysprobe",
+ "aterm-tempfile",
+ "aterm-types",
+ "aterm-uds",
+ "atpkg",
+ "jobserver_utils",
+ "libc",
+ "trust-resource-controller",
+ "trust-resource-provenance",
 ]
 
 [[package]]
@@ -2377,6 +2407,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver_utils"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 
@@ -2454,10 +2491,33 @@ version = "0.1.44"
 
 [[package]]
 name = "trust-build-cpu"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "libc",
+ "trust-sha2",
 ]
+
+[[package]]
+name = "trust-resource-controller"
+version = "0.13.0"
+dependencies = [
+ "libc",
+ "trust-resource-provenance",
+]
+
+[[package]]
+name = "trust-resource-provenance"
+version = "0.13.0"
+dependencies = [
+ "aterm-json",
+ "aterm-serde",
+ "libc",
+ "trust-sha2",
+]
+
+[[package]]
+name = "trust-sha2"
+version = "0.13.0"
 
 [[package]]
 name = "untrusted"

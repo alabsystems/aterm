@@ -76,17 +76,20 @@ enum CliInput {
     Command(Vec<String>),
 }
 fn parse_cli_input(args: Vec<OsString>) -> Result<CliInput> {
-    let raw = args
-        .into_iter()
-        .map(|s| s.into_string().map_err(|_| fail("arguments must be UTF-8")))
-        .collect::<Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(raw.len());
-    let mut iter = raw.into_iter();
-    while let Some(token) = iter.next() {
+    let mut out = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(raw) = iter.next() {
+        let token = raw
+            .into_string()
+            .map_err(|_| fail("arguments must be UTF-8"))?;
         if VALUE_FLAGS.contains(&token.as_str()) {
             out.push(token);
             if let Some(value) = iter.next() {
-                out.push(value);
+                out.push(
+                    value
+                        .into_string()
+                        .map_err(|_| fail("arguments must be UTF-8"))?,
+                );
             }
             continue;
         }
@@ -120,19 +123,19 @@ fn job(s: &str) -> Result<Job> {
         _ => Err(fail("job must be server or subscriber")),
     }
 }
-fn option<'a>(operands: &'a [&'a str], name: &str) -> Result<&'a str> {
+fn option<'a, S: AsRef<str>>(operands: &'a [S], name: &str) -> Result<&'a str> {
     let mut found = operands
         .as_chunks::<2>()
         .0
         .iter()
-        .filter(|pair| pair[0] == name);
+        .filter(|pair| pair[0].as_ref() == name);
     let pair = found
         .next()
         .ok_or_else(|| fail(format!("missing {name}")))?;
     if found.next().is_some() {
         return Err(fail(format!("duplicate {name}")));
     }
-    Ok(pair[1])
+    Ok(pair[1].as_ref())
 }
 
 fn backend(paths: Paths, signed: Option<Value>) -> Live {
@@ -209,10 +212,10 @@ pub(super) fn rpc(
                 .as_str()
                 .ok_or_else(|| fail(format!("missing {key}")))
         };
-        let mut live = backend(paths.clone(), None);
         match operation {
             "inspect" => {
                 let which = job(word("job")?)?;
+                let mut live = backend(paths, None);
                 let observed = live.observe(which)?;
                 Ok(
                     json!({"job":which.label(),"unit":observed.unit.map(|u|json!({"program":u.program,"args":u.args,"definition":u.definition,"image":u.image,"executable_sha256":u.executable_sha256})),"off":observed.off,"pin":observed.pin}),
@@ -233,7 +236,7 @@ pub(super) fn rpc(
                         "signed requester differs from authenticated transport",
                     ));
                 }
-                live.set_signed_request(signed.clone());
+                let mut live = backend(paths.clone(), Some(signed.clone()));
                 Ok(transaction::outcome_value(&transaction::activate(
                     &paths.home,
                     &request,
@@ -242,6 +245,7 @@ pub(super) fn rpc(
             }
             "recover" => {
                 let which = job(word("job")?)?;
+                let mut live = backend(paths.clone(), None);
                 Ok(
                     transaction::recover_checked(&paths.home, which, &mut live, || {
                         authorize_rpc(&paths, requester, key)
@@ -265,7 +269,7 @@ pub(super) fn rpc(
     )
 }
 
-fn non_empty_option<'a>(operands: &'a [&'a str], name: &str) -> Result<&'a str> {
+fn non_empty_option<'a, S: AsRef<str>>(operands: &'a [S], name: &str) -> Result<&'a str> {
     let v = option(operands, name)?;
     if v.is_empty() {
         return Err(fail(format!("{name} must be non-empty")));
@@ -306,72 +310,73 @@ fn execute_with_live(
             ));
         }
     };
-    let operands: Vec<&str> = normalized[1..].iter().map(String::as_str).collect();
+    let operands = &normalized[1..];
     if !operands.len().is_multiple_of(2)
         || operands
             .as_chunks::<2>()
             .0
             .iter()
-            .any(|pair| !allowed.contains(&pair[0]))
+            .any(|pair| !allowed.contains(&pair[0].as_str()))
     {
         return Err(fail(
             "unknown option or missing service-repair option value",
         ));
     }
     for required in allowed {
-        option(&operands, required)?;
+        option(operands, required)?;
     }
     // Offline verification must precede Paths::live, Store, identity and service discovery.
     if command == "verify-outcome" {
         let bounded = |flag, limit| -> Result<Vec<u8>> {
-            let path = Path::new(non_empty_option(&operands, flag)?);
+            let path = Path::new(non_empty_option(operands, flag)?);
             aterm_secrets::fsx::read_owned(path, limit)?
                 .ok_or_else(|| fail(format!("{} is missing", path.display())))
         };
         let outcome = service_activation::verify_outcome(
             &bounded("--outcome", service_activation::MAX_SIGNED_OUTCOME_BYTES)?,
             &bounded("--request", service_activation::MAX_EXPECTED_REQUEST_BYTES)?,
-            non_empty_option(&operands, "--target-node")?,
-            non_empty_option(&operands, "--target-key")?,
+            non_empty_option(operands, "--target-node")?,
+            non_empty_option(operands, "--target-key")?,
         )?;
         return Ok(json!({"verified":true,"fresh_activation_proven":false,
-            "node":outcome.request.node,"key":option(&operands,"--target-key")?,
+            "node":outcome.request.node,"key":option(operands,"--target-key")?,
             "outcome":transaction::outcome_value(&outcome)}));
     }
     match command {
         "stage" => {
-            non_empty_option(&operands, "--evidence")?;
-            non_empty_option(&operands, "--image")?;
+            non_empty_option(operands, "--evidence")?;
+            non_empty_option(operands, "--image")?;
         }
         "inspect" | "recover" => {
-            job(option(&operands, "--job")?)?;
+            job(option(operands, "--job")?)?;
         }
         "prepare" => {
-            job(option(&operands, "--job")?)?;
-            if !valid_image_sha256(option(&operands, "--image")?) {
+            job(option(operands, "--job")?)?;
+            if !valid_image_sha256(option(operands, "--image")?) {
                 return Err(fail("invalid service image sha256"));
             }
-            if !valid_nonce(option(&operands, "--nonce")?) {
+            if !valid_nonce(option(operands, "--nonce")?) {
                 return Err(fail(
                     "service repair nonce must be 16..128 ASCII letters, digits or hyphens",
                 ));
             }
-            non_empty_option(&operands, "--out")?;
+            non_empty_option(operands, "--out")?;
         }
         "sign" => {
-            non_empty_option(&operands, "--request")?;
-            non_empty_option(&operands, "--out")?;
+            non_empty_option(operands, "--request")?;
+            non_empty_option(operands, "--out")?;
         }
         "activate" => {
-            non_empty_option(&operands, "--request")?;
+            non_empty_option(operands, "--request")?;
         }
         _ => {}
     }
     let paths = live_context()?;
-    let store = Store::new(root(&paths)).map_err(fail)?;
+    let _store = Store::new(root(&paths)).map_err(fail)?;
     match command {
         "stage" => {
-            let evidence = Path::new(non_empty_option(&operands, "--evidence")?);
+            let dir = root(&paths);
+            let evidence = Path::new(non_empty_option(operands, "--evidence")?);
             let signed = SignedRelease {
                 manifest: String::from_utf8(read(&evidence.join("aterm-appcast.toml"))?)
                     .map_err(fail)?,
@@ -381,7 +386,6 @@ fn execute_with_live(
                     &evidence.join(aterm_update_core::roster::ROSTER_SIG_ASSET),
                 )?,
             };
-            let dir = root(&paths);
             let _authority_lock =
                 aterm_update_core::FileLock::acquire(&dir.join("authority.lock"))?;
             let floor = match aterm_secrets::fsx::read_owned(
@@ -393,10 +397,10 @@ fn execute_with_live(
                     .ok_or_else(|| fail("invalid authority floor"))?,
                 None => 0,
             };
-            let receipt = store
+            let receipt = _store
                 .materialize(
                     &signed,
-                    Path::new(non_empty_option(&operands, "--image")?),
+                    Path::new(non_empty_option(operands, "--image")?),
                     &read(&evidence.join("aterm-service-qualification.json"))?,
                     now()?,
                     floor,
@@ -414,36 +418,36 @@ fn execute_with_live(
             aterm_json::to_value(receipt).map_err(fail)
         }
         "inspect" => {
-            let mut live = backend(paths.clone(), None);
-            let which = job(option(&operands, "--job")?)?;
+            let mut live = backend(paths, None);
+            let which = job(option(operands, "--job")?)?;
             let observed = live.observe(which)?;
             Ok(
                 json!({"job":which.label(),"unit":observed.unit.map(|u|json!({"program":u.program,"args":u.args,"definition":u.definition,"image":u.image,"executable_sha256":u.executable_sha256})),"off":observed.off,"pin":observed.pin}),
             )
         }
         "prepare" => {
-            let job = job(option(&operands, "--job")?)?;
-            let desired = option(&operands, "--image")?;
+            let job = job(option(operands, "--job")?)?;
+            let desired = option(operands, "--image")?;
             let identity = identity()?;
             let request = prepare_request(
                 &paths,
                 job,
                 desired,
-                option(&operands, "--nonce")?,
+                option(operands, "--nonce")?,
                 identity.node(),
             )?;
             let body = transaction::request_value(&request);
             let sig = identity.sign_record(DOMAIN, &aterm_json::to_vec(&body).map_err(fail)?);
             let signed = json!({"request":body,"key":identity.key().hex(),"signature":hex(&sig)});
             aterm_secrets::fsx::write_atomic(
-                Path::new(non_empty_option(&operands, "--out")?),
+                Path::new(non_empty_option(operands, "--out")?),
                 &aterm_json::to_vec(&signed).map_err(fail)?,
                 0o600,
             )?;
             Ok(signed)
         }
         "sign" => {
-            let input = value(Path::new(non_empty_option(&operands, "--request")?))?;
+            let input = value(Path::new(non_empty_option(operands, "--request")?))?;
             let mut request = transaction::parse_request(input.get("request").unwrap_or(&input))?;
             let identity = identity()?;
             request.requester = identity.node().into();
@@ -451,14 +455,14 @@ fn execute_with_live(
             let sig = identity.sign_record(DOMAIN, &aterm_json::to_vec(&body).map_err(fail)?);
             let signed = json!({"request":body,"key":identity.key().hex(),"signature":hex(&sig)});
             aterm_secrets::fsx::write_atomic(
-                Path::new(non_empty_option(&operands, "--out")?),
+                Path::new(non_empty_option(operands, "--out")?),
                 &aterm_json::to_vec(&signed).map_err(fail)?,
                 0o600,
             )?;
             Ok(signed)
         }
         "activate" => {
-            let signed = value(Path::new(non_empty_option(&operands, "--request")?))?;
+            let signed = value(Path::new(non_empty_option(operands, "--request")?))?;
             let request = transaction::parse_request(&signed["request"])?;
             let mut live = backend(paths.clone(), Some(signed));
             let outcome = transaction::activate(&paths.home, &request, &mut live)?;
@@ -466,7 +470,7 @@ fn execute_with_live(
         }
         "recover" => {
             let mut live = backend(paths.clone(), None);
-            let which = job(option(&operands, "--job")?)?;
+            let which = job(option(operands, "--job")?)?;
             Ok(
                 transaction::recover_checked(&paths.home, which, &mut live, || {
                     if aterm_secrets::swarm::enabled_in_home(&paths.home)? {

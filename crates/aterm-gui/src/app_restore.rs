@@ -1505,9 +1505,8 @@ impl App {
             return None;
         }
         let snapshot = self.config.restore_session_or_default().then(|| {
-            let mut manifest = self.capture_restore_manifest();
+            let mut manifest = self.capture_desk_manifest();
             self.fill_desk_agents(&mut manifest);
-            self.fill_told(&mut manifest);
             manifest
         });
         self.end_session.took(snapshot.as_ref(), now);
@@ -1524,23 +1523,36 @@ impl App {
             .set_journal_durable(durable);
     }
 
-    /// Populates agent restore records and operator holds onto `manifest` during a clean quit, and
-    /// each leaf's told-once ids ([`Self::fill_told`]) either way.
+    /// Populates agent restore records and operator holds onto `manifest` during a clean quit.
     pub(crate) fn quit_agents(&mut self, manifest: &mut restore::RestoreManifest, keeps: bool) {
         if keeps {
             self.fill_desk_agents(manifest);
         } else {
             manifest.forget_agents_and_holds();
         }
-        self.fill_told(manifest);
+    }
+
+    /// The layout a restart restores ([`Self::capture_restore_manifest`]) with each leaf's
+    /// told-once ids filled from the same live sessions ([`Self::fill_told`]): a quit's (taken
+    /// when the last window's close decides the quit, before its teardown retires each tab's
+    /// herald slot, or at the quit itself), the crash journal's and an end of session's.
+    pub(crate) fn capture_desk_manifest(&self) -> restore::RestoreManifest {
+        let mut manifest = self.capture_restore_manifest();
+        self.fill_told(&mut manifest);
+        manifest
     }
 
     /// Writes each leaf's told-once ids ([`restore::TerminalLeafRestore::told`]) from its session's
-    /// herald memory, so whatever restores the manifest (a quit's, the crash journal's, an end of
-    /// session's) tells a need its owner was told of once across the restart.
+    /// herald memory as it stands at the tab's owner turn now
+    /// ([`crate::status_item::Herald::told_ids`]), so whatever restores the manifest tells a need
+    /// its owner was told of once across the restart, and one their turn since made news again is
+    /// news after it too. A leaf whose session the pool does not hold names none.
     fn fill_told(&self, manifest: &mut restore::RestoreManifest) {
         let herald = &self.presence.herald;
-        manifest.fill_told(&|id| crate::status_item::told_ids_row(&herald.told_ids(id)));
+        manifest.fill_told(&|id| {
+            let turn = self.pool.get(id)?.ctx.human_input.last_plain_enter();
+            crate::status_item::told_ids_row(&herald.told_ids(id, turn))
+        });
     }
 
     /// A quit's leaf carried its session's told-once ids ([`restore::TerminalLeafRestore::told`]):
@@ -1635,9 +1647,8 @@ impl App {
             return;
         }
         self.crash_journal.begin_capture();
-        let mut manifest = self.capture_restore_manifest();
+        let mut manifest = self.capture_desk_manifest();
         self.fill_desk_agents(&mut manifest);
-        self.fill_told(&mut manifest);
         let programs = self.crash_journal_programs(&manifest);
         let written = self.crash_journal.offer(manifest, programs, now);
         aterm_log::debug!(

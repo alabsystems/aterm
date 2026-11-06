@@ -12,6 +12,7 @@ use crate::NormalizedCoordinate;
 use crate::delta_set::DeltaSetIndexMap;
 use crate::parser::{F2DOT14, FromData, LazyArray16, Offset, Offset24, Offset32, Stream};
 use crate::var_store::ItemVariationStore;
+use crate::work::{OutlineWork, PaintWork};
 use crate::{Fixed, LazyArray32, RectF, Transform};
 use crate::{GlyphId, RgbaColor};
 
@@ -61,13 +62,6 @@ impl FromData for ClipRecord {
     }
 }
 
-impl ClipRecord {
-    /// Returns the glyphs range.
-    pub fn glyphs_range(&self) -> core::ops::RangeInclusive<GlyphId> {
-        self.start_glyph_id..=self.end_glyph_id
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct ClipList<'a> {
     data: &'a [u8],
@@ -75,12 +69,9 @@ struct ClipList<'a> {
 }
 
 impl<'a> ClipList<'a> {
-    pub fn get(
-        &self,
-        index: u32,
-        variation_data: &VariationData,
-        coords: &[NormalizedCoordinate],
-    ) -> Option<ClipBox> {
+    /// The clip box of record `index`. When the box varies, `deltas` reads
+    /// its four deltas from their base, and a `None` from it answers no box.
+    pub fn get(&self, index: u32, deltas: impl FnOnce(u32) -> Option<[f32; 4]>) -> Option<ClipBox> {
         let record = self.records.get(index)?;
         let offset = record.clip_box_offset.to_usize();
         self.data.get(offset..).and_then(|data| {
@@ -92,7 +83,7 @@ impl<'a> ClipList<'a> {
                 var_s.advance(8);
                 let var_index_base = var_s.read::<u32>()?;
 
-                variation_data.read_deltas::<4>(var_index_base, coords)
+                deltas(var_index_base)?
             } else {
                 [0.0, 0.0, 0.0, 0.0]
             };
@@ -107,18 +98,28 @@ impl<'a> ClipList<'a> {
     }
 
     /// Returns a ClipBox by glyph ID.
+    ///
+    /// Clip records are sorted by glyph and their ranges do not overlap
+    /// (OpenType `COLR`), so a bisection finds the one that holds the glyph: a
+    /// walk looks a clip box up at each PaintColrGlyph it visits.
     #[inline]
     pub fn find(
         &self,
         glyph_id: GlyphId,
-        variation_data: &VariationData,
-        coords: &[NormalizedCoordinate],
+        deltas: impl FnOnce(u32) -> Option<[f32; 4]>,
     ) -> Option<ClipBox> {
-        let index = self
-            .records
-            .into_iter()
-            .position(|v| v.glyphs_range().contains(&glyph_id))?;
-        self.get(index as u32, variation_data, coords)
+        let (index, _) = self.records.binary_search_by(|v| {
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.clip_records += 1);
+            if v.end_glyph_id < glyph_id {
+                core::cmp::Ordering::Less
+            } else if v.start_glyph_id > glyph_id {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        })?;
+        self.get(index, deltas)
     }
 }
 
@@ -769,33 +770,45 @@ impl<'a> Table<'a> {
 
     /// Returns the clip box for a glyph.
     pub fn clip_box(&self, glyph_id: GlyphId, coords: &[NormalizedCoordinate]) -> Option<ClipBox> {
-        self.clip_list
-            .find(glyph_id, &self.variation_data(), coords)
+        let variation_data = self.variation_data();
+        self.clip_list.find(glyph_id, |var_index_base| {
+            Some(variation_data.read_deltas::<4>(var_index_base, coords))
+        })
     }
 
-    /// Paints the color glyph.
-    pub fn paint(
+    /// Paints the color glyph. `outline_segments` outlines a glyph under the
+    /// [`OutlineWork`] it is given and counts the outline's segments: the walk
+    /// charges both before it hands the painter that outline. A walk its
+    /// [`PaintWork`] stopped answers `None`, a v1 glyph as a v0 one: the
+    /// painter was handed only part of the glyph.
+    pub(crate) fn paint(
         &self,
         glyph_id: GlyphId,
         palette: u16,
         painter: &mut dyn Painter<'a>,
         coords: &[NormalizedCoordinate],
         foreground_color: RgbaColor,
+        outline_segments: &dyn Fn(GlyphId, &mut OutlineWork) -> usize,
     ) -> Option<()> {
         let mut recursion_stack = RecursionStack {
             stack: [0; 64],
             len: 0,
-            visits: 0,
+            work: PaintWork::default(),
+            outline_segments,
         };
 
-        self.paint_impl(
+        let painted = self.paint_impl(
             glyph_id,
             palette,
             painter,
             &mut recursion_stack,
             coords,
             foreground_color,
-        )
+        );
+        if recursion_stack.work.refused() {
+            return None;
+        }
+        painted
     }
 
     fn paint_impl(
@@ -803,7 +816,7 @@ impl<'a> Table<'a> {
         glyph_id: GlyphId,
         palette: u16,
         painter: &mut dyn Painter<'a>,
-        recursion_stack: &mut RecursionStack,
+        recursion_stack: &mut RecursionStack<'_>,
         coords: &[NormalizedCoordinate],
         foreground_color: RgbaColor,
     ) -> Option<()> {
@@ -817,7 +830,7 @@ impl<'a> Table<'a> {
                 foreground_color,
             )
         } else if let Some(base) = self.get_v0(glyph_id) {
-            self.paint_v0(base, palette, painter, foreground_color)
+            self.paint_v0(base, palette, painter, recursion_stack, foreground_color)
         } else {
             None
         }
@@ -828,6 +841,7 @@ impl<'a> Table<'a> {
         base: BaseGlyphRecord,
         palette: u16,
         painter: &mut dyn Painter,
+        recursion_stack: &mut RecursionStack<'_>,
         foreground_color: RgbaColor,
     ) -> Option<()> {
         let start = base.first_layer_index;
@@ -835,6 +849,8 @@ impl<'a> Table<'a> {
         let layers = self.layers.slice(start..end)?;
 
         for layer in layers {
+            recursion_stack.work.take(1)?;
+            recursion_stack.outline(layer.glyph_id)?;
             if layer.palette_index == 0xFFFF {
                 painter.outline_glyph(layer.glyph_id);
                 painter.paint(Paint::Solid(foreground_color));
@@ -853,11 +869,18 @@ impl<'a> Table<'a> {
         base: BaseGlyphPaintRecord,
         palette: u16,
         painter: &mut dyn Painter<'a>,
-        recursion_stack: &mut RecursionStack,
+        recursion_stack: &mut RecursionStack<'_>,
         coords: &[NormalizedCoordinate],
         foreground_color: RgbaColor,
     ) -> Option<()> {
-        let clip_box = self.clip_box(base.glyph_id, coords);
+        let variation_data = self.variation_data();
+        let clip_box = self.clip_list.find(base.glyph_id, |var_index_base| {
+            variation_data.read_deltas_within::<4>(
+                var_index_base,
+                coords,
+                &mut recursion_stack.work,
+            )
+        });
         if let Some(clip_box) = clip_box {
             painter.push_clip_box(clip_box);
         }
@@ -885,7 +908,7 @@ impl<'a> Table<'a> {
         offset: usize,
         palette: u16,
         painter: &mut dyn Painter<'a>,
-        recursion_stack: &mut RecursionStack,
+        recursion_stack: &mut RecursionStack<'_>,
         coords: &[NormalizedCoordinate],
         foreground_color: RgbaColor,
     ) -> Option<()> {
@@ -917,7 +940,7 @@ impl<'a> Table<'a> {
         offset: usize,
         palette: u16,
         painter: &mut dyn Painter<'a>,
-        recursion_stack: &mut RecursionStack,
+        recursion_stack: &mut RecursionStack<'_>,
         s: &mut Stream,
         format: u8,
         coords: &[NormalizedCoordinate],
@@ -961,9 +984,11 @@ impl<'a> Table<'a> {
                 let alpha = s.read::<F2DOT14>()?;
                 let var_index_base = s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<1>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<1>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let mut color = if palette_index == u16::MAX {
                     foreground_color
@@ -980,6 +1005,9 @@ impl<'a> Table<'a> {
                     offset.saturating_add(color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
 
                 painter.paint(Paint::LinearGradient(LinearGradient {
                     x0: s.read::<i16>()? as f32,
@@ -999,13 +1027,19 @@ impl<'a> Table<'a> {
                     offset.saturating_add(var_color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
+                self.charge_stops(&color_line, coords, &mut recursion_stack.work)?;
                 let mut var_s = s.clone();
                 var_s.advance(12);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<6>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<6>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 painter.paint(Paint::LinearGradient(LinearGradient {
                     x0: s.read::<i16>()? as f32 + deltas[0],
@@ -1025,6 +1059,9 @@ impl<'a> Table<'a> {
                     offset.saturating_add(color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
                 painter.paint(Paint::RadialGradient(RadialGradient {
                     x0: s.read::<i16>()? as f32,
                     y0: s.read::<i16>()? as f32,
@@ -1043,14 +1080,20 @@ impl<'a> Table<'a> {
                     offset.saturating_add(color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
+                self.charge_stops(&color_line, coords, &mut recursion_stack.work)?;
 
                 let mut var_s = s.clone();
                 var_s.advance(12);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<6>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<6>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 painter.paint(Paint::RadialGradient(RadialGradient {
                     x0: s.read::<i16>()? as f32 + deltas[0],
@@ -1070,6 +1113,9 @@ impl<'a> Table<'a> {
                     offset.saturating_add(color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
                 painter.paint(Paint::SweepGradient(SweepGradient {
                     center_x: s.read::<i16>()? as f32,
                     center_y: s.read::<i16>()? as f32,
@@ -1086,14 +1132,20 @@ impl<'a> Table<'a> {
                     offset.saturating_add(color_line_offset.to_usize()),
                     foreground_color,
                 )?;
+                recursion_stack
+                    .work
+                    .take(usize::from(color_line.colors.len()))?;
+                self.charge_stops(&color_line, coords, &mut recursion_stack.work)?;
 
                 let mut var_s = s.clone();
                 var_s.advance(8);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<4>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<4>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 painter.paint(Paint::SweepGradient(SweepGradient {
                     center_x: s.read::<i16>()? as f32 + deltas[0],
@@ -1108,6 +1160,7 @@ impl<'a> Table<'a> {
             10 => {
                 let paint_offset = s.read::<Offset24>()?;
                 let glyph_id = s.read::<GlyphId>()?;
+                recursion_stack.outline(glyph_id)?;
                 painter.outline_glyph(glyph_id);
                 painter.push_clip();
 
@@ -1166,9 +1219,11 @@ impl<'a> Table<'a> {
                 var_s.advance(24);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<6>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<6>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let ts = Transform {
                     a: s.read::<Fixed>()?.apply_float_delta(deltas[0]),
@@ -1213,9 +1268,11 @@ impl<'a> Table<'a> {
                 var_s.advance(4);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<2>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<2>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let tx = f32::from(s.read::<i16>()?) + deltas[0];
                 let ty = f32::from(s.read::<i16>()?) + deltas[1];
@@ -1254,9 +1311,11 @@ impl<'a> Table<'a> {
                 var_s.advance(4);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<2>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<2>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let sx = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let sy = s.read::<F2DOT14>()?.apply_float_delta(deltas[1]);
@@ -1301,9 +1360,11 @@ impl<'a> Table<'a> {
                 var_s.advance(8);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<4>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<4>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let sx = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let sy = s.read::<F2DOT14>()?.apply_float_delta(deltas[1]);
@@ -1347,9 +1408,11 @@ impl<'a> Table<'a> {
                 var_s.advance(2);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<1>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<1>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let scale = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
 
@@ -1392,9 +1455,11 @@ impl<'a> Table<'a> {
                 var_s.advance(6);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<3>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<3>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let scale = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let center_x = f32::from(s.read::<i16>()?) + deltas[1];
@@ -1437,9 +1502,11 @@ impl<'a> Table<'a> {
                 var_s.advance(2);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<1>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<1>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let angle = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
 
@@ -1482,9 +1549,11 @@ impl<'a> Table<'a> {
                 var_s.advance(6);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<3>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<3>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let angle = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let center_x = f32::from(s.read::<i16>()?) + deltas[1];
@@ -1528,9 +1597,11 @@ impl<'a> Table<'a> {
                 var_s.advance(4);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<2>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<2>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let skew_x = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let skew_y = s.read::<F2DOT14>()?.apply_float_delta(deltas[1]);
@@ -1575,9 +1646,11 @@ impl<'a> Table<'a> {
                 var_s.advance(8);
                 let var_index_base = var_s.read::<u32>()?;
 
-                let deltas = self
-                    .variation_data()
-                    .read_deltas::<4>(var_index_base, coords);
+                let deltas = self.variation_data().read_deltas_within::<4>(
+                    var_index_base,
+                    coords,
+                    &mut recursion_stack.work,
+                )?;
 
                 let skew_x = s.read::<F2DOT14>()?.apply_float_delta(deltas[0]);
                 let skew_y = s.read::<F2DOT14>()?.apply_float_delta(deltas[1]);
@@ -1648,6 +1721,25 @@ impl<'a> Table<'a> {
         })
     }
 
+    /// Charge `work` the two deltas each stop of a variable colour line
+    /// holds, read by the painter as it takes the stops, at the instance the
+    /// walk paints.
+    fn charge_stops(
+        &self,
+        color_line: &VarColorLine<'_>,
+        coords: &[NormalizedCoordinate],
+        work: &mut PaintWork,
+    ) -> Option<()> {
+        let variation_data = self.variation_data();
+        if coords.is_empty() || variation_data.variation_store.is_none() {
+            return Some(());
+        }
+        for stop in color_line.colors {
+            variation_data.charge::<2>(stop.var_index_base, coords, work)?;
+        }
+        Some(())
+    }
+
     fn parse_var_color_line(
         &self,
         offset: usize,
@@ -1666,15 +1758,26 @@ impl<'a> Table<'a> {
     }
 }
 
-const MAX_PAINT_VISITS: u32 = 1 << 16;
-
-struct RecursionStack {
+/// The paint tables a walk is inside, and the walk's [`PaintWork`]: each
+/// table it enters, each v0 layer, colour stop and outline it hands the
+/// painter, and each item variation delta it or the painter reads, is
+/// charged there.
+struct RecursionStack<'f> {
     stack: [usize; 64],
     len: usize,
-    visits: u32,
+    work: PaintWork,
+    outline_segments: &'f dyn Fn(GlyphId, &mut OutlineWork) -> usize,
 }
 
-impl RecursionStack {
+impl RecursionStack<'_> {
+    /// Charge the outline of `glyph_id`, outlining it to count its segments
+    /// only once the outline's units are granted.
+    #[inline]
+    fn outline(&mut self, glyph_id: GlyphId) -> Option<()> {
+        let count = self.outline_segments;
+        self.work.outline(|work| count(glyph_id, work))
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -1684,13 +1787,10 @@ impl RecursionStack {
     pub fn push(&mut self, offset: usize) -> Result<(), ()> {
         #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
         crate::work::note(|s| s.paint_tables += 1);
-        if self.visits >= MAX_PAINT_VISITS {
-            return Err(());
-        }
+        self.work.take(1).ok_or(())?;
         let slot = self.stack.get_mut(self.len).ok_or(())?;
         *slot = offset;
         self.len += 1;
-        self.visits += 1;
         Ok(())
     }
 
@@ -1716,33 +1816,72 @@ struct VariationData<'a> {
     delta_map: Option<DeltaSetIndexMap<'a>>,
 }
 
-impl VariationData<'_> {
+impl<'a> VariationData<'a> {
+    /// The store and the item that the `i`th delta from `var_index_base`
+    /// reads at `coordinates`, or `None` when it reads none and is zero.
+    fn item(
+        &self,
+        var_index_base: u32,
+        i: usize,
+        coordinates: &[NormalizedCoordinate],
+    ) -> Option<(ItemVariationStore<'a>, u16, u16)> {
+        const NO_VARIATION_DELTAS: u32 = 0xFFFFFFFF;
+        if coordinates.is_empty() || var_index_base == NO_VARIATION_DELTAS {
+            return None;
+        }
+        let variation_store = self.variation_store?;
+        let index = var_index_base.wrapping_add(u32::try_from(i).ok()?);
+        let (outer, inner) = self.delta_map?.map(index)?;
+        Some((variation_store, outer, inner))
+    }
+
     fn read_deltas<const N: usize>(
         &self,
         var_index_base: u32,
         coordinates: &[NormalizedCoordinate],
     ) -> [f32; N] {
-        const NO_VARIATION_DELTAS: u32 = 0xFFFFFFFF;
         let mut deltas = [0.0; N];
-
-        if coordinates.is_empty() || var_index_base == NO_VARIATION_DELTAS {
-            return deltas;
-        }
-        let Some(variation_store) = self.variation_store.as_ref() else {
-            return deltas;
-        };
-
         for (i, delta) in deltas.iter_mut().enumerate() {
-            let index = u32::try_from(i)
-                .ok()
-                .map(|i| var_index_base.wrapping_add(i));
             *delta = self
-                .delta_map
-                .and_then(|d| d.map(index?))
-                .and_then(|d| variation_store.parse_delta(d.0, d.1, coordinates))
+                .item(var_index_base, i, coordinates)
+                .and_then(|(store, outer, inner)| store.parse_delta(outer, inner, coordinates))
                 .unwrap_or(0.0);
         }
-
         deltas
+    }
+
+    /// [`Self::read_deltas`] for a paint walk: each delta's region-axis
+    /// evaluations ([`ItemVariationStore::delta_steps`]) are charged to
+    /// `work` before it is read, and a refused charge reads no more.
+    fn read_deltas_within<const N: usize>(
+        &self,
+        var_index_base: u32,
+        coordinates: &[NormalizedCoordinate],
+        work: &mut PaintWork,
+    ) -> Option<[f32; N]> {
+        let mut deltas = [0.0; N];
+        for (i, delta) in deltas.iter_mut().enumerate() {
+            if let Some((store, outer, inner)) = self.item(var_index_base, i, coordinates) {
+                work.vary(store.delta_steps(outer, coordinates))?;
+                *delta = store.parse_delta(outer, inner, coordinates).unwrap_or(0.0);
+            }
+        }
+        Some(deltas)
+    }
+
+    /// Charge `work` what [`Self::read_deltas`] of the `N` deltas from
+    /// `var_index_base` at `coordinates` may cost, without reading them.
+    fn charge<const N: usize>(
+        &self,
+        var_index_base: u32,
+        coordinates: &[NormalizedCoordinate],
+        work: &mut PaintWork,
+    ) -> Option<()> {
+        for i in 0..N {
+            if let Some((store, outer, _)) = self.item(var_index_base, i, coordinates) {
+                work.vary(store.delta_steps(outer, coordinates))?;
+            }
+        }
+        Some(())
     }
 }

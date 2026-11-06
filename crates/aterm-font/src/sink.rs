@@ -36,6 +36,34 @@ impl OutlineSink for NullSink {
     fn close(&mut self) {}
 }
 
+/// Counts the segments of an outline: what a `COLR` walk charges a painter's
+/// outline.
+#[derive(Default)]
+pub(crate) struct SegmentCount(pub(crate) usize);
+
+impl OutlineSink for SegmentCount {
+    #[inline]
+    fn move_to(&mut self, _: f32, _: f32) {
+        self.0 += 1;
+    }
+    #[inline]
+    fn line_to(&mut self, _: f32, _: f32) {
+        self.0 += 1;
+    }
+    #[inline]
+    fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {
+        self.0 += 1;
+    }
+    #[inline]
+    fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {
+        self.0 += 1;
+    }
+    #[inline]
+    fn close(&mut self) {
+        self.0 += 1;
+    }
+}
+
 /// Forwards an outline to `inner` mapped through an affine transform.
 pub struct ScaledSink<'a, S: OutlineSink + ?Sized> {
     inner: &'a mut S,

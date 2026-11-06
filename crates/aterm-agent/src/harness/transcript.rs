@@ -290,6 +290,7 @@ const EXCERPT_PART: [Field; 5] = [
 ];
 const EXCERPT: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
@@ -602,7 +603,7 @@ pub(crate) fn conversation(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Conversation>(line).map(|v| v.0)
 }
 
-/// The survey's excerpts ([`super::excerpt`]) need a row's discriminants, its message id, text parts and tool call names and ids, but never a tool's input or result.
+/// The survey's excerpts ([`super::excerpt`]) need a row's discriminants and time, its message id, text parts and tool call names and ids, but never a tool's input or result.
 pub(super) fn excerpt(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Excerpt>(line).map(|v| v.0)
 }

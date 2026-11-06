@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
@@ -5990,6 +5990,46 @@ fn receive_cdp<T>(
     receive_cdp_observed(from, deadline, scope, || {})
 }
 
+/// How long one turn of a wait on `deadline` blocks: a wait that must also see `scope` cancelled,
+/// or count the host's sleep, looks again every 25 ms.
+fn cdp_tick(
+    deadline: Deadline<'_>,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<Duration, CdpReceiveError> {
+    let left = deadline.remaining().map_err(|_| CdpReceiveError::Timeout)?;
+    Ok(if scope.is_some() || deadline.counts_sleep() {
+        left.min(Duration::from_millis(25))
+    } else {
+        left
+    })
+}
+
+/// The writer's word on one command (whether all of it went out), within `deadline`. A word
+/// already given is taken even after `deadline` has passed or `scope` was cancelled: unlike a
+/// reply, it says what the pipe holds, which outlasts the call that waited for it
+/// ([`CdpClient::call_by`]).
+fn receive_written(
+    ack: &Receiver<bool>,
+    deadline: Deadline<'_>,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<bool, CdpReceiveError> {
+    loop {
+        match ack.try_recv() {
+            Ok(written) => return Ok(written),
+            Err(TryRecvError::Disconnected) => return Err(CdpReceiveError::Disconnected),
+            Err(TryRecvError::Empty) => {}
+        }
+        if scope.is_some_and(super::account_work::Scope::cancelled) {
+            return Err(CdpReceiveError::Cancelled);
+        }
+        match ack.recv_timeout(cdp_tick(deadline, scope)?) {
+            Ok(written) => return Ok(written),
+            Err(RecvTimeoutError::Disconnected) => return Err(CdpReceiveError::Disconnected),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn receive_cdp_observed<T>(
     from: &Receiver<T>,
     deadline: Deadline<'_>,
@@ -6000,13 +6040,7 @@ fn receive_cdp_observed<T>(
         if scope.is_some_and(super::account_work::Scope::cancelled) {
             return Err(CdpReceiveError::Cancelled);
         }
-        let left = deadline.remaining().map_err(|_| CdpReceiveError::Timeout)?;
-        let tick = if scope.is_some() || deadline.counts_sleep() {
-            left.min(Duration::from_millis(25))
-        } else {
-            left
-        };
-        match from.recv_timeout(tick) {
+        match from.recv_timeout(cdp_tick(deadline, scope)?) {
             Ok(value) => {
                 received();
                 return if scope.is_some_and(super::account_work::Scope::cancelled) {
@@ -6063,10 +6097,15 @@ impl CdpStartup {
             while let Ok((mut bytes, done)) = pending.recv() {
                 let written = to.write_all(&bytes).and_then(|()| to.flush()).is_ok();
                 bytes.fill(0);
-                let _ = done.send(written);
                 if !written {
-                    break;
+                    // Part of this frame may be on the pipe, and nothing may follow it: the
+                    // queue closes before the failure is told, so every later command is
+                    // refused ([`CdpClient::call_by`]).
+                    drop(pending);
+                    let _ = done.send(false);
+                    return;
                 }
+                let _ = done.send(true);
             }
         };
         spawn_cdp_work(reader, reader_scope)?;
@@ -6076,7 +6115,7 @@ impl CdpStartup {
             from: rx,
             next_id: 0,
             events: Vec::new(),
-            write_failed: false,
+            unwritten: None,
             work: self.work,
         })
     }
@@ -6084,11 +6123,13 @@ impl CdpStartup {
 
 /// Chrome DevTools Protocol client over `--remote-debugging-pipe` (fds 3 and 4).
 pub struct CdpClient {
+    /// The writer's queue, which it closes for good once a write failed.
     to: std::sync::mpsc::SyncSender<CdpWrite>,
     from: Receiver<Value>,
     next_id: u64,
     events: Vec<Value>,
-    write_failed: bool,
+    /// The writer's word on the last command, when its caller stopped waiting before it came.
+    unwritten: Option<Receiver<bool>>,
     // Client buffers and channels retire before this admission clone.
     work: Option<super::account_work::Scope>,
 }
@@ -6146,6 +6187,13 @@ impl CdpClient {
         )
     }
 
+    /// Sends a CDP command and waits within `deadline` for its matching response.
+    ///
+    /// The writer holds one command at a time. A command whose caller stopped waiting before
+    /// the writer said it went out still goes out whole, and the next call waits for that
+    /// before it sends its own, so a write that is merely late poisons nothing: a later call is
+    /// refused only when its own deadline ends before that write finishes. A write that failed
+    /// closes the writer's queue, which refuses every later command.
     pub(super) fn call_by(
         &mut self,
         session: Option<&str>,
@@ -6160,8 +6208,8 @@ impl CdpClient {
         {
             return Err("browser DevTools account work is paused");
         }
-        if self.write_failed {
-            return Err("browser DevTools pipe is unavailable");
+        if let Some(ack) = self.unwritten.take() {
+            self.wait_written(ack, deadline)?;
         }
         deadline.left()?;
         self.next_id += 1;
@@ -6172,25 +6220,13 @@ impl CdpClient {
         }
         let mut bytes = aterm_json::to_vec(&msg).map_err(|_| "failed encoding CDP command")?;
         bytes.push(0);
-        let (done, written) = std::sync::mpsc::sync_channel(1);
+        let (done, ack) = std::sync::mpsc::sync_channel(1);
+        // Never full: the writer had said the command before this one went out. A closed queue
+        // is a write that failed.
         if self.to.try_send((bytes, done)).is_err() {
-            self.write_failed = true;
             return Err("browser DevTools pipe is unavailable");
         }
-        match receive_cdp(&written, deadline, self.work.as_ref()) {
-            Ok(true) => {}
-            Err(CdpReceiveError::Cancelled) => {
-                return Err("browser DevTools account work is paused");
-            }
-            Ok(false) | Err(CdpReceiveError::Disconnected) => {
-                self.write_failed = true;
-                return Err("failed writing to browser DevTools pipe");
-            }
-            Err(CdpReceiveError::Timeout) => {
-                self.write_failed = true;
-                return Err("timed out writing to browser DevTools pipe");
-            }
-        }
+        self.wait_written(ack, deadline)?;
         loop {
             if deadline.expired() {
                 return Err("timed out waiting for browser DevTools response");
@@ -6215,6 +6251,30 @@ impl CdpClient {
                 Err(CdpReceiveError::Disconnected) => {
                     return Err("browser closed its DevTools pipe prematurely");
                 }
+            }
+        }
+    }
+
+    /// Waits within `deadline` for the writer's word on the command `ack` answers for. When
+    /// `deadline` passes or the work is cancelled before that word, `ack` is kept for the next
+    /// call to wait for ([`Self::call_by`]).
+    fn wait_written(
+        &mut self,
+        ack: Receiver<bool>,
+        deadline: Deadline<'_>,
+    ) -> Result<(), &'static str> {
+        match receive_written(&ack, deadline, self.work.as_ref()) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(CdpReceiveError::Disconnected) => {
+                Err("failed writing to browser DevTools pipe")
+            }
+            Err(CdpReceiveError::Cancelled) => {
+                self.unwritten = Some(ack);
+                Err("browser DevTools account work is paused")
+            }
+            Err(CdpReceiveError::Timeout) => {
+                self.unwritten = Some(ack);
+                Err("timed out writing to browser DevTools pipe")
             }
         }
     }
@@ -10534,32 +10594,134 @@ mod uri_authority_tests {
 mod cdp_error_tests {
     use super::*;
 
-    #[test]
-    fn a_full_command_pipe_times_out_and_cannot_accept_later_commands() {
-        let (command_read, command_write) = std::io::pipe().unwrap();
-        let (event_read, event_write) = std::io::pipe().unwrap();
-        let (done, result) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
+    /// The late write's test reads its pipe's readiness, which only unix has here.
+    #[cfg(unix)]
+    mod late_write {
+        use super::*;
+        use std::os::fd::AsFd as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// More than a pipe holds unread, so a command this long cannot finish going out until its
+        /// reader reads.
+        const UNREAD_FRAME: usize = 1024 * 1024;
+
+        /// A stand-in browser that reads nothing until `go`. Once the first command starts to arrive,
+        /// it makes `slept` say the host slept two hours, which ends a deadline that counts sleep on
+        /// it after that write began and before it can finish. After `go` it answers each command
+        /// with its id until its pipe ends, and returns each command's id and expression length.
+        fn unread_until(
+            mut commands: std::io::PipeReader,
+            mut replies: std::io::PipeWriter,
+            slept: Arc<AtomicU64>,
+            go: Receiver<()>,
+        ) -> std::thread::JoinHandle<Vec<(u64, usize)>> {
+            std::thread::spawn(move || {
+                let began = aterm_uds::ready::any_until(
+                    &[commands.as_fd()],
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                )
+                .is_ok_and(|ready| !ready.is_empty());
+                assert!(began, "the first command reached its pipe");
+                slept.store(7200 * 1_000_000_000, Ordering::Release);
+                let mut seen = Vec::new();
+                if go.recv().is_err() {
+                    return seen;
+                }
+                let mut pending = Vec::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match commands.read(&mut buf) {
+                        Ok(0) | Err(_) => return seen,
+                        Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    }
+                    for msg in split_nul_messages(&mut pending) {
+                        let id = msg["id"].as_u64().unwrap_or(0);
+                        let expression = msg
+                            .pointer("/params/expression")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len);
+                        seen.push((id, expression));
+                        let mut reply =
+                            aterm_json::to_vec(&json!({"id": id, "result": {"id": id}})).unwrap();
+                        reply.push(0);
+                        if replies.write_all(&reply).is_err() {
+                            return seen;
+                        }
+                    }
+                }
+            })
+        }
+
+        #[test]
+        fn a_late_write_holds_later_commands_back_until_it_finishes_and_poisons_none() {
+            let (commands, command_write) = std::io::pipe().unwrap();
+            let (event_read, replies) = std::io::pipe().unwrap();
+            let slept = Arc::new(AtomicU64::new(0));
+            let (go, start) = std::sync::mpsc::channel();
+            let browser = unread_until(commands, replies, slept.clone(), start);
             let mut client = CdpClient::new(command_write, event_read);
-            let first = client.call(
+            let continuous = || Some(slept.load(Ordering::Acquire));
+            let first = client.call_by(
                 None,
                 "Runtime.evaluate",
-                json!({"expression":"x".repeat(1024*1024)}),
-                Duration::from_millis(20),
+                json!({"expression": "x".repeat(UNREAD_FRAME)}),
+                Deadline::with_clocks(aterm_spec::wait::MUST_HAPPEN, &Instant::now, &continuous),
             );
-            let next = client.call(None, "Runtime.evaluate", json!({}), Duration::from_secs(1));
-            done.send((first, next)).unwrap();
-        });
-        let answer = result.recv_timeout(Duration::from_secs(60));
-        drop(command_read);
-        drop(event_write);
-        worker.join().unwrap();
-        let (first, next) = answer.expect("command deadline hung");
-        assert_eq!(
-            first.unwrap_err(),
-            "timed out writing to browser DevTools pipe"
+            // A call with no time left reports the unfinished write and sends nothing.
+            let held = client.call(
+                None,
+                "Runtime.evaluate",
+                json!({"expression": "held"}),
+                Duration::ZERO,
+            );
+            let _ = go.send(());
+            let next = client.call(
+                None,
+                "Runtime.evaluate",
+                json!({"expression": "next"}),
+                aterm_spec::wait::MUST_HAPPEN,
+            );
+            // Its pipe's end ends the stand-in.
+            drop(client);
+            let seen = browser.join().unwrap();
+            assert_eq!(first, Err("timed out writing to browser DevTools pipe"));
+            assert_eq!(held, Err("timed out writing to browser DevTools pipe"));
+            assert_eq!(next, Ok(json!({"id": 2})));
+            assert_eq!(seen, vec![(1, UNREAD_FRAME), (2, "next".len())]);
+        }
+    }
+
+    #[test]
+    fn a_failed_write_refuses_every_later_command() {
+        let (commands, command_write) = std::io::pipe().unwrap();
+        let (event_read, _replies) = std::io::pipe().unwrap();
+        // The browser is gone: a write fails.
+        drop(commands);
+        let mut client = CdpClient::new(command_write, event_read);
+        let first = client.call(
+            None,
+            "Browser.getVersion",
+            json!({}),
+            aterm_spec::wait::MUST_HAPPEN,
         );
-        assert_eq!(next.unwrap_err(), "browser DevTools pipe is unavailable");
+        let next = client.call(
+            None,
+            "Browser.getVersion",
+            json!({}),
+            aterm_spec::wait::MUST_HAPPEN,
+        );
+        assert_eq!(first, Err("failed writing to browser DevTools pipe"));
+        assert_eq!(next, Err("browser DevTools pipe is unavailable"));
+    }
+
+    #[test]
+    fn a_word_the_writer_gave_counts_after_its_deadline_passed() {
+        let (done, ack) = std::sync::mpsc::sync_channel(1);
+        done.send(true).unwrap();
+        drop(done);
+        let gone = Deadline::after(Duration::ZERO);
+        assert!(matches!(receive_written(&ack, gone, None), Ok(true)));
     }
 
     #[test]

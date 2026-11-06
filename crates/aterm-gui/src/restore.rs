@@ -158,11 +158,13 @@ pub(crate) struct TerminalLeafRestore {
     pub lineage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ep: Option<u32>,
-    /// The ids the herald's told-once memory held for this leaf's session at the quit
-    /// ([`crate::status_item::told_ids_row`]), so a need its owner was told of before the quit is
-    /// told once across the restart ([`crate::status_item::Herald::adopt`]). Only a quit's desk
-    /// writes it ([`RestoreManifest::fill_told`]); a seamless update carries the ids in the
-    /// session's status row (`SessionRecord::status_seen`).
+    /// The ids the herald's told-once memory held for this leaf's session when the layout was
+    /// captured ([`crate::status_item::told_ids_row`]), so a need its owner was told of before a
+    /// restart is told once across it ([`crate::status_item::Herald::adopt`]). A layout a cold
+    /// restore reads writes it (a quit's, the crash journal's image, an end of session's
+    /// snapshot: [`RestoreManifest::fill_told`] through `App::capture_desk_manifest`); a seamless
+    /// update's handoff layout does not, carrying the ids in the session's status row
+    /// (`SessionRecord::status_seen`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub told: Option<String>,
 }
@@ -2506,7 +2508,7 @@ impl RestoreManifest {
     }
 
     /// Put on every terminal leaf the told-once ids `told` says its session's herald holds
-    /// ([`TerminalLeafRestore::told`]), for a quit's desk.
+    /// ([`TerminalLeafRestore::told`]), for a layout a cold restore reads.
     pub(crate) fn fill_told(&mut self, told: &dyn Fn(u64) -> Option<String>) {
         self.fill_terminals(&mut |terminal| {
             if let Some(id) = terminal.local_id {

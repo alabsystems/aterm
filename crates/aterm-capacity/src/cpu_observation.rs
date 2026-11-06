@@ -1,131 +1,163 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only observations of the core toolchain's cooperative CPU unit leases.
-//! The core pool owns the file identities, record parser and lock protocol.
-//! These observations do not grant capacity or implement allocation policy.
-
-use std::path::Path;
+//! Read-only native CPU leases and crash-retained external reservations.
+//! Counts observe shared backing; they never grant capacity or prove closure.
 
 use aterm_json::{Map, Value};
+use std::path::Path;
 
-/// A held slot's diagnostic record, which is not proof of process identity.
+/// A slot's diagnostic record, not proof of process identity or release authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuHolder {
-    /// The zero-based CPU lease slot.
+    /// Zero-based slot in its native or external domain.
     pub slot: u32,
-    /// The process reported by the holder, absent when its record cannot be read.
+    /// Reported PID, absent when a held record is unreadable.
     pub reported_pid: Option<u32>,
-    /// The reported platform process-birth identity, if one was recorded.
+    /// Reported platform process-birth identity, if present.
     pub reported_birth: Option<u64>,
 }
 
-/// One nonblocking scan of a cooperative CPU lease pool.
-///
-/// Only [`Self::Ready`] provides occupied and available counts. Missing,
-/// initializing and unreadable pools do not imply unused capacity. Slot states
-/// are observations during the scan, not an atomic allocation transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CpuObservation {
-    /// This platform has no implementation of the native CPU lease pool.
-    Unsupported,
-    /// No pool exists at the supplied account capacity directory.
-    Absent,
-    /// An initializer currently holds the pool's configuration lock.
-    Initializing,
-    /// The account directory or pool could not be read safely.
-    Unreadable(String),
-    /// A successfully observed pool; kernel locks determine its occupied slots.
-    Ready {
-        /// Total number of slots declared by the pool.
-        total: usize,
-        /// Slots observed locked, including holders with unreadable records.
-        holders: Vec<CpuHolder>,
-    },
+/// Validated external-domain occupancy, including unsettled debt after owner loss.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuExternal {
+    /// Kernel-held external reservations, including unreadable owner records.
+    pub holders: Vec<CpuHolder>,
+    /// Unsettled reservations whose original kernel holder has closed.
+    pub retained: Vec<CpuHolder>,
+}
+impl CpuExternal {
+    /// All externally reserved units; neither process absence nor Drop releases them.
+    #[must_use]
+    pub fn occupied(&self) -> usize {
+        self.holders.len().saturating_add(self.retained.len())
+    }
+    fn json(&self) -> Value {
+        let mut out = Map::new();
+        out.insert("state".into(), Value::from("active"));
+        out.insert("held".into(), Value::from(self.holders.len() as u64));
+        out.insert("retained".into(), Value::from(self.retained.len() as u64));
+        out.insert("holders".into(), holders_json(&self.holders));
+        out.insert("retained_holders".into(), holders_json(&self.retained));
+        Value::Object(out)
+    }
 }
 
+/// A nonblocking observation, never an admission entitlement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CpuObservation {
+    /// No implementation on this platform.
+    Unsupported,
+    /// No native pool in an unactivated legacy namespace.
+    Absent,
+    /// The native pool initializer currently holds its lock.
+    Initializing,
+    /// An admission transaction currently prevents a coherent observation.
+    Busy,
+    /// Unavailable, partial, malformed or inconsistent backing.
+    Unreadable(String),
+    /// Valid native occupancy and optional validated external backing.
+    Ready {
+        /// Sealed physical slot count.
+        total: usize,
+        /// Native kernel-held slots, including unreadable reported owners.
+        holders: Vec<CpuHolder>,
+        /// None only for unactivated legacy raw observation, never mixed readiness.
+        external: Option<CpuExternal>,
+    },
+}
 impl CpuObservation {
-    /// Machine-readable observation shared by local capacity and authenticated control.
-    ///
-    /// Only a ready pool reports counts; absent or unreadable state never claims
-    /// free capacity. Holder identities remain explicitly reported diagnostics.
+    /// Observed unavailable units, including live and crash-retained external debt.
+    #[must_use]
+    pub fn occupied(&self) -> Option<usize> {
+        match self {
+            Self::Ready {
+                holders, external, ..
+            } => Some(
+                holders
+                    .len()
+                    .saturating_add(external.as_ref().map_or(0, CpuExternal::occupied)),
+            ),
+            _ => None,
+        }
+    }
+    /// Observed unreserved backing, not a promise of CPU or memory admission.
+    #[must_use]
+    pub fn available(&self) -> Option<usize> {
+        match self {
+            Self::Ready { total, .. } => Some(total.saturating_sub(self.occupied()?)),
+            _ => None,
+        }
+    }
+    /// Machine-readable facts shared by authenticated control and local capacity.
     #[must_use]
     pub fn json(&self) -> Value {
         let mut out = Map::new();
         let state = match self {
-            CpuObservation::Unsupported => "unsupported",
-            CpuObservation::Absent => "absent",
-            CpuObservation::Initializing => "initializing",
-            CpuObservation::Unreadable(error) => {
-                out.insert("error".to_owned(), Value::from(error.as_str()));
+            Self::Unsupported => "unsupported",
+            Self::Absent => "absent",
+            Self::Initializing => "initializing",
+            Self::Busy => "busy",
+            Self::Unreadable(error) => {
+                out.insert("error".into(), Value::from(error.as_str()));
                 "unreadable"
             }
-            CpuObservation::Ready { total, holders } => {
-                out.insert("total".to_owned(), Value::from(*total as u64));
-                out.insert("held".to_owned(), Value::from(holders.len() as u64));
+            Self::Ready {
+                total,
+                holders,
+                external,
+            } => {
+                out.insert("total".into(), Value::from(*total as u64));
                 out.insert(
-                    "available".to_owned(),
-                    Value::from((total - holders.len()) as u64),
+                    "held".into(),
+                    Value::from(self.occupied().unwrap_or(0) as u64),
                 );
-                let holders = holders
-                    .iter()
-                    .map(|holder| {
-                        let mut row = Map::new();
-                        row.insert("slot".to_owned(), Value::from(holder.slot));
-                        row.insert("reported_pid".to_owned(), Value::from(holder.reported_pid));
-                        row.insert(
-                            "reported_birth".to_owned(),
-                            Value::from(holder.reported_birth),
-                        );
-                        Value::Object(row)
-                    })
-                    .collect();
-                out.insert("holders".to_owned(), Value::Array(holders));
+                out.insert("native_held".into(), Value::from(holders.len() as u64));
+                out.insert(
+                    "available".into(),
+                    Value::from(self.available().unwrap_or(0) as u64),
+                );
+                out.insert("holders".into(), holders_json(holders));
+                let (basis, external) = match external {
+                    Some(external) => ("shared_native_retained", external.json()),
+                    None => ("raw_native", aterm_json::json!({"state":"unactivated"})),
+                };
+                out.insert("basis".into(), Value::from(basis));
+                out.insert("external".into(), external);
                 "ready"
             }
         };
-        out.insert("state".to_owned(), Value::from(state));
+        out.insert("state".into(), Value::from(state));
         Value::Object(out)
     }
-
-    /// Read an existing pool without creating, repairing or claiming any file.
-    ///
-    /// `dir` is the account capacity directory, usually [`crate::ledger::user_dir`].
-    /// Missing directory identity is unreadable on a supported platform. A busy
-    /// initialization lock is reported immediately instead of waiting for it.
+    /// Read existing backing only. Adopted mixed namespaces require the sidecar;
+    /// missing or invalid backing never appears as zero external reservation.
     #[must_use]
     pub fn read(dir: Option<&Path>) -> Self {
         #[cfg(unix)]
         {
-            use crate::build_cpu::{Pool, SlotState};
-
+            use crate::build_cpu::{LegacyRetirement, Pool};
             let Some(dir) = dir else {
-                return Self::Unreadable("account capacity directory unavailable".to_owned());
+                return Self::Unreadable("account capacity directory unavailable".into());
             };
-            let result = Pool::open_existing(dir)
-                .and_then(|pool| pool.map(|pool| pool.snapshot()).transpose());
-            match result {
-                Ok(None) => Self::Absent,
-                Ok(Some(slots)) => Self::Ready {
-                    total: slots.len(),
-                    holders: slots
-                        .into_iter()
-                        .filter_map(|slot| match slot {
-                            SlotState::Available { .. } => None,
-                            SlotState::Held {
-                                slot,
-                                reported_owner,
-                            } => Some(CpuHolder {
-                                slot,
-                                reported_pid: reported_owner.map(|owner| owner.pid),
-                                reported_birth: reported_owner.and_then(|owner| owner.birth),
-                            }),
-                        })
-                        .collect(),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Self::Initializing,
-                Err(error) => Self::Unreadable(error.to_string()),
-            }
+            let domain = match crate::user_namespace::resolve(dir) {
+                Ok(Some(_)) => CpuDomain::Mixed,
+                Ok(None) => CpuDomain::Legacy,
+                Err(error) => return Self::Unreadable(error.to_string()),
+            };
+            let pool = match Pool::open_existing(dir) {
+                Ok(Some(pool)) => pool,
+                Ok(None) if matches!(domain, CpuDomain::Legacy) => return Self::Absent,
+                Ok(None) => {
+                    return Self::Unreadable("mixed namespace has no native CPU pool".into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Self::Initializing;
+                }
+                Err(error) => return Self::Unreadable(error.to_string()),
+            };
+            let retirement = LegacyRetirement::open_canonical().ok();
+            Self::read_pool(&pool, domain, retirement.as_ref())
         }
         #[cfg(not(unix))]
         {
@@ -133,6 +165,87 @@ impl CpuObservation {
             Self::Unsupported
         }
     }
+    #[cfg(unix)]
+    fn read_pool(
+        pool: &crate::build_cpu::Pool,
+        domain: CpuDomain,
+        retirement: Option<&crate::build_cpu::LegacyRetirement>,
+    ) -> Self {
+        use crate::build_cpu::{ExternalDebt, RetainedSlotState, SlotState};
+        let (native, external) = match ExternalDebt::observe(pool, retirement) {
+            Ok(rows) => rows,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Self::Busy,
+            Err(error) => return Self::Unreadable(error.to_string()),
+        };
+        if matches!(domain, CpuDomain::Mixed) && external.is_none() {
+            return Self::Unreadable("mixed namespace has no external CPU backing".into());
+        }
+        let total = native.len();
+        let holders = native
+            .into_iter()
+            .filter_map(|slot| match slot {
+                SlotState::Available { .. } => None,
+                SlotState::Held {
+                    slot,
+                    reported_owner,
+                } => Some(holder(slot, reported_owner)),
+            })
+            .collect();
+        let external = external.map(|slots| {
+            let mut out = CpuExternal::default();
+            for slot in slots {
+                match slot {
+                    RetainedSlotState::Available { .. } => (),
+                    RetainedSlotState::Held {
+                        slot,
+                        reported_owner,
+                    } => out.holders.push(holder(slot, reported_owner)),
+                    RetainedSlotState::Retained {
+                        slot,
+                        reported_owner,
+                    } => out.retained.push(holder(slot, Some(reported_owner))),
+                }
+            }
+            out
+        });
+        let value = Self::Ready {
+            total,
+            holders,
+            external,
+        };
+        if value.occupied().is_some_and(|occupied| occupied > total) {
+            return Self::Unreadable("native and retained CPU occupancy exceeds backing".into());
+        }
+        value
+    }
+}
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum CpuDomain {
+    Legacy,
+    Mixed,
+}
+#[cfg(unix)]
+fn holder(slot: u32, owner: Option<crate::build_cpu::Owner>) -> CpuHolder {
+    CpuHolder {
+        slot,
+        reported_pid: owner.map(|owner| owner.pid),
+        reported_birth: owner.and_then(|owner| owner.birth),
+    }
+}
+fn holders_json(holders: &[CpuHolder]) -> Value {
+    Value::Array(
+        holders
+            .iter()
+            .map(|holder| {
+                let mut row = Map::new();
+                row.insert("slot".into(), Value::from(holder.slot));
+                row.insert("reported_pid".into(), Value::from(holder.reported_pid));
+                row.insert("reported_birth".into(), Value::from(holder.reported_birth));
+                Value::Object(row)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -145,6 +258,7 @@ mod wire_tests {
             CpuObservation::Unsupported,
             CpuObservation::Absent,
             CpuObservation::Initializing,
+            CpuObservation::Busy,
             CpuObservation::Unreadable("permission denied".into()),
         ] {
             let json = observation.json();
@@ -158,6 +272,7 @@ mod wire_tests {
     fn held_lock_without_owner_record_still_consumes_capacity() {
         let json = CpuObservation::Ready {
             total: 2,
+            external: None,
             holders: vec![CpuHolder {
                 slot: 1,
                 reported_pid: None,
@@ -173,137 +288,8 @@ mod wire_tests {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use std::num::NonZeroU32;
-    use std::time::{Duration, Instant};
-
-    use crate::build_cpu::{Owner, Pool};
-
-    use super::*;
-
-    const HANG: Duration = Duration::from_secs(60);
-
-    // A sibling test can fork while one of our descriptors is open. The
-    // inherited lock lasts until that child execs or closes it; observe the
-    // required state after that copy closes, rather than assuming one sample.
-    fn eventually<T>(what: &str, mut step: impl FnMut() -> Option<T>) -> T {
-        let deadline = Instant::now() + HANG;
-        loop {
-            if let Some(value) = step() {
-                return value;
-            }
-            assert!(Instant::now() < deadline, "{what} within the hang detector");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn pool(dir: &Path, slots: u32) -> Pool {
-        eventually(
-            "the pool opener's inherited initialization lock to close",
-            || match Pool::open_in(dir, NonZeroU32::new(slots).unwrap()) {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                result => Some(result.unwrap()),
-            },
-        )
-    }
-
-    #[test]
-    fn an_absent_pool_is_reported_without_creating_files() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-        assert_eq!(CpuObservation::read(Some(&missing)), CpuObservation::Absent);
-        assert!(!missing.exists());
-        assert_eq!(
-            CpuObservation::read(Some(dir.path())),
-            CpuObservation::Absent
-        );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-        assert!(matches!(
-            CpuObservation::read(None),
-            CpuObservation::Unreadable(_)
-        ));
-    }
-
-    #[test]
-    fn held_slots_follow_kernel_locks_and_not_stale_owner_records() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let pool = pool(dir.path(), 2);
-        let owner = Owner::current(Some(7));
-        let lease = eventually("a lease after the opener's last copy closes", || match pool
-            .try_acquire(owner)
-        {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-            result => result.unwrap(),
-        });
-        let expected = CpuObservation::Ready {
-            total: 2,
-            holders: vec![CpuHolder {
-                slot: lease.slot(),
-                reported_pid: Some(owner.pid),
-                reported_birth: Some(7),
-            }],
-        };
-        let observed = eventually("only the deliberately held lease remains", || {
-            let observed = CpuObservation::read(Some(dir.path()));
-            (observed == expected).then_some(observed)
-        });
-        assert_eq!(observed, expected);
-        drop(lease);
-        let released = eventually("the released lease's last copy to close", || {
-            let observed = CpuObservation::read(Some(dir.path()));
-            matches!(&observed, CpuObservation::Ready { total: 2, holders } if holders.is_empty())
-                .then_some(observed)
-        });
-        assert_eq!(
-            released,
-            CpuObservation::Ready {
-                total: 2,
-                holders: vec![]
-            }
-        );
-    }
-
-    #[test]
-    fn an_initializer_is_reported_without_waiting_for_its_lock() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let pool = pool(dir.path(), 1);
-        let _initializer = eventually("the initializer's last inherited copy to close", || {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(pool.path().join("init.lock"))
-                .unwrap();
-            match aterm_toolchain::record_lock::RecordLock::try_lock(file, 0) {
-                Err(std::fs::TryLockError::WouldBlock) => None,
-                result => Some(result.unwrap()),
-            }
-        });
-        let path = dir.path().to_owned();
-        let (send, receive) = std::sync::mpsc::channel();
-        let reader =
-            std::thread::spawn(move || send.send(CpuObservation::read(Some(&path))).unwrap());
-        assert_eq!(
-            receive
-                .recv_timeout(HANG)
-                .expect("pool observation must not wait on an initializer"),
-            CpuObservation::Initializing,
-        );
-        reader.join().unwrap();
-    }
-
-    #[test]
-    fn a_corrupt_pool_is_unreadable_and_is_not_repaired() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let pool = pool(dir.path(), 1);
-        let manifest = pool.path().join("pool");
-        std::fs::write(&manifest, "invalid").unwrap();
-        let observed = eventually("the corrupt pool is no longer initializing", || {
-            let observed = CpuObservation::read(Some(dir.path()));
-            (!matches!(observed, CpuObservation::Initializing)).then_some(observed)
-        });
-        assert!(matches!(observed, CpuObservation::Unreadable(_)));
-        assert_eq!(std::fs::read_to_string(manifest).unwrap(), "invalid");
-    }
-}
+#[path = "cpu_observation/tests.rs"]
+mod tests;
 
 #[cfg(all(test, not(unix)))]
 mod unsupported_tests {

@@ -510,11 +510,14 @@ pub fn next_link(
         LinkScope::Exact => Err("its path is not the listing's".to_string()),
     };
     scoped.map_err(|reason| refuse(&reason))?;
-    let mut pages = query_values(query, "page");
-    let first_page = pages.next();
-    if pages.next().is_some() {
-        return Err(refuse("it names more than one page"));
-    }
+    let first_page = {
+        let mut pages = query_values(query, "page");
+        let first_page = pages.next();
+        if pages.next().is_some() {
+            return Err(refuse("it names more than one page"));
+        }
+        first_page
+    };
     let page = first_page
         .and_then(crate::path::digits::<u32>)
         .ok_or_else(|| unnumbered_link(next_url, query))?;
@@ -523,11 +526,14 @@ pub fn next_link(
             "page {page} does not follow page {last_page}"
         )));
     }
-    let mut per_pages = query_values(query, "per_page");
-    let first_per_page = per_pages.next();
-    if per_pages.next().is_some() {
-        return Err(refuse("it names more than one per_page"));
-    }
+    let first_per_page = {
+        let mut per_pages = query_values(query, "per_page");
+        let first_per_page = per_pages.next();
+        if per_pages.next().is_some() {
+            return Err(refuse("it names more than one per_page"));
+        }
+        first_per_page
+    };
     if let Some(per_page) = first_per_page {
         let per_page = crate::path::digits::<u64>(per_page)
             .ok_or_else(|| refuse("its per_page is not a number"))?;
@@ -541,7 +547,7 @@ pub fn next_link(
         }
     }
     Ok(NextPage {
-        path_and_query: path_and_query.clone(),
+        path_and_query,
         page,
     })
 }
@@ -674,7 +680,7 @@ impl Walk<'_> {
     /// Read every page from the first.
     fn pass(&mut self) -> Result<Pass> {
         let mut call = self.first.clone();
-        let start = self.first.path_and_query();
+        let start = self.first.path_and_query_cow();
         let start_query = start.split_once('?').map_or("", |(_, query)| query);
         let mut page_no = query_value(start_query, "page")
             .and_then(crate::path::digits::<u32>)

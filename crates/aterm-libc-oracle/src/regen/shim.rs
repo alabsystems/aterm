@@ -510,12 +510,17 @@ fn bodies(cell: &Cell, decls: &Decls, out: &mut Vec<String>) -> Result<(), Strin
         handwritten::fd_word(cell.os)
     ));
     out.push(String::new());
-    if cell.os == Os::GnuLinux {
+    {
+        let word = if cell.os == Os::Darwin {
+            "u32"
+        } else {
+            "usize"
+        };
         out.extend(
             [
-                "/// Control messages are padded out to a pointer-sized boundary.",
+                "/// Control messages follow this ABI's control-message alignment.",
                 "const fn cmsg_align(len: usize) -> usize {",
-                "    (len + ::core::mem::size_of::<usize>() - 1) & !(::core::mem::size_of::<usize>() - 1)",
+                &format!("    (len + ::core::mem::size_of::<{word}>() - 1) & !(::core::mem::size_of::<{word}>() - 1)"),
                 "}",
                 "",
             ]
@@ -889,6 +894,11 @@ unsafe extern \"C\" {
         assert!(text.contains(declarations), "{text}");
         let body = "\
 type fd_word = u32;
+
+/// Control messages follow this ABI's control-message alignment.
+const fn cmsg_align(len: usize) -> usize {
+    (len + ::core::mem::size_of::<u32>() - 1) & !(::core::mem::size_of::<u32>() - 1)
+}
 
 #[inline]
 pub const extern \"C\" fn WSTOPSIG(status: c_int) -> c_int {

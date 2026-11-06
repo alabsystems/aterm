@@ -1208,6 +1208,44 @@ fn attach_image_spans(line: &mut Line, extras: &ScrolledRowExtras) {
     }
 }
 
+/// Extend a compatible run at or after `minimum_index`, or begin a new run.
+/// Passing zero for a column's first layer needs no ordering comparison.
+#[inline(always)]
+fn capture_image_layer(
+    open: &mut aterm_alloc::ArrayVec<(usize, u16), { 2 * crate::extra::MAX_IMAGE_LAYERS }>,
+    spans: &mut Vec<ImageSpan>,
+    col: u16,
+    layer: &crate::ImageRef,
+    minimum_index: usize,
+) -> usize {
+    if let Some(run) = open.iter_mut().find(|run| {
+        let span = &spans[run.0];
+        run.0 >= minimum_index
+            && Arc::ptr_eq(&span.image, &layer.image)
+            && span.kitty == layer.kitty
+            && span.image_row == layer.cell_row
+            && run.1 == layer.cell_col
+    }) {
+        run.1 = run.1.saturating_add(1);
+        spans[run.0].end_col = col.saturating_add(1);
+        run.0
+    } else {
+        let index = spans.len();
+        open.push((index, layer.cell_col.saturating_add(1)));
+        spans.push(ImageSpan {
+            kitty: layer.kitty,
+            ..ImageSpan::new(
+                col,
+                col.saturating_add(1),
+                layer.cell_row,
+                layer.cell_col,
+                Arc::clone(&layer.image),
+            )
+        });
+        index
+    }
+}
+
 /// Cell extras extracted from a scrolled-off row.
 #[derive(Debug, Clone, Default)]
 pub struct ScrolledRowExtras {
@@ -1268,7 +1306,9 @@ impl ScrolledRowExtras {
             && self.images.is_empty()
     }
 
-    /// The OSC 8 share of [`retained_memory_used`](Self::retained_memory_used): the span vector's capacity plus each span's URL and `id=` bytes, what [`strip_hyperlinks`](Self::strip_hyperlinks) gives back.
+    /// The OSC 8 share of [`retained_memory_used`](Self::retained_memory_used):
+    /// span capacity and per-reference payload/string charges. This is the
+    /// budget credit released by [`strip_hyperlinks`](Self::strip_hyperlinks).
     #[must_use]
     pub(crate) fn link_bytes(&self) -> usize {
         let mut total = self
@@ -1276,9 +1316,7 @@ impl ScrolledRowExtras {
             .capacity()
             .saturating_mul(std::mem::size_of::<HyperlinkSpan>());
         for span in &self.hyperlinks {
-            total = total
-                .saturating_add(span.url.len())
-                .saturating_add(span.id.as_ref().map_or(0, |id| id.len()));
+            total = total.saturating_add(span.retained_payload_bytes());
         }
         total
     }
@@ -1396,7 +1434,7 @@ impl Grid {
             }
         }
 
-        let mut current_span: Option<(u16, Arc<str>, Option<Arc<str>>)> = None;
+        let mut current_span: Option<(u16, &Arc<crate::HyperlinkData>)> = None;
 
         let cells = &row.as_slice()[..len];
         for (physical_col, cell) in cells.iter().enumerate() {
@@ -1440,39 +1478,41 @@ impl Grid {
                     result.underline_colors.push((col_u16, packed));
                 }
 
-                let url = extra.hyperlink().cloned();
-                let id = extra.hyperlink_id().cloned();
-                match (&current_span, url) {
-                    (None, Some(new_url)) => {
-                        current_span = Some((col_u16, new_url, id));
+                let payload = extra.hyperlink_data();
+                match (current_span, payload) {
+                    (None, Some(payload)) => {
+                        current_span = Some((col_u16, payload));
                     }
-                    (Some((_, prev_url, prev_id)), Some(ref new_url))
-                        if Arc::ptr_eq(prev_url, new_url) && *prev_id == id => {}
-                    (Some((start, prev_url, prev_id)), next) => {
-                        result.hyperlinks.push(HyperlinkSpan::with_id(
-                            *start,
+                    (Some((_, previous)), Some(payload))
+                        if crate::HyperlinkData::same_scope(previous, payload) => {}
+                    (Some((start, previous)), next) => {
+                        result.hyperlinks.push(HyperlinkSpan::from_shared(
+                            start,
                             col_u16,
-                            prev_url.clone(),
-                            prev_id.clone(),
+                            Arc::clone(previous),
                         ));
-                        current_span = next.map(|u| (col_u16, u, id));
+                        current_span = next.map(|payload| (col_u16, payload));
                     }
                     (None, None) => {}
                 }
             } else {
-                if let Some((start, prev_url, prev_id)) = current_span.take() {
-                    result
-                        .hyperlinks
-                        .push(HyperlinkSpan::with_id(start, col_u16, prev_url, prev_id));
+                if let Some((start, previous)) = current_span.take() {
+                    result.hyperlinks.push(HyperlinkSpan::from_shared(
+                        start,
+                        col_u16,
+                        Arc::clone(previous),
+                    ));
                 }
             }
         }
 
-        if let Some((start, url, id)) = current_span {
+        if let Some((start, payload)) = current_span {
             let end_col = u16::try_from(len).unwrap_or(u16::MAX);
-            result
-                .hyperlinks
-                .push(HyperlinkSpan::with_id(start, end_col, url, id));
+            result.hyperlinks.push(HyperlinkSpan::from_shared(
+                start,
+                end_col,
+                Arc::clone(payload),
+            ));
         }
     }
 
@@ -1486,15 +1526,13 @@ impl Grid {
             return;
         }
         let cells = row.as_slice();
-        let mut open: Vec<(ImageSpan, u16, usize)> = Vec::new();
-        let mut done: Vec<(ImageSpan, usize)> = Vec::new();
-        let mut next_birth = 0usize;
-        let continues = |(span, next, _): &(ImageSpan, u16, usize), layer: &crate::ImageRef| {
-            Arc::ptr_eq(&span.image, &layer.image)
-                && span.kitty == layer.kitty
-                && span.image_row == layer.cell_row
-                && *next == layer.cell_col
-        };
+        // Append each span once, at birth. Only active output indices need
+        // staging; stable sorting below preserves birth order within each key.
+        let first = result.images.len();
+        // A column can close every previous layer and open every current one
+        // before compaction, so two per-cell layer limits bound this array.
+        let mut open: aterm_alloc::ArrayVec<(usize, u16), { 2 * crate::extra::MAX_IMAGE_LAYERS }> =
+            aterm_alloc::ArrayVec::new();
         for (physical_col, cell) in cells.iter().enumerate() {
             let Ok(col_u16) = u16::try_from(physical_col) else {
                 break;
@@ -1506,48 +1544,46 @@ impl Grid {
             } else {
                 &[]
             };
-            let mut at = 0;
-            while at < open.len() {
-                if layers.iter().any(|layer| continues(&open[at], layer)) {
-                    at += 1;
-                } else {
-                    let (mut span, _, birth) = open.swap_remove(at);
-                    span.end_col = col_u16;
-                    done.push((span, birth));
-                }
-            }
-            for layer in layers {
-                if let Some(run) = open.iter_mut().find(|run| continues(run, layer)) {
-                    run.1 = run.1.saturating_add(1);
-                } else {
-                    let span = ImageSpan {
-                        kitty: layer.kitty,
-                        ..ImageSpan::new(
+            // Equal-key layers use emission order as their paint precedence.
+            // Reusing an older upper run after opening a lower one would put
+            // that upper run below it when the spans are restored.
+            if let Some((first_layer, rest)) = layers.split_first() {
+                let mut previous_layer = first_layer;
+                let mut previous_index =
+                    capture_image_layer(&mut open, &mut result.images, col_u16, first_layer, 0);
+                for layer in rest {
+                    previous_index = if previous_layer.image.z_index == layer.image.z_index
+                        && previous_layer.draw_key() == layer.draw_key()
+                    {
+                        capture_image_layer(
+                            &mut open,
+                            &mut result.images,
                             col_u16,
-                            col_u16,
-                            layer.cell_row,
-                            layer.cell_col,
-                            Arc::clone(&layer.image),
+                            layer,
+                            previous_index + 1,
                         )
+                    } else {
+                        capture_image_layer(&mut open, &mut result.images, col_u16, layer, 0)
                     };
-                    let birth = next_birth;
-                    next_birth += 1;
-                    open.push((span, layer.cell_col.saturating_add(1), birth));
+                    previous_layer = layer;
                 }
             }
+            // These indices are Copy. Compact them directly rather than relying
+            // on inlining a generic retain's unwind bookkeeping at every column.
+            let mut kept = 0;
+            for read in 0..open.len() {
+                let run = open[read];
+                if result.images[run.0].end_col > col_u16 {
+                    if kept != read {
+                        open[kept] = run;
+                    }
+                    kept += 1;
+                }
+            }
+            open.truncate(kept);
         }
-        let end_col = u16::try_from(cells.len()).unwrap_or(u16::MAX);
-        done.extend(open.into_iter().map(|(mut span, _, birth)| {
-            span.end_col = end_col;
-            (span, birth)
-        }));
-        done.sort_by_key(|&(ref span, birth)| {
-            (
-                aterm_types::layer_order(span.image.z_index, span.kitty),
-                birth,
-            )
-        });
-        result.images.extend(done.into_iter().map(|(span, _)| span));
+        result.images[first..]
+            .sort_by_key(|span| aterm_types::layer_order(span.image.z_index, span.kitty));
     }
 
     fn extract_hyperlinks_only_into(
@@ -1560,7 +1596,7 @@ impl Grid {
         if len == 0 || !extras.has_any_data() {
             return;
         }
-        let mut current_span: Option<(u16, Arc<str>, Option<Arc<str>>)> = None;
+        let mut current_span: Option<(u16, &Arc<crate::HyperlinkData>)> = None;
         let cells = &row.as_slice()[..len];
         for physical_col in 0..len {
             if is_spacer(cells, physical_col) {
@@ -1568,31 +1604,31 @@ impl Grid {
             }
             let col_u16 = u16::try_from(physical_col).unwrap_or(u16::MAX);
             let coord = CellCoord::new(row_idx, col_u16);
-            let url = extras.get(coord).and_then(|e| e.hyperlink().cloned());
-            let id = extras.get(coord).and_then(|e| e.hyperlink_id().cloned());
-            match (&current_span, url) {
-                (None, Some(new_url)) => {
-                    current_span = Some((col_u16, new_url, id));
+            let payload = extras.get(coord).and_then(|e| e.hyperlink_data());
+            match (current_span, payload) {
+                (None, Some(payload)) => {
+                    current_span = Some((col_u16, payload));
                 }
-                (Some((_, prev_url, prev_id)), Some(ref new_url))
-                    if Arc::ptr_eq(prev_url, new_url) && *prev_id == id => {}
-                (Some((start, prev_url, prev_id)), next) => {
-                    result.hyperlinks.push(HyperlinkSpan::with_id(
-                        *start,
+                (Some((_, previous)), Some(payload))
+                    if crate::HyperlinkData::same_scope(previous, payload) => {}
+                (Some((start, previous)), next) => {
+                    result.hyperlinks.push(HyperlinkSpan::from_shared(
+                        start,
                         col_u16,
-                        prev_url.clone(),
-                        prev_id.clone(),
+                        Arc::clone(previous),
                     ));
-                    current_span = next.map(|u| (col_u16, u, id));
+                    current_span = next.map(|payload| (col_u16, payload));
                 }
                 (None, None) => {}
             }
         }
-        if let Some((start, url, id)) = current_span {
+        if let Some((start, payload)) = current_span {
             let end_col = u16::try_from(len).unwrap_or(u16::MAX);
-            result
-                .hyperlinks
-                .push(HyperlinkSpan::with_id(start, end_col, url, id));
+            result.hyperlinks.push(HyperlinkSpan::from_shared(
+                start,
+                end_col,
+                Arc::clone(payload),
+            ));
         }
     }
 }

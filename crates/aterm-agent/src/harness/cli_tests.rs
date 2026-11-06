@@ -23,6 +23,15 @@ mod report_read;
 #[path = "cli_disk_output_tests.rs"]
 mod disk_output_results;
 
+#[path = "cli_disk_why_text_tests.rs"]
+mod disk_why_text;
+
+#[path = "cli_disk_free_text_tests.rs"]
+mod disk_free_text;
+
+#[path = "cli_disk_diagnostics_tests.rs"]
+mod disk_diagnostics;
+
 #[path = "cli_lapsed_login_tests.rs"]
 mod lapsed_login;
 
@@ -7233,13 +7242,33 @@ fn a_survey_says_only_what_a_rows_figures_support() {
         week,
         five_hour,
         read_at: Some(NOW - age),
+        ..RowReading::default()
     };
     let ahead = NOW + 3600;
     let wall = |reset| C::Limited {
         until: reset + accounts::RESET_GRACE_S,
     };
+    let walled = |age, walled_age, wall_until| RowReading {
+        read_at: Some(NOW - age),
+        walled_at: Some(NOW - walled_age),
+        wall_until,
+        ..RowReading::default()
+    };
     let fresh = SURVEY_READ_FRESH_S;
     for (base, reading, says) in [
+        // A read older than the row's newest wall, lapsed or not, says nothing of room, and neither
+        // does the read that showed that wall. CONTROL: one after it does. NEGATIVE CONTROL: a row
+        // read 5 minutes before a limit screen said `usable` once that wall's 30 minutes were up.
+        (C::Usable, walled(300, 60, None), C::Unseen),
+        (C::Unseen, walled(300, 60, None), C::Unseen),
+        (C::Usable, walled(60, 60, None), C::Unseen),
+        (C::Usable, walled(60, 300, None), C::Usable),
+        (C::Unseen, walled(60, 300, None), C::Usable),
+        // A wall only the rollouts show stands until it ends, and leaves the same mark.
+        (C::Usable, walled(60, 60, Some(ahead)), wall(ahead)),
+        (C::Low, walled(60, 60, Some(ahead)), wall(ahead)),
+        (C::Unseen, walled(60, 60, Some(NOW)), C::Unseen),
+        (C::SignedOut, walled(60, 60, Some(ahead)), C::SignedOut),
         (C::Usable, read(Some((42, ahead)), None, 60), C::Usable),
         (C::Usable, read(Some((42, ahead)), None, fresh), C::Usable),
         (
@@ -7303,6 +7332,7 @@ fn a_rollouts_newer_figures_replace_a_rows_and_older_ones_do_not() {
         week: Some((1, ahead)),
         five_hour: Some((9, ahead)),
         read_at: Some(NOW - 7 * 86_400),
+        ..RowReading::default()
     };
     let sample = |at| accounts::Sample {
         week_pct: Some(100),
@@ -7315,7 +7345,9 @@ fn a_rollouts_newer_figures_replace_a_rows_and_older_ones_do_not() {
         RowReading {
             week: Some((100, ahead)),
             five_hour: Some((9, ahead)),
+            week_named: true,
             read_at: Some(NOW - 60),
+            ..RowReading::default()
         }
     );
     assert_eq!(held.with_newer(&sample(NOW - 7 * 86_400), NOW), held);
@@ -7327,6 +7359,502 @@ fn a_rollouts_newer_figures_replace_a_rows_and_older_ones_do_not() {
         held.with_newer(&gone, NOW).week,
         held.week,
         "a window that has reset names nothing"
+    );
+    // A window read with no reset named is a figure still, which runs at most its length from that
+    // read. NEGATIVE CONTROL: its figure was thrown away while `read_at` moved on, so a window read
+    // full said `usable` and ranked as the least used of all.
+    let unnamed = accounts::Sample {
+        session_pct: Some(100),
+        ..accounts::Sample::default()
+    };
+    let unnamed = held.with_newer(
+        &accounts::Sample {
+            at: NOW - 60,
+            ..unnamed
+        },
+        NOW,
+    );
+    assert_eq!(
+        unnamed.five_hour,
+        Some((100, NOW - 60 + accounts::SESSION_WINDOW_S))
+    );
+    assert_eq!(
+        survey_condition(accounts::Condition::Usable, &unnamed, NOW),
+        accounts::Condition::Limited {
+            until: NOW - 60 + accounts::SESSION_WINDOW_S + accounts::RESET_GRACE_S
+        }
+    );
+}
+
+/// A lone Codex row `main` on the login `acct-lab-1`, in `env`'s home: the day folder its rollouts
+/// go in.
+fn lay_lone_codex_row(env: &Env) -> PathBuf {
+    let home = env.home.clone().expect("a home");
+    let codex_home = home.join(Cli::Codex.accounts().default_home);
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("mkdir");
+    std::fs::write(
+        accounts::roster_beside_for(&config, Cli::Codex).expect("a roster"),
+        "[[account]]\nlabel='main'\nclass='dedicated'\n",
+    )
+    .expect("write roster");
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": "a@example.test",
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "user-lab",
+            "chatgpt_account_id": "acct-lab-1",
+        }
+    }));
+    std::fs::create_dir_all(&codex_home).expect("mkdir");
+    std::fs::write(
+        codex_home.join("auth.json"),
+        aterm_json::to_vec(&aterm_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"id_token": token, "access_token": token, "account_id": "acct-lab-1"}
+        }))
+        .expect("JSON"),
+    )
+    .expect("write auth");
+    let day = codex_home.join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).expect("mkdir");
+    day
+}
+
+/// `lines` as the one rollout of the row [`lay_lone_codex_row`] laid, opened by its login.
+fn write_lone_rollout(day: &Path, now: i64, lines: &[String]) {
+    use crate::harness::codex_rollout::fixtures::meta_as;
+    let thread = "01900000-0000-7000-8000-000000000001";
+    let meta = meta_as(
+        (now - 7_200) * 1000,
+        thread,
+        thread,
+        None,
+        Some(crate::harness::codex_rollout::PAGINATED),
+        Some(("acct-lab-1", "user-lab")),
+    );
+    std::fs::write(
+        day.join(format!("rollout-2026-10-16T08-00-00-{thread}.jsonl")),
+        format!("{meta}{}", lines.concat()),
+    )
+    .expect("write rollout");
+}
+
+/// The one row of `env`'s Codex pool, surveyed at `now`.
+fn surveyed_lone_row(env: &Env, now: i64) -> SurveyAccount {
+    let config = env.config.as_deref().expect("a config path");
+    let places = (config, env.state.as_path(), env.home.as_deref());
+    let rows = survey_accounts(Cli::Codex, places, now)
+        .expect("the pool reads")
+        .rows;
+    let [row] = rows.as_slice() else {
+        panic!("one row: {rows:?}");
+    };
+    row.clone()
+}
+
+/// A WALLED CODEX ROW IS NEVER `usable`, WHATEVER SHOWED ITS WALL: its rollouts' full window of any
+/// kind, named reset or none, and a refusal with every window below full, as the endpoint reads
+/// them (`usage_of`). `--host any` takes no worker to a `limited` row until its wall ends. A wall
+/// that names no reset lifts at a later reading that is not full, at a launch's read that shows
+/// room, and when its window can have run out. NEGATIVE CONTROL: a refusal was read by nothing, a
+/// full window with no reset lost its figure, and one of another kind was never a figure, so each
+/// said `usable`, with no figure, and ranked first.
+#[test]
+fn a_survey_reads_every_wall_a_rows_rollouts_show() {
+    use crate::harness::codex_rollout::fixtures::{no_reset, rate, refused};
+    let tmp = tmp_dir("accounts-survey-walls");
+    let env = env_at(&tmp);
+    let day = lay_lone_codex_row(&env);
+    let now = env.now;
+    let at = now - 60;
+    let at_ms = at * 1000;
+    let week = now + 300_000;
+    let limited = |until: i64| accounts::Condition::Limited {
+        until: until + accounts::RESET_GRACE_S,
+    };
+    let of = |lines: &[String], at_now: i64| {
+        write_lone_rollout(&day, now, lines);
+        surveyed_lone_row(&env, at_now)
+    };
+    let row = of(
+        &[rate(at_ms, "codex", None, Some((30.0, 10_080, week)))],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.seven_day_pct),
+        (accounts::Condition::Usable, Some(30)),
+        "CONTROL: room, and no refusal"
+    );
+    let row = of(
+        &[refused(&rate(
+            at_ms,
+            "codex",
+            None,
+            Some((30.0, 10_080, week)),
+        ))],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.seven_day_pct, row.read_at),
+        (limited(week), Some(30), Some(at)),
+        "a refusal with its week at 30%"
+    );
+    for minutes in [1440, 90, 0] {
+        let row = of(
+            &[rate(at_ms, "codex", Some((100.0, minutes, week)), None)],
+            now,
+        );
+        assert_eq!(
+            (row.condition, row.five_hour_pct, row.seven_day_pct),
+            (limited(week), None, None),
+            "a full window of {minutes} minutes"
+        );
+    }
+    let row = of(
+        &[rate(at_ms, "codex", Some((100.0, 1440, week)), None)],
+        now + accounts::SESSION_WINDOW_S * 2,
+    );
+    assert_eq!(
+        row.condition,
+        limited(week),
+        "however old the reading, until its reset"
+    );
+
+    let five = no_reset(&rate(at_ms, "codex", Some((100.0, 300, 0)), None));
+    let ended = at + accounts::SESSION_WINDOW_S;
+    let row = of(std::slice::from_ref(&five), now);
+    assert_eq!(
+        (row.condition, row.five_hour_pct, row.read_at),
+        (limited(ended), Some(100), Some(at)),
+        "a five-hour window read full, no reset named"
+    );
+    let row = of(
+        &[no_reset(&rate(
+            at_ms,
+            "codex",
+            None,
+            Some((100.0, 10_080, 0)),
+        ))],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.seven_day_pct, row.week_reset),
+        (
+            limited(at + accounts::WEEK_WINDOW_S),
+            Some(100),
+            Some(at + accounts::WEEK_WINDOW_S)
+        ),
+        "a week read full, no reset named"
+    );
+    let row = of(
+        &[no_reset(&rate(
+            at_ms,
+            "codex",
+            None,
+            Some((40.0, 10_080, 0)),
+        ))],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.seven_day_pct),
+        (accounts::Condition::Usable, Some(40)),
+        "a window with room that names no reset ranks by its figure, never as unused"
+    );
+
+    let row = of(
+        &[
+            five.clone(),
+            no_reset(&rate(at_ms + 30_000, "codex", Some((20.0, 300, 0)), None)),
+        ],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.five_hour_pct),
+        (accounts::Condition::Usable, Some(20)),
+        "a later reading that is not full lifts it"
+    );
+    let row = of(std::slice::from_ref(&five), ended + 1);
+    assert_eq!(
+        (row.condition, row.five_hour_pct, row.read_at),
+        (accounts::Condition::Unseen, None, Some(at)),
+        "its window can have run out, and no read since shows room"
+    );
+
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, env.home.as_deref().expect("home"));
+    store
+        .transact(now, &mut None, |state| {
+            Ok(accounts::note_sample(
+                state,
+                "main",
+                accounts::Sample {
+                    week_pct: Some(30),
+                    week_reset: Some(week),
+                    at: now - 30,
+                    ..accounts::Sample::default()
+                },
+                now,
+            ))
+        })
+        .expect("a launch's read");
+    let row = of(
+        &[refused(&rate(
+            at_ms,
+            "codex",
+            None,
+            Some((30.0, 10_080, week)),
+        ))],
+        now,
+    );
+    assert_eq!(
+        (row.condition, row.seven_day_pct, row.read_at),
+        (accounts::Condition::Usable, Some(30), Some(now - 30)),
+        "a launch's read that showed room lifts a refusal"
+    );
+    let row = of(std::slice::from_ref(&five), now);
+    assert_eq!(
+        (row.condition, row.five_hour_pct),
+        (accounts::Condition::Usable, None),
+        "and a full window no reset was named for"
+    );
+}
+
+/// THE ENDPOINT'S WORD ON A FULL WINDOW WITH NO RESET stays a wall in the survey: the wall it writes
+/// stands 30 minutes (`NO_RESET_WALL_S`), and past that the row says `limited` until the window can
+/// have run out, not `low`, which would take a worker at the last rank. A read that shows room lifts
+/// it. NEGATIVE CONTROL: no figure holds a window with no reset, so past 30 minutes it said `low`
+/// with no figure.
+#[test]
+fn a_survey_reads_a_window_a_read_named_no_reset_for_as_a_wall() {
+    let tmp = tmp_dir("accounts-survey-unnamed");
+    let env = env_at(&tmp);
+    lay_lone_codex_row(&env);
+    let now = env.now;
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, env.home.as_deref().expect("home"));
+    let read = |week: f64, at: i64| {
+        let usage = crate::harness::codex_app_login::usage_of(
+            &aterm_json::json!({"rateLimits": {
+                "primary": {"usedPercent": week, "windowDurationMins": 10_080, "resetsAt": null}
+            }}),
+            at,
+        )
+        .expect("a usage");
+        store
+            .transact(at, &mut None, |state| {
+                let mut events = accounts::note_sample(state, "main", usage.sample.clone(), at);
+                for &(window, until) in &usage.walls {
+                    events.extend(accounts::note_wall(state, "main", window, until, at, at));
+                }
+                if usage.walls.is_empty() {
+                    events.extend(accounts::note_room(state, "main", &usage.sample, at));
+                }
+                Ok(events)
+            })
+            .expect("a read");
+    };
+    read(100.0, now);
+    let wall = accounts::NO_RESET_WALL_S[0];
+    let ended = now + accounts::WEEK_WINDOW_S;
+    let says = |at: i64| {
+        let row = surveyed_lone_row(&env, at);
+        (row.condition, row.seven_day_pct, row.week_reset)
+    };
+    assert_eq!(
+        says(now + wall - 1).0,
+        accounts::Condition::Limited { until: now + wall },
+        "the wall it wrote stands"
+    );
+    let limited = accounts::Condition::Limited {
+        until: ended + accounts::RESET_GRACE_S,
+    };
+    assert_eq!(
+        says(now + wall + 1),
+        (limited, Some(100), Some(ended)),
+        "past it, the window read full is still a wall"
+    );
+    assert_eq!(
+        says(ended - 1),
+        (limited, Some(100), Some(ended)),
+        "until the window can have run out"
+    );
+    assert_eq!(
+        says(ended),
+        (accounts::Condition::Unseen, None, None),
+        "and no read since shows room"
+    );
+    // A tap writes a new sample with its figure, so only a figure taken from another record is
+    // newer than the sample it sits beside. The harness's `low` on that sample stands.
+    let merged = now + wall + 30;
+    let named = now + 86_400;
+    store
+        .transact(merged, &mut None, |state| {
+            let mut from = accounts::Account::default();
+            from.windows.insert(
+                accounts::WEEK_LIMIT.to_owned(),
+                accounts::WindowFig {
+                    pct_x10: 200,
+                    reset: named,
+                    at: merged,
+                    by: "elsewhere".to_owned(),
+                    source: accounts::SOURCE_TAP.to_owned(),
+                    epoch_at: None,
+                },
+            );
+            let record = state.accounts.get_mut("main").expect("its record");
+            accounts::fill_observations(record, from);
+            Ok(Vec::new())
+        })
+        .expect("a merge");
+    assert_eq!(
+        says(merged + 60),
+        (accounts::Condition::Low, Some(20), Some(named)),
+        "a later figure with its reset named lifts it"
+    );
+    let later = now + wall + 60;
+    read(20.0, later);
+    assert_eq!(
+        says(later + 60),
+        (
+            accounts::Condition::Usable,
+            Some(20),
+            Some(later + accounts::WEEK_WINDOW_S)
+        ),
+        "a read that shows room lifts it"
+    );
+}
+
+/// A READ OLDER THAN A ROW'S NEWEST WALL NEVER SAYS `usable`, however long ago that wall lapsed: a
+/// wall stays in the record after it lapses, and no read shows what became of it. A read after it
+/// does, and a wall a read lifted counts for nothing. NEGATIVE CONTROL: a session showed Codex's
+/// limit screen 5 minutes after its last reading, and 30 minutes on the row said `usable` on that
+/// reading, so `--host any` chose it first with 3 days left on the wall.
+#[test]
+fn a_read_older_than_a_rows_wall_never_says_usable() {
+    use crate::harness::codex_rollout::fixtures::rate;
+    let tmp = tmp_dir("accounts-survey-lapsed");
+    let env = env_at(&tmp);
+    let day = lay_lone_codex_row(&env);
+    let now = env.now;
+    let week = now + 3 * 86_400;
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, env.home.as_deref().expect("home"));
+    let last_read = rate(
+        (now - 300) * 1000,
+        "codex",
+        None,
+        Some((97.0, 10_080, week)),
+    );
+    write_lone_rollout(&day, now, std::slice::from_ref(&last_read));
+    assert_eq!(
+        surveyed_lone_row(&env, now).condition,
+        accounts::Condition::Usable,
+        "CONTROL: read lately with room, and no wall"
+    );
+    store
+        .transact(now, &mut None, |state| {
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::UNNAMED_WINDOW,
+                None,
+                now,
+                now,
+            ))
+        })
+        .expect("a limit screen");
+    let lapsed = now + accounts::NO_RESET_WALL_S[0];
+    assert_eq!(
+        surveyed_lone_row(&env, lapsed - 1).condition,
+        accounts::Condition::Limited { until: lapsed },
+        "the wall stands"
+    );
+    for at in [lapsed + 1, now - 300 + SURVEY_READ_FRESH_S] {
+        let row = surveyed_lone_row(&env, at);
+        assert_eq!(
+            (row.condition, row.seven_day_pct, row.read_at),
+            (accounts::Condition::Unseen, Some(97), Some(now - 300)),
+            "its wall lapsed, read before it"
+        );
+    }
+    assert_eq!(
+        surveyed_lone_row(&env, now + 30 * 86_400).condition,
+        accounts::Condition::Unseen,
+        "a month on, the wall still in the record"
+    );
+    let reread = lapsed + 60;
+    write_lone_rollout(
+        &day,
+        now,
+        &[
+            last_read,
+            rate(reread * 1000, "codex", None, Some((97.5, 10_080, week))),
+        ],
+    );
+    assert_eq!(
+        surveyed_lone_row(&env, reread + 60).condition,
+        accounts::Condition::Usable,
+        "CONTROL: read after the wall, with room"
+    );
+
+    // The same of a read in the records, with no rollout to hold it.
+    let tmp = tmp_dir("accounts-survey-lapsed-record");
+    let env = env_at(&tmp);
+    lay_lone_codex_row(&env);
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, env.home.as_deref().expect("home"));
+    let room = |at: i64| accounts::Sample {
+        week_pct: Some(40),
+        week_reset: Some(week),
+        at,
+        ..accounts::Sample::default()
+    };
+    let until = now + 600;
+    store
+        .transact(now, &mut None, |state| {
+            let mut events = accounts::note_sample(state, "main", room(now - 300), now);
+            events.extend(accounts::note_wall(
+                state,
+                "main",
+                accounts::WEEK_LIMIT,
+                Some(until),
+                now,
+                now,
+            ));
+            Ok(events)
+        })
+        .expect("a read, then a wall");
+    let row = surveyed_lone_row(&env, until + accounts::RESET_GRACE_S + 1);
+    assert_eq!(
+        (row.condition, row.seven_day_pct),
+        (accounts::Condition::Unseen, Some(40)),
+        "a wall that named its reset, lapsed, read before it"
+    );
+
+    // A wall a read lifted counts for nothing, though the lift stamps it after that read.
+    let lifted = until + accounts::RESET_GRACE_S + 60;
+    store
+        .transact(lifted, &mut None, |state| {
+            let mut events = accounts::note_wall(
+                state,
+                "main",
+                accounts::WEEK_LIMIT,
+                Some(week),
+                lifted,
+                lifted,
+            );
+            let read = room(lifted + 10);
+            events.extend(accounts::note_sample(
+                state,
+                "main",
+                read.clone(),
+                lifted + 20,
+            ));
+            events.extend(accounts::note_room(state, "main", &read, lifted + 20));
+            Ok(events)
+        })
+        .expect("a wall, then a read that lifts it");
+    let row = surveyed_lone_row(&env, lifted + 30);
+    assert_eq!(
+        (row.condition, row.read_at),
+        (accounts::Condition::Usable, Some(lifted + 10)),
+        "CONTROL: its read shows room"
     );
 }
 
@@ -7692,6 +8220,512 @@ fn a_survey_reads_each_row_as_the_report_does() {
             moves: Some(PoolMoves::default()),
             ..SurveyPool::default()
         }
+    );
+}
+
+/// A SURVEY JUDGES A ROW'S LOGIN AS A LAUNCH DOES: a Codex row with no directory of its own is the
+/// default login, made only where the default home holds its login file, or where the OS keyring
+/// holds it, which is counted as made and not read. The survey said `enrolled=1` for such a row on
+/// a Mac signed out of it, so `--host any` sent a worker there that the launch refused.
+#[test]
+fn a_survey_judges_a_rows_login_as_a_launch_does() {
+    let tmp = tmp_dir("accounts-survey-enrolled");
+    let env = env_at(&tmp);
+    let home = env.home.clone().expect("a home");
+    let codex_home = home.join(Cli::Codex.accounts().default_home);
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("mkdir");
+    std::fs::create_dir_all(&codex_home).expect("mkdir");
+    std::fs::write(
+        accounts::roster_beside_for(&config, Cli::Codex).expect("a roster"),
+        "[[account]]\nlabel='main'\nclass='dedicated'\n",
+    )
+    .expect("write roster");
+    let places = (config.as_path(), env.state.as_path(), Some(home.as_path()));
+    let judged = || {
+        let pool = survey_accounts(Cli::Codex, places, env.now).expect("the pool reads");
+        let [row] = pool.rows.as_slice() else {
+            panic!("one row: {:?}", pool.rows);
+        };
+        let launches = accounts::enrolled_in(
+            Cli::Codex,
+            &accounts::roster_beside_for(&config, Cli::Codex)
+                .map(|path| Roster::load_for(Cli::Codex, &path).expect("the roster reads"))
+                .expect("a roster path"),
+            &home,
+        )
+        .contains("main");
+        (row.enrolled, row.condition, launches)
+    };
+
+    let (enrolled, condition, launches) = judged();
+    assert!(!launches, "the launch's own judge: no login here");
+    assert_eq!(
+        (enrolled, condition),
+        (false, accounts::Condition::NotEnrolled),
+        "signed out of its default login"
+    );
+
+    std::fs::write(codex_home.join("auth.json"), "{}").expect("write the login");
+    let (enrolled, condition, launches) = judged();
+    assert!(launches, "the launch's own judge: a login here");
+    assert!(enrolled, "CONTROL: its login file is there");
+    assert_ne!(condition, accounts::Condition::NotEnrolled);
+
+    // A keyring's login has no file, and no secret is read to say so.
+    std::fs::remove_file(codex_home.join("auth.json")).expect("remove the login");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write Codex's config");
+    let (enrolled, condition, _) = judged();
+    assert!(enrolled, "a login the keyring holds is counted as made");
+    assert_ne!(condition, accounts::Condition::NotEnrolled);
+}
+
+/// A SURVEY SAYS WHICH ROW A LAUNCH WOULD START ON, under the accounts mode, the owner's pin and the
+/// program it would run, as the launch's own judge does, and reads no provider to say so. `--host
+/// any` weighs that row alone: the best row of a pool a launch would not start on helps nothing.
+#[test]
+fn a_survey_says_which_row_a_launch_would_start_on() {
+    let tmp = tmp_dir("accounts-survey-launch");
+    let env = env_at(&tmp);
+    let home = env.home.clone().expect("a home");
+    let codex_home = home.join(Cli::Codex.accounts().default_home);
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("mkdir");
+    let work = tmp.path().join("logins/work");
+    std::fs::create_dir_all(&work).expect("mkdir");
+    std::fs::write(work.join("auth.json"), "{}").expect("write a login");
+    std::fs::create_dir_all(&codex_home).expect("mkdir");
+    std::fs::write(codex_home.join("auth.json"), "{}").expect("write the login");
+    std::fs::write(
+        accounts::roster_beside_for(&config, Cli::Codex).expect("a roster"),
+        format!(
+            "[[account]]\nlabel='main'\nclass='dedicated'\n\
+             [[account]]\nlabel='work'\nclass='dedicated'\ndir='{}'\n",
+            work.display()
+        ),
+    )
+    .expect("write roster");
+    let mode = |word: &str| {
+        std::fs::write(&config, format!("[harness]\naccounts = \"{word}\"\n")).expect("config");
+    };
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, &home);
+    let write = |edit: &dyn Fn(&mut accounts::State)| {
+        store
+            .transact(now, &mut None, |state| {
+                edit(state);
+                Ok(Vec::new())
+            })
+            .expect("write the record");
+    };
+    let wall = |state: &mut accounts::State, label: &str| {
+        let events = accounts::note_wall(
+            state,
+            label,
+            accounts::WEEK_LIMIT,
+            Some(now + 300_000),
+            now - 60,
+            now,
+        );
+        assert!(!events.is_empty(), "{label}'s wall is written");
+    };
+    let places = (config.as_path(), env.state.as_path(), Some(home.as_path()));
+    let launches = || {
+        let (rows, reads) = crate::harness::provider_read::captured(|| {
+            survey_accounts(Cli::Codex, places, now)
+                .expect("the pool reads")
+                .rows
+        });
+        assert_eq!(reads, [], "a survey asks no provider");
+        rows.iter()
+            .filter(|row| row.launch)
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+    };
+    let agents = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("mkdir");
+    let exe = crate::harness::codex_alab::lay_package(&tmp.path().join("package"), true);
+    std::fs::write(
+        agents.join("codex"),
+        crate::harness::codex_alab::twin_text(&exe),
+    )
+    .expect("twin");
+    let own_login_program = |own: bool| {
+        crate::harness::upgrade_drive::AGENTS_DIR
+            .with(|dir| *dir.borrow_mut() = own.then(|| agents.clone()));
+    };
+
+    // A program that keeps a row's login its own.
+    own_login_program(true);
+    write(&|state| wall(state, "main"));
+    mode("off");
+    assert_eq!(
+        launches(),
+        Vec::<String>::new(),
+        "rotation off runs the default login, whose wall nothing can show beside a second row"
+    );
+    mode("wall");
+    assert_eq!(launches(), ["work"], "CONTROL: rotation moves off the wall");
+
+    // The owner's pin holds under either.
+    write(&|state| {
+        state.pinned = true;
+        state.active = Some("work".to_owned());
+    });
+    mode("off");
+    assert_eq!(
+        launches(),
+        Vec::<String>::new(),
+        "rotation off takes the owner's pin, whose wall nothing can show beside a second row"
+    );
+
+    // A program that keeps no row's login its own is the machine's own login or nothing.
+    own_login_program(false);
+    assert_eq!(launches(), Vec::<String>::new(), "a pin it cannot honour");
+    write(&|state| {
+        state.pinned = false;
+        state.active = None;
+    });
+    assert_eq!(
+        launches(),
+        Vec::<String>::new(),
+        "rotation off is the default login, whose wall nothing can show beside a second row"
+    );
+    mode("wall");
+    assert_eq!(
+        launches(),
+        Vec::<String>::new(),
+        "only the default login can serve, and it is at a wall: the launch is refused"
+    );
+    write(&|state| {
+        state.accounts.remove("main");
+    });
+    assert_eq!(launches(), ["main"], "CONTROL: the same with no wall");
+
+    // A login the keyring holds is what a launch runs on, whatever the pool says, and no read can
+    // show a wall on it (`a_row_no_read_can_show_a_wall_on_takes_no_launch`).
+    own_login_program(true);
+    write(&|state| wall(state, "main"));
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write Codex's config");
+    assert_eq!(
+        launches(),
+        Vec::<String>::new(),
+        "a keyring's launch takes no row"
+    );
+    own_login_program(false);
+}
+
+/// A ROW NO READ CAN SHOW A WALL ON TAKES NO LAUNCH. A login at its weekly wall, with its own
+/// rollouts saying so: a launch on a lone row under rotation off reads nothing, but those rollouts
+/// show the wall, so the row says `limited` and a placement stays away by that. Where the keyring
+/// holds that login, or a second row is enrolled, no launch read, hold or rollout can show it, so the
+/// row would read `unseen` forever and `--host any` would pick it again and again: it says no launch
+/// starts on it, the owner's pin under rotation off included. NEGATIVE CONTROL: the row a launch
+/// runs on said `launch=1` in each. CONTROL: a default row with no login still takes the launch,
+/// which names the sign-in it lacks, and a pin on a lone row keeps it.
+#[test]
+fn a_row_no_read_can_show_a_wall_on_takes_no_launch() {
+    use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+    let tmp = tmp_dir("accounts-survey-launch-no-read");
+    let env = env_at(&tmp);
+    let home = env.home.clone().expect("a home");
+    let codex_home = home.join(Cli::Codex.accounts().default_home);
+    let now = env.now;
+    let week = now + 300_000;
+    let config = env.config.clone().expect("a config path");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("mkdir");
+    std::fs::write(&config, "[harness]\naccounts = \"off\"\n").expect("config");
+    let roster = accounts::roster_beside_for(&config, Cli::Codex).expect("a roster");
+    let lone = "[[account]]\nlabel='main'\nclass='dedicated'\n";
+    std::fs::write(&roster, lone).expect("write roster");
+
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": "a@example.test",
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "user-lab",
+            "chatgpt_account_id": "acct-lab-1",
+        }
+    }));
+    let login = codex_home.join("auth.json");
+    let login_body = aterm_json::to_vec(&aterm_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"id_token": token, "access_token": token, "account_id": "acct-lab-1"}
+    }))
+    .expect("JSON");
+    std::fs::create_dir_all(&codex_home).expect("mkdir");
+    std::fs::write(&login, &login_body).expect("write auth");
+    let day = codex_home.join("sessions/2026/10/16");
+    std::fs::create_dir_all(&day).expect("mkdir");
+    let thread = "01900000-0000-7000-8000-000000000001";
+    let at_ms = (now - 60) * 1000;
+    std::fs::write(
+        day.join(format!("rollout-2026-10-16T08-00-00-{thread}.jsonl")),
+        [
+            meta_as(
+                at_ms - 1_000,
+                thread,
+                thread,
+                None,
+                Some(crate::harness::codex_rollout::PAGINATED),
+                Some(("acct-lab-1", "user-lab")),
+            ),
+            rate(at_ms, "codex", None, Some((100.0, 10_080, week))),
+        ]
+        .concat(),
+    )
+    .expect("write rollout");
+
+    let places = (config.as_path(), env.state.as_path(), Some(home.as_path()));
+    let survey = || {
+        let (rows, reads) = crate::harness::provider_read::captured(|| {
+            survey_accounts(Cli::Codex, places, now)
+                .expect("the pool reads")
+                .rows
+        });
+        assert_eq!(reads, [], "a survey asks no provider");
+        rows.into_iter()
+            .map(|row| {
+                let walled = matches!(row.condition, accounts::Condition::Limited { .. });
+                (row.label, row.launch, walled, row.enrolled)
+            })
+            .collect::<Vec<_>>()
+    };
+    let main = |launch, walled, enrolled| ("main".to_owned(), launch, walled, enrolled);
+    let work = |launch, walled, enrolled| ("work".to_owned(), launch, walled, enrolled);
+
+    assert_eq!(
+        survey(),
+        [main(true, true, true)],
+        "CONTROL: a lone row's own rollouts show the wall its launch would not read"
+    );
+    // A program that keeps a row's login its own, or a pin on a row of its own is refused outright.
+    let agents = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("mkdir");
+    let exe = crate::harness::codex_alab::lay_package(&tmp.path().join("package"), true);
+    std::fs::write(
+        agents.join("codex"),
+        crate::harness::codex_alab::twin_text(&exe),
+    )
+    .expect("twin");
+    crate::harness::upgrade_drive::AGENTS_DIR.with(|dir| *dir.borrow_mut() = Some(agents));
+    let store = accounts::Store::at_for(&env.state, Cli::Codex, &home);
+    let pin = |label: Option<&str>| {
+        store
+            .transact(now, &mut None, |state| {
+                state.pinned = label.is_some();
+                state.active = label.map(str::to_owned);
+                Ok(Vec::new())
+            })
+            .expect("write the record");
+    };
+    pin(Some("main"));
+    assert_eq!(
+        survey(),
+        [main(true, true, true)],
+        "CONTROL: nor does a pin on that lone row change what shows it"
+    );
+    pin(None);
+
+    // A second enrolled row: a rollout now speaks for neither.
+    let other = tmp.path().join("logins/work");
+    std::fs::create_dir_all(&other).expect("mkdir");
+    std::fs::write(other.join("auth.json"), &login_body).expect("write a login");
+    let two = format!(
+        "{lone}[[account]]\nlabel='work'\nclass='dedicated'\ndir='{}'\n",
+        other.display()
+    );
+    std::fs::write(&roster, &two).expect("write roster");
+    assert_eq!(
+        survey(),
+        [main(false, false, true), work(false, false, true)],
+        "nothing shows the wall, so no row says a launch starts on it"
+    );
+    pin(Some("work"));
+    assert_eq!(
+        survey(),
+        [main(false, false, true), work(false, false, true)],
+        "the owner's pin runs on a row nothing can show a wall on either"
+    );
+    pin(None);
+
+    // Its default home holds no login: a launch there meets a sign-in, and `work`, now the only
+    // login here and the one these rollouts name, reads the wall they show.
+    std::fs::remove_file(&login).expect("remove the login");
+    assert_eq!(
+        survey(),
+        [main(true, false, false), work(false, true, true)],
+        "CONTROL: the row with no login still names what a launch lacks"
+    );
+    std::fs::write(&login, &login_body).expect("write auth");
+
+    // The keyring holds the login, on a lone row.
+    std::fs::write(&roster, lone).expect("write roster");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write Codex's config");
+    assert_eq!(
+        survey(),
+        [main(false, false, true)],
+        "a survey reads no rollout of a keyring's login and its launch reads nothing"
+    );
+    std::fs::write(&config, "[harness]\naccounts = \"wall\"\n").expect("config");
+    assert_eq!(
+        survey(),
+        [main(false, false, true)],
+        "the same under rotation: a keyring's launch takes no row in any mode"
+    );
+    crate::harness::upgrade_drive::AGENTS_DIR.with(|dir| *dir.borrow_mut() = None);
+}
+
+/// Claude Code's worker runs on the login of the machine it starts on, unless rotation moves it:
+/// what `task_launch::claude_pick` does, read here off the records.
+#[test]
+fn a_survey_says_which_claude_row_a_worker_would_start_on() {
+    let tmp = tmp_dir("accounts-survey-launch-claude");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    let store = env.accounts_store();
+    store
+        .transact(now, &mut None, |state| {
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::WEEK_LIMIT,
+                Some(now + 300_000),
+                now - 60,
+                now,
+            ))
+        })
+        .expect("write the record");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    let launches = |accounts: &str| {
+        std::fs::write(&config, format!("[harness]\naccounts = \"{accounts}\"\n")).expect("config");
+        let (rows, reads) = crate::harness::provider_read::captured(|| {
+            survey_accounts(Cli::Claude, places, now)
+                .expect("the pool reads")
+                .rows
+        });
+        assert_eq!(reads, [], "a survey asks no provider");
+        rows.iter()
+            .filter(|row| row.launch)
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(launches("off"), ["main"], "rotation off stays, at its wall");
+    assert_eq!(launches("wall"), ["work-2"], "CONTROL: rotation moves it");
+}
+
+/// THE REPORT SAYS WHAT A CLAUDE CODE WORKER TAKES, as a survey's `launch=` does, which `next:`
+/// cannot: it names the row a rotation moves a session to. `--host any`'s refusal sends a reader to
+/// the report for this, so it says each of the three: the row on this machine's own login, the row
+/// rotation moves the worker to, and no row at all where no row lists that login.
+#[test]
+fn the_report_says_what_a_claude_worker_takes_as_a_survey_does() {
+    let tmp = tmp_dir("accounts-report-worker-claude");
+    let env = env_at(&tmp);
+    let (work, _) = three_accounts(&tmp, &env);
+    let now = env.now;
+    let config = env.config.clone().expect("a config path");
+    let store = env.accounts_store();
+    store
+        .transact(now, &mut None, |state| {
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::WEEK_LIMIT,
+                Some(now + 300_000),
+                now - 60,
+                now,
+            ))
+        })
+        .expect("write the record");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    let read = |accounts: &str| {
+        std::fs::write(&config, format!("[harness]\naccounts = \"{accounts}\"\n")).expect("config");
+        let (code, text, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+        assert_eq!(code, exit(0), "{err}");
+        let (code, json, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+        assert_eq!(code, exit(0), "{err}");
+        let doc: Value = aterm_json::from_str(json.trim()).expect("JSON");
+        let launches: Vec<String> = survey_accounts(Cli::Claude, places, now)
+            .expect("the pool reads")
+            .rows
+            .iter()
+            .filter(|row| row.launch)
+            .map(|row| row.label.clone())
+            .collect();
+        (text, doc, launches)
+    };
+    let worker = "a Claude Code worker aterm starts";
+    let says = |text: &str, doc: &Value, line: String| {
+        assert!(text.lines().any(|said| said == line), "{line}: {text}");
+        assert_eq!(doc["next"]["worker"], Value::from(line.clone()), "{doc}");
+    };
+
+    let (text, doc, launches) = read("off");
+    assert_eq!(launches, ["main"], "rotation off stays, at its wall");
+    says(
+        &text,
+        &doc,
+        format!(
+            "{worker} takes `main`, the row this machine's own login counts as, for a plain start"
+        ),
+    );
+
+    let (text, doc, launches) = read("wall");
+    assert_eq!(launches, ["work-2"], "rotation moves it");
+    says(
+        &text,
+        &doc,
+        format!(
+            "{worker} takes `work-2` for a plain start: rotation moves it off `main`, the row \
+             this machine's own login counts as"
+        ),
+    );
+
+    // No row lists this machine's own login. `next:` still names a row a rotation could take.
+    let other = tmp.path().join("logins").join("work-3");
+    login_made_in(&other);
+    let roster = accounts::append_row("", "work-2", Class::Preferred, Some(work.as_str()))
+        .and_then(|text| {
+            accounts::append_row(
+                &text,
+                "work-3",
+                Class::Preferred,
+                Some(other.to_str().expect("utf-8")),
+            )
+        })
+        .expect("the rows admit");
+    std::fs::write(env.accounts_roster().expect("a config dir"), roster).expect("write");
+    let (text, doc, launches) = read("wall");
+    assert_eq!(
+        launches,
+        Vec::<String>::new(),
+        "no row says it starts there"
+    );
+    assert!(
+        text.lines().any(|line| line.starts_with("next: work-")),
+        "CONTROL: `next:` names a rotation's row, no launch's: {text}"
+    );
+    says(
+        &text,
+        &doc,
+        format!(
+            "{worker} takes no row: it runs on the login its starter carries, this machine's own, \
+             which no row of the roster lists for a plain one"
+        ),
     );
 }
 

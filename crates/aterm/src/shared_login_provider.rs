@@ -296,11 +296,11 @@ impl Approved {
             Some(_) => return Err("unsupported required account class".into()),
         };
         let kind = Kind::of(value, prepared.credential().is_some())?;
+        let mut label = String::with_capacity(47);
+        label.push_str("shared-");
+        aterm_codec::hex::push_lower(&mut label, &self.account[..20]);
         let row = accounts::Row {
-            label: format!(
-                "shared-{}",
-                &aterm_codec::hex::encode_lower(&self.account)[..40]
-            ),
+            label,
             class,
             email: Some(email.to_owned()),
             identity_email,

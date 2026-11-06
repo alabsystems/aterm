@@ -212,7 +212,8 @@ mod tests {
             let _ = aterm_uds::lifeline::wait_for_cut(lifeline);
             println!("{CUT_SEEN}");
         }
-        let end = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let end = std::time::Instant::now()
+            + std::time::Duration::from_secs(aterm_spec::wait::PARKED_SECS);
         if role == "ends" {
             std::thread::sleep(std::time::Duration::from_millis(500));
         } else {
@@ -226,7 +227,9 @@ mod tests {
     /// An instance in `world` whose process is this binary's `test` as the stand-in `role`, on
     /// its lifeline in a session of its own, as [`super::super::Instance::start`] starts one,
     /// once the stand-in holds its lifeline, so a stop's graces time its end and not its start;
-    /// with the rest of the stand-in's stdout.
+    /// with the rest of the stand-in's stdout. Its stop gives it the one-minute hang detector
+    /// ([`aterm_spec::wait::MUST_HAPPEN`]) to end by itself, not a lab instance's 8 s, so no stall
+    /// of the stand-in turns its own end into the stop's `SIGTERM`.
     fn instance_of(world: &World, test: &str, role: &str) -> (super::super::Instance, Said) {
         use aterm_uds::spawnfd::Stdio;
         use std::io::BufRead as _;
@@ -260,6 +263,10 @@ mod tests {
             _admission: None,
             cleanup: StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
             gui: None,
+            graces: super::super::Graces {
+                own: aterm_spec::wait::MUST_HAPPEN,
+                ..super::super::STOP_GRACES
+            },
         };
         (instance, said)
     }
@@ -531,6 +538,48 @@ mod tests {
         assert!(
             out.contains("PROBE truthful=true presence=Present world_kept=true"),
             "the end says the instance's pid still runs and keeps its world: {out}"
+        );
+    }
+
+    /// A windowed instance's aterm that ends between the two reads of its pid that a stop's wait
+    /// for its absence makes, and that its standing makes: each says it ended, neither that its
+    /// identity changed.
+    #[test]
+    fn an_aterm_that_ends_between_the_reads_of_its_pid_has_ended() {
+        use super::super::{BETWEEN_READS, Now, Proc, standing, wait_gui_absent};
+        const TEST: &str =
+            "instance::cleanup::tests::an_aterm_that_ends_between_the_reads_of_its_pid_has_ended";
+        if let Ok(role) = std::env::var(PROBE) {
+            stand_in(&role);
+        }
+        let ends = |mut gui: aterm_uds::spawnfd::Child| -> Box<dyn FnOnce()> {
+            Box::new(move || {
+                gui.kill().expect("end the aterm stand-in");
+                gui.wait().expect("reap the aterm stand-in");
+            })
+        };
+        let (gui, aterm) = gui_of(TEST);
+        BETWEEN_READS.set(Some(ends(gui)));
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        assert_eq!(
+            wait_gui_absent(true, Some(aterm), deadline),
+            Ok(()),
+            "the stop's wait establishes the aterm's end"
+        );
+        // A keeper that still runs, beside an aterm that ends between the reads.
+        let (keeper, _) = gui_of(TEST);
+        let pid = i32::try_from(keeper.id()).expect("pid");
+        let mut keeper = Proc::Child(keeper);
+        let (gui, aterm) = gui_of(TEST);
+        BETWEEN_READS.set(Some(ends(gui)));
+        let said = standing(&mut keeper, pid, true, Some(aterm));
+        if let Proc::Child(keeper) = &mut keeper {
+            keeper.kill().expect("end the keeper stand-in");
+            keeper.wait().expect("reap the keeper stand-in");
+        }
+        assert!(
+            said.ends_with(&format!("its aterm's pid {} {}", aterm.pid, Now::Ended)),
+            "the stop's standing says the aterm ended: {said}"
         );
     }
 

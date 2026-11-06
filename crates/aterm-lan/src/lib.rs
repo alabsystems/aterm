@@ -17,12 +17,20 @@
 
 #[cfg(unix)]
 mod bonjour;
+#[cfg(target_os = "macos")]
+mod bplist;
+#[cfg(target_os = "macos")]
+mod direct;
+#[cfg(target_os = "macos")]
+pub mod grant;
 #[cfg(unix)]
 mod server;
 
 #[cfg(target_os = "macos")]
 mod adopt;
 
+#[cfg(target_os = "macos")]
+pub use direct::provide_direct;
 #[cfg(unix)]
 pub use server::{Opts, serve};
 

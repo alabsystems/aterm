@@ -102,47 +102,16 @@ mod unix {
     }
 
     #[test]
-    fn the_initializers_lock_lets_go_while_a_copy_of_its_descriptor_lives() {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        fn file_of(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: fstat writes only the buffer; a descriptor nobody holds fails with EBADF.
-            (unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0).then(|| {
-                // SAFETY: fstat succeeded, so it filled the buffer.
-                let stat = unsafe { stat.assume_init() };
-                (stat.st_dev, stat.st_ino)
-            })
-        }
-        // A copy of the opener's descriptor stands for a forked child's before its exec: a host
-        // whose spawns fork (a `pre_exec` hook does) holds one of every descriptor open then.
+    fn opening_an_existing_pool_refuses_an_active_initializer_without_waiting() {
         let _fixture = kernel_fixture();
         let dir = tempfile::tempdir().unwrap();
         let pool = Pool::open_in(dir.path(), width(1)).unwrap();
         let held =
             std::fs::OpenOptions::new().write(true).open(pool.path().join("init.lock")).unwrap();
         held.lock().unwrap();
-        let identity = file_of(held.as_raw_fd()).unwrap();
-        let root = dir.path().to_owned();
-        let opener = std::thread::spawn(move || Pool::open_in(&root, width(1)).map(drop));
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let copy = loop {
-            // The opener's own descriptor onto init.lock, open while it waits on `held`.
-            let found = (0..4096)
-                .filter(|&fd| fd != held.as_raw_fd())
-                .find(|&fd| file_of(fd) == Some(identity));
-            if let Some(fd) = found {
-                // SAFETY: the opener keeps `fd` open until `held` lets go, after this borrow.
-                let opened = unsafe { BorrowedFd::borrow_raw(fd) };
-                break std::fs::File::from(opened.try_clone_to_owned().unwrap());
-            }
-            assert!(Instant::now() < deadline, "the opener's descriptor within the hang detector");
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        assert!(Pool::open_in(dir.path(), width(1)).is_err());
         held.unlock().unwrap();
-        opener.join().unwrap().unwrap();
-        assert!(Pool::open_existing(dir.path()).unwrap().is_some());
-        assert!(pool.try_acquire(owner()).unwrap().is_some());
-        drop(copy);
+        assert!(Pool::open_in(dir.path(), width(1)).is_ok());
     }
 
     #[test]
@@ -255,7 +224,7 @@ mod unix {
     }
 
     #[test]
-    fn interrupted_unpublished_initialization_can_restart() {
+    fn interrupted_unpublished_initialization_is_not_repaired() {
         let _fixture = kernel_fixture();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DIRECTORY_NAME);
@@ -266,10 +235,23 @@ mod unix {
             std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
         }
-        let pool = Pool::open_in(dir.path(), width(1)).unwrap();
-        let lease = pool.try_acquire(owner()).unwrap().unwrap();
-        assert_eq!(lease.slot(), 0);
-        assert!(Pool::open_existing(dir.path()).unwrap().is_some());
+        assert!(Pool::open_in(dir.path(), width(1)).is_err());
+        assert!(!path.join("pool").exists());
+    }
+
+    #[test]
+    fn existing_pool_opens_under_a_read_only_capacity_parent() {
+        let _fixture = kernel_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::open_in(dir.path(), width(2)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Pool::open_in(dir.path(), width(2));
+        let mismatch = Pool::open_in(dir.path(), width(1));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reopened = result.unwrap();
+        assert_eq!(reopened.path(), pool.path());
+        assert!(reopened.try_acquire(owner()).unwrap().is_some());
+        assert!(mismatch.is_err());
     }
 
     #[test]

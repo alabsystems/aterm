@@ -105,6 +105,186 @@ fn linked_writes_reuse_payload_and_overwrite_storage() {
     }
 }
 
+fn image_history_restore_reuses_layer_storage() {
+    use aterm_grid::{Grid, ImageData, ImageFormat, ImageRef, ImageScaling};
+    use std::{hint::black_box, sync::Arc};
+
+    for (rows, cols) in [(1_u16, 4_u16), (1, 80), (1, 256), (24, 80)] {
+        for layers in [1, 2] {
+            let mut source = Grid::new(rows, cols);
+            for layer in 0..layers {
+                let image = Arc::new(ImageData {
+                    bytes: vec![7; 256],
+                    format: ImageFormat::Png,
+                    cols,
+                    rows,
+                    z_index: layer,
+                    band_lift_px: 0,
+                    cell_offset_px: (0, 0),
+                    scaling: ImageScaling::Fit,
+                    source_rect: None,
+                });
+                for row in 0..rows {
+                    for col in 0..cols {
+                        source.stack_cell_image(
+                            row,
+                            col,
+                            ImageRef {
+                                image: Arc::clone(&image),
+                                cell_row: row,
+                                cell_col: col,
+                                kitty: None,
+                            },
+                        );
+                    }
+                }
+            }
+            let lines = source.checkpoint_visible_lines();
+            drop(source);
+            let mut grid = Grid::new(rows, cols);
+            grid.restore_visible_from_lines(&lines);
+            ALLOC_BYTES.store(0, Ordering::Relaxed);
+            let calls = count_allocations(|| {
+                for _ in 0..64 {
+                    black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+                }
+            });
+            assert_eq!(
+                (calls, ALLOC_BYTES.load(Ordering::Relaxed)),
+                (0, 0),
+                "warm image restore {rows}x{cols}, {layers} layers"
+            );
+            for row in 0..rows {
+                let spans = lines[usize::from(row)].images().unwrap();
+                for col in 0..cols {
+                    let actual = grid.cell_extra(row, col).unwrap().images();
+                    assert_eq!(actual.len(), spans.len());
+                    for (actual, span) in actual.iter().zip(spans) {
+                        assert!(Arc::ptr_eq(&actual.image, &span.image));
+                        assert_eq!((actual.cell_row, actual.cell_col), (row, col));
+                    }
+                }
+            }
+            {
+                let mut styled = aterm_core::terminal::Terminal::new(rows, cols);
+                styled
+                    .process(b"\x1b]8;id=styled;https://styled.example\x1b\\\x1b[38;2;12;34;56mx");
+                let mut styled_lines = styled.grid().checkpoint_visible_lines();
+                for (styled, image_line) in styled_lines.iter_mut().zip(&lines) {
+                    styled.set_images(image_line.images().unwrap().to_vec());
+                }
+                drop(styled);
+                grid.restore_visible_from_lines(&styled_lines);
+                ALLOC_BYTES.store(0, Ordering::Relaxed);
+                let calls = count_allocations(|| {
+                    for _ in 0..64 {
+                        black_box(&mut grid).restore_visible_from_lines(black_box(&styled_lines));
+                    }
+                });
+                assert_eq!(
+                    (calls, ALLOC_BYTES.load(Ordering::Relaxed)),
+                    (0, 0),
+                    "warm styled image restore {rows}x{cols}, {layers} layers"
+                );
+                assert_eq!(grid.fg_rgb_at(0, 0), Some([12, 34, 56]));
+                assert_eq!(
+                    grid.cell_extra(0, 0)
+                        .unwrap()
+                        .hyperlink_id()
+                        .map(AsRef::as_ref),
+                    Some("styled")
+                );
+            }
+            let images: Vec<_> = lines
+                .iter()
+                .flat_map(|line| line.images().unwrap())
+                .map(|span| Arc::downgrade(&span.image))
+                .collect();
+            let mut text = aterm_core::terminal::Terminal::new(rows, cols);
+            text.process(
+                "\x1b]8;id=new;https://new.example\x1b\\\x1b[38;2;12;34;56me\u{0301}".as_bytes(),
+            );
+            let text_lines = text.grid().checkpoint_visible_lines();
+            grid.restore_visible_from_lines(&text_lines);
+            assert_eq!(grid.fg_rgb_at(0, 0), Some([12, 34, 56]));
+            assert_eq!(
+                grid.cell_extra(0, 0)
+                    .unwrap()
+                    .hyperlink_id()
+                    .map(AsRef::as_ref),
+                Some("new")
+            );
+            assert_eq!(
+                grid.checkpoint_visible_lines()[0].as_str(),
+                text_lines[0].as_str()
+            );
+            assert!(!grid.extras().any_image());
+            drop(lines);
+            assert!(images.iter().all(|image| image.upgrade().is_none()));
+            grid.restore_visible_from_lines(&[]);
+            assert!(grid.extras().is_empty());
+            assert!(!grid.extras().any_image());
+        }
+    }
+}
+
+fn linked_history_restore_reuses_payload_storage() {
+    use aterm_core::terminal::Terminal;
+    use std::hint::black_box;
+
+    for (rows, cols) in [(1_u16, 4_u16), (1, 80), (1, 256), (24, 80)] {
+        let mut source = Terminal::new(rows, cols);
+        source.process(b"\x1b]8;id=history-link;https://example.com\x1b\\");
+        for row in 0..rows {
+            source.process(
+                format!("\x1b[{};1H{}", row + 1, "x".repeat(usize::from(cols))).as_bytes(),
+            );
+        }
+        let lines = source.grid().checkpoint_visible_lines();
+        drop(source);
+        let mut grid = aterm_grid::Grid::new(rows, cols);
+        grid.restore_visible_from_lines(&lines);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        let calls = count_allocations(|| {
+            for _ in 0..64 {
+                black_box(&mut grid).restore_visible_from_lines(black_box(&lines));
+            }
+        });
+        let bytes = ALLOC_BYTES.load(Ordering::Relaxed);
+        assert_eq!(
+            (calls, bytes),
+            (0, 0),
+            "warm linked history restore {rows}x{cols}"
+        );
+        for row in 0..rows {
+            for col in 0..cols {
+                let extra = grid.cell_extra(row, col).unwrap();
+                assert_eq!(
+                    extra.hyperlink().map(AsRef::as_ref),
+                    Some("https://example.com")
+                );
+                assert_eq!(
+                    extra.hyperlink_id().map(AsRef::as_ref),
+                    Some("history-link")
+                );
+            }
+        }
+        grid.cell_extra_mut(0, 0)
+            .set_hyperlink_id(Some(std::sync::Arc::from("edited")));
+        assert_eq!(
+            lines[0].hyperlinks().unwrap()[0].id.as_deref(),
+            Some("history-link")
+        );
+        assert_eq!(
+            grid.cell_extra(0, 1)
+                .unwrap()
+                .hyperlink_id()
+                .map(AsRef::as_ref),
+            Some("history-link")
+        );
+    }
+}
+
 fn floating_frame_reuses_warm_storage() {
     use aterm_core::render::RenderInput;
     use aterm_core::terminal::Terminal;
@@ -307,6 +487,8 @@ fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
 
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    image_history_restore_reuses_layer_storage();
+    linked_history_restore_reuses_payload_storage();
     linked_writes_reuse_payload_and_overwrite_storage();
     floating_frame_reuses_warm_storage();
     selective_truecolor_erase_reuses_warm_storage();

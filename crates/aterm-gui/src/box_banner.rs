@@ -11,11 +11,13 @@
 //! ([`aterm_core::terminal::Terminal::set_notification_admission`]), never on a clock:
 //!
 //! - the herald posts no banner for a program-claim need whose program wrote a notification
-//!   while the report before the need's own stood, or while the need's own stands: that
-//!   notification was the box's; nor for one whose box a banner of the herald's already told
+//!   while the report before the need's own stood, or while the need's own stands, and that
+//!   notification reached the person's queue: it was the box's (one the engine's pace or a full
+//!   queue dropped told nothing); nor for one whose box a banner of the herald's already told
 //!   (codex-alab's own ask about it, before a person's Autopilot Off gave the box back);
 //! - a notification the program writes while a `blocked` report the herald told stands is that
-//!   box's own, already told: it is dropped.
+//!   box's own, already told: it is dropped, as is one whose box the herald told between its
+//!   admission and its delivery.
 //!
 //! The herald's mark lasts only while the GUI shows that box ([`BoxBanner::shown`]): a
 //! foreground move off the program (its death included, which writes no `clear`), or any other
@@ -41,12 +43,24 @@ pub(crate) struct BoxBanner(Mutex<Snapshot>);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     revision: u64,
-    /// The report sequence (`ProgramStateReport::seq`) standing at the program's last admitted
-    /// notification.
+    /// The report sequence (`ProgramStateReport::seq`) standing at the program's last
+    /// notification that reached the person's queue ([`BoxBanner::deliver`]).
     noticed: Option<u64>,
+    /// The notification the engine admitted last, until its delivery is tried: the engine's
+    /// pace or a full queue can still drop it.
+    admitted: Option<Admitted>,
     /// Where the `blocked` report whose box a banner of the herald's told began
     /// (`ProgramStateReport::began`), while the GUI still shows it: a re-send of that report is
     /// the same box.
+    heralded: Option<u64>,
+}
+
+/// A notification the engine admitted and its callback has yet to deliver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Admitted {
+    /// The report sequence standing at it.
+    seq: u64,
+    /// The box the herald had told when it was admitted.
     heralded: Option<u64>,
 }
 
@@ -137,18 +151,47 @@ impl BoxBanner {
     }
 
     /// The engine's admission for this session's program notifications, written while
-    /// `report` stands: `false` for the box the herald told.
+    /// `report` stands: `false` for the box the herald told. An admitted notification tells no
+    /// box yet: only its delivery does ([`Self::deliver`]). Each admission moves the revision,
+    /// one equal to the last included, so an update's handoff that captured the custody before
+    /// it stands down.
     pub(crate) fn admit(&self, report: &ProgramStateReport) -> bool {
         let mut told = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let blocked = report
             .state
             .is_some_and(|state| state.state == ProgramStateWord::Blocked);
-        if blocked && told.heralded == Some(report.began) {
-            return false;
+        let admits = !(blocked && told.heralded == Some(report.began));
+        told.admitted = admits.then_some(Admitted {
+            seq: report.seq,
+            heralded: told.heralded,
+        });
+        if admits {
+            told.revision = told.revision.wrapping_add(1);
         }
-        told.noticed = Some(report.seq);
-        told.revision = told.revision.wrapping_add(1);
-        true
+        admits
+    }
+
+    /// The notification callback's turn on the notification the engine just admitted: `send`
+    /// queues it for the person and answers whether it was queued. Only a queued notification
+    /// tells the box standing at its admission; one the queue refused told nothing, so the
+    /// herald still tells that box. `send` runs under the lock the herald decides under, and is
+    /// not run for a notification whose box a banner of the herald's told since its admission
+    /// (the herald's own test, [`Self::herald`]): one banner per box, in either order.
+    pub(crate) fn deliver(&self, send: impl FnOnce() -> bool) {
+        let mut told = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let admitted = told.admitted.take();
+        let heralded = told.heralded;
+        if admitted.is_some_and(|a| {
+            heralded != a.heralded && heralded.is_some_and(|r| a.seq.saturating_add(1) >= r)
+        }) {
+            return;
+        }
+        if send()
+            && let Some(Admitted { seq, .. }) = admitted
+        {
+            told.noticed = Some(seq);
+            told.revision = told.revision.wrapping_add(1);
+        }
     }
 
     /// [`Self::admit`] as the engine takes it.
@@ -175,7 +218,7 @@ impl BoxBanner {
     /// ([`crate::needs::Need::report`]): `decide` is told whether the box was told already (the
     /// program's own notification was written while the report before it stood, or since, or a
     /// banner of the herald's told it) and answers what it decided and whether a banner went
-    /// out, which marks the box told. No notification is admitted while it decides.
+    /// out, which marks the box told. No notification is admitted or delivered while it decides.
     pub(crate) fn herald<T>(&self, report: u64, decide: impl FnOnce(bool) -> (T, bool)) -> T {
         let mut told = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let by_program = told
@@ -192,7 +235,7 @@ impl BoxBanner {
     /// The herald's turn on a need of another kind a person answers at the box (an ask, such as
     /// codex-alab's own) while the box whose `blocked` report began at `report` is shown:
     /// `decide` answers what it decided and whether a banner went out, which tells that box
-    /// too. No notification is admitted while it decides.
+    /// too. No notification is admitted or delivered while it decides.
     pub(crate) fn herald_beside<T>(&self, report: u64, decide: impl FnOnce() -> (T, bool)) -> T {
         let mut told = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let (decided, posted) = decide();
@@ -222,7 +265,13 @@ mod tests {
         let passed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&passed);
         term.set_notification_admission(banner.admission());
-        term.set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
+        let delivery = Arc::clone(&banner);
+        term.set_notification_callback(move |body| {
+            delivery.deliver(|| {
+                sink.lock().unwrap().push(body.to_string());
+                true
+            });
+        });
         let _ = term.apply_config(&aterm_core::config::TerminalConfig {
             allow_notifications: true,
             ..aterm_core::config::TerminalConfig::default()
@@ -563,6 +612,59 @@ mod tests {
             herald(&banner, term.program_state().began),
             "the question is aterm's to tell"
         );
+    }
+
+    /// A program that spent its notification pace (16 at once) writes its box's notification
+    /// and then the box's report, all at one clock: the pace drops the notification, so it told
+    /// nothing and the herald tells the box. NEGATIVE CONTROL: counting the box told at the
+    /// admission, before the pace, leaves the box with no banner at all.
+    #[test]
+    fn a_notification_the_pace_drops_tells_no_box() {
+        let (mut term, banner, passed) = engine();
+        let at = aterm_core::terminal::ClockReading::now();
+        term.process_at(&b"\x1b]9;flood\x07".repeat(100), at);
+        let flood = passed.lock().unwrap().len();
+        assert!(flood < 100, "PRECONDITION: the pace held the flood");
+        term.process_at(WORKING, at);
+        term.process_at(&[BOX_NOTICE, BLOCKED_PERMISSION].concat(), at);
+        assert_eq!(
+            passed.lock().unwrap().len(),
+            flood,
+            "PRECONDITION: the pace dropped the box's notification"
+        );
+        assert!(
+            herald(&banner, term.program_state().began),
+            "a box whose program notification never reached the person is aterm's to tell"
+        );
+    }
+
+    /// The herald tells a box between a notification's admission and its delivery (the engine
+    /// admits on the reader thread, the herald decides on the main thread): the notification
+    /// is not delivered, so the box gets one banner. CONTROL: a box the notification could not
+    /// have told (one whose report came after another) leaves it to be delivered and to tell.
+    #[test]
+    fn a_notification_whose_box_the_herald_told_since_its_admission_is_not_delivered() {
+        let (mut term, _, _) = engine();
+        term.process(WORKING);
+        let working = term.program_state();
+        term.process(BLOCKED_PERMISSION);
+        let blocked = term.program_state().began;
+        for (report, delivered) in [(working, false), (working, true)] {
+            let banner = BoxBanner::default();
+            assert!(banner.admit(&report));
+            let told = if delivered { blocked + 2 } else { blocked };
+            banner.herald(told, |_| ((), true));
+            let mut sent = false;
+            banner.deliver(|| {
+                sent = true;
+                true
+            });
+            assert_eq!(
+                sent, delivered,
+                "box {told}, notification at {}",
+                report.seq
+            );
+        }
     }
 
     /// codex re-sends the box's report (after an external editor, under its cache's forced

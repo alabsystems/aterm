@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright 2026 Andrew Yates
+
+use std::ffi::OsStr;
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use sha2::{Digest, Sha256};
+
+use crate::private::{self, identity, stamp};
+use crate::process::{self, Identity, Presence};
+use crate::schema::{Book, MAX_JSON, Record, hex, refused};
+
+const MAX_IMAGE: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug)]
+struct Backing {
+    path: PathBuf,
+    root: File,
+    images: File,
+    instances: File,
+    version: File,
+    lock: File,
+}
+
+/// Existing private account state, pinned by original open directory/file handles.
+#[derive(Clone, Debug)]
+pub struct Store(Arc<Backing>);
+
+/// A book row; validation is mandatory before using its helper or endpoint.
+#[derive(Clone, Debug)]
+pub struct Instance {
+    store: Store,
+    record: Record,
+    helper: PathBuf,
+    socket: PathBuf,
+}
+
+#[derive(Debug)]
+struct Image {
+    file: File,
+    before: Metadata,
+    directory: File,
+}
+
+/// A connected native ancestor with pinned image and socket identities.
+///
+/// The connection must remain open through post-response validation and the
+/// protocol's ACK. Dropping this value confers no release or closure authority.
+#[derive(Debug)]
+pub struct Host {
+    instance: Instance,
+    identity: Identity,
+    image: Image,
+    socket_parent: File,
+    stream: UnixStream,
+}
+
+/// An immutable helper selected through an actual native ancestor connection.
+/// The discovery stream has been closed; every spawn still validates original
+/// backing and actual loaded child identity before private data is delivered.
+#[derive(Debug)]
+pub struct PinnedHelper {
+    instance: Instance,
+    identity: Identity,
+    image: Image,
+    socket_parent: File,
+}
+
+fn same_file(actual: &File, original: &File) -> io::Result<bool> {
+    Ok(identity(&actual.metadata()?) == identity(&original.metadata()?))
+}
+fn expired(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }
+}
+impl Store {
+    /// Resolve the native account database home; environment paths grant no authority.
+    pub fn account_path() -> io::Result<PathBuf> {
+        #[cfg(target_os = "macos")]
+        let suffix = "Library/Caches/aterm/resource-host-v3.noindex";
+        #[cfg(not(target_os = "macos"))]
+        let suffix = ".cache/aterm/resource-host-v3.noindex";
+        Ok(process::account_home()?.join(suffix))
+    }
+    pub fn open_account() -> io::Result<Self> {
+        Self::open_at(&Self::account_path()?)
+    }
+    /// Open existing state only. Nothing creates, repairs or retires a namespace.
+    pub fn open_at(path: &Path) -> io::Result<Self> {
+        let root = private::directory(path)?;
+        let images = private::directory(&path.join("images"))?;
+        let instances = private::directory(&path.join("instances"))?;
+        let version = private::open_private(&root, OsStr::new("version.json"))?;
+        let lock = private::open_private(&root, OsStr::new("lock"))?;
+        let store = Self(Arc::new(Backing {
+            path: path.to_owned(),
+            root,
+            images,
+            instances,
+            version,
+            lock,
+        }));
+        store.check()?;
+        store.book()?;
+        Ok(store)
+    }
+    /// The pinned canonical location; this pathname alone grants no authority.
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+    /// Validate the original structural backing without creating or repairing it.
+    pub fn validate(&self) -> io::Result<()> {
+        self.check()
+    }
+    fn check(&self) -> io::Result<()> {
+        let backing = &self.0;
+        for (path, held) in [
+            (&backing.path, &backing.root),
+            (&backing.path.join("images"), &backing.images),
+            (&backing.path.join("instances"), &backing.instances),
+        ] {
+            if !same_file(&private::directory(path)?, held)? {
+                return Err(refused("provenance directory replaced"));
+            }
+        }
+        let (version, file) = private::read_private(&backing.root, OsStr::new("version.json"), 64)?;
+        if version != b"{\"version\":1}" || !same_file(&file, &backing.version)? {
+            return Err(refused("provenance version changed"));
+        }
+        let lock = private::open_private(&backing.root, OsStr::new("lock"))?;
+        if !same_file(&lock, &backing.lock)? || lock.metadata()?.len() != 0 {
+            return Err(refused("provenance lock changed"));
+        }
+        Ok(())
+    }
+    pub fn book(&self) -> io::Result<Book> {
+        self.check()?;
+        let (bytes, _) =
+            private::read_private(&self.0.instances, OsStr::new("book.json"), MAX_JSON)?;
+        let book = Book::decode(&bytes)?;
+        self.check()?;
+        Ok(book)
+    }
+    pub fn instances(&self) -> io::Result<Vec<Instance>> {
+        self.book()?
+            .instances
+            .into_iter()
+            .map(|record| {
+                let socket = record.socket_path()?;
+                let helper = self.0.path.join("images").join(&record.digest).join("aterm");
+                Ok(Instance { store: self.clone(), record, helper, socket })
+            })
+            .collect()
+    }
+    /// Find exactly one actual connected ancestor. Unknown/partial backing is a
+    /// refusal, never an absent row or zero resource reservation.
+    pub fn connect_ancestor(&self, deadline: Instant) -> io::Result<Host> {
+        let mut selected = None;
+        for instance in self.instances()? {
+            expired(deadline)?;
+            if instance.proven_stale() {
+                continue;
+            }
+            if let Some(host) = instance.connect_ancestor(deadline)? {
+                if selected.replace(host).is_some() {
+                    return Err(refused("ambiguous native custodian ancestors"));
+                }
+            }
+        }
+        selected.ok_or_else(|| refused("native custodian ancestor unavailable"))
+    }
+}
+impl Instance {
+    pub fn pid(&self) -> u32 {
+        self.record.pid
+    }
+    pub fn birth(&self) -> u64 {
+        self.record.birth
+    }
+    pub fn helper_path(&self) -> &Path {
+        &self.helper
+    }
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+    fn proven_stale(&self) -> bool {
+        if process::presence(self.pid()) == Presence::Absent {
+            return true;
+        }
+        let before = process::read_identity(self.pid()).ok();
+        before.is_some_and(|old| old.birth != self.birth())
+            && process::read_identity(self.pid()).ok() == before
+    }
+    fn open_image(&self, deadline: Instant) -> io::Result<Image> {
+        self.store.check()?;
+        let parent = self.helper.parent().ok_or_else(|| refused("missing helper parent"))?;
+        let directory = private::directory(parent)?;
+        if identity(&directory.metadata()?) != self.record.directory
+            || directory.metadata()?.mode() & 0o7777 != 0o500
+        {
+            return Err(refused("immutable image directory changed"));
+        }
+        let mut file = private::open_private(&directory, OsStr::new("aterm"))?;
+        let before = file.metadata()?;
+        if identity(&before) != self.record.image
+            || before.mode() & 0o7777 != 0o500
+            || before.len() == 0
+            || before.len() > MAX_IMAGE
+        {
+            return Err(refused("invalid immutable helper"));
+        }
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 65536];
+        let mut total = 0_u64;
+        loop {
+            expired(deadline)?;
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            total =
+                total.checked_add(count as u64).ok_or_else(|| refused("image size overflow"))?;
+            if total > MAX_IMAGE {
+                return Err(refused("oversized helper image"));
+            }
+            hash.update(&bytes[..count]);
+        }
+        if total != before.len()
+            || hex(&hash.finalize()) != self.record.digest
+            || stamp(&before) != stamp(&file.metadata()?)
+        {
+            return Err(refused("immutable helper content changed"));
+        }
+        let image = Image { file, before, directory };
+        self.check_image(&image)?;
+        Ok(image)
+    }
+    fn check_image(&self, image: &Image) -> io::Result<()> {
+        self.store.check()?;
+        let parent = private::directory(
+            self.helper.parent().ok_or_else(|| refused("missing helper parent"))?,
+        )?;
+        let current = private::open_private(&parent, OsStr::new("aterm"))?;
+        if !same_file(&parent, &image.directory)?
+            || parent.metadata()?.mode() & 0o7777 != 0o500
+            || stamp(&current.metadata()?) != stamp(&image.before)
+            || stamp(&image.file.metadata()?) != stamp(&image.before)
+        {
+            return Err(refused("pinned helper backing changed"));
+        }
+        Ok(())
+    }
+    /// Connect as the actual caller; the live kernel peer proves endpoint ownership.
+    pub fn connect_ancestor(&self, deadline: Instant) -> io::Result<Option<Host>> {
+        expired(deadline)?;
+        let image = self.open_image(deadline)?;
+        if process::host_boot()? != (self.record.host.clone(), self.record.boot.clone()) {
+            return Err(refused("custodian host or boot changed"));
+        }
+        let native = process::read_identity(self.pid())?;
+        if native.birth != self.birth()
+            || !process::image_matches(native, &image.file, &self.helper)?
+        {
+            return Err(refused("custodian no longer executes cached helper"));
+        }
+        let socket_parent = private::directory(
+            self.socket.parent().ok_or_else(|| refused("socket parent missing"))?,
+        )?;
+        self.check_socket(&socket_parent)?;
+        let stream = crate::connection::connect(&self.socket, deadline)?;
+        process::check_peer(&stream, native)?;
+        let host = Host { instance: self.clone(), identity: native, image, socket_parent, stream };
+        host.instance.check_socket(&host.socket_parent)?;
+        let own = process::read_identity(std::process::id())?;
+        if !process::stable_ancestor(native, own, deadline)? {
+            return Ok(None);
+        }
+        host.revalidate(deadline)?;
+        Ok(Some(host))
+    }
+    fn check_socket(&self, original_parent: &File) -> io::Result<()> {
+        let parent = private::directory(
+            self.socket.parent().ok_or_else(|| refused("socket parent missing"))?,
+        )?;
+        let meta = fs::symlink_metadata(&self.socket)?;
+        // SAFETY: geteuid reads only the current effective account identity.
+        if !same_file(&parent, original_parent)?
+            || !meta.file_type().is_socket()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o7077 != 0
+            || identity(&meta) != self.record.socket
+        {
+            return Err(refused("native socket backing changed"));
+        }
+        Ok(())
+    }
+}
+impl Host {
+    /// Keep original image/host backing while dropping the unused pre-HELLO
+    /// connection. The helper reconnects independently for its actual operation.
+    pub fn into_helper(self, deadline: Instant) -> io::Result<PinnedHelper> {
+        self.revalidate(deadline)?;
+        Ok(PinnedHelper {
+            instance: self.instance,
+            identity: self.identity,
+            image: self.image,
+            socket_parent: self.socket_parent,
+        })
+    }
+    pub fn pid(&self) -> u32 {
+        self.identity.pid
+    }
+    pub fn birth(&self) -> u64 {
+        self.identity.birth
+    }
+    pub fn helper_path(&self) -> &Path {
+        self.instance.helper_path()
+    }
+    pub fn socket_path(&self) -> &Path {
+        self.instance.socket_path()
+    }
+    pub fn stream(&self) -> &UnixStream {
+        &self.stream
+    }
+    /// Recheck before/after a bounded reply, then send the host protocol ACK
+    /// while this original connection remains alive. This grants no launch.
+    pub fn revalidate(&self, deadline: Instant) -> io::Result<()> {
+        validate_native_host(
+            &self.instance,
+            self.identity,
+            &self.image,
+            &self.socket_parent,
+            deadline,
+        )?;
+        process::check_peer(&self.stream, self.identity)?;
+        let own = process::read_identity(std::process::id())?;
+        if !process::stable_ancestor(self.identity, own, deadline)? {
+            return Err(refused("custodian is not actual ancestor"));
+        }
+        expired(deadline)
+    }
+}
+
+fn validate_native_host(
+    instance: &Instance,
+    identity: Identity,
+    image: &Image,
+    socket_parent: &File,
+    deadline: Instant,
+) -> io::Result<()> {
+    expired(deadline)?;
+    instance.check_image(image)?;
+    instance.check_socket(socket_parent)?;
+    if process::host_boot()? != (instance.record.host.clone(), instance.record.boot.clone())
+        || process::read_identity(identity.pid)? != identity
+        || !process::image_matches(identity, &image.file, instance.helper_path())?
+    {
+        return Err(refused("native custodian changed"));
+    }
+    let own = process::read_identity(std::process::id())?;
+    if !process::stable_ancestor(identity, own, deadline)? {
+        return Err(refused("custodian is not actual ancestor"));
+    }
+    expired(deadline)
+}
+impl PinnedHelper {
+    pub fn helper_path(&self) -> &Path {
+        self.instance.helper_path()
+    }
+    pub fn socket_path(&self) -> &Path {
+        self.instance.socket_path()
+    }
+    pub fn host_pid(&self) -> u32 {
+        self.identity.pid
+    }
+    pub fn host_birth(&self) -> u64 {
+        self.identity.birth
+    }
+    /// Fresh native process/image/boot/ancestry and original backing checks.
+    /// This does not inspect claims or confer admission authority.
+    pub fn validate(&self, deadline: Instant) -> io::Result<()> {
+        validate_native_host(
+            &self.instance,
+            self.identity,
+            &self.image,
+            &self.socket_parent,
+            deadline,
+        )
+    }
+    /// Reconnect as the actual native caller using the ORIGINAL verified image
+    /// handles. This never rehashes or reselects a different book row. Retain
+    /// the Host through post-response revalidation and the protocol ACK.
+    pub fn connect(&self, deadline: Instant) -> io::Result<Host> {
+        self.validate(deadline)?;
+        let stream = crate::connection::connect(self.socket_path(), deadline)?;
+        let host = Host {
+            instance: self.instance.clone(),
+            identity: self.identity,
+            image: Image {
+                file: self.image.file.try_clone()?,
+                before: self.image.before.clone(),
+                directory: self.image.directory.try_clone()?,
+            },
+            socket_parent: self.socket_parent.try_clone()?,
+            stream,
+        };
+        host.revalidate(deadline)?;
+        Ok(host)
+    }
+    /// Check an actual held, unreaped helper child against the ORIGINAL cached
+    /// image before sending any capability-bearing request. The caller must
+    /// retain this Child for helper health; a target is never represented by it.
+    pub fn validate_child(
+        &self,
+        child: &std::process::Child,
+        deadline: Instant,
+    ) -> io::Result<Identity> {
+        self.validate(deadline)?;
+        let own = process::read_identity(std::process::id())?;
+        let native = process::read_identity(child.id())?;
+        if native.parent != own.pid
+            || (cfg!(target_os = "macos") && native.parent_unique_id != own.unique_id)
+            || !process::image_matches(native, &self.image.file, self.helper_path())?
+            || process::read_identity(std::process::id())? != own
+            || process::read_identity(child.id())? != native
+        {
+            return Err(refused("helper is not the original image and direct owned child"));
+        }
+        self.validate(deadline)?;
+        Ok(native)
+    }
+}
+
+#[cfg(test)]
+#[path = "reader/tests.rs"]
+mod tests;

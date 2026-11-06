@@ -86,12 +86,7 @@ fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> 
         .map(|op| op.sequence)
         .max()
         .unwrap_or(0);
-    let pending = log
-        .eligible_and_merges()
-        .1
-        .iter()
-        .filter(|(writer, sequence)| *writer == actor && *sequence > last_business)
-        .count();
+    let pending = log.pending_merges_after(actor, last_business);
     log.append_records_bound().saturating_add(pending)
         <= REGISTRY
             .self_quota

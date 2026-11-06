@@ -21,17 +21,18 @@ mod initial;
 pub use initial::{
     BackgroundVaultAuthorization, BroughtForward, InitialSetupAdmission, InitialSetupAuthorization,
     InitialSetupObservation, InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart,
-    InitialSetupSnapshot, InitialSetupSnapshotError, InitialSetupUpgrade, ObservationRead,
-    ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext, SetupUpgrade,
-    StageEvent, VAULT_SETTINGS_UNREAD, Watches, activate_input_attachments, alab_mac,
-    apply_initial_setup, apply_initial_setup_observed, automatic_plan,
-    automatic_vault_bootstrap_allowed, bring_forward_restored_setup,
+    InitialSetupSnapshot, InitialSetupSnapshotError, InitialSetupUpgrade, InputServiceSet,
+    InputSetupScope, ObservationRead, ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks,
+    SetupNext, SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches,
+    activate_input_attachments, alab_mac, apply_initial_setup, apply_initial_setup_observed,
+    automatic_plan, automatic_vault_bootstrap_allowed, bring_forward_restored_setup,
     bring_forward_restored_setup_observing, check_background_workstation, check_initial_setup,
     check_initial_setup_observed, forget_set_aside_setup, initial_setup_access_revision,
     initial_setup_admission, initial_setup_finished, initial_setup_holds,
     initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
-    initial_setup_park_mark, initial_setup_review_revision, initial_setup_revision,
-    initial_setup_snapshot, initial_setup_snapshot_read_only, input_activation_revision,
+    initial_setup_park_mark, initial_setup_pending_workstation_revision,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_snapshot_read_only, input_activation_revision, input_setup_scope,
     look_for_the_vault_again, note_person_asked_for_access, note_setup_interrupted,
     observe_initial_setup, provisional_setup_widened, provisional_setup_widens,
     put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
@@ -43,8 +44,8 @@ pub use initial::{
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
     InitialSetupAdmissionFault, InitialSetupAdmissionStopTest, ProvisionalSetupWatchTest,
-    initial_setup_observation_at, initial_setup_snapshot_at, set_aside_unreadable_setup_at,
-    set_aside_unreadable_setup_at_observing,
+    initial_setup_observation_at, initial_setup_snapshot_at, input_setup_scope_at,
+    set_aside_unreadable_setup_at, set_aside_unreadable_setup_at_observing,
     set_aside_unreadable_setup_at_observing_before_checkpoint,
     set_aside_unreadable_setup_at_observing_done_error, with_initial_setup_vault_sync_at,
 };
@@ -1997,6 +1998,11 @@ trait Host {
     fn readings(&mut self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Preferences whose complete tagged item cohort this pass verified as wanted. A held,
+    /// unread or absent cohort supplies no new completion evidence.
+    fn verified_settings(&mut self) -> Selection {
+        Selection::none()
+    }
     /// The System State row the item `item` was built for.
     fn item_setting(&self, item: &str) -> Option<Setting> {
         aterm_machines::init_preferences::setting_of(item)
@@ -2066,6 +2072,8 @@ struct NativeHost {
     readings: Vec<(String, String)>,
     /// Each item's System State row, as the passes' tagged rows said ([`Host::item_setting`]).
     tagged: Vec<(String, Setting)>,
+    /// Complete preference cohorts verified by this pass, independent of other settings.
+    verified: Selection,
 }
 
 impl NativeHost {
@@ -2109,6 +2117,7 @@ impl NativeHost {
             drifted: Vec::new(),
             readings: Vec::new(),
             tagged: Vec::new(),
+            verified: Selection::none(),
         }
     }
 
@@ -2157,6 +2166,7 @@ impl Host for NativeHost {
     fn select(&mut self, selected: Selection) {
         self.selected = selected.workstation();
         self.prepared = None;
+        self.verified = Selection::none();
     }
     fn attempts(&mut self) -> Vec<Attempt> {
         std::mem::take(&mut self.attempts)
@@ -2178,6 +2188,9 @@ impl Host for NativeHost {
     }
     fn readings(&mut self) -> Vec<(String, String)> {
         std::mem::take(&mut self.readings)
+    }
+    fn verified_settings(&mut self) -> Selection {
+        std::mem::replace(&mut self.verified, Selection::none())
     }
     fn item_setting(&self, item: &str) -> Option<Setting> {
         self.tagged
@@ -2312,6 +2325,25 @@ impl Host for NativeHost {
         let rows = if apply {
             use aterm_machines::items::defaults::Scope;
             use aterm_machines::model::Read;
+            let tagged = result.tagged();
+            let selected = initial::preferences(group.selected(self.selected));
+            for setting in Setting::ALL {
+                if !selected.contains(setting) {
+                    continue;
+                }
+                let cohort: Vec<_> = tagged
+                    .iter()
+                    .filter(|(member, _)| *member == setting)
+                    .map(|(_, row)| *row)
+                    .collect();
+                if !cohort.is_empty()
+                    && cohort
+                        .iter()
+                        .all(|row| matches!(row.outcome, Outcome::Ok | Outcome::Changed))
+                {
+                    self.verified.set(setting, true);
+                }
+            }
             if let Ok(root) = state_root() {
                 initial::note_at_login(&root, initial::changed_at_login(result.tagged()));
             }
@@ -2882,6 +2914,9 @@ fn execute_pass(
     build: &str,
     now: u64,
 ) -> Result<Pass, String> {
+    // A failed earlier pass can end before its staging is drained. Only this pass's complete
+    // item cohorts can checkpoint the current selection.
+    let _ = host.verified_settings();
     let backup = root.join("original-preferences.json");
     let mut report = Report {
         action,
@@ -2985,6 +3020,10 @@ fn execute_pass(
             .map(|attempt| attempt.item),
     );
     settled.extend(host.settled());
+    let verified = host.verified_settings();
+    if !verified.is_empty() {
+        initial::record_verified_preferences(root, verified)?;
+    }
     if report.complete() {
         initial::record_applied(root, host.selection())?;
     }

@@ -337,8 +337,8 @@ pub struct GitOut {
 pub struct HelperCommand {
     /// The executable, absolute and canonical.
     pub exe: PathBuf,
-    /// The words before `auth git-credential`: `["agh"]` for `aterm` and `atpkg-publish`,
-    /// none for an executable whose file stem is `agh`.
+    /// The words before `auth git-credential`: `["agh"]` for `aterm`, `aterm-release`
+    /// and `atpkg-publish`, none for an executable whose file stem is `agh`.
     pub args: Vec<String>,
 }
 
@@ -349,26 +349,30 @@ fn unnamed(what: &str) -> Error {
 
 impl HelperCommand {
     /// `std::env::current_exe()`, canonicalized, with `args` by its file stem: `["agh"]` for
-    /// `aterm` and `atpkg-publish`, none for `agh`.
+    /// `aterm`, `aterm-release` and `atpkg-publish`, none for `agh`.
     ///
     /// # Errors
     ///
     /// could_not_run, why `the helper's executable cannot be named: {e}`, or, for any other
-    /// file stem, `… {stem} is not agh, aterm or atpkg-publish`.
+    /// file stem, `… {stem} is not agh, aterm, aterm-release or atpkg-publish`.
     pub fn current() -> Result<HelperCommand> {
         let exe = std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_err(|e| unnamed(&e.to_string()))?;
+        Self::for_executable(exe)
+    }
+
+    fn for_executable(exe: PathBuf) -> Result<HelperCommand> {
         let stem = exe
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
         let args = match stem.as_str() {
             "agh" => Vec::new(),
-            "aterm" | "atpkg-publish" => vec!["agh".to_string()],
+            "aterm" | "aterm-release" | "atpkg-publish" => vec!["agh".to_string()],
             _ => {
                 return Err(unnamed(&format!(
-                    "{stem} is not agh, aterm or atpkg-publish"
+                    "{stem} is not agh, aterm, aterm-release or atpkg-publish"
                 )));
             }
         };
@@ -1605,13 +1609,12 @@ mod unix {
                 Err(Error::refused(answer))
             }
         };
+        use std::fmt::Write as _;
         check_parents()?;
-        let old_input = batch
-            .rows()
-            .iter()
-            .enumerate()
-            .map(|(index, row)| format!("{} {index}\n", row.into))
-            .collect::<String>();
+        let mut old_input = String::new();
+        for (index, row) in batch.rows().iter().enumerate() {
+            let _ = writeln!(old_input, "{} {index}", row.into);
+        }
         let old = step(
             "old-values",
             vec![
@@ -1631,10 +1634,9 @@ mod unix {
                 return Err(Error::local("extra old cache ref"));
             };
             let mut columns = line.split_whitespace();
-            let expected_index = index.to_string();
             let oid = match (columns.next(), columns.next(), columns.next()) {
                 (Some(oid), Some(number), None)
-                    if crate::path::is_sha(oid) && number == expected_index =>
+                    if crate::path::is_sha(oid) && number.parse::<usize>().ok() == Some(index) =>
                 {
                     oid
                 }
@@ -1652,12 +1654,10 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None, None)?;
-        let fetch_input = batch
-            .rows()
-            .iter()
-            .enumerate()
-            .map(|(index, row)| format!("+{}:refs/agh/batch/{index}\n", row.source))
-            .collect::<String>();
+        let mut fetch_input = String::new();
+        for (index, row) in batch.rows().iter().enumerate() {
+            let _ = writeln!(fetch_input, "+{}:refs/agh/batch/{index}", row.source);
+        }
         step(
             "fetch",
             vec![
@@ -1709,9 +1709,10 @@ mod unix {
             ));
         }
         check_parents()?;
-        let objects_input = (0..batch.rows().len())
-            .map(|index| format!("refs/agh/batch/{index}\n"))
-            .collect::<String>();
+        let mut objects_input = String::new();
+        for index in 0..batch.rows().len() {
+            let _ = writeln!(objects_input, "refs/agh/batch/{index}");
+        }
         let source = scratch.map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf);
         step(
             "objects",
@@ -1734,7 +1735,11 @@ mod unix {
         check_parents()?;
         let mut transaction = "start\noption no-deref\n".to_string();
         for (row, old) in batch.rows().iter().zip(before) {
-            transaction.push_str(&format!("update {} {} {old}\n", row.into, row.expected_oid));
+            let _ = writeln!(
+                transaction,
+                "update {} {} {old}",
+                row.into, row.expected_oid
+            );
         }
         transaction.push_str("prepare\ncommit\n");
         step(
@@ -1894,9 +1899,11 @@ mod unix {
             }
             let mut metadata_roots = String::new();
             for u in batch.updates() {
-                metadata_roots.push_str(&format!("{}\n", u.after));
+                metadata_roots.push_str(&u.after);
+                metadata_roots.push('\n');
                 if u.before != ZERO {
-                    metadata_roots.push_str(&format!("{}\n", u.before));
+                    metadata_roots.push_str(&u.before);
+                    metadata_roots.push('\n');
                 }
             }
             let prefix = scratch
@@ -2019,10 +2026,13 @@ mod unix {
         if incremental {
             let mut roots = String::new();
             for u in batch.updates() {
-                roots.push_str(&format!("{}\n", u.after));
+                roots.push_str(&u.after);
+                roots.push('\n');
             }
             for u in batch.updates().iter().filter(|u| u.before != ZERO) {
-                roots.push_str(&format!("^{}\n", u.before));
+                roots.push('^');
+                roots.push_str(&u.before);
+                roots.push('\n');
             }
             let expected = checked_input(
                 "new-object-ids",
@@ -2177,7 +2187,8 @@ mod unix {
         // can race our earlier read even when BEFORE != AFTER in every input.
         // Other rows may have landed, so never call that a complete CAS success.
         let mut acknowledged = std::collections::BTreeSet::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
             let mut fields = line.split('\t');
             let (Some(flag), Some(spec), Some(_summary)) =
                 (fields.next(), fields.next(), fields.next())
@@ -2192,7 +2203,7 @@ mod unix {
                     .updates()
                     .iter()
                     .any(|u| u.reference == reference && u.after == source)
-                || !acknowledged.insert(reference.to_string())
+                || !acknowledged.insert(reference)
             {
                 return Err(Error::new(Kind::OutcomeUnknown, "native push did not acknowledge every explicit lease; concurrent changes or partial effects are possible")
                     .with_side_effect(if dry_run { SideEffect::None } else { SideEffect::Unknown }).with_repo(run.slug.to_string()));
@@ -2404,6 +2415,14 @@ mod unix {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn cutter_helper_uses_only_its_explicit_agh_dispatch() {
+        let helper = super::HelperCommand::for_executable("/owned/aterm-release".into()).unwrap();
+        assert_eq!(helper.args, ["agh"]);
+        assert_eq!(helper.exe, std::path::Path::new("/owned/aterm-release"));
+        assert!(super::HelperCommand::for_executable("/owned/unrelated-cutter".into()).is_err());
+    }
+
     #[test]
     fn main_is_fetched_into_no_branch_tag_or_remote_tracking_ref() {
         assert!(super::into_ok("refs/atpkg-publish/main-of-record"));

@@ -1268,10 +1268,11 @@ fn host_any_places_a_worker_only_where_its_needs_are_met() {
     assert_eq!(
         none,
         "--host any: no Mac can take agent=claude need=repo:trust,free:250g: 3 members answered, \
-         2 of them let this Mac drive them (`aterm fleet allow drive --from <this Mac>` there); \
-         of those, 1 have less free disk than it needs (free:250g), 1 cannot say whether they \
-         meet its needs (an aterm too old to report its home, checkouts and disk, or no read of \
-         its checkouts within 30 min), so none meets them"
+         2 of them can be driven from this Mac (of the others, 1 with no grant: `aterm fleet \
+         allow drive --from <this Mac>` there); of those, 1 have less free disk than it needs \
+         (free:250g), 1 cannot say whether they meet its needs (1 saying nothing of their home, \
+         checkouts or disk, from an aterm too old to, no read of its checkouts yet or a reply cut \
+         short: update it, or ask again), so none meets them"
     );
 }
 

@@ -157,6 +157,11 @@ impl Env {
     }
 }
 
+struct Guard {
+    source: OwnedFd,
+    target: RawFd,
+}
+
 /// A native command whose default child holds stdio and explicitly named guards. A converted
 /// [`super::TransparentCommand`] retains the caller's non-close-on-exec descriptors instead.
 pub struct Command {
@@ -169,7 +174,7 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     #[cfg(unix)]
-    guards: Vec<std::os::fd::OwnedFd>,
+    guards: Vec<Guard>,
     /// Pass-through commands retain the caller's non-close-on-exec table. Ordinary commands
     /// still hand on only explicitly named guards.
     inherit_all: bool,
@@ -364,17 +369,79 @@ impl Command {
         for guard in guards {
             let guard = super::off_the_targets(guard)?;
             crate::keep_out_of_children(&guard)?;
-            placed.push(guard);
+            placed.push(Guard {
+                target: guard.as_raw_fd(),
+                source: guard,
+            });
         }
         self.guards = placed;
         Ok(self)
     }
 
-    /// Stable child descriptor numbers after [`Self::inherit_guards`], available before spawn
+    /// Inherit these owned descriptions at explicit child-only descriptor numbers.
+    /// Private source copies are kept off every target before native file actions;
+    /// no occupied descriptor in this process is replaced or unmarked.
+    ///
+    /// # Errors
+    /// More than 130 guards, duplicate targets, stdio/out-of-bound targets, unavailable
+    /// descriptor copies, or a platform without native mapped placement. Relocated
+    /// guards cannot be used with in-place exec, whose failure preserves this table.
+    #[cfg(unix)]
+    pub fn inherit_guards_at(&mut self, guards: Vec<(OwnedFd, RawFd)>) -> io::Result<&mut Self> {
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = guards;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped guards need native spawn actions",
+            ));
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut limit = super::Rlimit { cur: 0, max: 0 };
+            // SAFETY: getrlimit writes exactly the live platform Rlimit storage.
+            if unsafe { super::getrlimit(super::RLIMIT_NOFILE, &mut limit) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let bound = super::ACTION_FD_LIMIT.min(super::descriptor_bound()) as u64;
+            let bound = bound.min(limit.cur);
+            let mut targets = std::collections::BTreeSet::new();
+            if guards.len() > super::MAX_GUARD_FDS
+                || guards.iter().any(|(_, at)| {
+                    *at < 3
+                        || u64::try_from(*at).ok().is_none_or(|at| at >= bound)
+                        || !targets.insert(*at)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid explicit guard targets",
+                ));
+            }
+            let mut placed = Vec::with_capacity(guards.len());
+            let mut excluded = Vec::new();
+            for (source, target) in guards {
+                let source = loop {
+                    let copy = super::placeable_copy(source.as_raw_fd())?;
+                    if !targets.contains(&copy.as_raw_fd()) {
+                        break copy;
+                    }
+                    // Keep excluded fresh slots occupied until all copies are
+                    // placed; repeated dup calls cannot choose them again.
+                    excluded.push(copy);
+                };
+                placed.push(Guard { source, target });
+            }
+            self.guards = placed;
+            Ok(self)
+        }
+    }
+
+    /// Stable child descriptor numbers after either inheritance method, available before spawn
     /// so an authenticated launch can journal each actual guard's identity and position.
     #[cfg(unix)]
     pub fn guard_targets(&self) -> impl ExactSizeIterator<Item = RawFd> + '_ {
-        self.guards.iter().map(AsRawFd::as_raw_fd)
+        self.guards.iter().map(|guard| guard.target)
     }
 
     /// Start the child in a new session of its own (`setsid`), with no controlling terminal.
@@ -1210,6 +1277,17 @@ impl Command {
             placeable_copy,
         };
         use std::os::unix::ffi::OsStrExt as _;
+        if replace
+            && self
+                .guards
+                .iter()
+                .any(|guard| guard.source.as_raw_fd() != guard.target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped guard exec cannot preserve the failure table",
+            ));
+        }
         if replace && self.disclaim.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1346,16 +1424,17 @@ impl Command {
             }
         }
         let mut guards = Vec::with_capacity(self.guards.len());
-        for target in self.guard_targets() {
+        for guard in &self.guards {
+            let target = guard.target;
             let source = if replace {
                 // SETEXEC cannot inherit a CLOEXEC source directly. Hand a private temporary
                 // copy to the original advertised number without changing the parent's slot.
-                let copy = exec_source(target)?;
+                let copy = exec_source(guard.source.as_raw_fd())?;
                 let source = copy.as_raw_fd();
                 handed.push(copy);
                 source
             } else {
-                target
+                guard.source.as_raw_fd()
             };
             guards.push((source, target));
         }
@@ -1603,6 +1682,16 @@ impl Command {
     fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
+        if self
+            .guards
+            .iter()
+            .any(|guard| guard.source.as_raw_fd() != guard.target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped guards need native spawn actions",
+            ));
+        }
         if self.disclaim.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

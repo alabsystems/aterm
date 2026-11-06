@@ -1152,9 +1152,13 @@ pub(super) fn archived_state(
     archive::query(namespace, reference, reap)
 }
 
-/// Existing record lines cannot be removed or rewritten by recovery. The only in-place
-/// update is the fixed-width measured-write row; the head and every custody event stay.
+/// Recovery accepts append/measured-write updates or a complete custody snapshot with
+/// exactly equal semantics and unchanged ordinary accounting. A snapshot cannot discard
+/// an unknown ARM or release a scope; retirement is a preceding committed event.
 fn known_record_update(before: &str, after: &str) -> bool {
+    if Journal::known_subgroup_compaction(before, after) {
+        return true;
+    }
     if !before.ends_with('\n') || !after.ends_with('\n') {
         return false;
     }

@@ -358,7 +358,7 @@ pub struct Journal {
     pub started: u64,
     #[serde(default)]
     pub linux: LinuxDecl,
-    /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`], `after-cut`, `site-deferred`, `check`.
+    /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`], `after-cut`, `tap-aligned`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
     /// The owner asks delivered and not yet resolved, by key: carried over to each new head, withdrawn by `--forget`.
@@ -470,7 +470,7 @@ impl Journal {
     /// The release reached its check: everything is done for R.
     #[must_use]
     pub fn finished(&self) -> bool {
-        self.has("check") && !self.has(SITE_DEFERRED)
+        self.has("check") && self.has(TAP_ALIGNED) && !self.has(SITE_DEFERRED)
     }
 
     #[must_use]
@@ -778,7 +778,8 @@ pub struct CutState {
     pub finished: bool,
 }
 
-/// The published release's shape checked and its website verified live.
+/// The published release's shape checked, its website verified live and its
+/// canonical tap aligned to the same validated website cohort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AfterCut {
     /// The step's line.
@@ -788,6 +789,10 @@ pub struct AfterCut {
 // Older journals recorded an unfinished website as a completed release.
 // They must resume the website step before they can become complete.
 const SITE_DEFERRED: &str = "site-deferred";
+
+// Older after-cut facts cover the website only. They cannot authorize skipping
+// the canonical tap operation after a resume.
+const TAP_ALIGNED: &str = "tap-aligned";
 
 /// The engine's ledger (`mappings.json`) as the release reads it, for one commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1376,7 +1381,7 @@ impl Run<'_> {
         }
 
         self.begin(Step::AfterCut)?;
-        let shaped = self.site_complete();
+        let shaped = self.after_cut_complete();
         if shaped && self.facts.fixtures.yes {
             let v = self.version();
             let landed = self.facts.fixtures.words.clone();
@@ -1387,7 +1392,8 @@ impl Run<'_> {
             if !shaped {
                 words.push(format!(
                     "would check v{v}'s shape as GitHub serves it, then bring alab.systems to \
-                     it (ship site --latest)"
+                     it (ship site --latest) and align the canonical tap to the same validated \
+                     site cohort (pub tap --bump --expect-version)"
                 ));
             }
             words.push(if self.facts.fixtures.yes {
@@ -3222,7 +3228,7 @@ impl Run<'_> {
                 Step::Verify => self.skip_verify().is_some(),
                 Step::Publish => self.skip_publish().is_some(),
                 Step::Cut => matches!(self.cut_mode(), CutMode::Done(_)),
-                Step::AfterCut => self.site_complete() && self.facts.fixtures.yes,
+                Step::AfterCut => self.after_cut_complete() && self.facts.fixtures.yes,
                 _ => false,
             };
             if skipped {
@@ -4473,13 +4479,14 @@ impl Run<'_> {
     fn after_cut(&mut self) -> Flow {
         let v = self.version();
         let mut notes = Vec::new();
-        if !self.site_complete() {
+        if !self.after_cut_complete() {
             match self.b.after_cut(&v) {
                 Ok(done) => {
                     if let Some(journal) = &mut self.journal {
                         journal.done.retain(|fact| fact != SITE_DEFERRED);
                     }
                     self.journal_add("after-cut")?;
+                    self.journal_add(TAP_ALIGNED)?;
                     notes.push(done.note);
                 }
                 Err(r) => return self.refuse(r),
@@ -4537,6 +4544,10 @@ impl Run<'_> {
 
     fn site_complete(&self) -> bool {
         self.journal_has("after-cut") && !self.journal_has(SITE_DEFERRED)
+    }
+
+    fn after_cut_complete(&self) -> bool {
+        self.site_complete() && self.journal_has(TAP_ALIGNED)
     }
 
     fn check(&mut self) -> Flow {

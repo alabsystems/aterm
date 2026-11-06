@@ -23,6 +23,8 @@ dev-seams = []
 # a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
+# Versioned read-only resource custody JSON shared by native clients and host.
+aterm-json = { workspace = true }
 # Hex for the loaded-code subject attached to Local Network observations.
 aterm-codec = { workspace = true }
 # Exclusive owned staging for the shared atomic theme writer.
@@ -58,8 +60,6 @@ aterm-uds = { workspace = true }
 aterm-spec = { workspace = true }
 # The machine-number models `machine_name::model_tests` holds `settle`, `choose` and `check` to.
 aterm-models-swarm = { workspace = true }
-# Test-only: a serializer for the `serde` feature's round-trip tests.
-aterm-json = { workspace = true }
 
 [lints]
 workspace = true

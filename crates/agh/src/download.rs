@@ -309,7 +309,7 @@ fn copy(
     seen: &mut dyn FnMut(&[u8]),
     wrote: &dyn Fn(&std::io::Error) -> Error,
 ) -> Result<u64> {
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; 16 * 1024];
     let mut total = 0u64;
     loop {
         let n = match body.read(&mut buf) {
@@ -461,7 +461,7 @@ fn file_digest_if_size(
         return Ok(Some(None));
     }
     let mut hasher = aterm_digest::Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; 16 * 1024];
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,

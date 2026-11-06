@@ -40,6 +40,7 @@ fn line() -> Procs {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };
@@ -112,6 +113,7 @@ fn a_held_claim_covers_and_frees_what_it_credits() {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };
@@ -203,6 +205,7 @@ fn the_cover_marker_reads_its_holders_claims_and_the_ledger_answers_without_it()
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };
@@ -256,6 +259,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
             pid: build,
             ppid: me,
             footprint: 0,
+            whole: 0,
             written: 0,
             cpu_ns: 0,
         },
@@ -263,6 +267,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
             pid: me,
             ppid: 1,
             footprint: 0,
+            whole: 0,
             written: 0,
             cpu_ns: 0,
         },
@@ -308,6 +313,7 @@ fn a_marker_names_one_claim_of_its_holder() {
             pid: build,
             ppid: me,
             footprint: 0,
+            whole: 0,
             written: 0,
             cpu_ns: 0,
         },
@@ -315,6 +321,7 @@ fn a_marker_names_one_claim_of_its_holder() {
             pid: me,
             ppid: 1,
             footprint: 0,
+            whole: 0,
             written: 0,
             cpu_ns: 0,
         },
@@ -395,6 +402,7 @@ fn a_disk_claim_covers_only_the_run_its_marker_names() {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };

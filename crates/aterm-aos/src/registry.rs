@@ -60,24 +60,26 @@ impl From<&Verdict> for Judged {
 
 /// `s` as one word of a row: whitespace and controls become `_`, so a value never splits its
 /// row or the line, and an empty value is `-`.
-fn token_word(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.is_empty() {
-        return std::borrow::Cow::Borrowed("-");
+struct TokenWord<'a>(&'a str);
+
+impl core::fmt::Display for TokenWord<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write as _;
+        if self.0.is_empty() {
+            return f.write_char('-');
+        }
+        if !self.0.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return f.write_str(self.0);
+        }
+        for c in self.0.chars() {
+            f.write_char(if c.is_whitespace() || c.is_control() {
+                '_'
+            } else {
+                c
+            })?;
+        }
+        Ok(())
     }
-    if !s.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    std::borrow::Cow::Owned(
-        s.chars()
-            .map(|c| {
-                if c.is_whitespace() || c.is_control() {
-                    '_'
-                } else {
-                    c
-                }
-            })
-            .collect(),
-    )
 }
 
 impl Judged {
@@ -101,10 +103,10 @@ impl Judged {
         match self {
             Judged::Pass => out.push_str("pass"),
             Judged::Fail { law, cursor } => {
-                let _ = write!(out, "fail:{}@{cursor}", token_word(law));
+                let _ = write!(out, "fail:{}@{cursor}", TokenWord(law));
             }
             Judged::Unjudged(why) => {
-                let _ = write!(out, "unjudged:{}", token_word(why));
+                let _ = write!(out, "unjudged:{}", TokenWord(why));
             }
         }
     }
@@ -175,7 +177,7 @@ impl Row {
                     out,
                     "segment cause={} code={} log_epoch={log_epoch} range={from}..{to} judged=",
                     cause.word(),
-                    token_word(code),
+                    TokenWord(code),
                 );
                 judged.write_token(out);
                 match kept {
@@ -186,14 +188,14 @@ impl Row {
                 }
             }
             Row::Detached { why } => {
-                let _ = write!(out, "detached why={}", token_word(why));
+                let _ = write!(out, "detached why={}", TokenWord(why));
             }
             Row::Unseen { on, why } => {
                 let _ = write!(
                     out,
                     "unseen={} why={}",
                     if *on { "on" } else { "off" },
-                    token_word(why)
+                    TokenWord(why)
                 );
             }
         }
@@ -308,8 +310,8 @@ impl Listing {
              waiting={} kept={} rows={} dropped={}",
             self.slot,
             self.kind.word(),
-            token_word(&self.task),
-            token_word(&self.code),
+            TokenWord(&self.task),
+            TokenWord(&self.code),
             self.attached,
             self.paused,
             self.revision,

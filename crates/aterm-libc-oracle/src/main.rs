@@ -4,9 +4,9 @@
 //! `aterm-libc-oracle` gate ([`siblings`], [`shape`], [`symbols`], [`controls`]) and authoring
 //! verbs ([`regen`], [`harvest`]).
 //!
-//! STOCK EXCEPTION: the authoring verbs compile the non-host cells with a stock rustup
-//! toolchain that has those targets' std (`--stock`, `stable` by default), because Trust
-//! ships std for its host only.
+//! STOCK EXCEPTION: authoring cells absent from the selected Trust sysroot use
+//! a stock rustup toolchain with those targets' std (`--stock`, `stable` by
+//! default). A Trust target with actual std/core stays under Trust.
 
 mod cargo;
 mod cells;
@@ -86,7 +86,7 @@ aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on 
 
 usage: targo --unverified run -q -p aterm-libc-oracle -- [--root <checkout>] [--target-dir <dir>]
        targo --unverified run -q -p aterm-libc-oracle -- regen [--root <checkout>] [--out <dir>]
-           [--work <dir>] [--docs <dir>] [--stock <toolchain>] [--no-format]
+           [--cell <key>] [--work <dir>] [--docs <dir>] [--stock <toolchain>] [--no-format]
        targo --unverified run -q -p aterm-libc-oracle -- harvest --cell <key> [--root <checkout>]
            [--work <dir>] [--docs <dir>] [--stock <toolchain>] [--write] <log>
 
@@ -94,11 +94,12 @@ usage: targo --unverified run -q -p aterm-libc-oracle -- [--root <checkout>] [--
   --target-dir <dir>  gate build dir (default: <checkout>/libc-oracle/target.noindex)
   -h, --help          print this help
 
-regen: rewrite all four cells' modules, crates/aterm-libc/src/{darwin,linux_gnu}_<arch>.rs and
+regen: rewrite all four cells by default (or only --cell), crates/aterm-libc/src/{darwin,linux_gnu}_<arch>.rs and
 libc-oracle/conformance/src/cell_<key>.rs, from reference libc rustdoc and const-eval probes,
-then trustfmt and seal them. The native cell compiles under Trust; non-host cells use stock
-rustup with target std installed (STOCK EXCEPTION: Trust ships std for its host only).
+then trustfmt and seal them. Cells with actual std/core in the selected Trust sysroot use
+Trust; remaining cells use stock rustup with target std installed (STOCK EXCEPTION).
   --out <dir>         write into this checkout-shaped directory instead of --root
+  --cell <key>        regenerate only mac, macx, linux or linuxa (native cell needs no stock)
   --work <dir>        scratch dir (default: <checkout>/libc-oracle/target.noindex/regen)
   --docs <dir>        use prebuilt libc-0.2.186-<triple>.json rustdoc dumps from <dir>
   --stock <toolchain> rustup toolchain for non-host cells (default: stable)
@@ -164,7 +165,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             Some("--stock") if !gate => {
                 out.stock = Some(value("--stock")?.to_string_lossy().into_owned());
             }
-            Some("--cell") if harvest => {
+            Some("--cell") if harvest || regen => {
                 out.cell = Some(value("--cell")?.to_string_lossy().into_owned());
             }
             Some("--write") if harvest => out.write = true,
@@ -256,6 +257,7 @@ fn regen_options(root: PathBuf, args: &Args) -> regen::Options {
             .map_or_else(|| root.join(ORACLE_TARGET).join("regen"), absolute),
         docs: args.docs.clone().map(absolute),
         stock: args.stock.clone().unwrap_or_else(|| "stable".into()),
+        cell: args.cell.clone(),
         format: !args.no_format,
         root,
     }

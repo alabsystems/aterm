@@ -462,6 +462,38 @@ pub fn seal_message(subject: &str, body: &Body, cert: &Cert) -> Vec<u8> {
     out
 }
 
+/// The person a record another Mac's lane brought speaks for, as `<person>@<src>`: the record
+/// `body`, of `kind`, for the session `sid` of `fleet`, on the lane the Mac `src` writes
+/// (`/f/<fleet>/in/<node>/<sid>/<src>/<kind>`), judged at `now_ms`. `None` for a record that
+/// names no person ([`BY_TOKEN`]). A Mac's mesh carries a person's post onto its own lane naming
+/// the person, the seal intact (`federate::Routes`); it is the person's only once that seal
+/// verifies, over the session, person and kind it was sealed for ([`post_address`]), under a
+/// certificate of the node key that names `src` ([`Signer::Node`]): that Mac alone writes that
+/// lane, under a link that proved its whole key. What a bridge hands a session as the person's,
+/// and what every observer view shows as the person's.
+///
+/// # Errors
+/// [`Refusal::Malformed`] for a record that names something other than a person, or that a lane
+/// of no Mac brought; else any of [`verify`]'s.
+pub fn carried_by(
+    fleet: &str,
+    sid: &str,
+    src: &str,
+    kind: &str,
+    body: &Body,
+    now_ms: u64,
+) -> Result<Option<String>, Refusal> {
+    let Some(by) = body.unknown.get(BY_TOKEN) else {
+        return Ok(None);
+    };
+    if !(crate::person::is_person_id(by) && crate::federate::is_node(src)) {
+        return Err(Refusal::Malformed);
+    }
+    let address = post_address(fleet, sid, by, kind);
+    verify(Signer::Node(src), &address, kind, body, now_ms)?;
+    Ok(Some(format!("{by}@{src}")))
+}
+
 /// The person key that sealed `body`, a post of `kind` bound for `address` (its
 /// [`post_address`]), when the node key `signer` names vouched for that key at `now_ms`:
 /// [`verify_seal`], for a kind a person posts.

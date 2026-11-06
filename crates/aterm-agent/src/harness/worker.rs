@@ -1007,9 +1007,14 @@ pub enum Readiness {
     Present,
     /// atpkg's verified install laid it just now.
     Installed,
-    /// atpkg's store holds no build of it and installs none here: why, in the launcher's words
-    /// ([`Admitted::kept_off`]). The line runs any copy of the shell's own.
-    KeptOff(String),
+    /// atpkg's store holds no build of it and installs none here. The line runs any copy of the
+    /// shell's own.
+    KeptOff {
+        /// Why, as whatever keeps it off says it ([`Admitted::kept_off_why`]).
+        why: String,
+        /// That in the launcher's words ([`Admitted::kept_off`]).
+        said: String,
+    },
 }
 
 /// Make sure the program `cli` runs is there before its worker's line is typed. Every program
@@ -1039,40 +1044,119 @@ pub fn ensure_program(
         return Ok(Readiness::Present);
     }
     if let Some(why) = held(program) {
-        return Ok(Readiness::KeptOff(format!(
+        let said = format!(
             "atpkg keeps no {program} here ({why}), and `spawn agent={}` installs none, so the \
              line runs any {program} of the shell's own",
             cli.word
-        )));
+        );
+        return Ok(Readiness::KeptOff { why, said });
     }
-    install(program).map_err(|why| format!("atpkg's install of {program} failed: {why}"))?;
+    install(program).map_err(|why| format!("{}{why}", install_failed(program)))?;
     if !present(program) {
         return Err(format!(
-            "atpkg's install of {program} left no {program} installed (no build serves this \
-             machine, or its install was refused)"
+            "no build of {program} serves this machine, or its install was refused; atpkg's \
+             install left no {program} installed"
         ));
     }
     Ok(Readiness::Installed)
 }
 
+/// What [`ensure_program`]'s words for a failed install of `program` lead atpkg's own with.
+fn install_failed(program: &str) -> String {
+    format!("atpkg's install of {program}{INSTALL_FAILED}")
+}
+
+/// Where atpkg's own words start in [`install_failed`]'s.
+const INSTALL_FAILED: &str = " failed: ";
+
+/// How atpkg leads a line that follows its failure (`print_unreachable_followup` in atpkg's
+/// `cli.rs`: when to re-run, when a GitHub limit resets). Such a line says nothing of the cause.
+const ATPKG_FOLLOW_UP: &str = "atpkg:   ";
+
+/// What atpkg said of its failure, from its stderr lines joined by ` | ` (`PassRun::why`): the last
+/// line that is no follow-up ([`ATPKG_FOLLOW_UP`]). A line starts where one is led `atpkg:`, since
+/// a refusal can hold ` | ` of its own (`vendor.rs`'s `payload must be raw-binary | tar-gz-binary`),
+/// and a stderr line with no such lead stays with the line before it. Its own
+/// `atpkg: install <program> failed: ` goes, since [`Refused::short`] already says that.
+fn atpkg_failure(said: &str) -> &str {
+    const JOIN: &str = " | ";
+    let mut rest = said;
+    let line = loop {
+        let Some(at) = rest.rfind(" | atpkg:") else {
+            break if rest.starts_with(ATPKG_FOLLOW_UP) {
+                said
+            } else {
+                rest
+            };
+        };
+        let line = &rest[at + JOIN.len()..];
+        if !line.starts_with(ATPKG_FOLLOW_UP) {
+            break line;
+        }
+        rest = &rest[..at];
+    };
+    line.strip_prefix("atpkg: install ")
+        .and_then(|rest| rest.split_once(INSTALL_FAILED))
+        .map_or(line, |(_, cause)| cause)
+}
+
+/// The bytes a stall's attention gives a launcher's refusal (`harness_host::StartupHold::Refused`),
+/// whose whole words stay in its log line and launch note.
+pub const REFUSAL_ROOM: usize = 85;
+
 /// Why a worker's launcher starts no worker ([`admit`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// The CLI is signed out for the login its line would start on ([`WorkerCli::signed_out`]).
-    /// Only a person can sign in.
+    /// The CLI is signed out for the login its line would start on ([`WorkerCli::signed_out`]),
+    /// or the launch's local check of a Google login found no usable grant and its renewal left
+    /// the login signed out ([`super::accounts_pool::prepare_google_worker`]). Only a person can
+    /// sign in.
     SignedOut(String),
     /// atpkg's install of the CLI's absent program failed, or left nothing installed
     /// ([`ensure_program`]).
     Program(String),
+    /// The preparation that follows the install failed with no person's sign-in to ask for: its
+    /// pool's location is unavailable, its account's selection changed, or the renewal of a
+    /// signed-out login could not run, which a later launch tries again ([`Admitted::prepare`]).
+    Preparation(String),
 }
 
 impl Refused {
-    /// The refusal's words.
+    /// The refusal's whole words.
     #[must_use]
     pub fn why(&self) -> &str {
         match self {
-            Self::SignedOut(why) | Self::Program(why) => why,
+            Self::SignedOut(why) | Self::Program(why) | Self::Preparation(why) => why,
         }
+    }
+
+    /// The refusal in the few words a stall's attention has room for, the cause and what mends it
+    /// first: a person's sign-in, the line atpkg said of its failure (`atpkg_failure`), or a
+    /// preparation's own words. [`Self::why`] keeps the whole of it for the launch's note and log.
+    #[must_use]
+    pub fn short(&self) -> String {
+        match self {
+            Self::SignedOut(_) => "signed out, a person must sign in".to_owned(),
+            Self::Program(why) => why.split_once(INSTALL_FAILED).map_or_else(
+                || why.clone(),
+                |(_, said)| format!("install failed: {}", atpkg_failure(said)),
+            ),
+            Self::Preparation(why) => why.clone(),
+        }
+    }
+}
+
+/// Words with no kind of their own are a preparation's.
+impl From<String> for Refused {
+    fn from(why: String) -> Self {
+        Self::Preparation(why)
+    }
+}
+
+/// Words with no kind of their own are a preparation's.
+impl From<&str> for Refused {
+    fn from(why: &str) -> Self {
+        Self::Preparation(why.to_owned())
     }
 }
 
@@ -1089,14 +1173,15 @@ impl Admitted {
     /// its readiness and returning the guard needed to recheck the prepared starter.
     ///
     /// # Errors
-    /// Preparation failed, or the replacement starter fails the CLI's sign-in check.
+    /// Preparation's own refusal, or [`Refused::SignedOut`] where the replacement starter fails
+    /// the CLI's sign-in check.
     pub fn prepare<T>(
         self,
         cli: &WorkerCli,
         user: Option<&Path>,
-        prepare: impl FnOnce(Starter) -> Result<(Starter, T), String>,
+        prepare: impl FnOnce(Starter) -> Result<(Starter, T), Refused>,
     ) -> Result<(Self, T), Refused> {
-        let (starter, guard) = prepare(self.starter).map_err(Refused::SignedOut)?;
+        let (starter, guard) = prepare(self.starter)?;
         if let Some(why) = cli.signed_out(&starter, user) {
             return Err(Refused::SignedOut(why));
         }
@@ -1167,7 +1252,17 @@ impl Admitted {
     #[must_use]
     pub fn kept_off(&self) -> Option<&str> {
         match &self.readiness {
-            Readiness::KeptOff(said) => Some(said),
+            Readiness::KeptOff { said, .. } => Some(said),
+            _ => None,
+        }
+    }
+
+    /// Why atpkg installs none of the CLI's program here, as whatever keeps it off says it
+    /// ([`Readiness::KeptOff`]): what a stall names if no copy of the shell's own starts.
+    #[must_use]
+    pub fn kept_off_why(&self) -> Option<&str> {
+        match &self.readiness {
+            Readiness::KeptOff { why, .. } => Some(why),
             _ => None,
         }
     }

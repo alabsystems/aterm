@@ -287,8 +287,14 @@ pub struct Proc {
     pub ppid: u32,
     /// The memory it holds now, bytes ([`Proc::of_reading`]: the lesser of its footprint and its
     /// resident size, on macOS its physical footprint and resident size, on Linux `RssAnon`): 0
-    /// where unread.
+    /// where unread. What a claim's reservation counts.
     pub footprint: u64,
+    /// Its footprint whole, bytes, the pages the kernel compressed or swapped out included (macOS
+    /// its physical footprint, Linux `RssAnon + VmSwap`: `ProcessReading::footprint`): never less
+    /// than [`Self::footprint`] as [`Proc::of_reading`] reads it, the same where only one figure
+    /// is read, 0 where unread. No reservation counts it; what a holder's tree holds past its
+    /// claims is reckoned by it ([`crate::Overrun`]).
+    pub whole: u64,
     /// Bytes it has written to disk since it started: 0 where unread (Linux).
     pub written: u64,
     /// The CPU time it and the children it reaped have used, nanoseconds
@@ -299,8 +305,11 @@ pub struct Proc {
 /// A process tree's use: what a claimant already takes, so its claims' reservations count only the rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TreeUse {
-    /// The tree's footprints, summed.
+    /// The tree's footprints ([`Proc::footprint`]), summed: what its claims' reservations count.
     pub footprint: u64,
+    /// The tree's whole footprints ([`Proc::whole`]), summed: what it holds, compressed and
+    /// swapped pages included.
+    pub whole: u64,
     /// The tree's bytes written, summed.
     pub written: u64,
 }
@@ -400,6 +409,7 @@ impl Procs {
             };
             if let Some(sum) = owner.and_then(|o| out.get_mut(&o)) {
                 sum.footprint = sum.footprint.saturating_add(p.footprint);
+                sum.whole = sum.whole.saturating_add(p.whole);
                 sum.written = sum.written.saturating_add(p.written);
             }
         }
@@ -596,6 +606,7 @@ impl Machine for Live {
                 pid: r.pid,
                 ppid: r.ppid,
                 footprint: 0,
+                whole: 0,
                 written: 0,
                 cpu_ns: 0,
             });
@@ -619,7 +630,9 @@ impl Proc {
     /// footprint holds 2 GiB of resident pages, credited 10 GiB, has its 12 GiB claim reserve 2
     /// GiB of the room it would take back as it touches them; credited 2 GiB, it reserves 10.
     /// Where the file-backed resident pages outnumber the compressed and swapped ones, the
-    /// footprint is credited whole, compressed pages included.
+    /// footprint is credited whole, compressed pages included. The footprint itself is kept beside
+    /// it ([`Proc::whole`]), so a line can say what a tree holds past its claim in pages the
+    /// credit leaves out.
     #[must_use]
     pub fn of_reading(p: &aterm_sysprobe::ProcessReading) -> Proc {
         let footprint = p.footprint.unwrap_or(0);
@@ -627,6 +640,7 @@ impl Proc {
             pid: p.pid,
             ppid: p.ppid,
             footprint: p.resident.map_or(footprint, |r| r.min(footprint)),
+            whole: footprint,
             written: p.disk_written.unwrap_or(0),
             cpu_ns: p
                 .cpu_ns

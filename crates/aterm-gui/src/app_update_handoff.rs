@@ -4621,8 +4621,6 @@ impl App {
             attempt: apply_attempt.clone(),
             same_image,
             #[cfg(unix)]
-            activity: self.update_handoff_activity_epoch,
-            #[cfg(unix)]
             next_attempt: self.next_update_handoff_id,
         }) {
             return if self.account_drain_unavailable() {

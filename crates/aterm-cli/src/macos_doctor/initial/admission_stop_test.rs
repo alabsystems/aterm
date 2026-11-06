@@ -96,6 +96,13 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         self.plan.clone()
     }
 
+    /// Choose the scratch plan that the real admission writer will persist.
+    #[must_use]
+    pub fn with_plan(mut self, plan: Plan) -> Self {
+        self.plan = plan;
+        self
+    }
+
     /// Admit and complete a scratch vault plan, without running its host stages.
     pub fn complete_vault_setup(&mut self) -> Result<u64, String> {
         self.plan.selection.set(Setting::Secrets, true);

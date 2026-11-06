@@ -37,7 +37,7 @@ pub fn evaluable() -> Vec<(&'static str, String)> {
 }
 
 /// Sweeps that write through pointers and run only as native tests.
-pub const NATIVE: [(&str, &str); 6] = [
+pub const NATIVE: [(&str, &str); 8] = [
     (
         "FD_ZERO",
         r#"unsafe { let mut a: @S@::fd_set = ::core::mem::zeroed(); let mut b: @R@::fd_set = ::core::mem::zeroed(); ::core::slice::from_raw_parts_mut((&mut a as *mut @S@::fd_set).cast::<u8>(), ::core::mem::size_of_val(&a)).fill(0xa5); ::core::slice::from_raw_parts_mut((&mut b as *mut @R@::fd_set).cast::<u8>(), ::core::mem::size_of_val(&b)).fill(0xa5); @S@::FD_ZERO(&mut a); @R@::FD_ZERO(&mut b); let ab = ::core::slice::from_raw_parts((&a as *const @S@::fd_set).cast::<u8>(), ::core::mem::size_of_val(&a)); let bb = ::core::slice::from_raw_parts((&b as *const @R@::fd_set).cast::<u8>(), ::core::mem::size_of_val(&b)); assert_eq!(ab, bb, "FD_ZERO writes a different bit pattern"); }"#,
@@ -61,6 +61,14 @@ pub const NATIVE: [(&str, &str); 6] = [
     (
         "CMSG_FIRSTHDR",
         r#"unsafe { let mut buf = [0u8; 256]; for controllen in [0usize, 1, 15, 16, 24, 64, 256] { let mut ma: @S@::msghdr = ::core::mem::zeroed(); ma.msg_control = buf.as_mut_ptr().cast(); ma.msg_controllen = controllen as _; let mb: @R@::msghdr = ::core::mem::transmute_copy(&ma); let pa = @S@::CMSG_FIRSTHDR(&ma) as usize; let pb = @R@::CMSG_FIRSTHDR(&mb) as usize; assert_eq!(pa, pb, "CMSG_FIRSTHDR differs at controllen {}", controllen); } }"#,
+    ),
+    (
+        "CMSG_DATA",
+        r#"unsafe { let mut buf = [0u64; 64]; let base = buf.as_mut_ptr().cast::<u8>(); let align = ::core::mem::align_of::<@R@::cmsghdr>(); for slot in 0..16 { let ptr = base.add(slot * align); let a = ptr.cast::<@S@::cmsghdr>(); let b = ptr.cast::<@R@::cmsghdr>(); assert_eq!(@S@::CMSG_DATA(a) as usize, @R@::CMSG_DATA(b) as usize, "CMSG_DATA differs at slot {}", slot); } }"#,
+    ),
+    (
+        "CMSG_NXTHDR",
+        r#"unsafe { let mut buf = [0u64; 64]; let base = buf.as_mut_ptr().cast::<u8>(); let align = ::core::mem::align_of::<@R@::cmsghdr>(); for controllen in [0usize, 1, 12, 13, 16, 64, 128, 512] { let mut ma: @S@::msghdr = ::core::mem::zeroed(); ma.msg_control = base.cast(); ma.msg_controllen = controllen as _; let mb: @R@::msghdr = ::core::mem::transmute_copy(&ma); assert_eq!(@S@::CMSG_NXTHDR(&ma, ::core::ptr::null()) as usize, @R@::CMSG_NXTHDR(&mb, ::core::ptr::null()) as usize, "CMSG_NXTHDR null differs"); for slot in [0usize, 1, 2, 16, 32] { let ptr = base.add(slot * align); let a = ptr.cast::<@S@::cmsghdr>(); a.write(::core::mem::zeroed()); for len in [0usize, 1, ::core::mem::size_of::<@R@::cmsghdr>() - 1, ::core::mem::size_of::<@R@::cmsghdr>(), 64, 128] { (*a).cmsg_len = len as _; assert_eq!(@S@::CMSG_NXTHDR(&ma, a) as usize, @R@::CMSG_NXTHDR(&mb, ptr.cast()) as usize, "CMSG_NXTHDR differs: controllen {}, slot {}, len {}", controllen, slot, len); } } } }"#,
     ),
 ];
 

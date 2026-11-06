@@ -38,7 +38,8 @@
 //! ([`BusKeeper`]): it retires the separate broker job (`aterm_link::enable::retire_broker_job`)
 //! and opens `bus.log` itself where the job did, in the fabric root, under the root's
 //! `mint.secret` (every `node.cap` and person cap was minted under it), sealed by aterm-link's
-//! rules, retained and rate limited by `aterm_link::broker_rules`, and served on the same
+//! rules, retained by `aterm_link::broker_rules::mesh_rules` (its mail held for the person carry
+//! too, §11 C3d) and rate limited by `aterm_link::broker_rules`, and served on the same
 //! `bus.sock`, so local clients and the rendezvous file stay as they were ([`open_bus`],
 //! [`BusHost`]). A poisoned log is reopened in process. The revocation pass covers it beside the
 //! two mesh logs ([`Mesh::join_bus`]), and a neighbour's `Bus` stream for it is served with the
@@ -1033,6 +1034,38 @@ impl Mesh {
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Remove",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Readmit",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Void",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "MeshRelay",
+            action = "Learn",
+            project = "aterm_mesh::tests::tables::relay_conformance::mesh_relay_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "FabricRouting",
             action = "RevokeB",
             project = "aterm_link::federate::conformance::routing_projection"
@@ -1055,16 +1088,6 @@ impl Mesh {
         let was = &applied.verdict;
         let keys_in: Vec<[u8; 32]> = verdict.keys.difference(&was.keys).copied().collect();
         let keys_out: Vec<[u8; 32]> = was.keys.difference(&verdict.keys).copied().collect();
-        let principals_in: Vec<String> = verdict
-            .principals
-            .difference(&was.principals)
-            .cloned()
-            .collect();
-        let principals_out: Vec<String> = was
-            .principals
-            .difference(&verdict.principals)
-            .cloned()
-            .collect();
         let bus = applied.bus.as_ref().map(|host| Arc::clone(&host.broker));
         for broker in [&self.tables.broker, &self.metrics.broker]
             .into_iter()
@@ -1073,13 +1096,13 @@ impl Mesh {
             for key in &keys_in {
                 broker.revoke_key(*key);
             }
-            for principal in &principals_in {
+            for principal in verdict.principals.difference(&was.principals) {
                 broker.revoke_principal(principal);
             }
             for key in &keys_out {
                 broker.unrevoke_key(key);
             }
-            for principal in &principals_out {
+            for principal in was.principals.difference(&verdict.principals) {
                 broker.unrevoke_principal(principal);
             }
             broker.set_origin_keys(verdict.origins.iter().copied());
@@ -1097,7 +1120,8 @@ impl Mesh {
             .bus_unretired
             .retain(|key| read.removed.contains(key));
         for key in &keys_in {
-            let principal = astream_broker::identity_principal(key);
+            let buf = principal_buf(key);
+            let principal = principal_str(&buf);
             if read.current.contains(key) {
                 aterm_log::info!(
                     "mesh: {principal} is revoked: another current key shares its principal"
@@ -1107,9 +1131,10 @@ impl Mesh {
             }
         }
         for key in &keys_out {
+            let buf = principal_buf(key);
             aterm_log::info!(
                 "mesh: {} is un-revoked: the membership log seats it again",
-                astream_broker::identity_principal(key)
+                principal_str(&buf)
             );
         }
         let alone = verdict.origins.len() == 1;
@@ -1187,9 +1212,10 @@ impl Mesh {
                 }
                 Err(e) => {
                     if applied.unretired.insert(key) {
+                        let buf = principal_buf(&key);
                         aterm_log::warn!(
                             "mesh: the rows of {} could not be retired yet: {e}",
-                            astream_broker::identity_principal(&key)
+                            principal_str(&buf)
                         );
                     }
                 }
@@ -1422,21 +1448,22 @@ impl Mesh {
         if self.is_stopped() {
             return incoming.refuse("unserved");
         }
-        let Some(host) = self.bus() else {
-            return incoming.refuse("unserved");
-        };
         let key = *incoming.peer().key.bytes();
-        match self.admits(&key) {
-            None => return incoming.refuse("unread"),
-            Some(false) => return incoming.refuse("out"),
-            Some(true) => {}
-        }
+        let (host, olds) = {
+            let applied = self.applied.lock_or_recover();
+            let Some(host) = applied.bus.clone() else {
+                return incoming.refuse("unserved");
+            };
+            let Some(read) = applied.read.as_ref() else {
+                return incoming.refuse("unread");
+            };
+            if key == self.me.key || !applied.verdict.origins.contains(&key) {
+                return incoming.refuse("out");
+            }
+            (host, retired_of(read, &key))
+        };
         let peer_buf = principal_buf(&key);
         let peer = principal_str(&peer_buf);
-        let olds = self
-            .standings()
-            .map(|read| retired_of(&read, &key))
-            .unwrap_or_default();
         let grants = match host.ring_for(&self.me.principal, peer, &olds) {
             Ok(grants) => grants,
             Err(e) => {
@@ -1633,7 +1660,8 @@ fn boot_id() -> Option<[u8; 16]> {
 /// guard its caller set), exactly as `aterm link broker` opened it: sealed at rest by aterm-link's
 /// rules unless `opts` names a key already (`at_rest::prepare`: a key beside the log, or one
 /// minted where `mint.secret` stands beside it), its legacy mark folded into the open
-/// (`durability::open_with`), retained by aterm's default rules and limited by its default rate
+/// (`durability::open_with`), retained by the mesh's rules (`broker_rules::mesh_rules`: aterm's
+/// default rules, the mesh's mail held for the person carry too) and limited by its default rate
 /// limit (each journaled and skipped where it cannot be set, as the broker did). The fabric
 /// world suite opens its broker through this too, so it runs against what the node service
 /// hosts.
@@ -1669,7 +1697,7 @@ pub fn open_bus(
         );
     }
     let broker = opened.broker;
-    if let Err(e) = aterm_link::broker_rules::retain(&broker) {
+    if let Err(e) = aterm_link::broker_rules::retain_mesh(&broker) {
         aterm_log::warn!(
             "mesh: {named}: its retention rules could not be set ({e}); it serves unretained"
         );

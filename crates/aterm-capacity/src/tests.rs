@@ -1623,6 +1623,7 @@ fn a_holders_own_use_is_not_reserved_twice() {
             record: &a,
             used: TreeUse {
                 footprint,
+                whole: footprint,
                 written: 0,
             },
             credited: TreeUse::default(),
@@ -1657,6 +1658,7 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
         pid: std::process::id(),
         ppid: 1,
         footprint: 20 * GIB,
+        whole: 20 * GIB,
         written: 0,
         cpu_ns: 0,
     }])));
@@ -1693,6 +1695,7 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
         pid,
         ppid,
         footprint: gib * GIB,
+        whole: gib * GIB,
         written: 0,
         cpu_ns: 0,
     };
@@ -1761,6 +1764,7 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };
@@ -1847,6 +1851,7 @@ fn a_holders_child_is_admitted_beside_its_ancestors_claim() {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     };
@@ -1883,6 +1888,7 @@ fn a_tree_sums_its_descendants() {
         pid,
         ppid,
         footprint: mib << 20,
+        whole: mib << 20,
         written: mib,
         cpu_ns: 0,
     };
@@ -1899,6 +1905,7 @@ fn a_tree_sums_its_descendants() {
         procs.tree(10),
         TreeUse {
             footprint: 15 << 20,
+            whole: 15 << 20,
             written: 15
         }
     );
@@ -1930,6 +1937,7 @@ fn disk_is_held_above_the_floor() {
         record: rec,
         used: TreeUse {
             footprint: 0,
+            whole: 0,
             written,
         },
         credited: TreeUse::default(),
@@ -2227,6 +2235,7 @@ fn the_listed_reservations_are_what_a_later_look_holds_its_need_to() {
             10,
             TreeUse {
                 footprint: 4 * GIB,
+                whole: 4 * GIB,
                 written: 5 * GIB,
             },
         ),
@@ -2234,6 +2243,7 @@ fn the_listed_reservations_are_what_a_later_look_holds_its_need_to() {
             30,
             TreeUse {
                 footprint: 2 * GIB,
+                whole: 2 * GIB,
                 written: GIB,
             },
         ),
@@ -3964,6 +3974,7 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
         pid: VM,
         ppid: 1,
         footprint: 14 * GIB,
+        whole: 14 * GIB,
         written: 0,
         cpu_ns: 0,
     }])));
@@ -4550,6 +4561,7 @@ fn retained_custody_reserves_the_whole_peak_despite_unrelated_pid_use_and_writes
             pid,
             TreeUse {
                 footprint: u64::MAX,
+                whole: u64::MAX,
                 written: u64::MAX,
             },
         );
@@ -5474,6 +5486,7 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
             record: r,
             used: TreeUse {
                 footprint: f * GIB,
+                whole: f * GIB,
                 written: 0,
             },
             credited: TreeUse::default(),
@@ -5816,13 +5829,17 @@ fn a_waiter_names_a_held_claims_holder_that_makes_no_progress() {
     std::thread::sleep(bound + Duration::from_millis(50));
     let (w, short) = waits(w, &m);
     let held = &short.holders[0];
-    assert!(held.stalled.is_some_and(|d| d >= bound), "{held:?}");
+    let span = held
+        .stalled
+        .filter(|d| *d >= bound)
+        .unwrap_or_else(|| panic!("stalled past the bound: {held:?}"));
+    // It says how long: the span its row carries, however late this look came.
     let line = w.line(&short);
     names(
         &line,
         &[
             &format!("pid {holder} holds"),
-            ", which has made no progress for 0 s (no CPU time, nothing written)",
+            &format!(", {}", aterm_toolchain::stall::no_progress(span)),
         ],
     );
     let stuck = crate::admit::stuck(&short.holders).expect("stuck behind it");
@@ -5851,16 +5868,125 @@ fn a_waiter_names_a_held_claims_holder_that_makes_no_progress() {
     drop(w);
 }
 
+/// The machine [`a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there`] waits on:
+/// [`on`]`(vol(200, 100, 10))`, its processes the stand-in holder, the VM its claim is credited
+/// with, and this process. Both read 5 ns of CPU time until [`Working::work`] names one of them;
+/// from then on each read of the processes finds that one 1 ns further on than the read before.
+/// A look reads them once, so the one named has worked between any two looks, however late
+/// either comes.
+#[cfg(unix)]
+struct Working {
+    at: Fixed,
+    holder: u32,
+    vm: u32,
+    /// The wait's bound: [`Working::worked_past_three_bounds`] counts the reads three of them
+    /// after the first that found the work.
+    bound: Duration,
+    reads: std::sync::Mutex<Reads>,
+}
+
+/// What [`Working`]'s reads find next, and what they have found since [`Working::work`].
+#[cfg(unix)]
+struct Reads {
+    /// Who works: `None` nobody, `Some(true)` the holder, `Some(false)` its VM.
+    who: Option<bool>,
+    /// The CPU time the next working read finds: one count for both, so the tree's sum grows on
+    /// across a change of who works. It starts at 6, so the first working read's sum (11) is not
+    /// the idle reads' (10), which the stuck wait before it left booked.
+    cpu_ns: u64,
+    /// When the first read since [`Working::work`] came.
+    first: Option<std::time::Instant>,
+    /// How many reads have come three bounds or more after [`Self::first`].
+    past_three_bounds: usize,
+}
+
+#[cfg(unix)]
+impl Working {
+    fn new(holder: u32, vm: u32, bound: Duration) -> Self {
+        Self {
+            at: on(vol(200, 100, 10)),
+            holder,
+            vm,
+            bound,
+            reads: std::sync::Mutex::new(Reads {
+                who: None,
+                cpu_ns: 6,
+                first: None,
+                past_three_bounds: 0,
+            }),
+        }
+    }
+
+    /// From now on the holder works if `holder`, else its VM, and the reads past three bounds
+    /// count from the next read.
+    fn work(&self, holder: bool) {
+        let mut reads = self.reads();
+        reads.who = Some(holder);
+        reads.first = None;
+        reads.past_three_bounds = 0;
+    }
+
+    /// Whether two reads, as many looks in a row as a wait reads stuck before it ends, have found
+    /// the work three bounds after the first read that did.
+    fn worked_past_three_bounds(&self) -> bool {
+        self.reads().past_three_bounds >= 2
+    }
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, Reads> {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(unix)]
+impl crate::Machine for Working {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        crate::Machine::read(&self.at, path)
+    }
+
+    fn procs(&self) -> Option<Procs> {
+        let (holder_ns, vm_ns) = {
+            let mut reads = self.reads();
+            match reads.who {
+                None => (5, 5),
+                Some(holder) => {
+                    let now = std::time::Instant::now();
+                    let first = *reads.first.get_or_insert(now);
+                    if now.saturating_duration_since(first) >= self.bound * 3 {
+                        reads.past_three_bounds += 1;
+                    }
+                    let ns = reads.cpu_ns;
+                    reads.cpu_ns += 1;
+                    if holder { (ns, 5) } else { (5, ns) }
+                }
+            }
+        };
+        let proc = |pid, cpu_ns| Proc {
+            pid,
+            ppid: 1,
+            cpu_ns,
+            ..Proc::default()
+        };
+        Some(Procs::of(vec![
+            proc(self.holder, holder_ns),
+            proc(self.vm, vm_ns),
+            proc(std::process::id(), 0),
+        ]))
+    }
+}
+
 /// A WAIT THAT ASKS TO END BEHIND A HOLDER THAT MAKES NO PROGRESS ENDS THERE
 /// (CW-WAIT-UNBOUNDED): behind a stand-in's held claim whose tree reads idle, a need that ends
 /// when stuck after a short bound gives up within the hang detector, naming the stand-in and how
 /// long it made no progress, and leaves the queue; the stand-in's claim stays held and the
 /// stand-in lives on, unsignalled. Its work is read with the processes its claim is credited
 /// with: idle itself, its credited VM working keeps the wait on. NEGATIVE CONTROLS: the same wait
-/// behind the stand-in working (its CPU time moving between looks), or behind it idle with its
-/// credited process working, goes on past three bounds and is admitted once the stand-in ends; a
-/// wait that ignores the end it asked for, or reads no credited process, fails the first part
-/// or the second by name.
+/// behind the stand-in idle with its credited process working, or behind the stand-in working
+/// (its CPU time grown at each look), goes on until two of its looks three bounds into that work
+/// have found it working; the first is then stopped, the second admitted once the stand-in ends. A
+/// wait that ignores the end it asked for, or reads no credited process, fails the first part or
+/// the second by name.
 #[cfg(unix)]
 #[test]
 fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
@@ -5874,31 +6000,8 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
             (STANDIN_CREDIT, vm.to_string()),
         ],
     );
-    let m = Arc::new(on(vol(200, 100, 10)));
-    let me = std::process::id();
-    let at = move |cpu_ns, vm_ns| {
-        Procs::of(vec![
-            Proc {
-                pid: holder,
-                ppid: 1,
-                cpu_ns,
-                ..Proc::default()
-            },
-            Proc {
-                pid: vm,
-                ppid: 1,
-                cpu_ns: vm_ns,
-                ..Proc::default()
-            },
-            Proc {
-                pid: me,
-                ppid: 1,
-                ..Proc::default()
-            },
-        ])
-    };
-    m.set_procs(Some(at(5, 5)));
     let bound = Duration::from_millis(200);
+    let m = Arc::new(Working::new(holder, vm, bound));
     let pace = Pace {
         poll: Duration::from_millis(10),
         line_every: Duration::from_secs(60),
@@ -5953,37 +6056,18 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
     assert!(matches!(child.try_wait(), Ok(None)), "the holder lives on");
 
     // Behind the holder idle with its credited VM working, then behind the holder working, the
-    // wait goes on: the first is stopped, the second admitted once the holder ends. The mover
-    // runs until then, so no span after it is one of no progress.
-    let (moving, holder_moves) = (
-        Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let mover = {
-        let (m, moving, holder_moves) = (
-            Arc::clone(&m),
-            Arc::clone(&moving),
-            Arc::clone(&holder_moves),
-        );
-        std::thread::spawn(move || {
-            let mut ns = 6;
-            while moving.load(Ordering::SeqCst) {
-                m.set_procs(Some(if holder_moves.load(Ordering::SeqCst) {
-                    at(ns, 5)
-                } else {
-                    at(5, ns)
-                }));
-                ns += 1;
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
+    // wait goes on: the first is stopped, the second admitted once the holder ends. Each wait
+    // starts once the last has ended, so no read of one is the other's.
     for holder_works in [false, true] {
-        holder_moves.store(holder_works, Ordering::SeqCst);
+        m.work(holder_works);
         let stop = Arc::new(AtomicBool::new(false));
         let waiting = wait(Arc::clone(&stop));
-        // Three bounds of the condition under test, not a wait for anything.
-        std::thread::sleep(bound * 3);
+        // Two of its looks three bounds into the work, or its end, which fails it by name below.
+        until_within(
+            MUST_HAPPEN,
+            "two of the wait's looks three bounds into the work, or its end",
+            || (waiting.is_finished() || m.worked_past_three_bounds()).then_some(()),
+        );
         assert!(
             !waiting.is_finished(),
             "a wait behind a working holder ended (the holder itself works: {holder_works}): {:?}",
@@ -6005,8 +6089,6 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
             );
         }
     }
-    moving.store(false, Ordering::SeqCst);
-    joined(mover, "the mover's end");
 }
 
 /// A wait is stuck only when every claim it names is held by a holder named stuck, for as long
@@ -6028,6 +6110,7 @@ fn a_wait_is_stuck_only_behind_holders_that_are_all_stuck() {
         order: (0, pid, 0),
         stalled: stalled.map(Duration::from_secs),
         credit: Vec::new(),
+        overrun: None,
     };
     let stuck =
         crate::admit::stuck(&[h(9, true, Some(960)), h(7, true, Some(900))]).expect("both stuck");

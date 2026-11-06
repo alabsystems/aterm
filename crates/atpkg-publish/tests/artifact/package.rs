@@ -24,7 +24,7 @@ use atpkg_publish::testkit::Keys;
 use super::super::shared::{Made, made_once};
 use super::fixture::{
     COMMIT, CPU_X86_64, DORMANT_LEDGER, FakeTools, bare_origin, client_verifies, git, macho, put,
-    put_exe, scratch, toolchain as fixture_toolchain, trust_repo, version_text,
+    put_exe, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo, version_text,
 };
 
 const MAC: &str = "aarch64-apple-darwin";
@@ -67,12 +67,21 @@ fn world(label: &str) -> World {
         ),
     );
     trust_repo(&home.join("trust"), DORMANT_LEDGER);
-    let bin = fixture_toolchain(&root.join("seal"));
+    let payload = ctx.pkg_prefix.join("store/trust/1");
+    let bin = fixture_toolchain(&payload);
     std::fs::rename(
-        root.join("seal/lib/librustc_driver-0123456789abcdef.so"),
-        root.join("seal/lib/librustc_driver-0123456789abcdef.dylib"),
+        payload.join("lib/librustc_driver-0123456789abcdef.so"),
+        payload.join("lib/librustc_driver-0123456789abcdef.dylib"),
     )
     .expect("rename the driver");
+    seed_mint(&payload, COMMIT);
+    put(
+        &atpkg::trust_lock::ready_marker(&ctx.pkg_prefix, 1),
+        b"ok\n",
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("1", payload.parent().expect("program").join("current"))
+        .expect("current");
     World {
         _tmp: tmp,
         root,
@@ -241,7 +250,17 @@ impl World {
     }
 
     fn pack(&self, request: &PackageRequest) -> Result<PackageOutcome, Error> {
-        package::pack_package_with(&self.ctx, request, &self.tools)
+        let inputs = atpkg_publish::project_toolchain::Inputs {
+            prefix: self.ctx.pkg_prefix.clone(),
+            repo: request.source_repo.clone(),
+            path: "/usr/bin:/bin".into(),
+            cargo_home: self.root.join("fixture cargo home"),
+            overrides: vec![],
+        };
+        package::pack_package_with_signed_root(&self.ctx, request, &self.tools, &inputs, &|build| {
+            assert_eq!(build, 1);
+            atpkg::tree::tree_root(self.bin.parent().expect("payload")).map_err(|e| e.to_string())
+        })
     }
 
     fn signed(&self) -> Vec<PathBuf> {
@@ -280,6 +299,50 @@ impl World {
         let r = publish_with(&self.ctx, &req, &mut log).map(|_| ());
         (r, log)
     }
+}
+
+#[test]
+fn package_compiler_authority_comes_from_exact_source_not_checkout_head() {
+    let mut w = world("package-committed-pin");
+    let lock = atpkg::trust_lock::TrustLock {
+        build: 1,
+        tree_root: "f".repeat(64),
+        compiler_commit: COMMIT.into(),
+        receipt: format!("SEED-MINT sha256:{}", "a".repeat(64)),
+        stock_toolchain: "1.95.0".into(),
+    };
+    put(
+        &w.source.join("trust.lock"),
+        atpkg_publish::adopt::lock_text(&lock)
+            .expect("lock")
+            .as_bytes(),
+    );
+    git(&w.source, &["add", "trust.lock"]);
+    git(&w.source, &["commit", "-qm", "package source compiler pin"]);
+    git(&w.source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    w.commit = git(&w.source, &["rev-parse", "HEAD"]);
+    let count = git(&w.source, &["rev-list", "--count", &w.commit]);
+    git(&w.source, &["rm", "trust.lock"]);
+    git(&w.source, &["commit", "-qm", "later checkout has no lock"]);
+    let mut lay = w.lay();
+    lay.version = format!("0.164.0-dev.{count}+g{}", &w.commit[..9]);
+    let dir = w.package("pinned-source", &lay);
+    let error = w
+        .pack(&w.request(&dir, ALAB))
+        .expect_err("the exact source pin disagrees with the compiler");
+    assert!(error.to_string().contains("source lock"), "{error}");
+    assert!(w.signed().is_empty());
+
+    let w = world("package-unlocked-source");
+    put(
+        &w.source.join("trust.lock"),
+        b"checkout HEAD has an unrelated malformed lock\n",
+    );
+    git(&w.source, &["add", "trust.lock"]);
+    git(&w.source, &["commit", "-qm", "unrelated checkout lock"]);
+    let dir = w.package("unlocked-source", &w.lay());
+    w.pack(&w.request(&dir, ALAB))
+        .expect("genuinely unlocked source uses the signed managed default, not HEAD's lock");
 }
 
 fn read(p: &Path) -> Vec<u8> {

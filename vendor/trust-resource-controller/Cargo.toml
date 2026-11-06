@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "trust-resource-controller"
+version = "0.13.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Private native resource member proxy protocol"
+
+[features]
+default = []
+client = ["dep:trust-resource-provenance"]
+
+[dependencies]
+trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
+libc = { path = "../../crates/aterm-libc" }
+
+[package.metadata.aterm-vendor]
+upstream = "https://github.com/alabsystems/trust"
+commit = "0116515bbffdf2b80fa27bd12d8e19a761444ec6"
+subdir = "crates/trust-resource-controller"

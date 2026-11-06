@@ -580,6 +580,150 @@ fn a_rules_change_keeps_each_class_whole_from_where_it_was() {
     assert_eq!(carried_since(None, &[], &retuned, 9), vec![9; 4]);
 }
 
+/// Where each rule's `keep` byte stands in Hello's entry `b` (`Retention::encode`'s layout).
+fn keep_bytes_at(b: &[u8]) -> Vec<usize> {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    let mut out = Vec::new();
+    let mut at = 1usize;
+    for _ in 0..b[0] {
+        out.push(at + 1);
+        at += 2 + 8 + 8;
+        at += 2 + u16_at(at);
+        let readers = b[at];
+        at += 1;
+        for _ in 0..readers {
+            at += 2 + u16_at(at);
+        }
+    }
+    assert_eq!(at, b.len(), "the walk read the whole entry");
+    out
+}
+
+/// A FORGETTING RULE (`Rule::forgetting`) in each form a rule takes: the rules file's
+/// `forget` word, wherever it stands among the options, reads as the builder's rule; Hello's
+/// entry (and the held store's `R` frame, which is the same encoding) carries it and reads
+/// it back, the default rule's too, as bit 1 of the `keep` byte; rules that forget nothing
+/// encode as before the bit (`keep` 0 or 1), so an older decoder reads them, and one byte
+/// that names a bit no build writes, or keeps the last value and forgets, is refused. A
+/// rule that keeps the last value only and forgets is refused by `Retention::new`, by a
+/// rules file's line (named) and by a decoder.
+#[test]
+fn a_forgetting_rule_reads_encodes_and_decodes_and_never_keeps_the_last_value() {
+    let mail = Rule::hold("/f/*/in/>")
+        .unwrap()
+        .until_read("/f/{2}/cur/{4}/node/inbox")
+        .unwrap()
+        .until_read("/f/{2}/cur/n-carry/node/carry")
+        .unwrap()
+        .forgetting()
+        .max_age(Duration::from_secs(7 * 86_400))
+        .max_bytes(64 << 20);
+    assert!(mail.forgets() && mail.keep() == Keep::All);
+    assert!(
+        !Rule::hold("/f/*/in/>").unwrap().forgets(),
+        "off by default"
+    );
+    let (_, r) = parse_rule_line(
+        "hold read=/f/{2}/cur/{4}/node/inbox read=/f/{2}/cur/n-carry/node/carry forget \
+         age=7d bytes=64MiB /f/*/in/>",
+    )
+    .unwrap();
+    assert_eq!(r, mail);
+    let (_, r) = parse_rule_line(
+        "hold forget age=7d bytes=64MiB read=/f/{2}/cur/{4}/node/inbox \
+         read=/f/{2}/cur/n-carry/node/carry /f/*/in/>",
+    )
+    .unwrap();
+    assert_eq!(r, mail, "the word stands anywhere among the options");
+    let (d, r) = parse_rule_line("default forget age=7d").unwrap();
+    assert!(d && r.forgets() && r.keep() == Keep::All);
+
+    let ev = || Rule::prefix("/f/*/pub/*/*/ev").unwrap();
+    let presence = || Rule::hold("/f/*/pub/*/*/presence").unwrap().last_only();
+    let forgetting = Retention::new(
+        vec![ev(), presence(), mail.clone()],
+        Rule::default_keeping_all().forgetting(),
+    )
+    .unwrap();
+    let b = forgetting.encode();
+    let back = Retention::decode(&b).expect("rules that forget read back");
+    assert_eq!(back, forgetting);
+    assert!(back.rules()[2].forgets() && back.default_rule().forgets());
+    assert!(!back.rules()[0].forgets() && !back.rules()[1].forgets());
+    assert!(back.forgets("/f/F/in/n1/s1/n2/task") && !back.forgets("/f/F/pub/n/s/presence"));
+    assert!(back.forgets_any());
+
+    // The keep bytes, rule by rule: ev keeps all (0), presence its last value (1), the mail
+    // and the default rule keep all and forget (2).
+    let plain = Retention::new(
+        vec![
+            ev(),
+            presence(),
+            Rule::hold("/f/*/in/>")
+                .unwrap()
+                .until_read("/f/{2}/cur/{4}/node/inbox")
+                .unwrap(),
+        ],
+        Rule::default_keeping_all(),
+    )
+    .unwrap();
+    assert!(!plain.forgets_any());
+    let keeps = |r: &Retention| -> Vec<u8> {
+        let b = r.encode();
+        keep_bytes_at(&b).into_iter().map(|at| b[at]).collect()
+    };
+    assert_eq!(
+        keeps(&plain),
+        vec![0, 1, 0, 0],
+        "no rule forgets: as before"
+    );
+    assert_eq!(keeps(&forgetting), vec![0, 1, 2, 2]);
+
+    // The mail rule's keep byte, rewritten: last and forget (3), and bits no build writes.
+    let at = keep_bytes_at(&b)[2];
+    assert_eq!(b[at], 2, "the mail rule's keep byte");
+    for bad in [3u8, 4, 6, 0x80] {
+        let mut x = b.clone();
+        x[at] = bad;
+        assert_eq!(Retention::decode(&x), None, "keep byte {bad:#x}");
+    }
+    let mut x = b;
+    x[at] = 0;
+    let unforgetting = Retention::decode(&x).unwrap();
+    assert!(
+        !unforgetting.rules()[2].forgets(),
+        "bit 1 is the whole flag"
+    );
+
+    // Last and forget, refused everywhere a rule is checked.
+    let both = Rule::hold("/f/*/pub/*/*/presence")
+        .unwrap()
+        .last_only()
+        .forgetting();
+    let e = Retention::new(vec![ev(), both], Rule::default_hold()).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("keeps the last value only and forgets"),
+        "{e}"
+    );
+    assert!(
+        Retention::new(vec![ev()], Rule::default_hold().forgetting()).is_err(),
+        "the default rule that keeps the last value only"
+    );
+    for line in [
+        "hold last forget /f/*/pub/*/*/presence",
+        "hold forget last /f/*/pub/*/*/presence",
+        "default last forget",
+    ] {
+        assert!(parse_rule_line(line).is_err(), "{line:?}");
+    }
+    assert_eq!(
+        parse_rules("prefix /x/>\nhold last forget /y\n").unwrap_err(),
+        "line 2: retention: the rule over \"/y\" keeps the last value only and forgets: a \
+         subject's `Last` row is what it keeps, so only a rule that keeps every record forgets"
+    );
+}
+
 /// A commit a record carries is counted in its bytes, as the frame holds it.
 #[test]
 fn record_bytes_is_the_plaintext_frame() {

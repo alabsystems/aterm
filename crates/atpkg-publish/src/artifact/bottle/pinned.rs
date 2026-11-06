@@ -40,12 +40,23 @@ pub(super) fn can_pack(recipe: &PinnedTool, triple: Triple) -> Result<()> {
             recipe.name
         )));
     }
-    if recipe.archive_for(platform(triple)).is_none() {
-        return Err(Error::cannot_run(format!(
+    let archive = recipe.archive_for(platform(triple)).ok_or_else(|| {
+        Error::cannot_run(format!(
             "{} has no pinned upstream archive for {triple}",
             recipe.name
-        )));
-    }
+        ))
+    })?;
+    let url = archive.url_at(recipe.version);
+    super::archive_container(archive_file(&url)?)?;
+    let (_, bottle) = super::bottle_row(recipe.name, triple)?;
+    crate::artifact::pkgdoc::check_exposes(
+        recipe.name,
+        &bottle
+            .exposes
+            .iter()
+            .map(|name| (*name).into())
+            .collect::<Vec<_>>(),
+    )?;
     if Triple::host() != Some(triple) {
         return Err(Error::cannot_run(format!(
             "{} qualification needs a native {triple} worker",
@@ -67,6 +78,15 @@ fn relative(value: &str) -> Result<&Path> {
         ));
     }
     Ok(path)
+}
+
+fn archive_file(url: &str) -> Result<&Path> {
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::refused("upstream archive URL has no filename"))?;
+    relative(filename)
 }
 
 fn copy_file(root: &Path, relative_path: &Path, destination: &Path) -> Result<()> {
@@ -93,6 +113,29 @@ fn installed_executable(recipe: &PinnedTool) -> Result<PathBuf> {
     }
 }
 
+/// Add only the catalog's admitted exposure names beside a single executable.
+/// Relative links keep the upstream name available inside its managed runtime
+/// without making a reserved interpreter name a global shim.
+fn expose_executable(stage: &Path, recipe: &PinnedTool, triple: Triple) -> Result<()> {
+    if !matches!(recipe.layout, Layout::Executable) {
+        return Ok(());
+    }
+    let (_, bottle) = super::bottle_row(recipe.name, triple)?;
+    let executable = installed_executable(recipe)?;
+    let target = executable
+        .file_name()
+        .ok_or_else(|| Error::refused("pinned executable has no file name"))?;
+    for exposed in bottle.exposes {
+        let name = atpkg::store::ToolName::new(exposed)
+            .ok_or_else(|| Error::refused("pinned exposure is not an admitted shim name"))?;
+        let alias = Path::new("bin").join(name.as_str());
+        if alias != executable {
+            crate::artifact::bundle::symlink(Path::new(target), &stage.join(alias))?;
+        }
+    }
+    Ok(())
+}
+
 fn prepare(
     request: &upstream::Request,
     recipe: &PinnedTool,
@@ -114,12 +157,8 @@ fn prepare(
             ))
         })?;
     let url = archive.url_at(recipe.version);
-    let filename = url
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| Error::refused("upstream archive URL has no filename"))?;
-    let input = work.join(relative(filename)?);
+    let input = work.join(archive_file(&url)?);
+    let container = super::archive_container(&input)?;
     download(&url, &input, archive.bytes)?;
     let (file, metadata) = crate::identity::open_regular_nonblock(&input)
         .map_err(|error| Error::io("open pinned upstream archive", &error))?;
@@ -141,7 +180,7 @@ fn prepare(
     atpkg::extract::extract_tree(
         &input,
         &unpacked,
-        super::archive_container(&input)?,
+        container,
         recipe.max_extract_bytes,
         atpkg::extract::ExtractOptions {
             strip_components: recipe.strip,
@@ -180,6 +219,7 @@ fn prepare(
         ));
     }
     arch::gate(request.triple, std::slice::from_ref(&executable))?;
+    expose_executable(&stage, recipe, request.triple)?;
     if recipe.licenses.is_empty() {
         return Err(Error::refused(
             "upstream recipe declares no license material",
@@ -300,7 +340,17 @@ fn qualify(result: &BottleOutcome, recipe: &PinnedTool) -> Result<()> {
         "cpython" => qualify_python(&program, &result.version, &stage, work.path(), &run),
         "openssl-signing" => openssl::qualify(&program, &result.version, work.path(), &run),
         "lean4" => lean::qualify(&program, &result.version, work.path(), &run),
-        "node" => node::qualify(&program, &result.version, work.path(), &run),
+        "node" => {
+            node::qualify(&program, &result.version, work.path(), &run)?;
+            let (_, bottle) = super::bottle_row(recipe.name, result.triple)?;
+            for exposed in bottle.exposes {
+                let alias = stage.join("bin").join(exposed);
+                if alias != program {
+                    node::qualify(&alias, &result.version, work.path(), &run)?;
+                }
+            }
+            Ok(())
+        }
         _ => Err(Error::refused("pinned tool has no runtime qualifier")),
     }?;
     let after = atpkg::tree::tree_root(&stage)
@@ -757,6 +807,42 @@ mod tests {
     }
 
     #[test]
+    fn a_versioned_node_exposure_keeps_the_literal_runtime_name_inside_the_package() {
+        let executable = thin_macho_bytes(0x0100_000c);
+        let pin = aterm_uds::host::upstream::NODE;
+        let mut fixture = Fixture::new(&[
+            TarEntry::File("bin/node", &executable, 0o755),
+            TarEntry::File("LICENSE", b"complete license fixture\n", 0o644),
+        ]);
+        fixture.request.program = pin.name.into();
+        fixture.request.version = pin.version.into();
+        fixture.recipe = PinnedTool {
+            archives: fixture.recipe.archives,
+            strip: 0,
+            ..pin
+        };
+        let tree = fixture.prepare().expect("versioned Node tree");
+        assert_eq!(
+            std::fs::read_link(tree.join("bin/node22")).unwrap(),
+            Path::new("node")
+        );
+        let (package, moved) = fixture.pack_and_stage(tree);
+        assert_eq!(
+            crate::lane::rows::local(&package.manifest).unwrap().exposes,
+            ["node22"]
+        );
+        assert_eq!(std::fs::read(moved.join("bin/node")).unwrap(), executable);
+        assert_eq!(std::fs::read(moved.join("bin/node22")).unwrap(), executable);
+        use std::os::unix::fs::MetadataExt as _;
+        let primary = std::fs::symlink_metadata(moved.join("bin/node")).unwrap();
+        let alias = std::fs::symlink_metadata(moved.join("bin/node22")).unwrap();
+        assert!(primary.is_file() && alias.is_file());
+        assert_eq!((primary.dev(), primary.ino()), (alias.dev(), alias.ino()));
+        assert!(!atpkg::store::shim_allowed("node"));
+        assert!(atpkg::store::shim_allowed("node22"));
+    }
+
+    #[test]
     fn cpython_archive_preserves_the_runtime_and_interpreter_aliases() {
         let executable = thin_macho_bytes(0x0100_000c);
         let pin = aterm_uds::host::upstream::CPYTHON;
@@ -972,6 +1058,34 @@ mod tests {
             );
             assert!(!fixture.work.path().join("unpacked").exists());
         }
+    }
+
+    #[test]
+    fn an_unsupported_pinned_container_refuses_before_download() {
+        let mut fixture = Fixture::new(&[]);
+        fixture.recipe.archives = Box::leak(Box::new([Archive {
+            url: "https://example.invalid/gitleaks.tar.xz",
+            ..fixture.recipe.archives[0]
+        }]));
+        assert!(
+            can_pack(&fixture.recipe, fixture.request.triple)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported bottle archive extension")
+        );
+        let error = prepare(
+            &fixture.request,
+            &fixture.recipe,
+            fixture.work.path(),
+            &|_, _, _| panic!("an unsupported container must not download"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported bottle archive extension")
+        );
+        assert!(!fixture.work.path().join("unpacked").exists());
     }
 
     #[test]

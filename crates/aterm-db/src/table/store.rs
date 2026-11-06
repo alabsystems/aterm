@@ -46,7 +46,7 @@ mod replicas;
 mod witness;
 use witness::Witness;
 
-pub use held::{Held, held_lengths, read_held};
+pub use held::{Held, held_length, held_lengths, read_held};
 
 #[cfg(test)]
 type ReplayObserver = Option<Box<dyn FnOnce()>>;
@@ -1216,16 +1216,21 @@ impl Store {
             return Ok(stored.receipt);
         }
         self.admit_proof(&conflict)?;
-        let mut index = self.index.clone();
-        if let Some(source) = conflict.discarded() {
+        let updated_index = if let Some(source) = conflict.discarded() {
+            let mut index = self.index.clone();
             index
                 .insert(source.header.clone())
                 .map_err(|_| Error::new("invalid discarded-source header"))?;
-        }
+            Some(index)
+        } else {
+            None
+        };
         let receipt = self.append(CONFLICT_SUBJECT, wire, conflict.id(), via)?;
         self.conflicts
             .insert(key, StoredConflict { conflict, receipt });
-        self.index = index;
+        if let Some(index) = updated_index {
+            self.index = index;
+        }
         self.poisoned = false;
         Ok(receipt)
     }
@@ -2141,7 +2146,18 @@ impl Store {
         // not form transferable cutoff evidence. Exclude those local-only
         // frontiers; the full index below still retains restrictive forks.
         let withheld = self.quarantine_closure();
-        let index = self.replication_index_with(&withheld)?;
+        let owned_index;
+        let index = if withheld.is_empty()
+            && !self
+                .conflicts
+                .values()
+                .any(|stored| stored.conflict.discarded().is_some())
+        {
+            &self.index
+        } else {
+            owned_index = self.replication_index_with(&withheld)?;
+            &owned_index
+        };
         let constraints = session_constraints(session)?;
         let table = self.scope.digest();
         let writers: BTreeSet<_> = session
@@ -2162,7 +2178,7 @@ impl Store {
         let cuts = self.removal_cuts(session, &withheld);
         let mut standing = Self::newest_cuts(cuts.iter().filter(|cut| !cut.signer_removed));
         let mut removals = Self::cut_frontiers(&standing);
-        let mut allowed = constraints.catalog_with(table, &index, &removals);
+        let mut allowed = constraints.catalog_with(table, index, &removals);
         if cuts.iter().any(|cut| cut.signer_removed) {
             for _ in 0..=cuts.len() {
                 let next = Self::newest_cuts(
@@ -2178,7 +2194,7 @@ impl Store {
                 }
                 standing = next;
                 removals = Self::cut_frontiers(&standing);
-                allowed = constraints.catalog_with(table, &index, &removals);
+                allowed = constraints.catalog_with(table, index, &removals);
             }
         }
         let counted: Vec<Digest> = standing.iter().map(|cut| cut.id).collect();
@@ -2424,8 +2440,6 @@ impl Store {
         )
     )]
     fn quarantine_closure(&self) -> BTreeSet<Digest> {
-        let mut children: BTreeMap<Digest, Vec<Digest>> = BTreeMap::new();
-        let mut writers = BTreeMap::<Actor, BTreeMap<u64, Vec<Digest>>>::new();
         let mut pending = Vec::new();
         for stored in self.conflicts.values() {
             for header in stored.conflict.headers() {
@@ -2442,6 +2456,13 @@ impl Store {
             if stored.quarantine.is_some() || forked.contains(&stored.header.actor) {
                 pending.push(*id);
             }
+        }
+        if pending.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut children: BTreeMap<Digest, Vec<Digest>> = BTreeMap::new();
+        let mut writers = BTreeMap::<Actor, BTreeMap<u64, Vec<Digest>>>::new();
+        for (id, stored) in &self.records {
             writers
                 .entry(stored.header.actor)
                 .or_default()
@@ -2627,18 +2648,32 @@ impl Store {
             .into_iter()
             .chain(self.quarantined_actors())
             .collect();
-        let mut positive = Index::new(MAX_RECORDS);
-        for stored in self.records.values() {
-            positive
-                .insert(stored.header.clone())
-                .map_err(|_| Error::new("invalid liability header"))?;
-        }
-        if self
-            .records
-            .values()
-            .any(|stored| conflicted.contains(&stored.header.actor))
-            || !positive.project().pending.is_empty()
+        if !conflicted.is_empty()
+            && self
+                .records
+                .values()
+                .any(|stored| conflicted.contains(&stored.header.actor))
         {
+            return Err(Error::new(
+                "table liability graph is incomplete or conflicting; keep allocations reserved",
+            ));
+        }
+        let has_pending = if self
+            .conflicts
+            .values()
+            .any(|stored| stored.conflict.discarded().is_some())
+        {
+            let mut positive = Index::new(MAX_RECORDS);
+            for stored in self.records.values() {
+                positive
+                    .insert(stored.header.clone())
+                    .map_err(|_| Error::new("invalid liability header"))?;
+            }
+            !positive.project().pending.is_empty()
+        } else {
+            !self.index.project().pending.is_empty()
+        };
+        if has_pending {
             return Err(Error::new(
                 "table liability graph is incomplete or conflicting; keep allocations reserved",
             ));

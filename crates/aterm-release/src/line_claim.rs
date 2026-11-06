@@ -116,13 +116,21 @@ fn remote(git: &dyn GitRunner, name: &str) -> Result<Option<(String, State)>, St
         return Ok(None);
     };
     git_ok(git, &["fetch", "--no-tags", "origin", &sha]).map_err(|e| e.to_string())?;
+    state_at(git, name, &sha).map(|state| Some((sha, state)))
+}
+
+fn state_at(git: &dyn GitRunner, name: &str, sha: &str) -> Result<State, String> {
     let out = git_ok(git, &["show", &format!("{sha}:line.toml")]).map_err(|e| e.to_string())?;
+    parse_state(&out.stdout_utf8(), name)
+}
+
+fn parse_state(text: &str, name: &str) -> Result<State, String> {
     let state: State =
-        aterm_toml::from_str(&out.stdout_utf8()).map_err(|e| format!("invalid fleet line: {e}"))?;
+        aterm_toml::from_str(text).map_err(|e| format!("invalid fleet line: {e}"))?;
     if reference(&state.line.version)? != name {
         return Err("fleet line version does not match its ref".into());
     }
-    Ok(Some((sha, state)))
+    Ok(state)
 }
 
 /// A fresh state-only tree, with the previous state as parent. The candidate checkout and
@@ -813,18 +821,23 @@ fn red_items(state: &State) -> String {
 }
 
 pub fn status(repo: &Path) -> Result<(), String> {
-    let git = GitCli::new(repo);
-    let refs = git_ok(
-        &git,
-        &["ls-remote", "--refs", "origin", "refs/aterm-release/line/*"],
-    )
-    .map_err(|e| e.to_string())?;
-    for line in refs.stdout_utf8().lines() {
-        let Some((_, name)) = line.split_once('\t') else {
-            continue;
-        };
-        if let Some((_, state)) = remote(&git, name)? {
-            println!(
+    let remote = crate::github_remote::Remote::origin(repo)?;
+    for row in status_rows(&remote)? {
+        println!("{row}");
+    }
+    Ok(())
+}
+
+fn status_rows(remote: &crate::github_remote::Remote) -> Result<Vec<String>, String> {
+    let mut rows = Vec::new();
+    for name in remote.list("refs/aterm-release/line/")?.keys() {
+        if let Some(sha) = remote.get(name)? {
+            remote.fetch_exact(&sha)?;
+            let bytes = remote.blob(&sha, Path::new("line.toml"))?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|error| format!("invalid fleet line UTF-8: {error}"))?;
+            let state = parse_state(text, name)?;
+            rows.push(format!(
                 "v{} {} {} step={} boundary={} at={} head={}",
                 state.line.version,
                 state.holder.host,
@@ -833,10 +846,10 @@ pub fn status(repo: &Path) -> Result<(), String> {
                 state.boundary,
                 state.at,
                 state.line.head()
-            );
+            ));
         }
     }
-    Ok(())
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -1009,6 +1022,53 @@ mod tests {
             git_ok(&git, &args).unwrap();
         }
         git
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_fleet_status_reads_the_actual_claim_without_changing_its_holder() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git_ok(&GitCli::new(&origin), &["init", "--bare"]).unwrap();
+        let writer = repository(dir.path(), "writer", &origin);
+        let name = reference("0.156.0").unwrap();
+        let initial = state("original-holder", 123);
+        let Write::Written(sha) = replace(&writer, &name, "", &initial) else {
+            panic!("fixture claim must be written");
+        };
+        let reader = repository(dir.path(), "reader", &origin);
+        let root = dir.path().join("reader");
+        let remote = crate::github_remote::tests::local(&root, &origin);
+        assert_eq!(
+            status_rows(&remote).unwrap(),
+            [
+                "v0.156.0 original-holder original-holder step=verify boundary=test-binary-finished at=123 head=base"
+            ]
+        );
+        assert_eq!(
+            crate::ledger::rev_parse(&GitCli::new(&origin), &name).unwrap(),
+            sha
+        );
+        assert!(
+            git_ok(&reader, &["for-each-ref", "--format=%(refname)"])
+                .unwrap()
+                .stdout_utf8()
+                .lines()
+                .all(|name| name.starts_with("refs/agh/"))
+        );
+        assert!(!root.join(".git/FETCH_HEAD").exists());
+        let mut wrong = initial;
+        wrong.line.version = "0.155.0".into();
+        assert!(matches!(
+            replace(&writer, &name, &sha, &wrong),
+            Write::Written(_)
+        ));
+        assert!(
+            status_rows(&remote)
+                .unwrap_err()
+                .contains("version does not match")
+        );
     }
 
     #[test]

@@ -748,6 +748,7 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
             });
             let mut reader = BufReader::new(stdout);
             let mut header = Vec::new();
+            let mut data = Vec::new();
             let mut result = Ok(());
             for entry in &mine {
                 const MAX_HEADER_BYTES: u64 = 4096;
@@ -795,8 +796,8 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
                     ));
                     break;
                 }
-                let mut data =
-                    Vec::with_capacity(usize::try_from(size).unwrap_or(0).saturating_add(1));
+                data.clear();
+                data.reserve(usize::try_from(size).unwrap_or(0).saturating_add(1));
                 if let Err(e) = (&mut reader)
                     .take(size.saturating_add(1))
                     .read_to_end(&mut data)

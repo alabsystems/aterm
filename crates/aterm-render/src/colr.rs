@@ -269,10 +269,13 @@ impl ColorRamp {
         if t >= last.0 {
             return last.1;
         }
-        let mut i = 0;
-        while i + 1 < self.stops.len() && self.stops[i + 1].0 < t {
-            i += 1;
-        }
+        // The last stop below `t`, found by bisection: each pixel samples the
+        // ramp, and a ramp may hold thousands of stops.
+        let i = self.stops[1..].partition_point(|s| {
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_ramp_stop_read();
+            s.0 < t
+        });
         let (o0, c0) = self.stops[i];
         let Some(&(o1, c1)) = self.stops.get(i + 1) else {
             return last.1;
@@ -562,6 +565,9 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
         self.pending = Some((glyph_id, self.cur));
     }
     fn paint(&mut self, paint: Paint<'a>) {
+        if self.pending.is_none() {
+            return;
+        }
         match self.resolve_paint(&paint) {
             Some(src) => self.fill_pending(&src),
             None => self.pending = None,
@@ -1081,6 +1087,47 @@ mod tests {
             90
         );
         assert_eq!(two(GradientExtend::Repeat).sample(f32::INFINITY).alpha, 255);
+    }
+
+    #[test]
+    fn a_ramp_of_many_stops_is_sampled_by_bisection_as_a_scan_would() {
+        let colours = [
+            RgbaColor::new(200, 30, 10, 255),
+            RgbaColor::new(10, 40, 220, 128),
+            RgbaColor::new(0, 250, 90, 0),
+        ];
+        // Offsets in pairs, as hard stops come: 2^16 stops, 2^15 offsets.
+        let n = 1usize << 16;
+        let stops: Vec<(f32, RgbaColor)> = (0..n)
+            .map(|i| ((i / 2) as f32 / (n / 2 - 1) as f32, colours[i % 3]))
+            .collect();
+        let scan = |t: f32| {
+            let mut i = 0;
+            while stops[i + 1].0 < t {
+                i += 1;
+            }
+            let ((o0, c0), (o1, c1)) = (stops[i], stops[i + 1]);
+            lerp_premul(c0, c1, (t - o0) / (o1 - o0))
+        };
+        let ramp = ColorRamp {
+            extend: GradientExtend::Pad,
+            stops: stops.clone(),
+        };
+        let _ = crate::test_counters::take_ramp_stops_read();
+        let samples = 1_000;
+        for k in 0..samples {
+            let t = (k as f32 + 0.5) / samples as f32;
+            let (got, want) = (ramp.sample(t), scan(t));
+            assert!(
+                rgba_eq(got, want),
+                "t {t}: {got:?} where a scan finds {want:?}"
+            );
+        }
+        let read = crate::test_counters::take_ramp_stops_read();
+        assert!(
+            read <= samples * 17,
+            "{samples} samples of {n} stops compared {read} of them"
+        );
     }
 
     #[test]

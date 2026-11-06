@@ -236,17 +236,33 @@ fn a_gpos_extension_of_an_extension_is_malformed() {
 }
 
 fn shared_paint_graph(depth: u32) -> Vec<u8> {
+    paint_dag(depth, &[2, 0, 0, 0x40, 0], 0)
+}
+
+/// Glyph 1 as a `depth`-level `COLR` v1 graph whose paints share children
+/// (2^`depth` paths) down to `leaf`'s paint table; with `v0_layers`, glyph 2
+/// is a `COLR` v0 glyph of that many layers.
+fn paint_dag(depth: u32, leaf: &[u8], v0_layers: u32) -> Vec<u8> {
+    paint_dag_over(depth, leaf, v0_layers, &[])
+}
+
+/// [`paint_dag`] with `extra` tables.
+fn paint_dag_over(depth: u32, leaf: &[u8], v0_layers: u32, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     let be16 = |v: u32| (v as u16).to_be_bytes();
     let be32 = |v: u32| v.to_be_bytes();
     let base_list = 34u32;
     let layer_list = base_list + 10;
     let paints = layer_list + 4 + 8 * depth;
+    let v0 = match v0_layers {
+        0 => 0,
+        _ => paints + 6 * depth + leaf.len() as u32,
+    };
     let mut colr: Vec<u8> = Vec::new();
     colr.extend(be16(1));
-    colr.extend(be16(0));
-    colr.extend(be32(0));
-    colr.extend(be32(0));
-    colr.extend(be16(0));
+    colr.extend(be16(u32::from(v0_layers > 0)));
+    colr.extend(be32(v0));
+    colr.extend(be32(if v0 == 0 { 0 } else { v0 + 6 }));
+    colr.extend(be16(v0_layers));
     colr.extend(be32(base_list));
     colr.extend(be32(layer_list));
     colr.extend(be32(0));
@@ -266,7 +282,14 @@ fn shared_paint_graph(depth: u32) -> Vec<u8> {
         colr.push(2);
         colr.extend(be32(2 * i));
     }
-    colr.extend([2, 0, 0, 0x40, 0]);
+    colr.extend(leaf);
+    if v0_layers > 0 {
+        colr.extend([0, 2, 0, 0]);
+        colr.extend(be16(v0_layers));
+        for _ in 0..v0_layers {
+            colr.extend([0, 1, 0, 0]);
+        }
+    }
     let mut cpal: Vec<u8> = Vec::new();
     for v in [0u16, 1, 1, 1] {
         cpal.extend(v.to_be_bytes());
@@ -274,7 +297,34 @@ fn shared_paint_graph(depth: u32) -> Vec<u8> {
     cpal.extend(be32(14));
     cpal.extend(be16(0));
     cpal.extend([0x10, 0x20, 0x30, 0xFF]);
-    sfnt(2, &[(b"COLR", &colr), (b"CPAL", &cpal)])
+    let mut tables: Vec<(&[u8; 4], &[u8])> = vec![(b"COLR", &colr), (b"CPAL", &cpal)];
+    tables.extend(extra);
+    sfnt(3, &tables)
+}
+
+/// `glyf` and `loca` where glyph 2 is `contours` contours of one on-curve
+/// point each, and glyphs 0 and 1 are empty: each contour is a move, a line
+/// back and a close, three segments for one outline step.
+fn glyf_dots(contours: u16) -> (Vec<u8>, Vec<u8>) {
+    let mut glyf: Vec<u8> = Vec::new();
+    glyf.extend(contours.to_be_bytes());
+    for v in [0, 0, contours, contours] {
+        glyf.extend(v.to_be_bytes());
+    }
+    for end in 0..contours {
+        glyf.extend(end.to_be_bytes());
+    }
+    glyf.extend([0, 0]);
+    // On curve, each coordinate one positive byte.
+    glyf.extend(std::iter::repeat_n(0x37, usize::from(contours)));
+    glyf.extend(std::iter::repeat_n(1, 2 * usize::from(contours)));
+    glyf.resize(glyf.len().next_multiple_of(2), 0);
+    let end = (glyf.len() / 2) as u16;
+    let loca = [0u16, 0, 0, end]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    (glyf, loca)
 }
 
 #[test]
@@ -285,22 +335,459 @@ fn a_colr_graph_that_shares_children_is_walked_within_a_budget() {
         let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
         assert!(face.is_color_glyph(GlyphId(1)), "glyph 1 is a colour glyph");
         let mut count = Count::default();
-        assert_eq!(
-            face.paint_color_glyph(GlyphId(1), 0, fg, &mut count),
-            Some(())
-        );
-        count.0
+        let painted = face.paint_color_glyph(GlyphId(1), 0, fg, &mut count);
+        (painted, count.0)
     };
     let _ = aterm_font::take_spent();
-    assert_eq!(painted(8), 256, "a small shared graph paints every path");
+    assert_eq!(
+        painted(8),
+        (Some(()), 256),
+        "a small shared graph paints every path"
+    );
     assert_eq!(aterm_font::take_spent().paint_tables, (1 << 9) - 1);
-    let deep = painted(60);
+    // The budget stops the deep walk, which answers that it painted no glyph.
+    let (whole, deep) = painted(60);
+    assert_eq!(whole, None);
     assert!(
         (1..=1 << 16).contains(&deep),
         "the deep graph painted {deep} times"
     );
     let walked = aterm_font::take_spent().paint_tables;
     assert!(walked > 1 << 16, "the capped walk read {walked}");
+}
+
+/// A `PaintLinearGradient` whose `ColorLine` (at +16) holds `stops` stops.
+fn gradient_leaf(stops: u32) -> Vec<u8> {
+    let mut leaf = vec![4, 0, 0, 16];
+    for v in [0i16, 0, 100, 0, 0, 100] {
+        leaf.extend(v.to_be_bytes());
+    }
+    leaf.push(0);
+    leaf.extend((stops as u16).to_be_bytes());
+    for i in 0..stops {
+        leaf.extend(((i * 16_384 / stops) as u16).to_be_bytes());
+        leaf.extend([0, 0, 0x40, 0]);
+    }
+    leaf
+}
+
+/// The colour stops and outlines a paint walk hands its painter. It reads
+/// stops only up to one past [`HANDED`], so a walk that hands out more fails
+/// at once.
+#[derive(Default)]
+struct Handed {
+    stops: usize,
+    outlines: usize,
+}
+
+const HANDED: usize = 1 << 16;
+
+impl<'a> Painter<'a> for Handed {
+    fn outline_glyph(&mut self, _: GlyphId) {
+        self.outlines += 1;
+    }
+    fn paint(&mut self, paint: Paint<'a>) {
+        let left = (HANDED + 1).saturating_sub(self.stops);
+        self.stops += match paint {
+            Paint::Solid(_) => 0,
+            Paint::LinearGradient(g) => g.stops(0, &[]).take(left).count(),
+            Paint::RadialGradient(g) => g.stops(0, &[]).take(left).count(),
+            Paint::SweepGradient(g) => g.stops(0, &[]).take(left).count(),
+        };
+    }
+    fn push_clip(&mut self) {}
+    fn push_clip_box(&mut self, _: ClipBox) {}
+    fn pop_clip(&mut self) {}
+    fn push_layer(&mut self, _: CompositeMode) {}
+    fn pop_layer(&mut self) {}
+    fn push_transform(&mut self, _: Transform) {}
+    fn pop_transform(&mut self) {}
+}
+
+#[test]
+fn a_colr_walk_charges_the_stops_and_outlines_it_hands_out_to_its_budget() {
+    // A walk the budget stops answers None; only the small graph paints whole.
+    let handed = |depth: u32, leaf: &[u8], v0_layers: u32| {
+        let bytes = paint_dag(depth, leaf, v0_layers);
+        let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+        let mut handed = Handed::default();
+        let painted =
+            face.paint_color_glyph(GlyphId(1), 0, RgbaColor::new(0, 0, 0, 255), &mut handed);
+        assert_eq!(painted.is_some(), depth < 16, "a {depth}-level walk");
+        handed
+    };
+    let small = handed(4, &gradient_leaf(4), 0);
+    assert_eq!(
+        (small.stops, small.outlines),
+        (64, 0),
+        "a small graph paints whole"
+    );
+    // Each of the walk's 2^15 gradients was 4,096 stops: 2^27 handed out.
+    let stops = handed(30, &gradient_leaf(4_096), 0).stops;
+    assert!(
+        (4_096..=HANDED).contains(&stops),
+        "the walk handed out {stops} stops"
+    );
+    // A PaintGlyph over a solid: 21,845 outlines under the table count alone.
+    let glyphs = handed(30, &[10, 0, 0, 6, 0, 1, 2, 0, 0, 0x40, 0], 0).outlines;
+    assert!(
+        (1..=1 << 14).contains(&glyphs),
+        "the walk handed out {glyphs} PaintGlyph outlines"
+    );
+    // A PaintColrGlyph onto a v0 glyph of 1,024 layers: 2^15 of them, 2^25 outlines.
+    let layers = handed(30, &[11, 0, 2], 1_024).outlines;
+    assert!(
+        (1_024..=1 << 14).contains(&layers),
+        "the walk handed out {layers} v0 layer outlines"
+    );
+    // A PaintGlyph of 4,096 one-point contours, 12,288 segments for 4,097
+    // outline steps: the step budget alone lets 63 through, 774,144 segments.
+    let (glyf, loca) = glyf_dots(4_096);
+    let leaf = [10, 0, 0, 6, 0, 2, 2, 0, 0, 0x40, 0];
+    let bytes = paint_dag_over(30, &leaf, 0, &[(b"glyf", &glyf), (b"loca", &loca)]);
+    let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+    let mut segments = Count::default();
+    let _ = aterm_font::take_spent();
+    assert!(face.outline_glyph(GlyphId(2), &mut segments).is_some());
+    let steps = aterm_font::take_spent().outline_steps;
+    assert_eq!((steps, segments.0), (4_097, 12_288), "glyph 2");
+    let mut handed = Handed::default();
+    assert_eq!(
+        face.paint_color_glyph(GlyphId(1), 0, RgbaColor::new(0, 0, 0, 255), &mut handed),
+        None
+    );
+    let segments = handed.outlines as u64 * segments.0;
+    assert!(
+        (1..=1 << 18).contains(&segments),
+        "the walk handed out {} outlines, {segments} segments",
+        handed.outlines
+    );
+}
+
+/// `glyf` and `loca` where glyph 0 has no contours, glyph 1 is `fan`
+/// copies of glyph 0 and glyph 2 `fan` copies of glyph 1: outlining glyph 2
+/// takes `1 + fan * (1 + fan)` steps and draws nothing.
+fn glyf_composite_fan(fan: u16) -> (Vec<u8>, Vec<u8>) {
+    let mut glyf: Vec<u8> = vec![0; 10];
+    let mut loca = vec![0u16, 5];
+    for child in [0u16, 1] {
+        glyf.extend((-1i16).to_be_bytes());
+        glyf.extend([0; 8]);
+        for i in 0..fan {
+            // ARGS_ARE_XY_VALUES, and MORE_COMPONENTS on all but the last.
+            let flags: u16 = if i + 1 < fan { 0x22 } else { 0x02 };
+            glyf.extend(flags.to_be_bytes());
+            glyf.extend(child.to_be_bytes());
+            glyf.extend([0, 0]);
+        }
+        loca.push((glyf.len() / 2) as u16);
+    }
+    (glyf, loca.iter().flat_map(|v| v.to_be_bytes()).collect())
+}
+
+#[test]
+fn a_colr_walk_charges_what_outlining_each_glyph_costs() {
+    // A PaintGlyph of a glyph that takes 4,033 outline steps and has no
+    // segment: the count of segments alone let 9,359 through, each outlined
+    // by the walk and again by the painter.
+    let (glyf, loca) = glyf_composite_fan(63);
+    let leaf = [10, 0, 0, 6, 0, 2, 2, 0, 0, 0x40, 0];
+    let bytes = paint_dag_over(30, &leaf, 0, &[(b"glyf", &glyf), (b"loca", &loca)]);
+    let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+    let mut segments = Count::default();
+    let _ = aterm_font::take_spent();
+    let _ = face.outline_glyph(GlyphId(2), &mut segments);
+    let one = aterm_font::take_spent().outline_steps;
+    assert_eq!(
+        (one, segments.0),
+        (4_033, 0),
+        "glyph 2's steps and segments"
+    );
+    let mut handed = Handed::default();
+    assert_eq!(
+        face.paint_color_glyph(GlyphId(1), 0, RgbaColor::new(0, 0, 0, 255), &mut handed),
+        None
+    );
+    let steps = aterm_font::take_spent().outline_steps;
+    assert!(
+        handed.outlines > 0 && steps <= (1 << 18) + one,
+        "the walk handed out {} outlines and outlined {steps} steps",
+        handed.outlines
+    );
+}
+
+/// Glyph 1 as a `depth`-level graph whose paints share children down to a
+/// PaintColrGlyph of glyph 5000, a solid, under a `ClipList` of `records`
+/// one-glyph records from glyph 10 and, last, one for glyph 5000.
+fn clipped_colr_glyph_dag(depth: u32, records: u32) -> Vec<u8> {
+    let be16 = |v: u32| (v as u16).to_be_bytes();
+    let be32 = |v: u32| v.to_be_bytes();
+    let base_list = 34u32;
+    let layer_list = base_list + 4 + 12;
+    let paints = layer_list + 4 + 8 * depth;
+    let solid = paints + 6 * depth + 3;
+    let clip_list = solid + 5;
+    let mut colr: Vec<u8> = Vec::new();
+    colr.extend(be16(1));
+    colr.extend(be16(0));
+    colr.extend(be32(0));
+    colr.extend(be32(0));
+    colr.extend(be16(0));
+    colr.extend(be32(base_list));
+    colr.extend(be32(layer_list));
+    colr.extend(be32(clip_list));
+    colr.extend(be32(0));
+    colr.extend(be32(0));
+    colr.extend(be32(2));
+    colr.extend(be16(1));
+    colr.extend(be32(paints - base_list));
+    colr.extend(be16(5000));
+    colr.extend(be32(solid - base_list));
+    colr.extend(be32(2 * depth));
+    for i in 0..depth {
+        let next = paints + 6 * (i + 1) - layer_list;
+        colr.extend(be32(next));
+        colr.extend(be32(next));
+    }
+    for i in 0..depth {
+        colr.push(1);
+        colr.push(2);
+        colr.extend(be32(2 * i));
+    }
+    colr.push(11);
+    colr.extend(be16(5000));
+    colr.extend([2, 0, 0, 0x40, 0]);
+    colr.push(1);
+    colr.extend(be32(records + 1));
+    let clip_box = 5 + 7 * (records + 1);
+    for glyph in (10..10 + records).chain([5000]) {
+        colr.extend(be16(glyph));
+        colr.extend(be16(glyph));
+        colr.extend(&be32(clip_box)[1..]);
+    }
+    colr.push(1);
+    for v in [-5i16, -6, 700, 800] {
+        colr.extend(v.to_be_bytes());
+    }
+    let mut cpal: Vec<u8> = Vec::new();
+    for v in [0u16, 1, 1, 1] {
+        cpal.extend(v.to_be_bytes());
+    }
+    cpal.extend(be32(14));
+    cpal.extend(be16(0));
+    cpal.extend([0x10, 0x20, 0x30, 0xFF]);
+    sfnt(2, &[(b"COLR", &colr), (b"CPAL", &cpal)])
+}
+
+/// The clip boxes a paint walk pushes.
+#[derive(Default)]
+struct Clips(Vec<[f32; 4]>);
+
+impl<'a> Painter<'a> for Clips {
+    fn outline_glyph(&mut self, _: GlyphId) {}
+    fn paint(&mut self, _: Paint<'a>) {}
+    fn push_clip(&mut self) {}
+    fn push_clip_box(&mut self, b: ClipBox) {
+        self.0.push([b.x_min, b.y_min, b.x_max, b.y_max]);
+    }
+    fn pop_clip(&mut self) {}
+    fn push_layer(&mut self, _: CompositeMode) {}
+    fn pop_layer(&mut self) {}
+    fn push_transform(&mut self, _: Transform) {}
+    fn pop_transform(&mut self) {}
+}
+
+#[test]
+fn a_colr_walk_finds_each_clip_box_by_bisection() {
+    let bytes = clipped_colr_glyph_dag(30, 4_096);
+    let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+    let _ = aterm_font::take_spent();
+    let mut clips = Clips::default();
+    assert_eq!(
+        face.paint_color_glyph(GlyphId(1), 0, RgbaColor::new(0, 0, 0, 255), &mut clips),
+        None
+    );
+    let read = aterm_font::take_spent().clip_records;
+    assert!(
+        clips.0.len() > 1 << 12,
+        "the walk reached glyph 5000 {} times",
+        clips.0.len()
+    );
+    assert!(clips.0.iter().all(|&b| b == [-5.0, -6.0, 700.0, 800.0]));
+    // Glyph 1 has no clip record, and each lookup bisects 4,097 records.
+    let lookups = clips.0.len() as u64 + 1;
+    assert!(
+        read <= 14 * lookups,
+        "{lookups} clip box lookups read {read} records"
+    );
+}
+
+/// Glyph 1 as a `depth`-level `COLR` v1 graph whose paints share children
+/// down to `leaf`, in a face of one axis whose `COLR` item variation store
+/// holds one delta set of `regions` region indices, every variation index
+/// mapped to it; glyph 2 is a solid under a clip box that varies.
+fn variable_paint_dag(depth: u32, leaf: &[u8], regions: u16) -> Vec<u8> {
+    let be16 = |v: u32| (v as u16).to_be_bytes();
+    let be32 = |v: u32| v.to_be_bytes();
+    let base_list = 34u32;
+    let layer_list = base_list + 4 + 12;
+    let paints = layer_list + 4 + 8 * depth;
+    let solid = paints + 6 * depth + leaf.len() as u32;
+    let clip_list = solid + 5;
+    let map = clip_list + 12 + 13;
+    let store = map + 5;
+    let mut colr: Vec<u8> = Vec::new();
+    colr.extend(be16(1));
+    colr.extend(be16(0));
+    colr.extend(be32(0));
+    colr.extend(be32(0));
+    colr.extend(be16(0));
+    for offset in [base_list, layer_list, clip_list, map, store] {
+        colr.extend(be32(offset));
+    }
+    colr.extend(be32(2));
+    colr.extend(be16(1));
+    colr.extend(be32(paints - base_list));
+    colr.extend(be16(2));
+    colr.extend(be32(solid - base_list));
+    colr.extend(be32(2 * depth));
+    for i in 0..depth {
+        let next = paints + 6 * (i + 1) - layer_list;
+        colr.extend(be32(next));
+        colr.extend(be32(next));
+    }
+    for i in 0..depth {
+        colr.push(1);
+        colr.push(2);
+        colr.extend(be32(2 * i));
+    }
+    colr.extend(leaf);
+    colr.extend([2, 0, 0, 0x40, 0]);
+    // One record, glyph 2's: a format 2 box whose deltas start at index 0.
+    colr.push(1);
+    colr.extend(be32(1));
+    colr.extend(be16(2));
+    colr.extend(be16(2));
+    colr.extend(&be32(12)[1..]);
+    colr.push(2);
+    for v in [-5i16, -6, 700, 800] {
+        colr.extend(v.to_be_bytes());
+    }
+    colr.extend(be32(0));
+    // A DeltaSetIndexMap of one 1-byte entry, (0, 0).
+    colr.extend([0, 0, 0, 1, 0]);
+    colr.extend(be16(1));
+    colr.extend(be32(12));
+    colr.extend(be16(1));
+    colr.extend(be32(22));
+    // One region of one axis, peaking at its maximum.
+    colr.extend(be16(1));
+    colr.extend(be16(1));
+    for v in [0i16, 0x4000, 0x4000] {
+        colr.extend(v.to_be_bytes());
+    }
+    // One item of byte deltas, `regions` of them, each naming region 0.
+    colr.extend(be16(1));
+    colr.extend(be16(0));
+    colr.extend(be16(u32::from(regions)));
+    colr.extend(vec![0u8; 2 * usize::from(regions)]);
+    colr.extend(vec![1u8; usize::from(regions)]);
+    let mut cpal: Vec<u8> = Vec::new();
+    for v in [0u16, 1, 1, 1] {
+        cpal.extend(v.to_be_bytes());
+    }
+    cpal.extend(be32(14));
+    cpal.extend(be16(0));
+    cpal.extend([0x10, 0x20, 0x30, 0xFF]);
+    let mut fvar: Vec<u8> = Vec::new();
+    for v in [1u16, 0, 16, 2, 1, 20, 0, 8] {
+        fvar.extend(v.to_be_bytes());
+    }
+    fvar.extend(*b"wght");
+    for v in [100i32, 400, 900] {
+        fvar.extend((v << 16).to_be_bytes());
+    }
+    fvar.extend(be16(0));
+    fvar.extend(be16(256));
+    sfnt(3, &[(b"COLR", &colr), (b"CPAL", &cpal), (b"fvar", &fvar)])
+}
+
+/// A PaintVarTransform (six deltas from index 0) over a solid.
+fn var_transform_leaf() -> Vec<u8> {
+    let mut leaf = vec![13, 0, 0, 7, 0, 0, 12, 2, 0, 0, 0x40, 0];
+    for v in [1i32 << 16, 0, 0, 1 << 16, 0, 0] {
+        leaf.extend(v.to_be_bytes());
+    }
+    leaf.extend(0u32.to_be_bytes());
+    leaf
+}
+
+/// A PaintVarLinearGradient that does not vary, whose `VarColorLine` (at
+/// +20) holds `stops` stops, each two deltas from index 0.
+fn var_gradient_leaf(stops: u32) -> Vec<u8> {
+    let mut leaf = vec![5, 0, 0, 20];
+    for v in [0i16, 0, 100, 0, 0, 100] {
+        leaf.extend(v.to_be_bytes());
+    }
+    leaf.extend(u32::MAX.to_be_bytes());
+    leaf.push(0);
+    leaf.extend((stops as u16).to_be_bytes());
+    for i in 0..stops {
+        leaf.extend(((i * 16_384 / stops) as u16).to_be_bytes());
+        leaf.extend([0, 0, 0x40, 0]);
+        leaf.extend(0u32.to_be_bytes());
+    }
+    leaf
+}
+
+/// Takes each linear gradient's stops once, at the face's instance.
+struct AtInstance<'c>(&'c [aterm_font::NormalizedCoordinate]);
+
+impl<'a> Painter<'a> for AtInstance<'_> {
+    fn outline_glyph(&mut self, _: GlyphId) {}
+    fn paint(&mut self, paint: Paint<'a>) {
+        if let Paint::LinearGradient(g) = paint {
+            let _ = g.stops(0, self.0).count();
+        }
+    }
+    fn push_clip(&mut self) {}
+    fn push_clip_box(&mut self, _: ClipBox) {}
+    fn pop_clip(&mut self) {}
+    fn push_layer(&mut self, _: CompositeMode) {}
+    fn pop_layer(&mut self) {}
+    fn push_transform(&mut self, _: Transform) {}
+    fn pop_transform(&mut self) {}
+}
+
+#[test]
+fn a_colr_walk_charges_the_variation_deltas_it_and_its_painter_read() {
+    // Region-axis evaluations: each delta of the face's one set costs 1,024.
+    let read = |depth: u32, leaf: &[u8]| {
+        let bytes = variable_paint_dag(depth, leaf, 1_024);
+        let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
+        let coords = face.variation_coordinates();
+        assert_eq!(coords.len(), 1, "the face has one axis");
+        let _ = aterm_font::take_spent();
+        let fg = RgbaColor::new(0, 0, 0, 255);
+        let painted = face.paint_color_glyph(GlyphId(1), 0, fg, &mut AtInstance(coords));
+        (painted, aterm_font::take_spent().delta_steps)
+    };
+    let leaves = [
+        ("PaintVarTransform", var_transform_leaf(), 6),
+        ("variable colour line", var_gradient_leaf(16), 2 * 16),
+        ("PaintColrGlyph under a varying clip box", vec![11, 0, 2], 4),
+    ];
+    for (what, leaf, deltas) in leaves {
+        // A small graph reads every delta at each of its 4 leaves.
+        assert_eq!(read(2, &leaf), (Some(()), 4 * deltas * 1_024), "{what}");
+        // The walk's 2^16 tables alone reach 10^8 evaluations.
+        let (painted, deep) = read(30, &leaf);
+        assert_eq!(painted, None, "{what}");
+        assert!(
+            deep <= 1 << 20,
+            "{what}: the walk and its painter made {deep} evaluations"
+        );
+    }
 }
 
 /// The sweep gradients a COLR glyph paints: centre and angles.

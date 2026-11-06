@@ -91,6 +91,7 @@ fn ordinary_full_screen_scrollback_does_not_bump_piecewise_row_revision() {
 #[test]
 fn codex_scroll_keeps_footer_metadata_on_its_content_in_parser_order() {
     let mut term = Terminal::new(5, 10);
+    term.set_osc_event_polling(true);
     term.process(SEED_ROWS);
     term.process(b"\x1b[5;1H\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
     term.add_named_mark("footer");

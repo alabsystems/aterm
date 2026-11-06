@@ -255,8 +255,8 @@ fn parse_cid_local_subrs<'a>(
     parse_index::<u16>(&mut s)
 }
 
-struct CharStringParserContext<'a> {
-    work: crate::work::OutlineWork,
+struct CharStringParserContext<'a, 'w> {
+    work: &'w mut crate::work::OutlineWork,
     metadata: &'a Table<'a>,
     width: Option<f32>,
     stems_len: u32,
@@ -272,6 +272,7 @@ fn parse_char_string(
     glyph_id: GlyphId,
     width_only: bool,
     builder: &mut dyn OutlineSink,
+    work: &mut crate::work::OutlineWork,
 ) -> Result<(Rect, Option<f32>), CFFError> {
     let local_subrs = match metadata.kind {
         FontKind::SID(ref sid) => Some(sid.local_subrs),
@@ -279,7 +280,7 @@ fn parse_char_string(
     };
 
     let mut ctx = CharStringParserContext {
-        work: crate::work::OutlineWork::default(),
+        work,
         metadata,
         width: None,
         stems_len: 0,
@@ -329,7 +330,7 @@ fn parse_char_string(
 }
 
 fn _parse_char_string(
-    ctx: &mut CharStringParserContext,
+    ctx: &mut CharStringParserContext<'_, '_>,
     char_string: &[u8],
     depth: u8,
     p: &mut CharStringParser,
@@ -833,11 +834,21 @@ impl<'a> Table<'a> {
         glyph_id: GlyphId,
         builder: &mut dyn OutlineSink,
     ) -> Result<Rect, CFFError> {
+        self.outline_within(glyph_id, builder, &mut crate::work::OutlineWork::default())
+    }
+
+    /// [`Table::outline`] under `work`.
+    pub(crate) fn outline_within(
+        &self,
+        glyph_id: GlyphId,
+        builder: &mut dyn OutlineSink,
+        work: &mut crate::work::OutlineWork,
+    ) -> Result<Rect, CFFError> {
         let data = self
             .char_strings
             .get(u32::from(glyph_id.0))
             .ok_or(CFFError::NoGlyph)?;
-        parse_char_string(data, self, glyph_id, false, builder).map(|v| v.0)
+        parse_char_string(data, self, glyph_id, false, builder, work).map(|v| v.0)
     }
 
     /// Resolves a Glyph ID for a code point ([`Face::glyph_index`](crate::Face::glyph_index)).
@@ -861,8 +872,9 @@ impl<'a> Table<'a> {
         match self.kind {
             FontKind::SID(ref sid) => {
                 let data = self.char_strings.get(u32::from(glyph_id.0))?;
+                let mut work = crate::work::OutlineWork::default();
                 let (_, width) =
-                    parse_char_string(data, self, glyph_id, true, &mut NullSink).ok()?;
+                    parse_char_string(data, self, glyph_id, true, &mut NullSink, &mut work).ok()?;
                 let width = width
                     .map(|w| sid.nominal_width + w)
                     .unwrap_or(sid.default_width);

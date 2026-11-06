@@ -462,12 +462,18 @@ impl GooglePoolWorker {
 /// the identity Google proved at sign-in, and the grant file need only be present and open.
 /// Staged renewal uses the common bounded native sign-in budget and retains its publication and
 /// authority guards; its own canonical check is part of that sign-in.
+///
+/// # Errors
+///
+/// [`super::worker::Refused::SignedOut`] where the row is signed out here and no renewal replaced
+/// its grant for a reason that takes a person ([`renewal_refused`]), or the renewed row is still
+/// signed out; any other failure is [`super::worker::Refused::Preparation`].
 #[cfg(unix)]
 pub fn prepare_google_worker(
     seat: &Seat<'_>,
     program: &Path,
     starter: super::worker::Starter,
-) -> Result<Option<GooglePoolWorker>, String> {
+) -> Result<Option<GooglePoolWorker>, super::worker::Refused> {
     let lifetime = super::account_work::Lifetime::default();
     let scope = lifetime.enter().expect("new account lifetime admits work");
     prepare_google_worker_scoped(scope, seat, program, starter)
@@ -481,7 +487,7 @@ pub fn prepare_google_worker_scoped(
     seat: &Seat<'_>,
     program: &Path,
     starter: super::worker::Starter,
-) -> Result<Option<GooglePoolWorker>, String> {
+) -> Result<Option<GooglePoolWorker>, super::worker::Refused> {
     if scope.cancelled() {
         return Err("account work was cancelled".into());
     }
@@ -532,19 +538,38 @@ pub fn prepare_google_worker_scoped(
             if scope.cancelled() {
                 return Err("account work was cancelled".into());
             }
-            if result == super::cli::Renewal::Renewed {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Native Google staged renewal did not complete: {result:?}"
-                ))
-            }
+            renewal_refused(result)
         },
     );
     if scope.cancelled() {
         return Err("account work was cancelled".into());
     }
     result
+}
+
+/// What a renewal of a login signed out here leaves of a worker's launch. A
+/// sign-in that failed or wants a person, one onto the wrong account, and one that renewed another
+/// account all leave the login signed out, and read `why=signin`. One that could not run (a
+/// failure, a busy sign-in, a deferral or a bot check) leaves it signed out too, but reads
+/// `why=startup`: a later launch tries the renewal again, so no person is asked yet.
+///
+/// # Errors
+///
+/// Every outcome but [`super::cli::Renewal::Renewed`].
+#[cfg(unix)]
+fn renewal_refused(result: super::cli::Renewal) -> Result<(), super::worker::Refused> {
+    use super::cli::Renewal;
+    let words = format!("Native Google staged renewal did not complete: {result:?}");
+    match result {
+        Renewal::Renewed => Ok(()),
+        Renewal::AuthFailed
+        | Renewal::WrongAccount
+        | Renewal::OtherRenewed
+        | Renewal::NeedsPerson => Err(super::worker::Refused::SignedOut(words)),
+        Renewal::Failed | Renewal::SigninHeld | Renewal::Deferred | Renewal::BotCheck => {
+            Err(super::worker::Refused::Preparation(words))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -558,8 +583,8 @@ fn recover_google_worker_with(
         super::agy_signin::PublishedGoogleGrant,
         super::agy_signin::PublishedRefusal,
     >,
-    renew: impl FnOnce(&Row, &accounts::Logins) -> Result<(), String>,
-) -> Result<Option<GooglePoolWorker>, String> {
+    renew: impl FnOnce(&Row, &accounts::Logins) -> Result<(), super::worker::Refused>,
+) -> Result<Option<GooglePoolWorker>, super::worker::Refused> {
     let started = std::time::Instant::now();
     let captured = pool_snapshot(seat, Cli::Agy)?;
     let selection = GoogleSelection::read(seat, &captured.state)?;
@@ -578,7 +603,7 @@ fn recover_google_worker_with(
         }
     });
     let Some(row) = signed_out else {
-        return first;
+        return first.map_err(super::worker::Refused::Preparation);
     };
     // Drop the failed check's profile claim before staging. A policy change
     // or another renewal wins; neither permits authentication on this stale scope.
@@ -631,11 +656,22 @@ fn recover_google_worker_with(
         }
     }
     // A second signed-out answer terminates this attempt; never recurse into authentication.
+    let mut signed_out_again = false;
     let worker = prepare_google_worker_with(seat, starter, |row, profile| {
         if row != next {
             return Err("Renewed Google account changed before its check".into());
         }
-        check(row, profile).map_err(|error| error.to_string())
+        check(row, profile).map_err(|error| {
+            signed_out_again = matches!(error, super::agy_signin::PublishedRefusal::SignedOut);
+            error.to_string()
+        })
+    })
+    .map_err(|why| {
+        if signed_out_again {
+            super::worker::Refused::SignedOut(why)
+        } else {
+            super::worker::Refused::Preparation(why)
+        }
     })?
     .ok_or("Renewed Google profile lost its pool binding")?;
     if worker.selection != selection
@@ -1940,6 +1976,63 @@ pub fn launch_now<'a>(
     }
 }
 
+/// The row a worker with no starter of its kind would run on here, as the records stand: what a
+/// survey says of this Mac ([`super::cli::survey_accounts`]), so a placement weighs that row and no
+/// other. It reads no usage, records no claim and prepares no login. Claude Code's is the row on
+/// this machine's own login, unless [`accounts::claude_worker_move`], the task launcher's own rule,
+/// moves the worker. Every other CLI's is [`launch_now`]'s pick, or the row on this machine's own login where that takes no
+/// row, and for Codex only if a wall on it can show ([`codex_row_can_show_a_wall`]). `None` where
+/// the launch is refused, runs on a login no row lists, or is Codex's on one no read here can show a
+/// wall on. A launch also reads the row it picks and may leave it for a wall that read finds, which
+/// no record here can say.
+#[must_use]
+pub fn unstarted_launch_row<'a>(
+    (cli, keyring, mode): (Cli, bool, Mode),
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    program: Option<&Path>,
+    now: i64,
+) -> Option<&'a Row> {
+    if cli == Cli::Claude {
+        let own_login = accounts::ProcessLogin::of_env(std::iter::empty());
+        let from = roster.row(accounts::judged_label(roster, &own_login)?)?;
+        let moved = accounts::claude_worker_move(roster, state, enrolled, &own_login, mode, now);
+        return Some(moved.map_or(from, |(_, row)| row));
+    }
+    let row = match launch_now((cli, keyring, mode), roster, state, enrolled, program, now).ok()? {
+        Some(row) => row,
+        None => roster.row_for_login(None)?,
+    };
+    (cli != Cli::Codex || codex_row_can_show_a_wall(keyring, mode, roster, enrolled, row))
+        .then_some(row)
+}
+
+/// Whether anything here can show a wall on `row`, the one a Codex launch would run on. Under
+/// rotation its launch reads it ([`read_launch_rows`], [`read_lone_wall`]). A launch under rotation
+/// off reads nothing, the owner's pin or not, so only the row's own rollouts can, and those speak for
+/// a row only where no other is enrolled here (`row_rollout_sample`). A login the OS keyring holds
+/// has neither: its launch reads nothing and a survey reads no rollout of it. A row with no login
+/// here has no wall to show, and a launch on it meets a sign-in, which that row names.
+fn codex_row_can_show_a_wall(
+    keyring: bool,
+    mode: Mode,
+    roster: &Roster,
+    enrolled: &std::collections::BTreeSet<String>,
+    row: &Row,
+) -> bool {
+    if keyring {
+        return false;
+    }
+    if mode != Mode::Off || !enrolled.contains(&row.label) {
+        return true;
+    }
+    !roster
+        .rows
+        .iter()
+        .any(|other| other.label != row.label && enrolled.contains(&other.label))
+}
+
 /// Observe the login a launch would take after rejecting known stored identity contradictions.
 /// Unpinned failed rows are excluded from temporary selection state, as failed preparations are
 /// at launch. This reads no usage, prepares no overlay and changes no account records.
@@ -2217,7 +2310,7 @@ fn pick_row<'a>(
 /// A launch's refusal where `cli`'s pool has no usable row.
 fn unusable(cli: Cli) -> String {
     format!(
-        "{} account pool has no usable account; inspect `{}`",
+        "{} account pool has no usable account; see `{}`",
         cli.id(),
         super::accounts_step::Step::Report(cli)
     )
@@ -2276,9 +2369,9 @@ fn off_claim_refused(cli: Cli, label: &str, why: accounts::WhyNot) -> String {
         other => other.as_str().to_owned(),
     };
     format!(
-        "{} account `{label}`, the owner's pin under `accounts = \"off\"`, is not this Mac's to \
-         use now: {because}; `{}` ends the pin, after which a launch takes no row and runs on the \
-         login its starter carries{NO_WORKER}",
+        "{} pin `{label}` is not this Mac's now: {because}; `{}` ends the owner's pin under \
+         `accounts = \"off\"`, after which a launch takes no row and runs on the login its starter \
+         carries{NO_WORKER}",
         cli.id(),
         unpin_line(cli)
     )

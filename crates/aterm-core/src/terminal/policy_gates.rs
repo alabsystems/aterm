@@ -19,6 +19,9 @@ const XTWINOPS_MAX_PS: u16 = 24;
 /// The rate-limit id the response sink debits once per reply ([`PolicyState`], [`RateLimitSlot`]).
 pub(super) const RESPONSE_LIMIT_ID: &str = "response";
 
+/// The rate-limit id a program notification (OSC 9, 99 or 777) debits once.
+pub(super) const NOTIFICATIONS_LIMIT_ID: &str = "notifications";
+
 const XTWINOPS_GATES: usize = XTWINOPS_MAX_PS as usize + 1;
 const SHELL_MAJORS: [u32; 2] = [133, 633];
 const SHELL_SUBCOMMANDS: usize = 26;
@@ -124,6 +127,8 @@ pub(super) struct PolicyState {
     shell: [[BridgeDecision; SHELL_SUBCOMMANDS]; SHELL_MAJORS.len()],
     /// The [`RESPONSE_LIMIT_ID`] bucket's slot in `engine`'s limiter set ([`Default`]).
     response_limit: RateLimitSlot,
+    /// The [`NOTIFICATIONS_LIMIT_ID`] bucket's slot in `engine`'s limiter set.
+    notifications_limit: RateLimitSlot,
 }
 
 impl PolicyState {
@@ -136,6 +141,7 @@ impl PolicyState {
             xtwinops: compile_xtwinops(None),
             shell: compile_shell(None),
             response_limit: RateLimitSlot::UNDECLARED,
+            notifications_limit: RateLimitSlot::UNDECLARED,
         }
     }
 
@@ -145,6 +151,7 @@ impl PolicyState {
         self.xtwinops = compile_xtwinops(Some(&engine));
         self.shell = compile_shell(Some(&engine));
         self.response_limit = engine.rate_limit_slot(RESPONSE_LIMIT_ID);
+        self.notifications_limit = engine.rate_limit_slot(NOTIFICATIONS_LIMIT_ID);
         self.engine = Some(engine);
     }
 
@@ -201,6 +208,20 @@ impl PolicyState {
     ) -> Option<bool> {
         let engine = self.engine.as_mut()?;
         Some(engine.rate_limit_try_consume_slot(self.response_limit, amount, clock))
+    }
+
+    /// Debit one program notification from the installed policy's [`NOTIFICATIONS_LIMIT_ID`]
+    /// bucket, or `None` when no installed policy declares one.
+    #[inline]
+    pub(super) fn notification_limit_try_consume<T: TimeSource>(
+        &mut self,
+        clock: &T,
+    ) -> Option<bool> {
+        if self.notifications_limit == RateLimitSlot::UNDECLARED {
+            return None;
+        }
+        let engine = self.engine.as_mut()?;
+        Some(engine.rate_limit_try_consume_slot(self.notifications_limit, 1, clock))
     }
 
     /// Look up a rate-limit configuration in the installed policy.
@@ -265,6 +286,7 @@ impl super::checkpoint_heap::Heap for PolicyState {
             xtwinops: _,
             shell: _,
             response_limit: _,
+            notifications_limit: _,
         } = self;
         const _: () = assert!(
             !std::mem::needs_drop::<(

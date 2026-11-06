@@ -18,7 +18,7 @@ use crate::{Event, MeshLog};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Instant;
 
@@ -39,12 +39,24 @@ struct Fake {
     egress: Mutex<Option<Weak<Egress>>>,
     changed: Mutex<u64>,
     moved: Condvar,
+    /// Whether the stand-in fails to read its inventory, as a store whose read fails: an
+    /// `Inventory` it answers ends before its greeting ([`Self::refuse`]).
+    refuses: AtomicBool,
+    /// The tables the stand-in does not take, as a vault whose Commons policy excludes them:
+    /// their records are refused, and an `Inventory` is given none ([`Self::exclude`]).
+    excludes: Mutex<BTreeSet<Digest>>,
 }
 
-/// The records of a stand-in store file: its newline-terminated lines. The egress threads and the
-/// test append to one file at once, so a line still being written (no newline yet) is no record
-/// until it is whole.
+/// Every stand-in store file is read and written under this, in this process: a store's own writes
+/// (the test's thread) and its ingest (the mesh's) append to one file at once, and an append counts
+/// the file's records under it ([`append_line`]).
+static FILES: Mutex<()> = Mutex::new(());
+
+/// The records of a stand-in store file: its newline-terminated lines, read under [`FILES`]. A child
+/// process appends under no lock of this one ([`child_append`]), so a line still being written (no
+/// newline yet) is no record until it is whole.
 fn lines(path: &Path) -> Vec<String> {
+    let _files = lock(&FILES);
     std::fs::read_to_string(path)
         .map(|text| {
             text.split_inclusive('\n')
@@ -55,9 +67,12 @@ fn lines(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Append one record as one write, its newline included: `writeln!` on a `File` writes the line
-/// and its newline apart, so two threads appending at once could join two records into one line.
-fn append_line(path: &Path, line: &str) {
+/// Append `line` to the stand-in file at `path` as one write, its newline included (`writeln!` on a
+/// `File` writes the line and its newline apart, so two appends at once could join two records into
+/// one line): how many lines it holds then, counted under the same guard, so another append cannot
+/// land between the two and give both one length.
+fn append_line(path: &Path, line: &str) -> u64 {
+    let _files = lock(&FILES);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -67,6 +82,12 @@ fn append_line(path: &Path, line: &str) {
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
     file.write_all(&bytes).expect("a stand-in record");
+    // Its records are its newline-terminated lines, as [`lines`] reads them.
+    std::fs::read(path)
+        .expect("the stand-in store file")
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count() as u64
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -95,6 +116,8 @@ impl Fake {
             egress: Mutex::new(None),
             changed: Mutex::new(0),
             moved: Condvar::new(),
+            refuses: AtomicBool::new(false),
+            excludes: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -187,8 +210,7 @@ impl Fake {
     /// Append `wire` of `kind` to `table`, feeding the egress as the store's sink does.
     fn append(&self, table: &Digest, kind: Kind, wire: &[u8], mesh: bool) {
         let file = self.table_file(table);
-        append_line(&file, &format!("{} {}", kind.byte(), hex(wire)));
-        let length = lines(&file).len() as u64;
+        let length = append_line(&file, &format!("{} {}", kind.byte(), hex(wire)));
         if let Some(egress) = self.egress() {
             egress.feed(Feed::Table {
                 key: TableKey {
@@ -223,6 +245,16 @@ impl Fake {
         self.bump();
     }
 
+    /// Fail (`on`) or serve every read of this stand-in's inventory.
+    fn refuse(&self, on: bool) {
+        self.refuses.store(on, Ordering::Release);
+    }
+
+    /// Take no record of `table` from now on.
+    fn exclude(&self, table: Digest) {
+        lock(&self.excludes).insert(table);
+    }
+
     /// A local write: `writer` writes `text` to the test's table.
     fn write(&self, writer: &str, text: &str) {
         self.append(
@@ -246,10 +278,14 @@ impl Fake {
             })
             .map(|line| line + "\n")
             .collect();
-        // A reader racing the rewrite reads the file before or after it, never a cut of it.
-        let next = file.with_extension("next");
-        std::fs::write(&next, kept).expect("the stand-in store file");
-        std::fs::rename(&next, &file).expect("the stand-in store file");
+        {
+            // A reader racing the rewrite (a child process takes no lock of this one) reads the
+            // file before or after it, never a cut of it.
+            let _files = lock(&FILES);
+            let next = file.with_extension("next");
+            std::fs::write(&next, kept).expect("the stand-in store file");
+            std::fs::rename(&next, &file).expect("the stand-in store file");
+        }
         self.bump();
     }
 
@@ -264,6 +300,12 @@ impl Fake {
 
 impl Stores for Fake {
     fn ingest_table(&self, table: Digest, kind: Kind, wires: &[Vec<u8>]) -> Vec<Verdict> {
+        if lock(&self.excludes).contains(&table) {
+            return vec![
+                Verdict::Refused("the stand-in does not take this table".to_owned());
+                wires.len()
+            ];
+        }
         wires
             .iter()
             .map(|wire| {
@@ -345,6 +387,10 @@ impl Stores for Fake {
             .collect())
     }
 
+    fn takes(&self, table: Digest) -> io::Result<bool> {
+        Ok(!lock(&self.excludes).contains(&table))
+    }
+
     fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>> {
         let records = self.records(&table);
         Ok(
@@ -392,6 +438,11 @@ impl Stores for Fake {
     }
 
     fn members_inventory(&self) -> io::Result<BTreeSet<Digest>> {
+        if self.refuses.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "the stand-in refuses to read its inventory",
+            ));
+        }
         Ok(self.members().iter().map(|r| stores::digest(r)).collect())
     }
 
@@ -857,6 +908,110 @@ fn a_record_cut_below_a_sleeping_macs_cursor_reaches_it_by_one_inventory() {
     }
 }
 
+/// A table a Mac never held, first written and cut from every log while it was away, reaches it
+/// by the `Inventory` its return starts, which gives it a table only the other side holds; a
+/// table its stores do not take is given it by none. With `BOTH_HOLD_ONLY` on (the rule before
+/// §11 B8), the exchange runs and moves nothing.
+#[test]
+fn a_table_first_written_and_cut_while_a_mac_was_away_reaches_it_by_inventory() {
+    /// A table B's stores do not take.
+    const OTHER: Digest = [0x6b; 32];
+    for one_sided in [true, false] {
+        crate::inventory::BOTH_HOLD_ONLY.with(|on| on.set(!one_sided));
+        let lab = Lab::new();
+        let mut macs: Vec<(Mac, Arc<Fake>)> =
+            (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+        start_all(&lab, &mut macs);
+        macs[1].1.exclude(OTHER);
+        // B goes away before either table has a record, so it never held one; A writes both, and
+        // its log, the only one that holds them, is cut past them.
+        macs[1].0.stop();
+        macs[0].1.write("w", "first");
+        macs[0]
+            .1
+            .append(&TABLE, Kind::Conflict, b"w|a-conflict", false);
+        macs[0]
+            .1
+            .append(&OTHER, Kind::Operation, b"w|not-taken", false);
+        let egress = macs[0].0.mesh().egress().expect("an egress");
+        for (table, length) in [(TABLE, 2), (OTHER, 1)] {
+            let key = TableKey {
+                table,
+                recovery: false,
+            };
+            assert!(egress.wait_published(key, length, Instant::now() + HANG));
+        }
+        let last = [TABLE, OTHER]
+            .iter()
+            .map(|table| egress.last_published(table).expect("A published it"))
+            .max()
+            .expect("two tables");
+        let ingest = macs[0].0.mesh().ingest().expect("an ingest consumer");
+        assert!(ingest.wait_committed_for_test(last, Instant::now() + HANG));
+        let floor = ingest.floor(macs[0].0.mesh());
+        assert!(floor > last, "the floor {floor} passes the last at {last}");
+        macs[0]
+            .0
+            .mesh()
+            .cut_tables_for_test(floor)
+            .expect("the cut");
+        assert!(!log_holds(&macs[0].0, "first"), "the cut passed the table");
+        let mark = macs[0].0.seen.mark();
+        macs[1].0.start(&lab);
+        macs[1]
+            .1
+            .serve(&macs[1].0.mesh().egress().expect("an egress"));
+        lab.tick();
+        // A's relay reads the gap and asks the exchange. A reports it once it read B's batches,
+        // which B sends after it took every record A gave it.
+        macs[0].0.seen.until("A's gap exchange ends", |events| {
+            started_for(events, mark, Reason::Gap) >= 1
+        });
+        for (mac, _) in &macs {
+            let inventory = mac.mesh().inventory().expect("an Inventory");
+            assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+        }
+        let sent: usize = lock(&macs[0].0.seen.events)
+            .iter()
+            .skip(mark)
+            .filter_map(|event| match event {
+                Event::Inventory {
+                    reason: Some(Reason::Gap),
+                    sent,
+                    ..
+                } => Some(*sent),
+                _ => None,
+            })
+            .sum();
+        let held = |fake: &Fake, table: &Digest| -> BTreeSet<(Kind, Vec<u8>)> {
+            fake.records(table).into_iter().collect()
+        };
+        if one_sided {
+            assert_eq!(
+                held(&macs[1].1, &TABLE),
+                held(&macs[0].1, &TABLE),
+                "B holds every record of the table it never held"
+            );
+            assert_eq!(
+                sent, 2,
+                "A gave B the table's two records, and none of the other's"
+            );
+            assert!(
+                !log_holds(&macs[1].0, "first"),
+                "the record reached B by the exchange, in no log of B's"
+            );
+        } else {
+            assert_eq!(sent, 0, "the both-hold rule moves nothing");
+            assert!(held(&macs[1].1, &TABLE).is_empty());
+        }
+        assert!(
+            held(&macs[1].1, &OTHER).is_empty() && !macs[1].1.table_file(&OTHER).exists(),
+            "B was given a table its stores do not take"
+        );
+        crate::inventory::BOTH_HOLD_ONLY.with(|on| on.set(false));
+    }
+}
+
 /// The offset of the table operation on `mac`'s `tables.log` whose text is `text`.
 fn offset_of(mac: &Mac, text: &str) -> u64 {
     offset_carrying(mac, format!("|{text}").as_bytes())
@@ -970,6 +1125,30 @@ fn a_neighbour_that_lost_what_it_answered_gets_it_back_by_the_lineage_exchange()
                 "the lost record came back with no lineage exchange"
             );
         }
+    }
+}
+
+/// Whether `mac`'s `tables.log` holds the table operation whose text is `text`, of what it keeps:
+/// a cut leaves the log complete only from its oldest, and a fetch below that is refused.
+fn log_holds(mac: &Mac, text: &str) -> bool {
+    let tail = format!("|{text}");
+    let mut client = mac
+        .mesh()
+        .read_client(MeshLog::Tables, "/t/>", Some(HANG))
+        .expect("a reader");
+    let mut from = client.oldest("/t/>").expect("the oldest").0.unwrap_or(0);
+    loop {
+        let (page, (next, head)) = client.fetch(from, "/t/>", 1024).expect("a page");
+        if page
+            .iter()
+            .any(|(_, _, body)| body.windows(tail.len()).any(|w| w == tail.as_bytes()))
+        {
+            return true;
+        }
+        if next >= head {
+            return false;
+        }
+        from = next;
     }
 }
 
@@ -1621,3 +1800,110 @@ fn a_push_another_process_asks_is_answered_by_the_nodes_relay() {
         "no node answers"
     );
 }
+
+/// `a`'s link to `b`.
+fn link_between(a: &Mac, b: &Mac) -> Arc<aterm_net::fleet::link::Link> {
+    a.run
+        .as_ref()
+        .expect("A runs")
+        .table
+        .links()
+        .into_iter()
+        .find(|link| astream_broker::identity_principal(link.peer().key.bytes()) == b.principal)
+        .expect("a link to B")
+}
+
+/// Cut `b` off, and wait until `a`'s relays to it ended.
+fn cut_off(lab: &Lab, a: &Mac, b: &Mac) {
+    let since = a.seen.mark();
+    b.cut(lab);
+    a.seen.until("A's relays to B end", |events| {
+        let ended: BTreeSet<MeshLog> = events
+            .iter()
+            .skip(since)
+            .filter_map(|event| match event {
+                Event::Ended { peer, log, .. } if *peer == b.principal => Some(*log),
+                _ => None,
+            })
+            .collect();
+        ended.len() == MeshLog::ALL.len()
+    });
+}
+
+/// Whether `a` ran an `Inventory` with `b` for `NewLink` from event `since` on: an exchange that
+/// opened a link, not one skipped as quiet.
+fn ran_new_link(events: &[Event], b: &Mac, since: usize) -> bool {
+    events.iter().skip(since).any(|event| {
+        matches!(
+            event,
+            Event::Inventory {
+                peer,
+                reason: Some(Reason::NewLink),
+                ..
+            } if *peer == b.principal
+        )
+    })
+}
+
+/// Heal `b`'s cut and wait until `a`'s relays follow it again and `a` ran its `NewLink` exchange
+/// with `b` there. The relays resume with their cursors and ask nothing, so the exchange is the
+/// one asked before the cut.
+fn heal_until_ran(lab: &Lab, a: &Mac, b: &Mac) {
+    let since = a.seen.mark();
+    b.heal(lab);
+    a.until_following(&[b], since);
+    a.seen.until("the ask runs over the next link", |events| {
+        ran_new_link(events, b, since)
+    });
+}
+
+/// An ask outlives the link it was asked over: one whose link closed before the worker ran it (a
+/// duplicate that replaced a new link, before its start's `NewLink` ask ran) runs over the
+/// neighbour's next link, though the relay that resumes there with its cursor asks nothing itself.
+#[test]
+fn an_ask_whose_link_closed_runs_over_the_next() {
+    let lab = Lab::new();
+    let mut macs: Vec<(Mac, Arc<Fake>)> =
+        (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+    start_all(&lab, &mut macs);
+    let (a, b) = (&macs[0].0, &macs[1].0);
+    let link = link_between(a, b);
+    cut_off(&lab, a, b);
+    // A's summary moves past the one its first exchange left quiet, so the ask opens a link.
+    macs[0].1.write("w", "while-cut");
+    let inventory = a.mesh().inventory().expect("an Inventory");
+    inventory.request(&b.principal, &link, Reason::NewLink);
+    assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+    heal_until_ran(&lab, a, b);
+}
+
+/// An exchange that broke off on its link runs again over the neighbour's next link: B's store
+/// fails the exchange A asks over their live link, and once it serves again, A's ask runs over
+/// the link the heal of a cut opens, where the relays resume with their cursors and ask nothing.
+#[test]
+fn an_exchange_that_broke_off_runs_again_over_the_next_link() {
+    let lab = Lab::new();
+    let mut macs: Vec<(Mac, Arc<Fake>)> =
+        (1..=2).map(|tag| tables_mac(&lab, tag, &["w"])).collect();
+    start_all(&lab, &mut macs);
+    let (a, b) = (&macs[0].0, &macs[1].0);
+    let link = link_between(a, b);
+    macs[1].1.refuse(true);
+    // A's summary moves past the one its first exchange left quiet, so the ask opens the link.
+    macs[0].1.write("w", "unanswered");
+    let inventory = a.mesh().inventory().expect("an Inventory");
+    let since = a.seen.mark();
+    inventory.request(&b.principal, &link, Reason::NewLink);
+    assert!(inventory.wait_idle_for_test(Instant::now() + HANG));
+    assert!(
+        !ran_new_link(&lock(&a.seen.events), b, since),
+        "the exchange broke off"
+    );
+    macs[1].1.refuse(false);
+    cut_off(&lab, a, b);
+    heal_until_ran(&lab, a, b);
+}
+
+/// `MeshRelay`'s conformance (§11 B8), on this lab's Macs and stand-in stores.
+#[path = "relay_conformance_tests.rs"]
+mod relay_conformance;

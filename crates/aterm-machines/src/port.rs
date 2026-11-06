@@ -2672,6 +2672,8 @@ mod fake {
         /// What [`System::full_disk_access`] answers: `None`, not measured, unless a test
         /// grants it.
         pub full_disk_access: Option<bool>,
+        /// Native keyboard service IDs; unscripted, the inert machine has no services.
+        pub keyboard_services: Option<Result<Vec<u64>, String>>,
         /// What [`System::running_app`] answers: `None` unless a test names a bundle.
         pub running_app: Option<PathBuf>,
         /// What [`System::volume`] answers for every path: `None`, unread, unless a test sets
@@ -3518,6 +3520,16 @@ mod fake {
     }
 
     impl System for Fake {
+        fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("keyboard-service-ids".into());
+            self.keyboard_services
+                .clone()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
         fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {
             self
         }

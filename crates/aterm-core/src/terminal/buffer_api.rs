@@ -348,7 +348,16 @@ impl Terminal {
         pending
     }
 
-    /// Pops the oldest queued OSC app-event `(code, payload)`.
+    /// Queue OSC app-events for [`Self::take_osc_event`] (`true`), or drop the queued ones and
+    /// queue none (`false`, the default). A host that never drains the queue leaves it off, so
+    /// the terminal keeps no events for it and a row splice has none to move.
+    #[inline]
+    pub fn set_osc_event_polling(&mut self, on: bool) {
+        self.transient.osc_events.set_polled(on);
+    }
+
+    /// Pops the oldest queued OSC app-event `(code, payload)`; none unless the host polls
+    /// ([`Self::set_osc_event_polling`]).
     #[inline]
     #[must_use]
     pub fn take_osc_event(&mut self) -> Option<(u32, String)> {
@@ -712,6 +721,7 @@ mod tests {
         let drain =
             |term: &mut Terminal| std::iter::from_fn(|| term.take_osc_event()).collect::<Vec<_>>();
         let mut unreset = Terminal::new(24, 80);
+        unreset.set_osc_event_polling(true);
         unreset.process(sent);
         let all = drain(&mut unreset);
         let has = |code: u32, part: &str| {
@@ -728,6 +738,7 @@ mod tests {
             ("the host's reset", None),
         ] {
             let mut term = Terminal::new(24, 80);
+            term.set_osc_event_polling(true);
             match erase {
                 Some(bytes) => term.process(&[sent, bytes].concat()),
                 None => {
@@ -791,6 +802,7 @@ mod tests {
     #[test]
     fn osc_7_queues_real_cwd_path() {
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.process(b"\x1b]7;file://host/home/user/project\x07");
         assert_eq!(term.current_working_directory(), Some("/home/user/project"));
         assert_eq!(
@@ -808,6 +820,7 @@ mod tests {
     #[test]
     fn osc_133_marks_queue_real_payloads() {
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.process(b"\x1b]133;A\x07");
         term.process(b"\x1b]133;B\x07");
         term.process(b"\x1b]133;C\x07");
@@ -820,10 +833,114 @@ mod tests {
         assert_eq!(codes[3].1, "D;exit=42", "D carries the real exit code");
     }
 
+    /// One shell prompt's marks, cwd and clipboard write: four OSC 133 marks, an OSC 7 and an
+    /// OSC 52, each of which a polling host is told of.
+    fn prompt(i: usize) -> Vec<u8> {
+        format!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07echo {i}\r\n\x1b]133;C\x07{i}\r\n\x1b]133;D;0\x07\
+             \x1b]7;file:///tmp/{i}\x07\x1b]52;c;aGk=\x07"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_host_that_never_polls_is_queued_no_osc_event() {
+        let mut term = Terminal::new(24, 80);
+        term.authorize_clipboard_access(crate::terminal::ClipboardAccess::Write);
+        for i in 0..300 {
+            term.process(&prompt(i));
+        }
+        assert!(
+            !term.has_osc_events(),
+            "nobody drains the queue, so it holds nothing"
+        );
+        assert_eq!(term.transient.osc_events.bytes(), 0);
+
+        term.set_osc_event_polling(true);
+        term.process(&prompt(300));
+        assert_eq!(
+            std::iter::from_fn(|| term.take_osc_event()).count(),
+            6,
+            "a polling host is told of each"
+        );
+        term.process(&prompt(301));
+        term.set_osc_event_polling(false);
+        assert!(
+            !term.has_osc_events(),
+            "turning polling off drops what was queued"
+        );
+        term.process(&prompt(302));
+        assert!(!term.has_osc_events());
+    }
+
+    /// A region scroll that archives a row splices the absolute rows at every CSI; the queued
+    /// marks it walks are the ones it can move, so marks left in history cost it nothing.
+    #[test]
+    fn a_region_scroll_walks_no_queued_mark_it_cannot_move() {
+        use super::super::transient_state::{OscEventQueue, shift_meter};
+        let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
+        for i in 0..300 {
+            term.process(&prompt(i));
+        }
+        term.process(&b"\r\n".repeat(30));
+        let queued = term.transient.osc_events.snapshot();
+        assert_eq!(queued.len(), OscEventQueue::MAX_EVENTS, "the queue is full");
+        let mut scroll = b"\x1b[1;23r\x1b[23;1H".to_vec();
+        for _ in 0..4096 {
+            scroll.extend_from_slice(b"\n\x1b[m");
+        }
+        let history = term.grid().scrollback_lines();
+        let _ = shift_meter::take();
+        term.process(&scroll);
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            history + 4096,
+            "every line spliced"
+        );
+        assert_eq!(shift_meter::take(), 0, "no mark sat at or past a splice");
+        assert_eq!(
+            term.transient.osc_events.snapshot(),
+            queued,
+            "and none moved"
+        );
+
+        // A mark on the protected footer row rides it down by every spliced row.
+        term.process(b"\x1b[r\x1b[24;1H\x1b]133;A\x07");
+        let footer = term
+            .transient
+            .osc_events
+            .snapshot()
+            .pop()
+            .expect("the footer mark");
+        let row = |payload: &str| -> u64 {
+            let (_, rest) = payload.split_once(";row=").expect("a row");
+            rest.split_once(";col=")
+                .expect("a col")
+                .0
+                .parse()
+                .expect("a number")
+        };
+        term.process(&scroll);
+        let moved = term
+            .transient
+            .osc_events
+            .snapshot()
+            .pop()
+            .expect("the footer mark");
+        assert_eq!(row(&moved.1), row(&footer.1) + 4096);
+        assert_eq!(
+            term.transient.osc_events.snapshot().len(),
+            OscEventQueue::MAX_EVENTS
+        );
+        assert!(term.transient.osc_events.bytes() <= OscEventQueue::MAX_BYTES);
+    }
+
     #[test]
     fn osc_52_flood_is_held_to_the_event_byte_budget() {
         use super::super::transient_state::OscEventQueue;
         let mut term = Terminal::new(24, 80);
+        term.set_osc_event_polling(true);
         term.authorize_clipboard_access(crate::terminal::ClipboardAccess::Write);
         let payload = |i: u8| char::from(b'a' + i % 26).to_string().repeat(60_000);
         for i in 0..40 {

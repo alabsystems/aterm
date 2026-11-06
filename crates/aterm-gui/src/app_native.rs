@@ -8248,7 +8248,7 @@ impl App {
         match (disposition, outcome) {
             (AttemptDisposition::Complete, UpdateOutcome::Accepted) => {
                 aterm_log::info!(
-                    "update auto-apply started for build {} (new process launching; \
+                    "update auto-apply accepted for build {} (handoff preparation; \
                      attempt {})",
                     intent.build,
                     intent.attempts
@@ -9076,64 +9076,7 @@ impl App {
                     self.apply_staged_update_now(safety_token, mode, Some(worker_attempt), None)
                 }) {
                     Ok(()) => UpdateOutcome::Accepted,
-                    #[cfg(unix)]
-                    Err(error) if error.held_for_read_of().is_some() => {
-                        let held = error.held_for_read_of();
-                        let message = error.into_message();
-                        if self.native_updater_service.abort_apply(&attempt, message) {
-                            self.publish_native_update_state();
-                        }
-                        if let Some(held) = held {
-                            self.hold_person_apply(held);
-                        }
-                        UpdateOutcome::Accepted
-                    }
-                    #[cfg(unix)]
-                    Err(error) if error.is_activity_deferred() => {
-                        let message = error.into_message();
-                        if self
-                            .native_updater_service
-                            .abort_apply(&attempt, message.clone())
-                        {
-                            self.publish_native_update_state();
-                        }
-                        UpdateOutcome::Deferred { reason: message }
-                    }
-                    Err(error) if error.is_refused() => {
-                        let message = error.into_message();
-                        if self
-                            .native_updater_service
-                            .abort_apply(&attempt, message.clone())
-                        {
-                            self.publish_native_update_state();
-                        }
-                        UpdateOutcome::Blocked {
-                            reasons: vec![message],
-                        }
-                    }
-                    #[cfg(unix)]
-                    Err(error) if error.is_park_missed() => {
-                        let message = error.into_message();
-                        if self
-                            .native_updater_service
-                            .abort_apply(&attempt, message.clone())
-                        {
-                            self.publish_native_update_state();
-                        }
-                        self.fork_park_miss_outcome(&attempt, mode, message)
-                    }
-                    #[cfg(unix)]
-                    Err(error) if error.is_capture_refused() => {
-                        let message = error.into_message();
-                        if self
-                            .native_updater_service
-                            .abort_apply(&attempt, message.clone())
-                        {
-                            self.publish_native_update_state();
-                        }
-                        fork_capture_refusal_outcome(mode, message)
-                    }
-                    Err(error) => self.abort_unstarted_native_apply(&attempt, error.into_message()),
+                    Err(error) => self.unstarted_native_apply_outcome(&attempt, mode, error),
                 }
             }
             ApplyDecision::Blocked(reasons) => {
@@ -9146,6 +9089,53 @@ impl App {
             ApplyDecision::Ignored => UpdateOutcome::Failed {
                 message: "updater apply preflight became stale".to_string(),
             },
+        }
+    }
+
+    /// Keep failures before and after asynchronous account settlement in the same lane.
+    pub(crate) fn unstarted_native_apply_outcome(
+        &mut self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+        mode: ApplyMode,
+        error: crate::UpdateHandoffStartError,
+    ) -> UpdateOutcome {
+        #[cfg(not(unix))]
+        let _ = mode;
+        if self
+            .native_updater_service
+            .abort_apply(attempt, error.to_string())
+        {
+            self.publish_native_update_state();
+        }
+        match error {
+            #[cfg(unix)]
+            crate::UpdateHandoffStartError::HeldForRead {
+                target_build,
+                until,
+                ..
+            } => {
+                self.hold_person_apply(crate::HeldPersonApply {
+                    target_build,
+                    until,
+                });
+                UpdateOutcome::Accepted
+            }
+            #[cfg(unix)]
+            crate::UpdateHandoffStartError::ActivityDeferred(reason) => {
+                UpdateOutcome::Deferred { reason }
+            }
+            crate::UpdateHandoffStartError::Refused(message) => UpdateOutcome::Blocked {
+                reasons: vec![message],
+            },
+            #[cfg(unix)]
+            crate::UpdateHandoffStartError::ParkMissed(message) => {
+                self.fork_park_miss_outcome(attempt, mode, message)
+            }
+            #[cfg(unix)]
+            crate::UpdateHandoffStartError::CaptureRefused(message) => {
+                fork_capture_refusal_outcome(mode, message)
+            }
+            crate::UpdateHandoffStartError::Failed(message) => UpdateOutcome::Failed { message },
         }
     }
 
@@ -9576,9 +9566,28 @@ impl App {
     }
 
     #[cfg(any(unix, test))]
-    fn arm_activity_revoked_overlap_retry(
+    pub(crate) fn arm_activity_revoked_overlap_retry(
         &mut self,
         attempt: &crate::native_updater_service::ApplyAttemptTicket,
+    ) -> Option<std::time::Duration> {
+        self.arm_unstarted_overlap_retry(attempt, AutomaticRetryKind::ActivityRevoked)
+    }
+
+    /// A close preflight that became blocked while account work drained keeps the same
+    /// bounded cadence as a blocker found before that asynchronous wait.
+    #[cfg(unix)]
+    pub(crate) fn arm_account_preflight_retry(
+        &mut self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+    ) -> Option<std::time::Duration> {
+        self.arm_unstarted_overlap_retry(attempt, AutomaticRetryKind::PreflightBlocked)
+    }
+
+    #[cfg(any(unix, test))]
+    fn arm_unstarted_overlap_retry(
+        &mut self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+        kind: AutomaticRetryKind,
     ) -> Option<std::time::Duration> {
         let dmg_sha256 = decode_dmg_sha256(attempt.target_dmg_sha256())?;
         let build = attempt.target_build();
@@ -9592,8 +9601,7 @@ impl App {
                         < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
             })
             .map_or(0, |retry| retry.cycles);
-        let delay = automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked)
-            .expect("the activity-revoked spacing saturates and is never exhausted");
+        let delay = automatic_retry_delay(cycles, kind).unwrap_or(PREFLIGHT_BLOCK_COOLDOWN);
         self.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256,

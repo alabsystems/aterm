@@ -102,7 +102,8 @@ pub enum LaunchError {
     /// No authoritative no-child receipt was obtained. Retain uncertain custody.
     Refused(io::Error),
     /// This exact controlled attempt started no target. Pass the receipt to
-    /// [`Claim::cancel_cohort`] before treating its durable ARM as cancelled.
+    /// [`Claim::cancel_cohort`] or [`Claim::cancel_subgroup`] for the corresponding launch
+    /// before treating its durable ARM as cancelled.
     NotSpawned(Box<NotSpawned>),
     /// The target actually started, but BIND did not complete. Keep the owned child,
     /// retry its binding or supervise drain, and retain the original reservation.
@@ -162,6 +163,76 @@ pub(crate) fn launch(claim: &mut Claim, command: &mut Command) -> Result<CohortC
     launch_with(claim, command, Claim::bind_cohort)
 }
 
+pub(crate) fn launch_subgroup_with(
+    claim: &mut Claim,
+    root: &mut CohortChild,
+    command: &mut Command,
+    bind: impl FnOnce(&mut Claim, &mut Spawned) -> io::Result<Cohort>,
+) -> Result<CohortChild, LaunchError> {
+    // An actual live original root supplies launch authority. A numeric observation, a
+    // subgroup masquerading as the root, or a replaced child cannot register new work.
+    if !root.spawned.key().is_current() || !root.spawned.is_original_child() {
+        return Err(LaunchError::Refused(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subgroup launch needs the original current root child",
+        )));
+    }
+    let current = Cohort::of_child(root.spawned.child_mut()).map_err(LaunchError::Refused)?;
+    if current != root.cohort {
+        return Err(LaunchError::Refused(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subgroup root changed",
+        )));
+    }
+    let attempt = claim
+        .arm_subgroup(&root.cohort)
+        .map_err(LaunchError::Refused)?;
+    let mut spawned = command
+        .spawn_cohort(attempt)
+        .map_err(|failure| match failure {
+            SpawnFailure::NotSpawned(proof) => LaunchError::NotSpawned(proof),
+            SpawnFailure::Refused(error) => LaunchError::Refused(error),
+        })?;
+    match bind(claim, &mut spawned) {
+        Ok(cohort) => Ok(CohortChild { spawned, cohort }),
+        Err(error) => Err(LaunchError::Unbound {
+            spawned: Box::new(spawned),
+            error,
+        }),
+    }
+}
+
+pub(crate) fn launch_subgroup(
+    claim: &mut Claim,
+    root: &mut CohortChild,
+    command: &mut Command,
+) -> Result<CohortChild, LaunchError> {
+    launch_subgroup_with(claim, root, command, Claim::bind_subgroup_actual)
+}
+
+pub(crate) fn bind_subgroup(
+    claim: &mut Claim,
+    mut spawned: Spawned,
+) -> Result<CohortChild, LaunchError> {
+    match claim.bind_subgroup_actual(&mut spawned) {
+        Ok(cohort) => Ok(CohortChild { spawned, cohort }),
+        Err(error) => Err(LaunchError::Unbound {
+            spawned: Box::new(spawned),
+            error,
+        }),
+    }
+}
+
+pub(crate) fn retire_subgroup(claim: &mut Claim, subgroup: &CohortChild) -> io::Result<()> {
+    if !subgroup.spawned.key().is_current() || !subgroup.spawned.is_original_child() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subgroup retirement needs the original actual child",
+        ));
+    }
+    claim.retire_subgroup_actual(subgroup.spawned.key(), &subgroup.cohort)
+}
+
 pub(crate) fn launch_member(
     claim: &Claim,
     leader: &mut CohortChild,
@@ -193,3 +264,7 @@ pub(crate) fn launch_member(
 #[cfg(test)]
 #[path = "cohort_launch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cohort_subgroup_tests.rs"]
+mod subgroup_tests;

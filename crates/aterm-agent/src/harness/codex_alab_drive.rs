@@ -86,7 +86,7 @@ impl AlabKernel for Live {
         // lstat keeps dangling links unknown rather than following them to ENOENT.
         match std::fs::symlink_metadata(file) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Owner::Dead,
-            _ => aterm_uds::ownerlock::probe(file),
+            _ => aterm_uds::ownerlock::probe_any(file),
         }
     }
 

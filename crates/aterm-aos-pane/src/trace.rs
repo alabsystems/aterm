@@ -192,10 +192,10 @@ fn run(
     schema: &PaneSchema,
     code: &PrebuiltPane,
     start: PaneState,
+    start_digest: Digest,
     inputs: &[PaneInput],
     effects: &[EffectRecord],
 ) -> PaneCheck {
-    let start_digest = aterm_aos::task::state_digest(schema, &start);
     let mut port = ShadowPort::new(effects);
     let mut first_fail = None;
     let mut matched = 0usize;
@@ -313,10 +313,12 @@ impl PaneRecording {
     #[must_use]
     pub fn check(&self, code: PaneCode, build: &str) -> PaneCheck {
         let code = PrebuiltPane::new(code, build);
+        let start_digest = aterm_aos::task::state_digest(&self.schema, &self.start);
         run(
             &self.schema,
             &code,
             self.start.clone(),
+            start_digest,
             &self.inputs,
             &self.effects,
         )
@@ -326,6 +328,11 @@ impl PaneRecording {
     /// # Errors
     /// [`PaneTraceFault::Full`] past [`PANE_MAX_EVENTS`], or [`PaneTraceFault::Checkpoint`] or [`PaneTraceFault::Log`] for a state or input past the frame cap.
     pub fn trace(&self, code: PaneCode, build: &str) -> Result<PaneTrace, PaneTraceFault> {
+        if self.inputs.len() > PANE_MAX_EVENTS {
+            return Err(PaneTraceFault::Full(LogFull {
+                limit: PANE_MAX_EVENTS,
+            }));
+        }
         let prebuilt = PrebuiltPane::new(code, build);
         let identity = pane_identity(&prebuilt);
         let checkpoint = Checkpoint::capture(
@@ -341,30 +348,33 @@ impl PaneRecording {
                 parent: None,
             },
         );
-        let mut log = EventLog::<PaneSchema>::with_capacity(
-            LogHeader {
+        let start_digest = checkpoint.state_digest();
+        let ancestor = checkpoint.digest();
+        let checkpoint = checkpoint.encode().map_err(PaneTraceFault::Checkpoint)?;
+        let log = EventLog::<PaneSchema>::encode_inputs(
+            &self.schema,
+            &LogHeader {
                 identity: identity.clone(),
                 log_epoch: 0,
                 first_cursor: 0,
-                ancestor: checkpoint.digest(),
+                ancestor,
             },
-            PANE_MAX_EVENTS,
-            self.inputs.len(),
-        );
-        for i in &self.inputs {
-            log.push(i.clone()).map_err(PaneTraceFault::Full)?;
-        }
+            false,
+            &self.inputs,
+        )
+        .map_err(PaneTraceFault::Log)?;
         let check = run(
             &self.schema,
             &prebuilt,
             self.start.clone(),
+            start_digest,
             &self.inputs,
             &self.effects,
         );
         Ok(PaneTrace {
             identity,
-            checkpoint: checkpoint.encode().map_err(PaneTraceFault::Checkpoint)?,
-            log: log.encode(&self.schema).map_err(PaneTraceFault::Log)?,
+            checkpoint,
+            log,
             effects: self.effects.clone(),
             head_state: check.state_digest,
             head_chain: check.observation_chain,
@@ -457,8 +467,8 @@ impl PaneTrace {
             let identity = d.identity()?;
             let head_state = d.digest("trace.head_state")?;
             let head_chain = d.digest("trace.head_chain")?;
-            let checkpoint = d.bytes("trace.checkpoint")?.to_vec();
-            let log = d.bytes("trace.log")?.to_vec();
+            let checkpoint = d.bytes("trace.checkpoint")?;
+            let log = d.bytes("trace.log")?;
             let n = d.count("trace.effects", len_u64(PANE_MAX_EVENTS))?;
             let mut effects = Vec::with_capacity(n.min(body.len() / 46));
             for i in 0..n {
@@ -485,18 +495,19 @@ impl PaneTrace {
                     result: Vec::new(),
                 });
             }
-            Ok(PaneTrace {
-                identity,
-                checkpoint,
-                log,
-                effects,
-                head_state,
-                head_chain,
-            })
+            Ok((identity, checkpoint, log, effects, head_state, head_chain))
         })();
-        let trace = read.map_err(PaneTraceFault::Wire)?;
+        let (identity, checkpoint, log, effects, head_state, head_chain) =
+            read.map_err(PaneTraceFault::Wire)?;
         d.finish().map_err(PaneTraceFault::Wire)?;
-        Ok(trace)
+        Ok(PaneTrace {
+            identity,
+            checkpoint: checkpoint.to_vec(),
+            log: log.to_vec(),
+            effects,
+            head_state,
+            head_chain,
+        })
     }
 
     /// Refuses a trace whose identity no code of `build` runs, then replays it from its checkpoint on `origin` under that code, its replies shadowed by the recorded ones, judges it by `pane.faithful-replay`, and checks the replay reached the exporter's head.
@@ -573,7 +584,14 @@ impl PaneTrace {
         if tail != Tail::Clean {
             return Err(PaneTraceFault::Tail(tail));
         }
-        let check = run(&schema, &prebuilt, start, log.inputs(), &self.effects);
+        let check = run(
+            &schema,
+            &prebuilt,
+            start,
+            checkpoint.state_digest(),
+            log.inputs(),
+            &self.effects,
+        );
         if check.state_digest != self.head_state {
             return Err(PaneTraceFault::State {
                 recorded: self.head_state,

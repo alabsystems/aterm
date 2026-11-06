@@ -3,8 +3,8 @@
 
 //! The fold's key and the epoch a table writer seals under (one-mesh design §4.2 M6, §11 B11):
 //! the network key is HKDF-SHA-256 of the `[everyone]` key, a writer takes the lowest newest
-//! epoch it holds that wraps no removed recipient, and an epoch that still wraps a removed Mac is
-//! the view a writer waits on.
+//! epoch it holds that is not due a rotation (P1's gate, `Log::head_due`), and an epoch that is
+//! due is the view a writer waits on.
 
 use super::signed::{Mac, founded, three_macs};
 use crate::membership_log::{Body, EpochAudience, Log, RecordId, fold_network_key};
@@ -69,7 +69,7 @@ fn a_member_seals_under_its_newest_everyone_epoch_through_the_derived_key() {
         let view = log.fold_epoch_view(&mac.identity).unwrap().unwrap();
         assert_eq!(view.basis, epoch);
         assert_eq!(view.generation, 1);
-        assert!(!view.wraps_removed);
+        assert!(!view.due);
         assert_eq!(*view.key, *fold_network_key(log.network(), &epoch, &key));
         assert_eq!(
             *log.unwrap_fold_epoch(&epoch, &mac.identity)
@@ -94,7 +94,7 @@ fn a_held_remove_makes_the_view_wait_until_the_rotation_arrives() {
     let held = log.fold_epoch_view(&macs[1].identity).unwrap().unwrap();
     assert_eq!(held.basis, first);
     assert!(
-        held.wraps_removed,
+        held.due,
         "the newest epoch still wraps the removed Mac: a writer waits"
     );
     assert!(log.fold_epoch_view(&macs[2].identity).unwrap().is_none());
@@ -107,13 +107,13 @@ fn a_held_remove_makes_the_view_wait_until_the_rotation_arrives() {
     for mac in &macs[..2] {
         let view = log.fold_epoch_view(&mac.identity).unwrap().unwrap();
         assert_eq!(view.basis, second);
-        assert!(!view.wraps_removed);
+        assert!(!view.due);
         assert_eq!(*view.key, *fold_network_key(log.network(), &second, &key));
     }
 }
 
-/// M6: among concurrent newest epochs a writer takes the lowest id that wraps no removed
-/// recipient, and only when none qualifies the lowest that does (and waits).
+/// M6: among concurrent newest epochs a writer takes the lowest id that is not due, and only
+/// when none qualifies the lowest that is (and waits).
 #[test]
 fn concurrent_heads_resolve_to_the_lowest_qualifying_id() {
     let (macs, entrants) = three_macs();
@@ -144,9 +144,10 @@ fn concurrent_heads_resolve_to_the_lowest_qualifying_id() {
     remove(&mut removed, &macs, 2);
     let waiting = removed.fold_epoch_view(&macs[0].identity).unwrap().unwrap();
     assert_eq!(waiting.basis, lowest);
-    assert!(waiting.wraps_removed);
-    // A head that wraps the removed Mac yields to a concurrent one that does not, whatever
-    // their ids; the two are minted on separate branches, so both stay newest.
+    assert!(waiting.due);
+    // A head that wraps the removed Mac yields to a concurrent one that follows the `Remove` and
+    // does not, whatever their ids; the two are minted on separate branches, so both stay
+    // newest.
     let (macs2, entrants2) = three_macs();
     let (base2, _, _) = founded(&macs2, &entrants2);
     let mut left = base2.clone();
@@ -158,16 +159,56 @@ fn concurrent_heads_resolve_to_the_lowest_qualifying_id() {
         2,
         2_000,
     );
-    let b = mint(&mut right, &macs2[1], &[&macs2[0], &macs2[1]], 2, 2_000).0;
+    remove(&mut right, &macs2, 2);
+    let b = mint(&mut right, &macs2[1], &[&macs2[0], &macs2[1]], 2, 3_100).0;
     left.merge(&right).unwrap();
-    remove(&mut left, &macs2, 2);
     assert_eq!(left.newest_epochs(&EpochAudience::Everyone).len(), 2);
     let view = left.fold_epoch_view(&macs2[0].identity).unwrap().unwrap();
     assert_eq!(
         view.basis, b,
         "the head that wraps no removed Mac is the one sealed under"
     );
-    assert!(!view.wraps_removed);
+    assert!(!view.due);
+}
+
+/// P1's gate, not the held `Wrap`s, decides the table writer's wait (one-mesh proofs P1b). The
+/// second Mac mints an `[everyone]` epoch wrapped to all three; the first holds the epoch and its
+/// `Wrap`s to the first two, not yet the one to the third, and removes the third beside it. No
+/// held `Wrap` of the epoch goes to a removed Mac, but the `Remove` is not in its causal past, so
+/// the third Mac opens it once its `Wrap` arrives: the epoch is due, and the writer waits.
+///
+/// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=table-held-wrap` reads the held `Wrap`s alone,
+/// as before P1b, and the assert that the writer waits fails.
+#[test]
+fn a_newest_epoch_whose_remove_is_outside_its_past_is_due_whatever_wraps_are_held() {
+    let (macs, entrants) = three_macs();
+    let (base, _, _) = founded(&macs, &entrants);
+    let mut minter = base.clone();
+    let (epoch, _) = mint(
+        &mut minter,
+        &macs[1],
+        &[&macs[0], &macs[1], &macs[2]],
+        2,
+        2_000,
+    );
+    let mut writer = base;
+    remove(&mut writer, &macs, 2);
+    let third = macs[2].identity.recipient();
+    for record in minter.records() {
+        let wrap_to_third =
+            matches!(record.body(), Body::Wrap { recipient, .. } if *recipient == third);
+        if writer.get(record.id()).is_none() && !wrap_to_third {
+            writer.insert(record.clone()).unwrap();
+        }
+    }
+    assert_eq!(writer.newest_epochs(&EpochAudience::Everyone), vec![epoch]);
+    assert!(writer.recipient_is_removed(&third));
+    let view = writer.fold_epoch_view(&macs[0].identity).unwrap().unwrap();
+    assert_eq!(view.basis, epoch);
+    assert!(
+        view.due,
+        "the epoch's past lacks the Remove: a table writer waits"
+    );
 }
 
 /// A table writer's historical grant under an `[everyone]` epoch: the seats it was wrapped to,

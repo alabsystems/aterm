@@ -170,6 +170,60 @@ fn a_delivered_operation_applies_once_and_bad_or_unselected_records_are_refused(
     );
 }
 
+/// A ring window's table one Mac wrote and another has no storage for (§11 B8, the mesh's
+/// one-sided tables): the other's selection lists it not, and a row of it is refused, until
+/// `mesh_takes` takes it up as a repair round takes up one a peer offers; then the selection lists
+/// it and the row applies. A table outside the window, or of no ring, is not taken.
+#[test]
+fn a_ring_table_a_mac_never_held_is_taken_up_by_mesh_takes_and_its_row_then_applies() {
+    let now = aterm_time::unix_millis().unwrap() / 1000;
+    for ring in [
+        &crate::catalog::ring::CLAIMS,
+        &crate::catalog::ring::RECOVERIES,
+        &crate::catalog::ring::JOURNAL,
+    ] {
+        let lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let (table, wire) = {
+            let a = lab.bootstrap(0);
+            let session = Session::open(&a).unwrap();
+            let directory = Directory::new(&lab.paths[0], a.trust());
+            let epoch = ring.epoch_of(now);
+            let mut store = directory.enroll_ring(&session, ring, epoch, now).unwrap();
+            let receipt = store.commit_own(&session, b"a ring row").unwrap();
+            let wire = store.wire(&session, &receipt.id).unwrap().unwrap().to_vec();
+            (ring.scope(directory.trust(), epoch).unwrap().digest(), wire)
+        };
+        let mut b = replica(&lab, 1);
+        b.ring_clock = Some(now);
+        assert!(!b.mesh_tables().unwrap().contains(&table), "{}", ring.role);
+        assert!(
+            matches!(
+                b.mesh_ingest(table, Kind::Operation, std::slice::from_ref(&wire))
+                    .unwrap()
+                    .as_slice(),
+                [Verdict::Refused(_)]
+            ),
+            "a row of a ring table B has not taken up is refused ({})",
+            ring.role
+        );
+        let trust = lab.bootstrap(1).trust();
+        let old = ring.scope(trust, ring.epoch_of(now) - 10).unwrap().digest();
+        assert!(!b.mesh_takes(old).unwrap(), "a period outside the window");
+        assert!(!b.mesh_takes([7; 32]).unwrap(), "a table of no ring");
+        assert!(b.mesh_takes(table).unwrap(), "{}", ring.role);
+        assert!(b.mesh_tables().unwrap().contains(&table), "{}", ring.role);
+        let applied = b
+            .mesh_ingest(table, Kind::Operation, std::slice::from_ref(&wire))
+            .unwrap();
+        assert!(
+            matches!(applied.as_slice(), [Verdict::Applied(_)]),
+            "{}: {applied:?}",
+            ring.role
+        );
+        assert!(b.mesh_takes(table).unwrap(), "a selected table is taken");
+    }
+}
+
 /// Admit every Mac of `lab` as `roles`, with the rotation entered into the control journals of
 /// `told` alone; the rotation's bytes, to tell the others later.
 fn admit_telling(lab: &Lab, roles: &[Role], told: &[usize]) -> Vec<u8> {

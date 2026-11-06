@@ -121,10 +121,7 @@ fn settled_in(alab_dir: &Path, table: &[u8; 32]) -> bool {
     let Ok(bytes) = aterm_uds::private_file::read_private(alab_dir, "settled", 256) else {
         return false;
     };
-    let Ok(held) = std::str::from_utf8(&bytes) else {
-        return false;
-    };
-    let trimmed = held.trim().as_bytes();
+    let trimmed = bytes.trim_ascii();
     let mut decoded = [0u8; 32];
     !trimmed.iter().any(u8::is_ascii_uppercase)
         && aterm_codec::hex::decode_into(trimmed, &mut decoded)
@@ -452,16 +449,14 @@ fn look(
             view.my_machine().is_some()
         }
         Ok(Some(LabRead::Unchanged)) => {
-            let logins = logins_of(&held.mail, toml_logins);
-            let mailboxes = named_mailboxes(&held.placed, &logins);
-            if let Some(lab) = held
-                .lab
-                .as_mut()
-                .filter(|lab| lab.settled != settled || lab.mailboxes != mailboxes)
-            {
-                let lab = Arc::make_mut(lab);
-                lab.settled = settled;
-                lab.mailboxes = mailboxes;
+            if let Some(lab) = held.lab.as_mut() {
+                let logins = logins_of(&held.mail, toml_logins);
+                let mailboxes = named_mailboxes(&held.placed, &logins);
+                if lab.settled != settled || lab.mailboxes != mailboxes {
+                    let lab = Arc::make_mut(lab);
+                    lab.settled = settled;
+                    lab.mailboxes = mailboxes;
+                }
             }
             false
         }
@@ -562,6 +557,7 @@ impl Cache {
                 .lab(&self.config, was)
                 .map_err(|why| why.to_string())
         };
+        let admitted = matches!(read, Ok(Some(LabRead::Projected(..) | LabRead::Unchanged)));
         // A new projection reads the registry's mailboxes and address rows too: names and
         // patterns, never a value (`mail::sign_in_read`). One that does not read keeps the held
         // ones.
@@ -570,8 +566,12 @@ impl Cache {
             .flatten()
             .map(|(found, addresses)| (lab_mail(&found), addresses));
         let dir = settled_dir();
-        let settled = settled(&registry, dir.as_deref());
-        let toml = mailbox_names(&self.paths);
+        let settled = admitted && settled(&registry, dir.as_deref());
+        let toml = if admitted {
+            mailbox_names(&self.paths)
+        } else {
+            Vec::new()
+        };
         let mut held = self
             .held
             .lock()
@@ -581,7 +581,11 @@ impl Cache {
             held.mail = mail;
             held.addresses = addresses;
         }
-        let logins = mailbox_logins(&held.addresses, &toml);
+        let logins = if toml.is_empty() {
+            BTreeMap::new()
+        } else {
+            mailbox_logins(&held.addresses, &toml)
+        };
         if look(&mut held, read, settled, &logins, named, Instant::now())
             && let Some(dir) = dir.as_deref()
         {

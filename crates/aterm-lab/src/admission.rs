@@ -666,13 +666,16 @@ mod tests {
             "lane is not a memory or Timing claim"
         );
         drop(original);
+        // A sibling fork can retain the CLOEXEC description until exec. Wait for its final
+        // close, as the record-lock tests do; dropping this guard is not a latency promise.
+        let start = Instant::now();
         window_lane_in(
             &other,
             Some(&ledger),
             "timing fixture",
-            Wait::No,
+            Wait::Block,
             &mut |_| {},
-            &|| false,
+            &|| start.elapsed() >= MUST_HAPPEN,
         )
         .unwrap();
     }

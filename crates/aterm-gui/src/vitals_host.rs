@@ -602,7 +602,7 @@ impl Parked {
     }
 }
 
-/// How many of the PTY reader's feeds moved the screen
+/// How many of the PTY reader's feeds moved the screen, and when the last one did
 /// (`docs/DESIGN-system-awareness-2026-10-16.md` §6.1): counted by the reader under its hold of the
 /// term lock, after each feed whose screen generation ([`crate::control::screen_gen`]) is not the
 /// one it saw after its last feed. The output wake reads it without the term lock
@@ -615,6 +615,9 @@ pub(crate) struct ScreenMoves {
     /// The generation the reader saw after its last feed; only the feeding side takes it.
     seen: Mutex<Option<crate::control::ScreenGen>>,
     moves: AtomicU64,
+    /// When a feed last moved the screen, on the wall clock ([`aterm_gui_timing::wall_ms`]); `0`
+    /// before one did.
+    moved_ms: AtomicU64,
 }
 
 impl ScreenMoves {
@@ -627,6 +630,8 @@ impl ScreenMoves {
             .replace(now)
             != Some(now);
         if moved {
+            self.moved_ms
+                .store(aterm_gui_timing::wall_ms(), Ordering::Relaxed);
             self.moves.fetch_add(1, Ordering::Release);
             // The wake protocol's store-buffer pair, with [`Self::count_after_clear`]: the reader
             // counts this move, then reads the session's wake latch to post or coalesce its wake;
@@ -638,6 +643,13 @@ impl ScreenMoves {
             fence(Ordering::SeqCst);
         }
         moved
+    }
+
+    /// When a feed last moved the screen ([`Self::moved_ms`]): what a session's last topic post
+    /// is newer than, or not, where its screen's rows are its words
+    /// ([`crate::survey::last_words`]).
+    pub(crate) fn moved_ms(&self) -> u64 {
+        self.moved_ms.load(Ordering::Relaxed)
     }
 
     /// How many feeds moved the screen so far.

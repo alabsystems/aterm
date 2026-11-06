@@ -73,6 +73,24 @@ pub(crate) fn write_aterm_toml(path: &Path, text: &str) -> std::io::Result<()> {
 /// One-minute hang detector for startup: a version probe or an instance listening.
 pub const BOOT: Duration = Duration::from_secs(60);
 
+/// What a stop gives an instance once it has cut its lifeline: a time to end by itself before the
+/// stop signals its group `SIGTERM` (a launchd job's: before it removes the job), then, for this
+/// run's child, a time to end on that signal before `SIGKILL`; each within the stop's one-minute
+/// deadline ([`BOOT`]).
+#[derive(Clone, Copy, Debug)]
+struct Graces {
+    /// From the lifeline's cut to `SIGTERM` (or the job's removal).
+    own: Duration,
+    /// From `SIGTERM` to `SIGKILL`.
+    term: Duration,
+}
+
+/// A lab instance's graces: 8 s to end by itself, 5 s more once signalled.
+const STOP_GRACES: Graces = Graces {
+    own: Duration::from_secs(8),
+    term: Duration::from_secs(5),
+};
+
 /// The scratch world an instance runs in.
 pub struct World {
     /// The private directory holding everything below.
@@ -654,6 +672,8 @@ pub struct Instance {
     _admission: Option<WindowAdmission>,
     cleanup: cleanup::StopRecord,
     gui: Option<aterm_uds::process::Identity>,
+    /// What its stop gives it before each signal ([`STOP_GRACES`]).
+    graces: Graces,
 }
 
 /// What one `ctl` client run said.
@@ -910,6 +930,7 @@ impl Instance {
             _admission: admission,
             cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
             gui: None,
+            graces: STOP_GRACES,
         })
     }
 
@@ -964,6 +985,7 @@ impl Instance {
             _admission: admission,
             cleanup: cleanup::StopRecord::new(&world.dir, world.cleanup_failed.clone(), pid),
             gui: None,
+            graces: STOP_GRACES,
         })
     }
 
@@ -1233,6 +1255,7 @@ impl Instance {
                 self.pid,
                 self.kept,
                 self.gui,
+                self.graces,
             )
             .map_err(|why| {
                 format!(
@@ -1289,13 +1312,41 @@ fn now_of(presence: aterm_uds::process::ProcessPresence, same: Option<bool>) -> 
 }
 
 /// What a windowed instance's aterm (`gui`, as the stop knew it) is now, from what the kernel
-/// says of its pid (`presence`) and the identity that pid has now (`now`).
+/// says of its pid (`presence`) and the identity that pid has now (`now`), as [`aterm_seen`]
+/// reads them.
 fn aterm_now(
     gui: aterm_uds::process::Identity,
     presence: aterm_uds::process::ProcessPresence,
     now: Option<aterm_uds::process::Identity>,
 ) -> Now {
     now_of(presence, now.map(|now| now == gui))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test does once between [`aterm_seen`]'s two reads on this thread: end the aterm.
+    static BETWEEN_READS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What the kernel says now of the pid of a windowed instance's aterm (`gui`, as the stop knew
+/// it): its presence, and the identity the pid names, read first. An exit only moves forward, so
+/// an identity unreadable because the aterm's exit had begun is followed by `Exited` or `Absent`,
+/// its end, never by `Present` unless the kernel has since given its pid to another process. Read
+/// the other way round, a `Present` read just before the aterm's exit began meets an unreadable
+/// identity, which would say the aterm changed when it ended.
+fn aterm_seen(
+    gui: aterm_uds::process::Identity,
+) -> (
+    aterm_uds::process::ProcessPresence,
+    Option<aterm_uds::process::Identity>,
+) {
+    let now = aterm_uds::process::read_identity(gui.pid);
+    #[cfg(test)]
+    if let Some(between) = BETWEEN_READS.take() {
+        between();
+    }
+    (aterm_uds::process::process_presence(gui.pid), now)
 }
 
 /// What the kernel says now of an instance whose stop did not establish its end, judged by what
@@ -1309,7 +1360,7 @@ fn standing(
     kept: bool,
     gui: Option<aterm_uds::process::Identity>,
 ) -> String {
-    use aterm_uds::process::{process_presence, read_identity};
+    use aterm_uds::process::process_presence;
     let what = if kept {
         "its keeper's"
     } else {
@@ -1334,7 +1385,8 @@ fn standing(
     }
     match gui {
         Some(gui) => {
-            let now = aterm_now(gui, process_presence(gui.pid), read_identity(gui.pid));
+            let (presence, now) = aterm_seen(gui);
+            let now = aterm_now(gui, presence, now);
             format!("{own}, its aterm's pid {} {now}", gui.pid)
         }
         None => format!("{own}, its aterm's pid was never read"),
@@ -1348,16 +1400,17 @@ fn cut_short(phase: &str, Stopped(sig): Stopped) -> String {
 }
 
 /// Cut the instance's lifeline and wait, under one one-minute deadline, for the end of its
-/// process (signalled after its graces when it is this run's child, its job removed when it is a
-/// launchd job's) and of a windowed one's aterm (`kept`, `gui`). A second signal cuts a wait
-/// short ([`stop::Grace`]); each wait then looks once more before it gives up, so an end that
-/// came with the cut is still established.
+/// process (signalled after each of its `graces` when it is this run's child, its job removed
+/// after the first when it is a launchd job's) and of a windowed one's aterm (`kept`, `gui`). A
+/// second signal cuts a wait short ([`stop::Grace`]); each wait then looks once more before it
+/// gives up, so an end that came with the cut is still established.
 fn stop_process(
     child: &mut Proc,
     lifeline: &mut Option<aterm_uds::lifeline::Lifeline>,
     pid: i32,
     kept: bool,
     gui: Option<aterm_uds::process::Identity>,
+    graces: Graces,
 ) -> Result<(), String> {
     use aterm_uds::process::{ProcessPresence, process_presence};
     let deadline = Instant::now() + BOOT;
@@ -1367,7 +1420,7 @@ fn stop_process(
     if let Proc::Job(job) = child {
         job.cut();
         // A cut here leaves the job's registration to remove, which no last look can establish.
-        let grace = (Instant::now() + Duration::from_secs(8)).min(deadline);
+        let grace = (Instant::now() + graces.own).min(deadline);
         while Instant::now() < grace && job.running() {
             stop::sleep(Duration::from_millis(20))
                 .map_err(|cut| cut_short("job lifeline grace", cut))?;
@@ -1394,8 +1447,8 @@ fn stop_process(
     let Proc::Child(child) = child else {
         unreachable!()
     };
-    for (grace, signal) in [(8, libc::SIGTERM), (5, libc::SIGKILL)] {
-        let until = (Instant::now() + Duration::from_secs(grace)).min(deadline);
+    for (grace, signal) in [(graces.own, libc::SIGTERM), (graces.term, libc::SIGKILL)] {
+        let until = (Instant::now() + grace).min(deadline);
         let mut cut = None;
         loop {
             if child
@@ -1466,16 +1519,16 @@ fn wait_gui_absent(
     gui: Option<aterm_uds::process::Identity>,
     deadline: Instant,
 ) -> Result<(), String> {
-    use aterm_uds::process::{ProcessPresence, process_presence, read_identity};
+    use aterm_uds::process::ProcessPresence;
     let mut cut = None;
     loop {
-        let presence = gui.map_or(ProcessPresence::Unknown, |gui| process_presence(gui.pid));
+        let (presence, now) = gui.map_or((ProcessPresence::Unknown, None), aterm_seen);
         if gui_closed(required, gui.is_some(), presence)? {
             return Ok(());
         }
         if let Some(gui) = gui
             && presence == ProcessPresence::Present
-            && read_identity(gui.pid) != Some(gui)
+            && now != Some(gui)
         {
             return Err(
                 "original GUI identity changed or became unreadable before absence was observed"

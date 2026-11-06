@@ -609,8 +609,8 @@ pub(crate) struct SessionFactory {
     /// The event loop's turn state ([`LoopIdle`]), stamped by the main thread and read by every
     /// tab's PTY reader ([`gated_output_wake`]).
     pub(crate) loop_idle: Arc<LoopIdle>,
-    /// Desktop-notification channel shared by every tab (bounded, `notify::NOTIFY_QUEUE_CAP`).
-    pub(crate) notify_tx: std::sync::mpsc::SyncSender<notify::NotifyMsg>,
+    /// Desktop-notification queue shared by every tab, with slots kept for aterm's own notices ([`notify::Notifier`]).
+    pub(crate) notify_tx: notify::Notifier,
     /// Config `allow_kitty_file_transfer` (default false).
     pub(crate) allow_kitty_file_transfer: bool,
     /// Config `temporal_recording` (default [`crate::app_config::DEFAULT_TEMPORAL_RECORDING`]).
@@ -5541,7 +5541,7 @@ fn install_clipboard(
 fn configure_notifications(
     term: &Arc<Mutex<Terminal>>,
     reach: HostReach,
-    notify_tx: &std::sync::mpsc::SyncSender<notify::NotifyMsg>,
+    notify_tx: &notify::Notifier,
     id: u64,
     witness: &Arc<crate::spare::Witness>,
     banner: &Arc<crate::box_banner::BoxBanner>,
@@ -5550,26 +5550,35 @@ fn configure_notifications(
         return;
     }
     let mut t = term_lock(term);
-    // One banner per box: codex's own notification for a box the herald told is dropped.
+    // One banner per box: codex's own notification for a box the herald told is dropped, and
+    // only one the queue took tells a box.
     t.set_notification_admission(banner.admission());
     let tx = notify_tx.clone();
     let w = Arc::clone(witness);
+    let told = Arc::clone(banner);
     t.set_notification_callback(move |body| {
         w.host_effects.fetch_add(1, Ordering::Relaxed);
-        let _ = tx.try_send(notify::NotifyMsg::program(id, None, body.to_string()));
+        told.deliver(|| {
+            tx.try_send(notify::NotifyMsg::program(id, None, body.to_string()))
+                .is_ok()
+        });
     });
     let tx = notify_tx.clone();
     let w = Arc::clone(witness);
+    let told = Arc::clone(banner);
     t.set_advanced_notification_callback(move |n| {
         if !n.has_content() {
             return;
         }
         w.host_effects.fetch_add(1, Ordering::Relaxed);
-        let _ = tx.try_send(notify::NotifyMsg::program(
-            id,
-            n.title,
-            n.body.unwrap_or_default(),
-        ));
+        told.deliver(|| {
+            tx.try_send(notify::NotifyMsg::program(
+                id,
+                n.title,
+                n.body.unwrap_or_default(),
+            ))
+            .is_ok()
+        });
     });
 }
 
@@ -10290,7 +10299,7 @@ mod clipboard_coalesce_tests {
 
 #[cfg(test)]
 mod host_reach_tests {
-    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel, sync_channel};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -10450,7 +10459,7 @@ mod host_reach_tests {
                 Some(&notifications_allowed()),
                 None,
             )));
-            let (tx, notices) = sync_channel(8);
+            let (tx, notices) = super::notify::Notifier::channel();
             configure_notifications(
                 &term,
                 host_reach(mode),
@@ -10494,7 +10503,7 @@ mod host_reach_tests {
             Some(&notifications_allowed()),
             None,
         )));
-        let (tx, notices) = sync_channel(8);
+        let (tx, notices) = super::notify::Notifier::channel();
         let banner = Arc::new(crate::box_banner::BoxBanner::default());
         configure_notifications(
             &term,
@@ -10518,6 +10527,65 @@ mod host_reach_tests {
             posted(&term, &notices),
             NOTICES.len(),
             "the box was answered"
+        );
+    }
+
+    /// Other tabs' notices hold every program slot of the process-wide queue when a codex tab
+    /// writes its box's notification: the queue refuses it, so it told nothing and the herald
+    /// tells the box. Once a slot is free the next box's notification is queued and tells it.
+    /// NEGATIVE CONTROL: counting the box told at the admission leaves it with no banner.
+    #[test]
+    fn a_notification_the_full_queue_refuses_tells_no_box() {
+        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
+        const NOTICE: &[u8] = b"\x1b]9;Approval requested\x07";
+        let term = Arc::new(Mutex::new(new_live_terminal(
+            24,
+            80,
+            Some(&notifications_allowed()),
+            None,
+        )));
+        let (tx, notices) = super::notify::Notifier::channel();
+        let banner = Arc::new(crate::box_banner::BoxBanner::default());
+        configure_notifications(
+            &term,
+            host_reach(Cm::User),
+            &tx,
+            1,
+            &Arc::default(),
+            &banner,
+        );
+        let other_tabs = (0..)
+            .take_while(|_| {
+                tx.try_send(super::notify::NotifyMsg::program(2, None, "flood".into()))
+                    .is_ok()
+            })
+            .count();
+        assert!(
+            other_tabs > 0,
+            "PRECONDITION: the other tabs filled the queue"
+        );
+        term_lock(&term).process(&[WORKING, NOTICE, BLOCKED].concat());
+        let report = term_lock(&term).program_state().began;
+        assert!(
+            banner.herald(report, |told| (!told, false)),
+            "a box whose notification the full queue refused is aterm's to tell"
+        );
+        assert_eq!(
+            notices.try_iter().count(),
+            other_tabs,
+            "only the other tabs'"
+        );
+        term_lock(&term).process(&[WORKING, NOTICE, BLOCKED].concat());
+        let report = term_lock(&term).program_state().began;
+        assert_eq!(
+            notices.try_iter().count(),
+            1,
+            "CONTROL: a free slot queues it"
+        );
+        assert!(
+            banner.herald(report, |told| (told, false)),
+            "CONTROL: a queued notification told its box"
         );
     }
 }

@@ -27,6 +27,10 @@ pub struct Excerpts {
     pub said: Option<String>,
     /// The newest assistant text capped from the end ([`cap_end`]).
     pub said_end: Option<String>,
+    /// When the row [`Self::said`] came from was written, in unix milliseconds, where the row says
+    /// (a Claude Code transcript's and a codex rollout's `timestamp`): what a newer topic post is
+    /// newer than, however late its words were read.
+    pub said_at_ms: Option<i64>,
     /// Name of the newest unanswered tool call in the latest assistant message.
     pub doing: Option<String>,
 }
@@ -146,8 +150,9 @@ pub fn prompt_key(text: &str) -> u64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scan {
     prompts: Vec<Prompt>,
-    /// The newest text, cut keeping its head and cut keeping its end.
-    said: Option<(String, String)>,
+    /// The newest text, cut keeping its head and cut keeping its end, and when its row was
+    /// written ([`Excerpts::said_at_ms`]).
+    said: Option<(String, String, Option<i64>)>,
     flight: Flight,
 }
 
@@ -276,7 +281,12 @@ impl Scan {
                 if self.said.is_none()
                     && let Some(text) = parts.map(Vec::as_slice).and_then(newest_text)
                 {
-                    self.said = Some((cap(&text, EXCERPT_BYTES), cap_end(&text, EXCERPT_BYTES)));
+                    let at = row
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(super::codex_rollout::stamp_ms);
+                    self.said =
+                        Some((cap(&text, EXCERPT_BYTES), cap_end(&text, EXCERPT_BYTES), at));
                 }
                 let id = message.get("id").and_then(Value::as_str).map(str::to_owned);
                 let calls = parts.map(Vec::as_slice).map(tool_calls).unwrap_or_default();
@@ -435,11 +445,15 @@ impl Scan {
             Flight::Message { pending, .. } => pending.first().map(|(_, name)| name.clone()),
             Flight::Open { .. } | Flight::Idle => None,
         };
-        let (said, said_end) = self.said.clone().unzip();
+        let (said, said_end, said_at_ms) = match self.said.clone() {
+            Some((said, said_end, at)) => (Some(said), Some(said_end), at),
+            None => (None, None, None),
+        };
         Excerpts {
             prompts: self.prompts.clone(),
             said,
             said_end,
+            said_at_ms,
             doing,
         }
     }
@@ -609,6 +623,7 @@ pub fn agy_excerpts_from(
         prompts,
         said,
         said_end,
+        said_at_ms: None,
         doing,
     }
 }
@@ -730,6 +745,7 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
         prompts,
         said,
         said_end,
+        said_at_ms: None,
         doing,
     }
 }

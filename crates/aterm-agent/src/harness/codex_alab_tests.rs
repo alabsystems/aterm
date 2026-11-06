@@ -794,3 +794,194 @@ fn no_clause_of_a_refusal_starts_with_a_capital() {
         }
     }
 }
+
+/// SUCH A REFUSAL LEADS WITH WHAT BLOCKS THE LAUNCH AND WHAT MENDS IT, so a stall's attention, which
+/// keeps a long refusal's first clause alone, never loses them to the program's name or a path: the
+/// row and its sign-in, its wall's end, the build that serves, the row's pin, or the pin's end.
+/// CONTROL: the whole of what it said before stays after that clause.
+#[test]
+fn a_refusal_on_such_a_codex_leads_with_what_mends_it() {
+    let why = AuthPathUnread::Unnamed(PathBuf::from("/Users//someone/.local/share/atpkg/codex"));
+    let until = 1_800_003_750;
+    let first = |said: String| said.split_once("; ").expect("clauses").0.to_owned();
+    let signed_out = DefaultRow::SignedOut {
+        label: "main".into(),
+        stored: true,
+    };
+    let walled = DefaultRow::Walled {
+        label: "main".into(),
+        window: "five_hour".into(),
+        reset: None,
+        until,
+    };
+    let opens = crate::harness::usage::rfc3339_utc(until);
+    let served_by = why.served_by().to_string();
+    let use_main = unread_fix(Some("main"));
+    let sign_in = default_sign_in();
+    for (default, says) in [
+        (&signed_out, ["`main`", "signed out", sign_in.as_str()]),
+        (
+            &DefaultRow::SignedOut {
+                label: "main".into(),
+                stored: false,
+            },
+            ["`main`", "not signed in here", sign_in.as_str()],
+        ),
+        (&walled, ["`main`", "`five_hour` limit", opens.as_str()]),
+        (
+            &DefaultRow::Unlisted,
+            ["no row", "login", served_by.as_str()],
+        ),
+        (
+            &DefaultRow::Moved("main".into()),
+            ["no row", "login", served_by.as_str()],
+        ),
+        (
+            &DefaultRow::Serves("main".into()),
+            ["`main`", "runs this Codex", use_main.as_str()],
+        ),
+        (
+            &DefaultRow::Other {
+                label: "main".into(),
+                why: "held for another Mac's warm set".into(),
+            },
+            ["`main`", "runs this Codex", "another Mac's warm set"],
+        ),
+    ] {
+        for said in [
+            only_default(&why, None, default),
+            only_default(&why, Some("work"), default),
+            only_default_carried(&why, "work", default, true),
+        ] {
+            let lead = first(said.clone());
+            assert!(lead.len() <= 85, "{} bytes: {lead}", lead.len());
+            for word in &says {
+                assert!(lead.contains(word), "{word}: {lead}");
+            }
+            assert!(said.contains(&why.to_string()), "CONTROL: {said}");
+        }
+    }
+    let lead = first(only_default_pinned(&why, "work", &signed_out));
+    assert!(lead.len() <= 85, "{} bytes: {lead}", lead.len());
+    assert!(
+        lead.contains("`work`") && lead.contains(&unpin_fix()),
+        "{lead}"
+    );
+}
+
+/// A LONG LABEL NEVER COSTS A REFUSAL ITS COMMAND: its first clause stays within a stall's room,
+/// the label cut and the command whole, up to the longest label the roster takes. A row's pin must
+/// name its whole label, so one too long to fit gives the report that lists the row. A wall keeps
+/// its end whatever its window's word. NEGATIVE CONTROL: before, a pin on `work-2` and a
+/// `personal-mac` row lost their command's end to the bound. CONTROL: a label that fits is whole
+/// and offers its own pin, and the whole words keep the pin of a label that does not.
+#[test]
+fn a_long_label_never_costs_a_refusal_its_command() {
+    let why = AuthPathUnread::Older(PathBuf::from("/opt/codex-alab/bin/codex"));
+    let first = |said: &str| said.split_once("; ").expect("clauses").0.to_owned();
+    let until = 1_800_003_750;
+    let opens = crate::harness::usage::rfc3339_utc(until);
+    let longest = "a".repeat(64);
+    let report = Step::Report(Cli::Codex).to_string();
+    for label in ["work-2", "personal-mac", "ten-bytes0", longest.as_str()] {
+        let lead = first(&only_default_pinned(
+            &why,
+            label,
+            &DefaultRow::SignedOut {
+                label: "main".into(),
+                stored: true,
+            },
+        ));
+        assert!(lead.len() <= REFUSAL_ROOM, "{} bytes: {lead}", lead.len());
+        assert!(lead.ends_with(&format!("`{}`", unpin_fix())), "{lead}");
+
+        for (default, end) in [
+            (
+                DefaultRow::SignedOut {
+                    label: label.to_owned(),
+                    stored: true,
+                },
+                format!("`{}`", default_sign_in()),
+            ),
+            (
+                DefaultRow::SignedOut {
+                    label: label.to_owned(),
+                    stored: false,
+                },
+                format!("`{}`", default_sign_in()),
+            ),
+            (
+                DefaultRow::Walled {
+                    label: label.to_owned(),
+                    window: "five_hour".into(),
+                    reset: None,
+                    until,
+                },
+                opens.clone(),
+            ),
+            (
+                DefaultRow::Walled {
+                    label: label.to_owned(),
+                    window: "rate_limit_reached".into(),
+                    reset: None,
+                    until,
+                },
+                opens.clone(),
+            ),
+            (
+                DefaultRow::Other {
+                    label: label.to_owned(),
+                    why: "held for another Mac's warm set".into(),
+                },
+                "held for another Mac's warm set".to_owned(),
+            ),
+        ] {
+            let lead = first(&only_default(&why, None, &default));
+            assert!(lead.len() <= REFUSAL_ROOM, "{} bytes: {lead}", lead.len());
+            assert!(lead.ends_with(&end), "{default:?}: {lead}");
+        }
+
+        let said = only_default(&why, None, &DefaultRow::Serves(label.to_owned()));
+        let lead = first(&said);
+        assert!(lead.len() <= REFUSAL_ROOM, "{} bytes: {lead}", lead.len());
+        let pin = unread_fix(Some(label));
+        assert!(said.contains(&pin), "CONTROL: {said}");
+        if lead.contains(&pin) {
+            assert_eq!(
+                lead,
+                format!("only `{label}` runs this Codex: `{pin}`"),
+                "CONTROL: it fits"
+            );
+        } else {
+            assert!(lead.ends_with(&format!("`{report}` lists it")), "{lead}");
+            assert!(
+                !lead.contains("accounts use"),
+                "no pin of a cut label: {lead}"
+            );
+        }
+    }
+    assert!(
+        first(&only_default(
+            &why,
+            None,
+            &DefaultRow::Serves("work-2".into())
+        ))
+        .contains(&unread_fix(Some("work-2"))),
+        "CONTROL: a short label is offered its own pin"
+    );
+    assert!(
+        !first(&only_default(
+            &why,
+            None,
+            &DefaultRow::Serves(longest.clone())
+        ))
+        .contains(&longest),
+        "a long label is cut"
+    );
+    let lead = first(&only_default_pinned(
+        &why,
+        "personal-mac",
+        &DefaultRow::Unlisted,
+    ));
+    assert!(lead.contains("`personal-mac`"), "CONTROL: it fits: {lead}");
+}

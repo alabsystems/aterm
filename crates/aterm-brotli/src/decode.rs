@@ -444,11 +444,11 @@ impl<R: Read> Decoder<R> {
         self.out.reserve(insert);
         let (mut p1, mut p2) = (self.p1, self.p2);
         let mut mode = mb.modes[mb.literal.current as usize];
-        let mut map = 64 * mb.literal.current as usize;
+        let mut map = &mb.literal_map[64 * mb.literal.current as usize..][..64];
         for _ in 0..insert {
             if mb.literal.tick(b)? {
                 mode = mb.modes[mb.literal.current as usize];
-                map = 64 * mb.literal.current as usize;
+                map = &mb.literal_map[64 * mb.literal.current as usize..][..64];
             }
             let context = match mode {
                 0 => p1 & 0x3f,
@@ -456,7 +456,7 @@ impl<R: Read> Decoder<R> {
                 2 => LUT0[usize::from(p1)] | LUT1[usize::from(p2)],
                 _ => (LUT2[usize::from(p1)] << 3) | LUT2[usize::from(p2)],
             };
-            let tree = mb.literal_map[map + usize::from(context)];
+            let tree = map[usize::from(context)];
             let byte = mb.literal_codes[usize::from(tree)].decode(b)? as u8;
             self.out.push(byte);
             p2 = p1;
@@ -540,6 +540,7 @@ impl<R: Read> Decoder<R> {
         if len > mb.left {
             return corrupt("a copy runs past its meta-block");
         }
+        self.out.reserve(len);
         // The output holds at least the window's reach of history, so `distance` is in it.
         let start = self.out.len() - distance;
         let mut left = len;

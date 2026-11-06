@@ -22,6 +22,11 @@ aterm-keeper = { workspace = true }
 # chmod/chown of the socket and its folder, poll, clonefile and renamex_np's swap.
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The allowed direct path (src/direct.rs): the app macOS holds responsible for this process,
+# whose Local Network answer it applies.
+aterm-containment = { workspace = true }
+
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
 

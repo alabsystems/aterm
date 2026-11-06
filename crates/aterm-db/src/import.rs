@@ -276,9 +276,10 @@ fn candidate_document(path: &Path) -> Result<Value> {
         if row.iter().all(|cell| !nonempty(cell)) {
             continue;
         }
-        let email = row.get(email_column).map(|s| s.trim()).filter(|email| {
-            crate::contacts::validate("email-addresses", &json!({"address":email})).is_ok()
-        });
+        let email = row
+            .get(email_column)
+            .map(|s| s.trim())
+            .filter(|email| crate::contacts::validate_email_address(email).is_ok());
         let machine_slot = machine_column
             .and_then(|column| row.get(column))
             .map(|s| s.trim())
@@ -394,12 +395,12 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
             rejected += 1;
             continue;
         };
-        let email_id = object_id(b"aterm-db/email-address/1", &[email.as_bytes()]);
-        let email_value = json!({"address":email});
-        if crate::contacts::validate("email-addresses", &email_value).is_err() {
+        if crate::contacts::validate_email_address(email).is_err() {
             rejected += 1;
             continue;
         }
+        let email_id = object_id(b"aterm-db/email-address/1", &[email.as_bytes()]);
+        let email_value = json!({"address":email});
         changes.insert(
             ("email-addresses".into(), email_id.clone()),
             Change {
@@ -408,11 +409,11 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
                 value: Some(email_value),
             },
         );
-        let label = label_col
+        let raw_label = label_col
             .and_then(|column| row.get(column))
-            .map(|s| s.trim())
-            .filter(|s| crate::machines::Slot::parse(s).is_ok());
-        let slot = label.and_then(|s| crate::machines::Slot::parse(s).ok());
+            .map(|s| s.trim());
+        let slot = raw_label.and_then(|s| crate::machines::Slot::parse(s).ok());
+        let label = raw_label.filter(|_| slot.is_some());
         let mut source_cells = Vec::new();
         for (column, cell) in row.iter().enumerate() {
             if nonempty(cell) && column != email_col {

@@ -155,6 +155,25 @@ impl Current<'_> {
     pub(crate) fn check(&self, what: &str) -> Result<(), String> {
         self.shared.check(what)
     }
+
+    /// Unbind everything the context holds (`ClearState`), then flush it.
+    /// A frame leaves its last pass's target bound, and only a successful
+    /// present unbinds a swap chain's buffer 0; a released flip chain lives
+    /// on while the context refers to it, so its window takes no new one
+    /// (`CreateSwapChainForHwnd` answers `E_ACCESSDENIED`). Microsoft's
+    /// `ID3D11DeviceContext::Flush` ("Deferred Destruction Issues with Flip
+    /// Presentation Swap Chains") forces that destruction this way. Every
+    /// pass binds the state it draws with, so no later frame reads what this
+    /// clears; it is never called with a pass open.
+    pub(crate) fn clear_state_and_flush(&self) {
+        let ctx = self.ctx();
+        // SAFETY: the context is held (this guard); neither call takes an
+        // argument.
+        unsafe {
+            (ctx.vt.ClearState)(ctx.raw);
+            (ctx.vt.Flush)(ctx.raw);
+        }
+    }
 }
 
 impl Drop for Current<'_> {

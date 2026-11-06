@@ -172,6 +172,8 @@ mod capture_after_present_conformance;
 mod chrome_regrow_conformance;
 #[cfg(target_os = "macos")]
 mod control_allocation_monitor;
+#[cfg(unix)]
+mod control_resource_admission;
 mod control_theme;
 #[cfg(all(test, unix))]
 mod crash_journal_conformance;
@@ -200,6 +202,10 @@ mod os_appearance;
 mod precommit_input_conformance;
 mod resolved_colors;
 mod resolved_typography;
+#[cfg(unix)]
+mod resource_admission_attach;
+#[cfg(unix)]
+mod resource_admission_host;
 #[cfg(all(test, unix))]
 mod restore_pass_conformance;
 mod retired_workers;
@@ -216,6 +222,7 @@ mod window_show_conformance;
 mod work_count_tests;
 #[cfg(test)]
 mod work_counts;
+mod worker_mail;
 mod worker_reaper;
 
 /// The running build number, as the window hands it to `aterm_update`.
@@ -9742,6 +9749,7 @@ impl UpdateHandoffStartError {
         matches!(self, Self::ActivityDeferred(_))
     }
 
+    #[cfg(all(test, unix))]
     const fn is_refused(&self) -> bool {
         matches!(self, Self::Refused(_))
     }
@@ -16211,6 +16219,7 @@ impl App {
     /// The `Wake::TaskChanged` arm.
     pub(crate) fn on_task_changed(&mut self, session: u64) {
         self.note_worker_conclusion(session);
+        self.mail_worker_news(session);
         self.rebuild_teams();
         self.refresh_presence_session(session);
         self.refresh_team_chrome(session);
@@ -16234,6 +16243,7 @@ impl App {
         self.refresh_autopilot_menu(session);
         self.journal_owner_words(session);
         self.record_wire_autopilot(session, dropped);
+        self.mail_worker_news(session);
     }
 
     fn on_output_wake(&mut self, session: u64, now: Instant) {
@@ -22978,16 +22988,18 @@ impl PassRun {
         classify_pass_exit(self.code, self.seen.saw_start, self.seen.saw_terminal)
     }
 
+    /// What atpkg said, on one line, at most 2000 characters. A long one keeps its end, since atpkg
+    /// closes its stderr with the failure and what follows from it.
     fn why(&self) -> String {
-        self.said
+        let said = self
+            .said
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
-            .join(" | ")
-            .chars()
-            .take(2000)
-            .collect()
+            .join(" | ");
+        let over = said.chars().count().saturating_sub(2000);
+        said.chars().skip(over).collect()
     }
 
     fn recorded_cached_index_cause(&self, layout: Option<&atpkg::store::Layout>) -> Option<String> {
@@ -28681,7 +28693,7 @@ pub fn main_entry_with_network(
         let mut manifest = app
             .quit_capture
             .take()
-            .unwrap_or_else(|| app.capture_restore_manifest());
+            .unwrap_or_else(|| app.capture_desk_manifest());
         let keeps = app.desk.quit_keeps_agents(system_quit::asked());
         app.quit_agents(&mut manifest, keeps);
         let run = app.crash_journal.run().map(crash_journal::JournalId::stem);

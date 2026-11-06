@@ -126,8 +126,15 @@ pub fn resource_for(path: &str) -> &'static str {
 /// The identity's fingerprint, or `anonymous`.
 #[inline]
 #[must_use]
+pub(crate) fn book_key_str(identity: &IdentityRef) -> &str {
+    identity.fingerprint().unwrap_or("anonymous")
+}
+
+/// The identity's fingerprint, or `anonymous`.
+#[inline]
+#[must_use]
 pub fn book_key(identity: &IdentityRef) -> String {
-    identity.fingerprint().unwrap_or("anonymous").to_string()
+    book_key_str(identity).to_string()
 }
 
 /// The advisory per-identity rate book: `<dir>/<key>.json`, `{"v":1,"resources":{…}}`.

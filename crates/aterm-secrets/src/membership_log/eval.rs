@@ -332,10 +332,21 @@ pub enum NodeStanding {
 /// ([`Membership::revoking_rows`], `aterm_mesh_core::revocation::gate_row`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RevokingRow {
+    /// The row's entry: the genesis or the binding `Admit`. An epoch's gate needs it in the
+    /// epoch's causal past as well as the `Remove`s, so every Mac that holds the epoch holds the
+    /// row and reads its recipient as revoked (one-mesh proofs P1b, `gateFix`).
+    pub entry: RecordId,
     /// The `Remove`s (an accepted quorum's shares included) that took the row out.
     pub removes: BTreeSet<RecordId>,
-    /// Whether a seat row that is not out binds the recipient (a co-holder admitted beside the
-    /// `Remove`s): an epoch's gate then needs every one of them in its causal past, not one.
+    /// Those of [`Self::removes`] that take the row by themselves, not as a quorum's share (one
+    /// that lies in the row's entry's past takes it only as a share), and are authorized with
+    /// nothing void (an Undo's share that a Mac its target removed signed is not). A view that
+    /// holds the epoch need not hold enough shares to accept the quorum, so only these open the
+    /// gate's one-`Remove` clause (one-mesh proofs P1b).
+    pub alone: BTreeSet<RecordId>,
+    /// Whether a seat row that none of the `Remove`s [`Self::alone`] reads takes out binds the
+    /// recipient (a co-holder admitted beside the `Remove`s, or a seat only a quorum took out):
+    /// an epoch's gate then needs every `Remove` in its causal past, not one.
     pub recipient_live: bool,
 }
 
@@ -392,10 +403,11 @@ impl Membership {
         &self.removed_recipients
     }
     /// The seat rows that revoke their recipient, as P1's causal gate reads them: a newest
-    /// epoch is due a rotation, and no writer seals under it, unless for each row every `Remove`
-    /// that took it lies in the epoch's causal past, or one does and no live row binds the
-    /// recipient (`Log::head_due`). The gate reads no `Wrap`: another Mac may have handed the
-    /// epoch to the recipient beside the `Remove`.
+    /// epoch is due a rotation, and no writer seals under it, unless for each row its entry and
+    /// every `Remove` that took it lie in the epoch's causal past, or its entry and one `Remove`
+    /// that takes it by itself ([`RevokingRow::alone`]) do and no live row binds the recipient
+    /// (`Log::head_due`). The gate reads no `Wrap`: another Mac may have handed the epoch to the
+    /// recipient beside the `Remove`.
     pub const fn revoking_rows(&self) -> &BTreeSet<RevokingRow> {
         &self.revoking_rows
     }
@@ -724,6 +736,13 @@ pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelati
 #[derive(Debug)]
 pub(super) struct Effective {
     counts: Vec<bool>,
+    /// Whether each record is authorized with nothing void (`batch_may_wrap`'s negative control).
+    #[cfg(any(test, debug_assertions))]
+    plain: Vec<bool>,
+    /// Whether each record is an accepted quorum's share that is not authorized with nothing void:
+    /// an Undo's share that a Mac its target removed signed, which a view that holds too few of
+    /// the quorum's shares reads as no removal.
+    undo_share: Vec<bool>,
     /// The evaluated log's index as it stood: its chunks, shared with the log's own.
     reach: Reach,
     #[cfg(test)]
@@ -737,6 +756,21 @@ impl Effective {
     /// Whether record `index` is authorized, unvoided and not cut off by an effective removal.
     pub(super) fn counts(&self, index: usize) -> bool {
         self.counts.get(index).copied().unwrap_or(false)
+    }
+
+    /// Whether record `index` counts ([`Effective::counts`]) and every Mac that holds it reads it
+    /// so: it is no Undo's share that only its own quorum authorizes. Every other record a void
+    /// authorizes has that quorum in its own past, since an honest Mac signs only as a member of
+    /// its own view (an Undo's share, which a removed Mac signs, is the one exception), so a Mac
+    /// that holds the record holds the quorum too.
+    pub(super) fn counts_where_held(&self, index: usize) -> bool {
+        self.counts(index) && !self.undo_share.get(index).copied().unwrap_or(false)
+    }
+
+    /// Whether record `index` counts ([`Effective::counts`]) and is authorized with nothing void.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn counts_plain(&self, index: usize) -> bool {
+        self.counts(index) && self.plain.get(index).copied().unwrap_or(false)
     }
 
     /// Whether record `a` lies in record `b`'s strict causal past.
@@ -1490,9 +1524,9 @@ impl<'a> Graph<'a> {
         let (removed_recipients, revoking_rows) = self.revocation(
             &bound_seats,
             &standing,
-            candidates,
-            accepted,
+            (candidates, accepted),
             &superseded_by,
+            &plain,
         );
         let mut claimed_labels: BTreeSet<String> =
             self.listed().iter().map(|f| f.label.clone()).collect();
@@ -1844,17 +1878,18 @@ impl<'a> Graph<'a> {
         &self,
         bound_seats: &[(usize, Seat<'a>)],
         standing: &Standing,
-        candidates: &[Candidate],
-        accepted: &[usize],
+        (candidates, accepted): (&[Candidate], &[usize]),
         superseded_by: &BTreeMap<MemberId, MemberId>,
+        plain_auth: &[bool],
     ) -> (BTreeSet<Recipient>, BTreeSet<RevokingRow>) {
         #[cfg(any(test, debug_assertions))]
-        let (skips_superseded, arrival_order) = (
+        let (skips_superseded, arrival_order, alone_unauthorized) = (
             aterm_types::negative_control::on("revocation-skips-superseded"),
             aterm_types::negative_control::on("revocation-arrival-order"),
+            aterm_types::negative_control::on("alone-unauthorized"),
         );
         #[cfg(not(any(test, debug_assertions)))]
-        let (skips_superseded, arrival_order) = (false, false);
+        let (skips_superseded, arrival_order, alone_unauthorized) = (false, false, false);
         let mut actors: BTreeMap<MemberId, usize> = BTreeMap::new();
         let mut recipients: BTreeMap<Recipient, usize> = BTreeMap::new();
         let mut by_index: Vec<Recipient> = Vec::new();
@@ -1917,17 +1952,39 @@ impl<'a> Graph<'a> {
             }
         };
         let table = Table::new(&rows, &removes, before);
+        // The same `Remove`s, each read alone and as the log reads with nothing void: whether a
+        // quorum accepts a share is this view's (it holds enough shares), and another Mac's view
+        // of the same epoch may not, so the gate trusts a share only where it takes the row by
+        // itself, and a `Remove` only a quorum's voids authorize (an Undo share a removed Mac
+        // signed) only where that Mac stands with nothing void (one-mesh proofs P1b: the World
+        // reads every `Remove` as plain, and each decision here is at least as strict).
+        // NEGATIVE CONTROL `alone-unauthorized`: count every standing `Remove` alone.
+        let plain: Vec<Remove> = removes
+            .iter()
+            .map(|&remove| Remove {
+                quorum: false,
+                live: remove.live && (alone_unauthorized || plain_auth[remove.record]),
+                ..remove
+            })
+            .collect();
+        let alone = Table::new(&rows, &plain, before);
         let mut revoked = BTreeSet::new();
         let mut revoking = BTreeSet::new();
+        let id = |j: usize| *self.records[removes[j].record].id();
         for i in table.revoking_rows() {
             let recipient = rows[i].recipient;
             revoked.insert(by_index[recipient]);
             revoking.insert(RevokingRow {
+                entry: *self.records[rows[i].entry].id(),
                 removes: (0..removes.len())
                     .filter(|&j| table.takes(j, i))
-                    .map(|j| *self.records[removes[j].record].id())
+                    .map(id)
                     .collect(),
-                recipient_live: table.bound_live(recipient),
+                alone: (0..removes.len())
+                    .filter(|&j| alone.takes(j, i))
+                    .map(id)
+                    .collect(),
+                recipient_live: alone.bound_live(recipient),
             });
         }
         (revoked, revoking)
@@ -2547,8 +2604,17 @@ impl<'a> Graph<'a> {
             keyed[epoch] = true;
         }
         let usable_wrap = self.usable_wraps(&counts, &dependents);
+        let mut undo_share = vec![false; self.records.len()];
+        for &q in &weighing.accepted {
+            for &share in &weighing.candidates[q].shares {
+                undo_share[share] = !plain[share];
+            }
+        }
         Effective {
             counts,
+            #[cfg(any(test, debug_assertions))]
+            plain,
+            undo_share,
             reach: self.reach.clone(),
             #[cfg(test)]
             oracle: self.oracle,

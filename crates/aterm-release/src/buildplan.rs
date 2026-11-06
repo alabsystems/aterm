@@ -1520,7 +1520,7 @@ fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
     let mut read = aterm_verify::compile_account::Artifacts::default();
     let mut line = Vec::new();
     let mut overflow = false;
-    let mut chunk = [0; 64 * 1024];
+    let mut chunk = [0; 16 * 1024];
     let book = |line: &[u8], read: &mut aterm_verify::compile_account::Artifacts| {
         if let Ok(text) = std::str::from_utf8(line) {
             read.book(text);

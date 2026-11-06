@@ -176,7 +176,8 @@ pub(crate) fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
 
 /// Whether `text` is a full sha: 40 lowercase hex digits.
 #[inline]
-pub(crate) fn is_sha(text: &str) -> bool {
+#[must_use]
+pub fn is_sha(text: &str) -> bool {
     aterm_codec::hex::is_lower(text, 40)
 }
 
@@ -201,7 +202,8 @@ pub(crate) fn reference_refusal(reference: &str) -> String {
 /// Whether `name` is a ref git's `check-ref-format` accepts under `refs/`: one or more
 /// components after `refs/`, none empty, starting with `.` or ending with `.lock`; no `..`,
 /// `@{`, ASCII control or DEL, space, `~`, `^`, `:`, `?`, `*`, `[` or `\`; and no trailing `.`.
-pub(crate) fn ref_name_ok(name: &str) -> bool {
+#[must_use]
+pub fn ref_name_ok(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("refs/") else {
         return false;
     };

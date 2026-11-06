@@ -302,46 +302,55 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
     // Group by window identity: sorted by reset, a reading joins the group before it when the
     // two resets lie within the tolerance.
     current.sort_unstable_by_key(|r| (r.reset, r.t, r.by));
-    let mut groups: Vec<&[&Reading]> = Vec::new();
-    let mut group_start = 0;
-    for i in 1..current.len() {
-        if reset_of(current[i]).abs_diff(reset_of(current[i - 1])) > RESET_TOLERANCE_S {
-            groups.push(&current[group_start..i]);
-            group_start = i;
-        }
+    let mut last_group_start = current.len() - 1;
+    while last_group_start > 0
+        && reset_of(current[last_group_start]).abs_diff(reset_of(current[last_group_start - 1]))
+            <= RESET_TOLERANCE_S
+    {
+        last_group_start -= 1;
     }
-    groups.push(&current[group_start..]);
     // The newest group names the current window; a group a whole window before it is the
     // window that ended, not a disagreement about this one.
-    let newest_reset = groups.last()?.iter().map(|r| reset_of(r)).min()?;
-    let overlapping: Vec<&&[&Reading]> = groups
-        .iter()
-        .filter(|g| {
-            let reset = g.iter().map(|r| reset_of(r)).max().unwrap_or(0);
-            newest_reset
-                .saturating_sub(reset)
-                .saturating_add(RESET_TOLERANCE_S)
-                < length
-        })
-        .collect();
+    let newest_reset = reset_of(current[last_group_start]);
+    let mut overlap_start = last_group_start;
+    while overlap_start > 0
+        && newest_reset
+            .saturating_sub(reset_of(current[overlap_start - 1]))
+            .saturating_add(RESET_TOLERANCE_S)
+            < length
+    {
+        overlap_start -= 1;
+        while overlap_start > 0
+            && reset_of(current[overlap_start]).abs_diff(reset_of(current[overlap_start - 1]))
+                <= RESET_TOLERANCE_S
+        {
+            overlap_start -= 1;
+        }
+    }
+    let overlapping = if RESET_TOLERANCE_S < length {
+        &current[overlap_start..]
+    } else {
+        &[]
+    };
     let start = overlapping
-        .iter()
-        .flat_map(|g| g.iter())
-        .map(|r| reset_of(r))
-        .min()
-        .map_or(0, |reset| reset.saturating_sub(length));
+        .first()
+        .map_or(0, |r| reset_of(r).saturating_sub(length));
     let fig = figure(
-        overlapping.iter().flat_map(|g| g.iter().copied()).chain(
+        overlapping.iter().copied().chain(
             readings
                 .iter()
                 .filter(|r| r.reset.is_none() && r.t >= start),
         ),
     )?;
-    let reset = match overlapping.as_slice() {
-        // Every reset has one tolerance, so the newest reading's reset.
-        [one] => one.iter().max_by_key(|r| (r.t, r.by)).and_then(|r| r.reset),
-        _ => None,
-    };
+    // Every reset in a single group has one tolerance, so the newest reading's reset.
+    let reset = (overlap_start == last_group_start && !overlapping.is_empty())
+        .then(|| {
+            overlapping
+                .iter()
+                .max_by_key(|r| (r.t, r.by))
+                .and_then(|r| r.reset)
+        })
+        .flatten();
     Some(Usage::Current {
         pct: fig.pct,
         reset,
@@ -725,32 +734,32 @@ impl Counters {
     fn hour_tokens(&self, hour: Window, now_ms: u64) -> HourTokens {
         let span = hour.span();
         let mut by_node: BTreeMap<Node, Tokens> = BTreeMap::new();
-        for metric in Metric::ALL {
-            if let Metric::Class(cli, family, class) = metric {
-                for (node, s) in self.per_node(metric, span.clone()) {
-                    let t = by_node.entry(node).or_default();
-                    let fam = t.by_family.entry((cli, family)).or_default();
-                    *fam = fam.saturating_add(s.sum());
-                    let c = t.by_cli.entry(cli).or_default();
-                    *c = c.saturating_add(s.sum());
-                    if class == TokenClass::Output {
-                        let n = t.turns.entry(cli).or_default();
-                        *n = n.saturating_add(s.count());
+        for metric in Metric::ALL.into_iter().rev() {
+            match metric {
+                Metric::Class(cli, family, class) => {
+                    for (node, s) in self.per_node(metric, span.clone()) {
+                        let t = by_node.entry(node).or_default();
+                        let fam = t.by_family.entry((cli, family)).or_default();
+                        *fam = fam.saturating_add(s.sum());
+                        let c = t.by_cli.entry(cli).or_default();
+                        *c = c.saturating_add(s.sum());
+                        if class == TokenClass::Output {
+                            let n = t.turns.entry(cli).or_default();
+                            *n = n.saturating_add(s.count());
+                        }
                     }
                 }
-            }
-        }
-        for metric in Metric::ALL {
-            if let Metric::Tokens(cli) = metric {
-                for (node, s) in self.per_node(metric, span.clone()) {
-                    let t = by_node.entry(node).or_default();
-                    let c = t.by_cli.entry(cli).or_default();
-                    if s.sum() > *c {
-                        *c = s.sum();
-                        t.from_minutes = true;
+                Metric::Tokens(cli) => {
+                    for (node, s) in self.per_node(metric, span.clone()) {
+                        let t = by_node.entry(node).or_default();
+                        let c = t.by_cli.entry(cli).or_default();
+                        if s.sum() > *c {
+                            *c = s.sum();
+                            t.from_minutes = true;
+                        }
+                        let n = t.turns.entry(cli).or_default();
+                        *n = (*n).max(s.count());
                     }
-                    let n = t.turns.entry(cli).or_default();
-                    *n = (*n).max(s.count());
                 }
             }
         }

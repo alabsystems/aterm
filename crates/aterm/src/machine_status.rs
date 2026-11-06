@@ -310,12 +310,12 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
             stages,
             ..
         } => {
-            if stages.iter().any(|stage| stage.status == "stopped") {
-                let stopped: Vec<&str> = stages
-                    .iter()
-                    .filter(|stage| stage.status == "stopped")
-                    .map(|stage| stage.name.as_str())
-                    .collect();
+            let stopped: Vec<&str> = stages
+                .iter()
+                .filter(|stage| stage.status == "stopped")
+                .map(|stage| stage.name.as_str())
+                .collect();
+            if !stopped.is_empty() {
                 Area::off(
                     NAME,
                     format!(
@@ -378,11 +378,6 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                 })
                 .map(|stage| stage.name.as_str())
                 .collect();
-            let open: Vec<&str> = stages
-                .iter()
-                .filter(|stage| matches!(stage.status.as_str(), "pending" | "running" | "waiting"))
-                .map(|stage| stage.name.as_str())
-                .collect();
             if !held.is_empty() {
                 Area::due(
                     NAME,
@@ -390,14 +385,23 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                     Who::Person,
                     "press Check again in System State",
                 )
-            } else if open.is_empty() {
-                Area::ok(NAME, "nothing left to run")
             } else {
-                Area::working(
-                    NAME,
-                    format!("still to finish: {}", open.join(", ")),
-                    "aterm runs each step by itself",
-                )
+                let open: Vec<&str> = stages
+                    .iter()
+                    .filter(|stage| {
+                        matches!(stage.status.as_str(), "pending" | "running" | "waiting")
+                    })
+                    .map(|stage| stage.name.as_str())
+                    .collect();
+                if open.is_empty() {
+                    Area::ok(NAME, "nothing left to run")
+                } else {
+                    Area::working(
+                        NAME,
+                        format!("still to finish: {}", open.join(", ")),
+                        "aterm runs each step by itself",
+                    )
+                }
             }
         }
     })
@@ -884,8 +888,12 @@ pub(crate) fn agents_area(agents: &Agents) -> Area {
 /// `text` with every email address in it replaced by `<email>`: a word with a local part, an
 /// `@` and a dotted domain. `@self`, `user@host` and a lone `@` stay.
 pub(crate) fn scrub(text: &str) -> String {
+    scrub_cow(text).into_owned()
+}
+
+fn scrub_cow(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('@') {
-        return text.to_owned();
+        return std::borrow::Cow::Borrowed(text);
     }
     let local = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-');
     let domain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-');
@@ -923,7 +931,7 @@ pub(crate) fn scrub(text: &str) -> String {
             i = at + 1;
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// The text report: one line an area, and its step under it.
@@ -953,10 +961,10 @@ pub(crate) fn render_json(areas: &[Area]) -> String {
             aterm_json::json!({
                 "area": area.name,
                 "state": area.level.word(),
-                "says": scrub(&area.says),
+                "says": scrub_cow(&area.says).as_ref(),
                 "next": area.next.as_ref().map(|step| aterm_json::json!({
                     "who": step.who.word(),
-                    "act": scrub(&step.act),
+                    "act": scrub_cow(&step.act).as_ref(),
                 })),
             })
         })

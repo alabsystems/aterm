@@ -522,6 +522,7 @@ fn proc(pid: u32, ppid: u32) -> Proc {
         pid,
         ppid,
         footprint: 0,
+        whole: 0,
         written: 0,
         cpu_ns: 0,
     }

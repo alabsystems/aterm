@@ -3280,6 +3280,19 @@ pub(crate) fn cmd_spawn_metered(
     reply
 }
 
+/// A worker's `order` as the spawn that served it over `driver`'s fleet drive gives it: a manager
+/// it names (`from=`) runs on the driving Mac ([`crate::task_launch::TaskOrder::manager_node`]);
+/// a spawn made on this Mac, or one that names no manager, names no Mac.
+fn under_drive(
+    order: crate::task_launch::TaskOrder,
+    driver: Option<crate::fabric::Driver>,
+) -> crate::task_launch::TaskOrder {
+    crate::task_launch::TaskOrder {
+        manager_node: order.caller.as_ref().and(driver).map(|driver| driver.node),
+        ..order
+    }
+}
+
 /// Handles `spawn ...`, creating a new terminal session or worker on the main thread; `by` the
 /// caller its tab's open names (`crate::control::control_session::caller_actor_of`).
 pub(crate) fn cmd_spawn(
@@ -3331,6 +3344,7 @@ pub(crate) fn cmd_spawn(
                     }
                 }
             };
+            let task = task.map(|order| under_drive(order, crate::fabric::serving_driver()));
             let shell = task
                 .is_none()
                 .then(crate::fabric::serving_driver)
@@ -3946,10 +3960,18 @@ impl crate::App {
         mark.from = Some(worker.from);
         crate::task_record::mark_session_task_within(&ctx, local, &mark, std::time::Duration::ZERO)
             .map_err(|_| "busy update-committing".to_string())?;
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_task_worker(worker.order.agent, worker.order.trusted_cwd.clone());
+        {
+            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.set_task_worker(worker.order.agent, worker.order.trusted_cwd.clone());
+            // A manager that is a session here is here, whatever drive the spawn came over.
+            timeline.set_task_manager_node(
+                worker
+                    .order
+                    .manager_node
+                    .clone()
+                    .filter(|_| worker.caller.is_none()),
+            );
+        }
         let human = ctx.human_input.seq();
         Ok(crate::task_launch::Launch {
             local,
@@ -5180,6 +5202,7 @@ mod worker_start_app_tests {
                 agent: aterm_phase::Program::Claude,
                 model: None,
                 caller: None,
+                manager_node: None,
                 trusted_cwd: None,
                 fact_line: true,
                 autopilot: crate::task_launch::WORKER_AUTOPILOT,
@@ -5403,6 +5426,78 @@ mod worker_start_app_tests {
         app.pool.get(local).expect("live session").ctx.clone()
     }
 
+    /// A WORKER SPAWNED OVER A FLEET DRIVE NAMES ITS MANAGER'S MAC, THE DRIVER'S, where the spawn
+    /// names a manager; with no drive, or no manager, it names none.
+    #[test]
+    fn a_spawn_over_a_fleet_drive_names_the_driving_mac_as_its_managers() {
+        let driver = || crate::fabric::Driver {
+            node: "n-cccccccccccccccc".to_string(),
+            host: "beta".to_string(),
+        };
+        let managed = || TaskOrder {
+            caller: Some(SessionId::new("s-0123456789abcdef0123")),
+            ..worker().order
+        };
+        assert_eq!(
+            super::under_drive(managed(), Some(driver())).manager_node,
+            Some(driver().node)
+        );
+        assert_eq!(super::under_drive(managed(), None).manager_node, None);
+        assert_eq!(
+            super::under_drive(worker().order, Some(driver())).manager_node,
+            None,
+            "a worker with no manager has no manager's Mac"
+        );
+        // The spawn verb reads the drive it is served over.
+        let _driving = crate::fabric::DrivingAs::enter(driver());
+        assert_eq!(
+            super::under_drive(managed(), crate::fabric::serving_driver()).manager_node,
+            Some(driver().node)
+        );
+    }
+
+    /// A WORKER'S RECORD KEEPS ITS MANAGER'S MAC only where the manager is no session here: a
+    /// fleet spawn whose `from=` names a session of this Mac has its manager here.
+    #[test]
+    fn a_started_workers_record_keeps_its_managers_mac_only_for_a_manager_not_here() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-manager")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.push_stub_tab(wid, crate::stub_session(1));
+            app.push_stub_tab(wid, crate::stub_session(2));
+            let node = "n-cccccccccccccccc".to_string();
+            let started = |app: &mut App, local: u64, caller: Option<u64>| {
+                let sid = sid_of(app, local);
+                let mut ask = worker();
+                ask.order.manager_node = Some(node.clone());
+                ask.caller = caller;
+                let seed = ask.seed();
+                let pending = app.ready_worker(&sid, ask, seed).expect("a worker");
+                drop(pending);
+                ctx_of(app, local)
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .task()
+                    .and_then(|task| task.manager_node.clone())
+            };
+            assert_eq!(
+                started(&mut app, 1, None),
+                Some(node.clone()),
+                "a manager on the driving Mac"
+            );
+            assert_eq!(
+                started(&mut app, 2, Some(0)),
+                None,
+                "a manager that is a session here"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn google_worker_preparation_enters_the_apps_scope_before_any_launcher() {
@@ -5458,6 +5553,43 @@ mod worker_start_app_tests {
             let drained = pause.try_wait().unwrap();
             drained.resume().unwrap();
             assert!(app.account_work.enter().is_some());
+        });
+    }
+
+    /// A SHUTDOWN WHILE A REDRAWN PROMPT SETTLES BLAMES NO SHELL. The look again after a redraw
+    /// ends on the same cancellation as the launcher's first look, so it says the same word: a
+    /// dispatcher reading `why=shell` would hold a working member's shell at fault.
+    #[cfg(unix)]
+    #[test]
+    fn a_shutdown_while_a_redrawn_prompt_settles_blames_no_shell() {
+        let state = aterm_tempfile::TempDir::new().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let app = App::headless_for_test();
+            let sid = sid_of(&app, 0);
+            let ctx = ctx_of(&app, 0);
+            let mut ask = worker();
+            ask.order.agent = aterm_phase::Program::Agy;
+            let launch = app.start_worker(&sid, ask).unwrap();
+            crate::feed_session_for_test(&app, 0, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let prompt =
+                crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO).unwrap();
+            let pause = app.account_work.pause().unwrap();
+            assert!(launch.account_scope.as_ref().unwrap().cancelled());
+            let pause = pause.try_wait().unwrap_err();
+            let typed = crate::task_launch::type_at_prompt(&launch, prompt, |_| {
+                Ok::<Result<&'static str, _>, std::convert::Infallible>(Err(
+                    crate::task_launch::Untyped::Unsettled,
+                ))
+            });
+            assert_eq!(typed, None);
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            assert_eq!(
+                (record.state, record.why),
+                (TaskState::Stalled, Some("held"))
+            );
+            assert!(!record.attention, "a shutdown asks nothing of anyone");
+            drop(launch);
+            pause.try_wait().unwrap().resume().unwrap();
         });
     }
 
@@ -5671,6 +5803,68 @@ mod worker_start_app_tests {
         }
     }
 
+    /// A PAUSE BETWEEN A POOL'S TRIES ENDS AS A HOLD DOES: on the same subscription, with the task
+    /// or the session. A launcher that slept through a stall would go on to try again, and a try can
+    /// claim a row, or install a program, for a task the lead was told did not start. The pause is
+    /// far longer than this test's hang detector, so only the stall can have ended it. CONTROL: a
+    /// pause nothing ends runs out and says go on.
+    #[test]
+    fn a_startup_stall_ends_a_launchers_retry_pause() {
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-retry-ends")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            app.push_stub_tab(WindowId(0), crate::stub_session(2));
+            let sid = sid_of(&app, 1);
+            let ctx = ctx_of(&app, 1);
+            let (seed, _path) = seeded(&sid);
+            let launch = app.ready_worker(&sid, worker(), seed).expect("a worker");
+            let launch = launch.launch;
+            let long = crate::task_launch::PoolWait::Retry(std::time::Duration::from_secs(600));
+
+            let mut wait = crate::task_launch::pool_wait_for(&launch, "held");
+            assert!(
+                wait(&crate::task_launch::PoolWait::Retry(
+                    std::time::Duration::from_millis(1)
+                )),
+                "CONTROL: a pause nothing ended"
+            );
+            drop(wait);
+
+            let (said, heard) = std::sync::mpsc::channel();
+            let pausing = std::thread::spawn(move || {
+                let _ = said.send(crate::task_launch::pool_wait_for(&launch, "held")(&long));
+                (launch, long)
+            });
+            let mut stalled = crate::task_record::TaskMark::new(TaskState::Stalled);
+            stalled.why = Some("startup");
+            crate::task_record::mark_session_task(&ctx, 1, &stalled).expect("unfenced");
+            assert_eq!(
+                heard.recv_timeout(std::time::Duration::from_secs(60)),
+                Ok(false),
+                "the stall ended the pause, and no further try follows"
+            );
+            drop(pausing.join().expect("the launcher's pause"));
+
+            let sid = sid_of(&app, 2);
+            let (seed, _path) = seeded(&sid);
+            let launch = app
+                .ready_worker(&sid, worker(), seed)
+                .expect("a worker")
+                .launch;
+            app.exit_session_logical(2);
+            assert!(
+                !crate::task_launch::pool_wait_for(&launch, "held")(
+                    &crate::task_launch::PoolWait::Retry(std::time::Duration::from_secs(600))
+                ),
+                "its session's end ends the pause"
+            );
+        });
+    }
+
     /// A launcher holding a launch for a pool keeps no clock either: the deadline's stall ends the
     /// hold, its session's mark goes with it, and nothing is tried again when the row opens, so a
     /// dispatcher that placed the worker elsewhere never gets a second run days on.
@@ -5798,6 +5992,98 @@ mod worker_start_app_tests {
                 said.starts_with(crate::harness_host::STARTUP_HEAD),
                 "{said}"
             );
+        });
+    }
+
+    /// A REFUSED ADMISSION NAMES THE MEMBER AND THE CAUSE where a dispatcher reads them, under its
+    /// own `why=`, raised with the mark, so the next placement can keep that program off that
+    /// member. NEGATIVE CONTROL: before, a sign-out or a failed install marked its `why=` with no
+    /// attention at all, its cause only in this Mac's log. A record that moved on raises nothing.
+    #[test]
+    fn a_refused_admission_names_its_member_and_cause_under_its_own_why() {
+        use aterm_agent::harness::worker::Refused;
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-admission")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(1));
+            let ctx = ctx_of(&app, 1);
+            let attention = || {
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .attention_owners
+                    .get(crate::harness_host::ATTENTION_OWNER)
+                    .map(str::to_owned)
+            };
+            let mark = |to: TaskState| {
+                crate::task_record::mark_session_task(
+                    &ctx,
+                    1,
+                    &crate::task_record::TaskMark::new(to),
+                )
+                .expect("unfenced");
+            };
+            let refuse = |refused: Refused| {
+                let taken = crate::task_launch::take_admission(
+                    &ctx,
+                    1,
+                    aterm_phase::Program::Codex,
+                    Err::<(aterm_agent::harness::worker::Admitted, ()), _>(refused),
+                    || Some("m22".to_owned()),
+                );
+                assert!(taken.is_none(), "a refused worker goes no further");
+            };
+
+            mark(TaskState::Done);
+            refuse(Refused::SignedOut("signed out".to_owned()));
+            assert_eq!(
+                attention(),
+                None,
+                "CONTROL: a record that moved on raises nothing"
+            );
+
+            for (refused, why, cause) in [
+                (
+                    Refused::SignedOut(
+                        "Grok Build is signed out for this worker (no sign-in at \
+                         /Users//someone/.grok/auth.json), so no worker was started"
+                            .to_owned(),
+                    ),
+                    crate::task_record::WHY_SIGNIN,
+                    "signed out, a person must sign in",
+                ),
+                (
+                    Refused::Program(
+                        "atpkg's install of codex failed: vendor head unreachable".to_owned(),
+                    ),
+                    crate::task_record::WHY_INSTALL,
+                    "install failed: vendor head unreachable",
+                ),
+                (
+                    Refused::Preparation("Native Google pool location is unavailable".to_owned()),
+                    "startup",
+                    "Native Google pool location is unavailable",
+                ),
+            ] {
+                mark(TaskState::Working);
+                refuse(refused);
+                let record = ctx.timeline.lock().unwrap().task().cloned();
+                assert_eq!(
+                    record.map(|record| (record.state, record.why)),
+                    Some((TaskState::Stalled, Some(why))),
+                );
+                let said = attention().expect("the cause");
+                assert_eq!(
+                    said,
+                    format!(
+                        "{}no Codex started on m22: {cause} (its task is marked stalled why={why})",
+                        crate::harness_host::STARTUP_HEAD
+                    )
+                );
+            }
         });
     }
 
@@ -5948,7 +6234,7 @@ mod worker_start_app_tests {
             assert!(why.contains("stalled why=startup now"), "{why}");
             let launch = waiting.join().expect("the launcher's wait");
 
-            crate::task_launch::stall_task_why(&ctx, 1, "shell", &why);
+            crate::task_launch::stall_task_shell(&ctx, 1, &why);
             assert_eq!(record(), (TaskState::Stalled, Some("startup")));
 
             let working = crate::task_record::TaskMark::new(TaskState::Working);
@@ -5958,7 +6244,7 @@ mod worker_start_app_tests {
                 crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO).is_ok(),
                 "CONTROL: a working task's prompt takes its line"
             );
-            crate::task_launch::stall_task_why(&ctx, 1, "shell", "CONTROL");
+            crate::task_launch::stall_task_shell(&ctx, 1, "CONTROL");
             assert_eq!(
                 record(),
                 (TaskState::Stalled, Some("shell")),

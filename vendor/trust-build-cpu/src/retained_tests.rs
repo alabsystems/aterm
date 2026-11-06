@@ -25,6 +25,29 @@ fn owner() -> Owner {
     Owner::current(Some(123))
 }
 
+#[test]
+fn retained_identity_binds_pool_inode_and_original_debt_generation() {
+    let _fixture = kernel_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let pool = RetainedPool::create_private(&directory.path().join("one"), width(1)).unwrap();
+    let first = pool.try_acquire(owner()).unwrap().unwrap();
+    let identity = first.identity().unwrap();
+    assert_eq!(identity.slot, first.slot());
+    assert_eq!(identity.owner, owner());
+    assert_eq!(identity, first.identity().unwrap());
+    first.settle().unwrap();
+    let second = pool.try_acquire(owner()).unwrap().unwrap();
+    let next = second.identity().unwrap();
+    assert_eq!(identity.manifest, next.manifest);
+    assert_eq!(identity.file, next.file);
+    assert_ne!(identity.nonce, next.nonce);
+    let other = RetainedPool::create_private(&directory.path().join("two"), width(1)).unwrap();
+    let foreign = other.try_acquire(owner()).unwrap().unwrap();
+    assert_ne!(identity.manifest, foreign.identity().unwrap().manifest);
+    drop((second, foreign));
+    assert!(pool.try_acquire(owner()).unwrap().is_none(), "saved identity is not settlement");
+}
+
 fn slot(root: &Path, number: u32) -> PathBuf {
     root.join(BACKEND).join(format!("slot-{number:08x}"))
 }
@@ -209,12 +232,15 @@ fn a_changed_canonical_nonce_cannot_authorize_the_original_capability() {
     let root = directory.path().join("retained");
     let pool = RetainedPool::create_private(&root, width(1)).unwrap();
     let lease = pool.try_acquire(owner()).unwrap().unwrap();
+    assert!(lease.identity().is_ok());
     let path = slot(&root, lease.slot());
     let mut changed = std::fs::read(&path).unwrap();
     let position = changed.windows(b"nonce=".len()).position(|part| part == b"nonce=").unwrap()
         + b"nonce=".len();
     changed[position] = if changed[position] == b'0' { b'1' } else { b'0' };
     overwrite(&path, &changed);
+    assert!(lease.identity().is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), changed);
     assert!(lease.settle().is_err());
     assert_kernel_ownership_released(&root, 0);
     let reopened = RetainedPool::open_existing(&root).unwrap().unwrap();

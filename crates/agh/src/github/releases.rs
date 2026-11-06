@@ -493,7 +493,7 @@ impl UploadFile {
             )));
         }
         let mut hasher = aterm_digest::Sha256::new();
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = [0u8; 16 * 1024];
         let mut len = 0u64;
         loop {
             match file.read(&mut buf) {
@@ -1965,13 +1965,13 @@ impl<'a> Releases<'a> {
                         e.with_side_effect(crate::SideEffect::Applied)
                             .with_repo(self.slug.to_string())
                     })?;
-                let got = asset.digest.clone().unwrap_or_default();
-                if Sha256Digest::parse(&got) != Some(ours) {
+                let got = asset.digest.as_deref().unwrap_or_default();
+                if Sha256Digest::parse(got) != Some(ours) {
                     // GitHub answered 201: the asset with those bytes is on the release.
                     return Err(applied(self.conflict(
                         Sub::DigestMismatch {
                             expected: ours.to_string(),
-                            got: got.clone(),
+                            got: got.to_string(),
                         },
                         format!("GitHub holds {name} as {got}, not {ours}"),
                     )));
@@ -2036,8 +2036,8 @@ impl<'a> Releases<'a> {
         let temporary = clobber_temporary(name, &ours);
         writer.push_check()?;
         let first = writer.assets_of(id)?;
-        let old = first.iter().find(|a| a.name == name).cloned();
-        if let Some(asset) = &old
+        let old = first.iter().find(|a| a.name == name);
+        if let Some(asset) = old
             && asset.holds(ours)?
         {
             let others = count_of(first.iter().filter(|a| a.name != name).count());
@@ -2054,11 +2054,11 @@ impl<'a> Releases<'a> {
         if let Some(error) = self.temporary_fault(&temporary) {
             return Err(error);
         }
-        let mut parked = first.iter().find(|a| a.name == temporary).cloned();
+        let mut parked = first.iter().find(|a| a.name == temporary);
         // What this call's DELETE of a cut temporary asset may have done: every error after it
         // says at least that (`took`).
         let mut cleared = crate::SideEffect::None;
-        if let Some(cut) = parked.as_ref().filter(|asset| !asset.is_uploaded()) {
+        if let Some(cut) = parked.filter(|asset| !asset.is_uploaded()) {
             // A temporary asset of these bytes that never finished: a clobber of these bytes
             // cut in step 1, or one running beside this one, which N84 lets a clobber replace.
             // `upload_as` would read it as another upload in progress and refuse every rerun,
@@ -2069,11 +2069,11 @@ impl<'a> Releases<'a> {
             parked = None;
         }
         let after_clear = |e: Error| took(e, cleared);
-        let ours_parked = match &parked {
+        let ours_parked = match parked {
             Some(asset) if asset.holds(ours)? => Some(asset),
             _ => None,
         };
-        let (renamed, count) = match (&old, ours_parked) {
+        let (renamed, count) = match (old, ours_parked) {
             (None, None) if parked.is_none() => {
                 return self
                     .upload_as(permit, release, file, name)
@@ -2086,7 +2086,7 @@ impl<'a> Releases<'a> {
                     .map_err(after_clear)?;
                 // The temporary asset is on the release now, so every error after it says a
                 // write took effect (`applied`, unless it says unknown).
-                if let Some(old) = &old {
+                if let Some(old) = old {
                     self.delete_asset_id(permit, old.id).map_err(applied)?;
                     self.await_gone(permit, id, old).map_err(applied)?;
                 }

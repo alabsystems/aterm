@@ -2,9 +2,15 @@
 // Copyright 2026 Andrew Yates
 //! The work budgets over real faces (TF.5 of
 //! docs/AUDIT-third-party-2026-10-15.md): how many outline steps each glyph
-//! takes against aterm-font's 65,536 (`src/work.rs`) and how many `COLR`
-//! paint tables each colour glyph walks against its 2^16
-//! (`MAX_PAINT_VISITS`), read through aterm-font's debug-build seam
+//! takes against aterm-font's 65,536 (`src/work.rs`) and how much `COLR`
+//! paint work each colour glyph's walk spends against its 2^16
+//! (`PAINT_STEPS`: paint tables, v0 layers, colour stops and outlines, with
+//! the tables beside it), how many outline segments against its 2^18
+//! (`PAINT_SEGMENTS`) and how many steps outlining them takes against its
+//! 2^18 and 2^25 (`PAINT_OUTLINE_STEPS`, `PAINT_OUTLINE_VARIATION`), and
+//! how many region-axis evaluations the item variation deltas it and its
+//! painter read take against its 2^20 (`PAINT_DELTA_STEPS`), read
+//! through aterm-font's debug-build seam
 //! `take_spent`. Beside each count, the glyph as ttf-parser 0.25.1 answers
 //! it, which has no such budget: the outline's commands and box (each
 //! coordinate's f32 bits) and the paint walk's calls must match, so a
@@ -197,12 +203,21 @@ struct Tally {
     walk_differ: u64,
     walks_refused: u64,
     paint: Heaviest,
+    tables: Heaviest,
+    segments: Heaviest,
+    walk_steps: Heaviest,
+    walk_variation: Heaviest,
+    walk_deltas: Heaviest,
     /// Glyph-instances per power-of-two step bucket (`2^k <= steps < 2^(k+1)`).
     histogram: BTreeMap<u32, u64>,
 }
 
 const OUTLINE_BUDGET: u64 = 65_536;
 const PAINT_BUDGET: u64 = 1 << 16;
+const PAINT_SEGMENTS: u64 = 1 << 18;
+const PAINT_OUTLINE_STEPS: u64 = 1 << 18;
+const PAINT_OUTLINE_VARIATION: u64 = 1 << 25;
+const PAINT_DELTA_STEPS: u64 = 1 << 20;
 
 fn instances(face: &ttf_parser::Face) -> Vec<Vec<(ttf_parser::Tag, f32)>> {
     let axes: Vec<_> = face.variation_axes().into_iter().collect();
@@ -283,7 +298,11 @@ pub(crate) fn run(dir: &str, extra: &[String]) {
                         aterm_font::RgbaColor::new(fg.0, fg.1, fg.2, fg.3),
                         &mut Walk(&mut a),
                     );
-                    let tables = aterm_font::take_spent().paint_tables;
+                    let spent = aterm_font::take_spent();
+                    let (tables, work, segments) =
+                        (spent.paint_tables, spent.paint_work, spent.paint_segments);
+                    let (walk_steps, walk_variation) = (spent.outline_steps, spent.variation_steps);
+                    let walk_deltas = spent.paint_delta_steps;
                     a.bytes(if painted.is_some() { b"+" } else { b"!" });
                     let painted = theirs.paint_color_glyph(
                         ttf_parser::GlyphId(g),
@@ -292,15 +311,32 @@ pub(crate) fn run(dir: &str, extra: &[String]) {
                         &mut Walk(&mut b),
                     );
                     b.bytes(if painted.is_some() { b"+" } else { b"!" });
-                    t.walks_refused += u64::from(tables > PAINT_BUDGET);
+                    t.walks_refused += u64::from(
+                        work > PAINT_BUDGET
+                            || segments > PAINT_SEGMENTS
+                            || walk_steps > PAINT_OUTLINE_STEPS
+                            || walk_variation > PAINT_OUTLINE_VARIATION
+                            || walk_deltas > PAINT_DELTA_STEPS,
+                    );
                     t.paint
+                        .see(work, || format!("{path}#{index} [{inst}] gid {g}"));
+                    t.tables
                         .see(tables, || format!("{path}#{index} [{inst}] gid {g}"));
+                    t.segments
+                        .see(segments, || format!("{path}#{index} [{inst}] gid {g}"));
+                    t.walk_steps
+                        .see(walk_steps, || format!("{path}#{index} [{inst}] gid {g}"));
+                    t.walk_variation.see(walk_variation, || {
+                        format!("{path}#{index} [{inst}] gid {g}")
+                    });
+                    t.walk_deltas
+                        .see(walk_deltas, || format!("{path}#{index} [{inst}] gid {g}"));
                     if a.hex() != b.hex() {
                         t.walk_differ += 1;
                         face_differ += 1;
                         if face_differ <= 3 {
                             report.push(format!(
-                                "PAINT DIFFERS {path}#{index} [{inst}] gid {g} ({tables} tables)"
+                                "PAINT DIFFERS {path}#{index} [{inst}] gid {g} ({tables} tables, {work} work)"
                             ));
                         }
                     }
@@ -340,7 +376,22 @@ pub(crate) fn run(dir: &str, extra: &[String]) {
         t.outline_differ
     );
     println!(
-        "budgets: {} COLR faces, {} colour glyph walks: heaviest {} paint tables ({}), {} refused at 2^16; {} differ from ttf-parser",
-        t.colour_faces, t.colour_walks, t.paint.spent, t.paint.at, t.walks_refused, t.walk_differ
+        "budgets: {} COLR faces, {} colour glyph walks: heaviest {} paint work ({}), {} paint tables ({}), {} outline segments ({}), {} outline steps ({}), {} gvar steps ({}), {} item variation delta steps ({}), {} refused at 2^16, 2^18 segments, 2^18 outline steps, 2^25 gvar steps or 2^20 delta steps; {} differ from ttf-parser",
+        t.colour_faces,
+        t.colour_walks,
+        t.paint.spent,
+        t.paint.at,
+        t.tables.spent,
+        t.tables.at,
+        t.segments.spent,
+        t.segments.at,
+        t.walk_steps.spent,
+        t.walk_steps.at,
+        t.walk_variation.spent,
+        t.walk_variation.at,
+        t.walk_deltas.spent,
+        t.walk_deltas.at,
+        t.walks_refused,
+        t.walk_differ
     );
 }

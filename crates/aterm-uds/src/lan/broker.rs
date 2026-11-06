@@ -27,6 +27,10 @@ pub struct BrokerHello {
     pub protocol: u32,
     /// Its build.
     pub build: String,
+    /// `Some(macOS's allowance, in words)` when no broker is installed and this process serves
+    /// the broker's protocol to itself under that allowance ([`super::direct`]): the answer is
+    /// this process's own server's, not the root broker's.
+    pub direct: Option<String>,
 }
 
 /// A connection whose hellos were exchanged and whose request went.
@@ -63,7 +67,15 @@ fn open(request: Option<&Request>) -> Result<Session, LanError> {
 fn open_at(request: Option<&Request>, path: &Path, ours: u32) -> Result<Session, LanError> {
     let stream = match crate::connect::until(path, Instant::now() + DIAL_HANG) {
         Ok(stream) => stream,
-        Err(error) if not_installed(&error) => return Err(Unavailable::NotInstalled.into()),
+        // No broker: this process's own server, when macOS already allowed this code
+        // (`super::direct`); a broker that answers, refuses or speaks another protocol is the
+        // broker, and its answer stands.
+        Err(error) if not_installed(&error) => {
+            return match super::direct::open() {
+                Ok((stream, allowed)) => exchange(stream, request, ours, Some(allowed)),
+                Err(_) => Err(Unavailable::NotInstalled.into()),
+            };
+        }
         Err(error) => return Err(error.into()),
     };
     let wanted = broker_uid();
@@ -84,6 +96,17 @@ fn open_at(request: Option<&Request>, path: &Path, ours: u32) -> Result<Session,
             .into());
         }
     }
+    exchange(stream, request, ours, None)
+}
+
+/// The hellos, and `request`, on a broker's `stream` (`direct`: this process's own server's, under
+/// that allowance).
+fn exchange(
+    stream: CtlStream,
+    request: Option<&Request>,
+    ours: u32,
+    direct: Option<String>,
+) -> Result<Session, LanError> {
     let mut bytes = wire::encode(&Frame::Hello {
         protocol: ours,
         build: super::hello_build().to_owned(),
@@ -104,7 +127,11 @@ fn open_at(request: Option<&Request>, path: &Path, ours: u32) -> Result<Session,
         (first, Ok(())) => first?,
     };
     let broker = match first {
-        Some(Frame::Hello { protocol, build }) => BrokerHello { protocol, build },
+        Some(Frame::Hello { protocol, build }) => BrokerHello {
+            protocol,
+            build,
+            direct,
+        },
         Some(other) => return Err(unexpected(&other).into()),
         None => {
             return Err(Unavailable::Refused(

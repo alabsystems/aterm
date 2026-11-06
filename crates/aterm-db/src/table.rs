@@ -14,7 +14,7 @@ use crate::{
     Error, Result,
     crypto::{self, Causal, MAX_BODY, MAX_OPERATION, Reader},
 };
-use astream_wire::sync::{Actor, Digest, Header, Index, MAX_PARENTS};
+use astream_wire::sync::{Actor, Digest, Header, MAX_PARENTS};
 use aterm_digest::{Sha256, hkdf_expand_32, hkdf_extract};
 use aterm_secrets::{
     SecretBytes,
@@ -101,7 +101,7 @@ pub struct Record {
     scope: Scope,
     roster: Digest,
     epoch: u64,
-    header: Header,
+    pub(super) header: Header,
     authored_ms: u64,
     payload: SecretBytes,
 }
@@ -131,7 +131,7 @@ impl Record {
 thread_local! {
     /// The negative control of the table writer's wait (one-mesh M4, §11 B11): while set, a
     /// writer that holds a `Remove` whose rotation has not arrived seals its table write at once,
-    /// under the epoch that still wraps the removed Mac, as before B11. A test sets it for its
+    /// under the epoch that is due it, as before B11. A test sets it for its
     /// thread; a lab instance turns it on for its whole process with `tables-dont-wait` in
     /// `ATERM_TEST_NEGATIVE_CONTROL` ([`aterm_types::negative_control::on`]).
     pub(crate) static TABLES_DONT_WAIT: std::cell::Cell<bool> =
@@ -689,26 +689,26 @@ impl<'a> Session<'a> {
             selected.extend(log.commons_epoch_ids());
             selected.extend(log.fold_epoch_ids());
         }
-        let window: Vec<_> = selected
-            .iter()
-            .filter(|id| after.is_none_or(|after| **id > after))
-            .chain(
-                selected
-                    .iter()
-                    .filter(|id| after.is_some_and(|after| **id <= after)),
-            )
-            .take(limit)
-            .copied()
-            .collect();
-        let next = window.last().copied();
-        let needed = window
-            .into_iter()
-            .filter(|id| {
-                self.bootstrap
-                    .historical(&self.journal, &self.access, *id)
-                    .is_err()
-            })
-            .collect();
+        use std::ops::Bound::{Excluded, Unbounded};
+        let tail = match after {
+            Some(after) => selected.range((Excluded(after), Unbounded)),
+            None => selected.range::<Digest, _>(..),
+        };
+        let head = after.into_iter().flat_map(|after| selected.range(..=after));
+        let mut next = None;
+        let mut needed = Vec::new();
+        for id in tail.chain(head).take(limit) {
+            next = Some(*id);
+            if self.history.borrow().contains_key(id) {
+                continue;
+            }
+            match self.bootstrap.historical(&self.journal, &self.access, *id) {
+                Ok(history) => {
+                    self.history.borrow_mut().insert(*id, history);
+                }
+                Err(_) => needed.push(*id),
+            }
+        }
         Ok((needed, next))
     }
 
@@ -1093,7 +1093,9 @@ impl<'a> Session<'a> {
         Ok(())
     }
     /// Whether a write now waits for a removal's rotation (one-mesh M4): the epoch this session
-    /// would seal under still wraps a Mac the log removed. The store keeps such a write pending
+    /// would seal under is due one (P1's gate, `Log::head_due`: its causal past lacks a revoking
+    /// row's entry or the `Remove`s that row's gate needs, or it still wraps a Mac the log
+    /// removed). The store keeps such a write pending
     /// (`table::store::pending`) and seals it under the new epoch once that arrives.
     pub(crate) fn waits_for_rotation(&self) -> bool {
         self.access.waits_for_rotation(!tables_dont_wait())
@@ -1257,13 +1259,11 @@ impl<'a> Session<'a> {
                 .device()
                 .with_seed(|seed| crypto::signed(seed, DOMAIN, &wire))?,
         );
-        check_shape(Header {
-            id: Sha256::digest(&wire),
-            actor: self.actor(),
-            sequence: causal.sequence,
-            previous: causal.previous,
-            parents: causal.parents.to_vec(),
-        })?;
+        check_causal_links(causal.sequence, causal.previous, causal.parents)?;
+        let id = Sha256::digest(&wire);
+        if causal.parents.contains(&id) {
+            return Err(Error::new("malformed table causal header"));
+        }
         Ok(wire)
     }
     /// Authenticate a bounded record under its exact historical writer roster.
@@ -1610,14 +1610,18 @@ impl<'w> Envelope<'w> {
         let body = r.take(n)?;
         r.take(64)?;
         r.end()?;
+        check_causal_links(sequence, previous, &parents)?;
+        let id = signatures::verify(&actor[..32].try_into().unwrap(), wire)?;
+        if parents.contains(&id) {
+            return Err(Error::new("malformed table causal header"));
+        }
         let header = Header {
-            id: signatures::verify(&actor[..32].try_into().unwrap(), wire)?,
+            id,
             actor,
             sequence,
             previous,
             parents,
         };
-        check_shape(header.clone())?;
         Ok(Self {
             roster,
             epoch,
@@ -1638,11 +1642,17 @@ pub(crate) fn envelope_roster(wire: &[u8]) -> Option<Digest> {
         .and_then(|s| s.try_into().ok())
 }
 
-fn check_shape(header: Header) -> Result<()> {
-    Index::new(1)
-        .insert(header)
-        .map(|_| ())
-        .map_err(|_| Error::new("malformed table causal header"))
+fn check_causal_links(sequence: u64, previous: Option<Digest>, parents: &[Digest]) -> Result<()> {
+    if sequence > 0
+        && (sequence == 1) == previous.is_none()
+        && parents.len() <= MAX_PARENTS
+        && parents.windows(2).all(|p| p[0] < p[1])
+        && previous.is_none_or(|p| parents.binary_search(&p).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(Error::new("malformed table causal header"))
+    }
 }
 
 fn node_bytes_denied(roster: &aterm_secrets::swarm_roster::SwarmRoster, bytes: &[u8]) -> bool {

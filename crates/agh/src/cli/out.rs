@@ -323,7 +323,9 @@ fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) 
 
 fn raw_line_into(out: &mut String, projected: &Value, plan: &Plan) {
     let path = plan.fields.as_ref().and_then(|f| f.first());
-    let value = path.map_or(Value::Null, |path| project::value_at(projected, path));
+    let value = path.map_or(std::borrow::Cow::Borrowed(&Value::Null), |path| {
+        project::value_at(projected, path)
+    });
     format::cell_into(out, &value);
     out.push('\n');
 }
@@ -470,12 +472,13 @@ pub(crate) fn receipt_value(out: &mut String, value: &str) {
 /// Formats `receipt` as an `agh: ok verb=...` line with redacted values.
 #[must_use]
 pub fn receipt_line(receipt: &Receipt, redactor: &Redactor) -> String {
-    let mut line = String::from("agh: ok");
+    let mut line = String::with_capacity(128);
+    line.push_str("agh: ok");
     let mut push = |key: &str, value: &str| {
         line.push(' ');
         line.push_str(key);
         line.push('=');
-        receipt_value(&mut line, &redactor.apply(value));
+        receipt_value(&mut line, &redactor.apply_cow(value));
     };
     push("verb", &receipt.verb);
     if let Some(repo) = &receipt.repo {

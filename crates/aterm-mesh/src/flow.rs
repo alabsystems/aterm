@@ -238,12 +238,7 @@ impl Mesh {
             table,
             recovery: false,
         };
-        let length = stores
-            .table_lengths()
-            .ok()?
-            .into_iter()
-            .find_map(|(k, length)| (k == key).then_some(length))
-            .unwrap_or(0);
+        let length = stores.table_length(key).ok()?.unwrap_or(0);
         if !egress.wait_published(key, length, deadline) {
             return Some(Pushed::TimedOut);
         }

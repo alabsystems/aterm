@@ -22,6 +22,8 @@ pub(crate) fn tiered_terminal(rows: u16, cols: u16) -> Terminal {
         .tiered_scrollback_defaults()
         .build();
     term.set_compress_offload_active(true);
+    // The facade drains the OSC app-event queue (`take_osc_events`).
+    term.set_osc_event_polling(true);
     term
 }
 

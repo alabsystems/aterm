@@ -3526,30 +3526,32 @@ fn screen_never_sends_a_line_past_the_reply_cap() {
     assert!(out.contains(&format!("\"nbytes\":{}", 3 << 20)));
 }
 
+/// An over-cap `screen` read gathers once and stops serializing at the cap, and a frame past the
+/// cap is never kept for a `cells` watch, so none can pin one: the refusal is kept instead, and
+/// a later read of the same frame answers from it ungathered. The frame a `cells` watch builds
+/// within the cap, its pictures left out, is kept and serves a `screen` read ungathered.
 #[test]
-fn an_over_cap_screen_gathers_again_only_for_a_published_frames_pictures() {
-    use crate::frame_memo::{FrameSlot, Styled};
+fn an_over_cap_screen_gathers_once_a_read_and_is_never_kept() {
+    use crate::frame_memo::FrameSlot;
     use crate::work_counts::take_styled_frames_gathered as gathered;
     use aterm_core::terminal::Terminal;
     let too_big = "ERR screen: frame too large";
     let truncated = |out: &str| {
         out.starts_with("OK 1\n") && out.matches("\"format\":\"truncated\"").count() == 2
     };
+    let kept = |slot: &FrameSlot| slot.look_frame().styled_for_test().is_some();
 
     let term = Arc::new(Mutex::new(Terminal::new(120, 300)));
     let slot = Arc::new(FrameSlot::default());
     gathered();
     assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
     assert_eq!(gathered(), 1, "one gather for the ERR line");
-    let hold = FrameSlot::hold_cells(&slot);
+    let hold = FrameSlot::hold_cells(&slot).expect("a cells hold");
     assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
-    assert_eq!(gathered(), 1, "the read that published gathered once");
+    assert_eq!(gathered(), 1, "a read gathers once, and once only");
+    assert!(!kept(&slot), "no frame past the cap is kept");
     assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
-    assert_eq!(
-        gathered(),
-        0,
-        "a published frame with no picture is not gathered"
-    );
+    assert_eq!(gathered(), 0, "the kept refusal answers the same frame");
     drop(hold);
 
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -3564,25 +3566,71 @@ fn an_over_cap_screen_gathers_again_only_for_a_published_frames_pictures() {
     let slot = Arc::new(FrameSlot::default());
     gathered();
     assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
-    assert_eq!(gathered(), 1, "its own snapshot, rebuilt without them");
-    let _hold = FrameSlot::hold_cells(&slot);
+    assert_eq!(gathered(), 1, "its own snapshot, serialized without them");
+    assert!(!kept(&slot), "nothing is kept with no cells watch");
+    let _hold = FrameSlot::hold_cells(&slot).expect("a cells hold");
     assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
-    assert_eq!(gathered(), 1, "the read that published gathered once");
-    assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
-    assert_eq!(
-        gathered(),
-        1,
-        "the negative control: a published frame's pictures are left out of a fresh gather"
+    assert_eq!(gathered(), 1, "gathered once, kept without its pictures");
+    assert!(
+        kept(&slot),
+        "the frame within the cap is kept for the cells watch"
     );
-    let look = slot.look_frame();
-    let t = term.lock().unwrap();
-    let key = crate::frame_key::FrameKey::read(&t);
-    match look.styled(&t, &key) {
-        Styled::Hit(frame) => assert!(
-            frame.carries_image_payloads(),
-            "the published frame keeps its payloads"
-        ),
-        Styled::Miss(_) => panic!("the frame stays published"),
+    assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
+    assert_eq!(gathered(), 0, "served the kept frame");
+}
+
+/// A grid whose styled frame passes the reply-line cap by its floor alone (300 by 300 cells,
+/// 18 MB at the least) is refused before anything is gathered, with or without a `cells`
+/// watch. NEGATIVE CONTROL: a read that gathers first and checks the cap last gathers once.
+#[test]
+fn a_screen_frame_past_the_cap_by_its_floor_is_refused_ungathered() {
+    use crate::frame_memo::FrameSlot;
+    use crate::work_counts::take_styled_frames_gathered as gathered;
+    use aterm_core::terminal::Terminal;
+    let cap = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
+    let floor = crate::control::styled_frame_floor(300, 300);
+    assert!(floor > cap, "PRECONDITION: the floor passes the cap");
+    let term = Arc::new(Mutex::new(Terminal::new(300, 300)));
+    let slot = Arc::new(FrameSlot::default());
+    gathered();
+    let out = cmd_screen_styled_json(&term, &slot, "");
+    assert_eq!(gathered(), 0, "refused ungathered");
+    assert!(
+        out.starts_with(&format!(
+            "ERR screen: frame too large ({floor} bytes > {cap})"
+        )),
+        "{out}"
+    );
+    let _hold = FrameSlot::hold_cells(&slot).expect("a cells hold");
+    assert!(cmd_screen_styled_json(&term, &slot, "").starts_with("ERR screen:"));
+    assert_eq!(gathered(), 0, "refused ungathered under a cells watch");
+}
+
+/// Pictures whose base64 cannot fit the reply-line cap beside the grid (two of 3 MiB, 8 MiB of
+/// base64 on a 24 by 80 grid) are never encoded: the frame is served with them named
+/// `truncated`. NEGATIVE CONTROL: encoding before the cap is checked encodes both.
+#[test]
+fn pictures_past_the_cap_are_never_encoded() {
+    use crate::frame_memo::FrameSlot;
+    use crate::work_counts::take_images_encoded as encoded;
+    use aterm_core::terminal::Terminal;
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    for (row, fill) in [(1, 3u8), (12, 4)] {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(3 << 20, fill);
+        let b64 = aterm_codec::base64::encode(&png).expect("encodes");
+        term.lock().unwrap().process(
+            format!("\x1b[{row};1H\x1b]1337;File=inline=1;width=10;height=4:{b64}\x07").as_bytes(),
+        );
+    }
+    let slot = Arc::new(FrameSlot::default());
+    for watched in [false, true] {
+        let _hold = watched.then(|| FrameSlot::hold_cells(&slot).expect("a cells hold"));
+        encoded();
+        let out = cmd_screen_styled_json(&term, &slot, "");
+        assert!(out.starts_with("OK 1\n"), "{}", &out[..out.len().min(120)]);
+        assert_eq!(out.matches("\"format\":\"truncated\"").count(), 2);
+        assert_eq!(encoded(), 0, "no picture encoded (cells watch: {watched})");
     }
 }
 

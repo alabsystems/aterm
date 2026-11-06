@@ -380,6 +380,9 @@ const TOKEN_FLOOR: usize = 20;
 /// `` unknown field `bogus` `` still names its key; and any remaining run of
 /// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more becomes `…`.
 fn unquoted(message: &str) -> String {
+    if !message.contains(['"', '`']) {
+        return mask_long_words(message).into_owned();
+    }
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(at) = rest.find(['"', '`']) {
@@ -394,7 +397,7 @@ fn unquoted(message: &str) -> String {
         rest = after;
     }
     out.push_str(rest);
-    mask_long_words(&out)
+    mask_long_words(&out).into_owned()
 }
 
 /// `body` split at its closing `quote` (a `\` escapes the next character inside a double-
@@ -429,8 +432,15 @@ fn short_key_or_mark(inner: &str) -> bool {
 }
 
 /// `text` with each run of `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more replaced by `…`.
-fn mask_long_words(text: &str) -> String {
+fn mask_long_words(text: &str) -> std::borrow::Cow<'_, str> {
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    if text.len() < TOKEN_FLOOR
+        || !text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|run| run.len() >= TOKEN_FLOOR)
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -454,7 +464,7 @@ fn mask_long_words(text: &str) -> String {
             out.push_str(&text[start..i]);
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// The chain step that sends no credential.
@@ -560,14 +570,26 @@ struct Shown<'a> {
     rule: Option<fn(&str) -> bool>,
 }
 
-impl std::fmt::Display for Shown<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Shown<'_> {
+    fn as_cow(&self) -> std::borrow::Cow<'_, str> {
         let named = self.rule.is_some_and(|rule| rule(self.value));
         if named && !has_hex_run(self.value) {
-            f.write_str(self.value)
+            std::borrow::Cow::Borrowed(self.value)
         } else {
-            f.write_str(&mask_long_words(self.value))
+            mask_long_words(self.value)
         }
+    }
+}
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_cow())
+    }
+}
+
+impl std::fmt::Debug for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.as_cow(), f)
     }
 }
 
@@ -581,7 +603,7 @@ fn has_hex_run(text: &str) -> bool {
 /// An agh.toml value as a valid profile's row prints it (`agh whoami`, `agh auth status`).
 pub(crate) fn masked(text: &str) -> String {
     if has_hex_run(text) {
-        mask_long_words(text)
+        mask_long_words(text).into_owned()
     } else {
         text.to_string()
     }
@@ -1007,7 +1029,7 @@ impl Rows<'_> {
                     format!(
                         "writers row {}: caller {:?} is not [a-z][a-z0-9-]{{0,31}}",
                         i + 1,
-                        as_name(caller).to_string()
+                        as_name(caller)
                     ),
                 );
             }
@@ -1032,7 +1054,7 @@ impl Rows<'_> {
                         "L11",
                         format!(
                             "writers row for {shown}: {:?} is not a literal OWNER/NAME",
-                            as_value(entry).to_string()
+                            as_value(entry)
                         ),
                     );
                     continue;

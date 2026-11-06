@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright 2026 Andrew Yates
+
+use crate::*;
+fn request() -> Request {
+    Request {
+        binding: JobBinding {
+            session: "s-abcd".into(),
+            root_attempt: [1; 16],
+            capability: [2; 32],
+        },
+        member_attempt: [3; 16],
+        role: Role::Compile,
+        command: CommandSpec {
+            program: b"/sdk/trustc".to_vec(),
+            arg0: Some(b"trustc".to_vec()),
+            args: vec![vec![b'a', 0xff]],
+            environment: vec![(b"KEY".to_vec(), vec![0xfe])],
+            cwd: b"/source".to_vec(),
+        },
+        delegations: Delegations {
+            cpu: Some(Descriptor { source: 5, target: 3 }),
+            gnu: GnuTransport::NamedFifo {
+                locator: b"/private/tokens".to_vec(),
+                device: 1,
+                inode: 2,
+                read: Descriptor { source: 6, target: 4 },
+                write: Descriptor { source: 7, target: 5 },
+            },
+            fences: vec![],
+        },
+        timeout_ns: Some(100),
+    }
+}
+#[test]
+fn request_preserves_os_bytes_named_transport_and_refuses_ambiguous_input() {
+    let original = request();
+    let bytes = original.encode().unwrap();
+    assert!(Request::decode(&bytes).unwrap() == original);
+    for end in 0..bytes.len() {
+        assert!(Request::decode(&bytes[..end]).is_err());
+    }
+    let mut extra = bytes.clone();
+    extra.push(0);
+    assert!(Request::decode(&extra).is_err());
+    let mut invalid = request();
+    invalid.delegations.cpu.as_mut().unwrap().source = CONTROL_FD;
+    assert!(invalid.encode().is_err());
+    let mut invalid = request();
+    invalid.command.environment.push(invalid.command.environment[0].clone());
+    assert!(invalid.encode().is_err());
+    let mut invalid = request();
+    invalid.delegations.gnu = GnuTransport::None;
+    assert!(invalid.encode().is_err());
+    let mut invalid = request();
+    invalid.binding.session = format!("s-{}", "a".repeat(63));
+    assert!(invalid.encode().is_err());
+    let mut invalid = request();
+    invalid.member_attempt = invalid.binding.root_attempt;
+    assert!(invalid.encode().is_err());
+}
+fn started() -> Started {
+    Started {
+        identity: Identity { pid: 42, birth: 123, birth_kind: BirthKind::MacosWallMicroseconds },
+        monotonic_ns: 2,
+        unix_ns: 3,
+    }
+}
+#[test]
+fn lifecycle_and_cancellation_are_bound_and_unknown_keeps_execution_facts() {
+    let outcomes = [
+        Status::Attached,
+        Status::Started(started()),
+        Status::Finished {
+            outcome: Outcome::Signal(9),
+            cause: CompletionCause::ResourceLimit,
+            runtime_ns: 7,
+        },
+        Status::Refused { reason: "before launch".into() },
+        Status::Unknown { reason: "lost terminal".into(), started: Some(started()) },
+    ];
+    for status in outcomes {
+        let frame = StatusFrame { root_attempt: [1; 16], member_attempt: [3; 16], status };
+        let encoded = frame.encode().unwrap();
+        assert_eq!(StatusFrame::decode(&encoded, [1; 16], [3; 16]).unwrap(), frame);
+        assert!(StatusFrame::decode(&encoded, [1; 16], [4; 16]).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(StatusFrame::decode(&trailing, [1; 16], [3; 16]).is_err());
+    }
+    let cancel = Cancel { root_attempt: [1; 16], member_attempt: [3; 16] };
+    assert_eq!(Cancel::decode(&cancel.encode().unwrap(), cancel).unwrap(), cancel);
+    let mut invalid = started();
+    invalid.identity.pid = 1;
+    assert!(
+        StatusFrame {
+            root_attempt: [1; 16],
+            member_attempt: [3; 16],
+            status: Status::Started(invalid)
+        }
+        .encode()
+        .is_err()
+    );
+}
+#[test]
+fn producer_answer_matches_one_pending_call_and_actual_helper_identity() {
+    let proof = ProducerChallenge {
+        root_attempt: [1; 16],
+        member_attempt: [3; 16],
+        helper: started().identity,
+        nonce: [5; 32],
+    };
+    assert!(ProducerChallenge::decode(&proof.encode().unwrap()).unwrap() == proof);
+    assert!(proof.verify_answer(&proof.answer().unwrap()).is_ok());
+    assert!(proof.verify_answer(&proof.encode().unwrap()).is_err());
+    let mut other = proof.clone();
+    other.helper.birth += 1;
+    assert!(proof.verify_answer(&other.answer().unwrap()).is_err());
+    let mut other = proof.clone();
+    other.member_attempt = [4; 16];
+    assert!(proof.verify_answer(&other.answer().unwrap()).is_err());
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn framed_channel_bounds_partial_input_and_poisoning() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut a = Channel::new(a).unwrap();
+    let mut b = Channel::new(b).unwrap();
+    assert!(!b.ready_to_receive().unwrap());
+    let payload = request().encode().unwrap();
+    a.send(&payload, Instant::now() + Duration::from_secs(1)).unwrap();
+    assert_eq!(b.receive(Instant::now() + Duration::from_secs(1)).unwrap(), payload);
+    let (mut raw, read) = UnixStream::pair().unwrap();
+    let mut read = Channel::new(read).unwrap();
+    raw.write_all(&[0, 0, 0, 5, 1]).unwrap();
+    drop(raw);
+    assert!(read.receive(Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(read.poisoned());
+    assert!(read.receive(Instant::now() + Duration::from_secs(1)).is_err());
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut a = Channel::new(a).unwrap();
+    drop(b);
+    assert!(a.send(b"closed", Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(a.poisoned());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn closed_peer_is_safe_with_default_sigpipe() {
+    const CHILD: &str = "TRUST_CONTROLLER_SIGPIPE_FIXTURE";
+    if std::env::var_os(CHILD).is_some() {
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        // SAFETY: this dedicated reexecuted fixture process owns its signal
+        // disposition; restore POSIX default to detect a missing MSG_NOSIGNAL.
+        assert_ne!(unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) }, libc::SIG_ERR);
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let mut channel = Channel::new(stream).unwrap();
+        assert!(channel.send(b"closed", Instant::now() + Duration::from_secs(1)).is_err());
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::closed_peer_is_safe_with_default_sigpipe"])
+        .env(CHILD, "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "default SIGPIPE killed controller fixture: {status}");
+}
+
+#[test]
+fn context_uses_one_original_claim_and_only_exact_root_can_request_initial_cpu() {
+    let query = ContextQuery { binding: request().binding, call_attempt: [9; 16] };
+    let original_root = started().identity;
+    let context = Context {
+        session: query.binding.session.clone(),
+        root_attempt: query.binding.root_attempt,
+        host: "apple:host".into(),
+        boot: "abcd".into(),
+        original_root,
+        subject: Subject::Root { identity: original_root },
+        cpu: Cpu::CooperativeShared {
+            ceiling: 28,
+            native_manifest: FileIdentity { device: 1, inode: 10 },
+        },
+        memory: Memory {
+            bytes: 1 << 30,
+            namespace: [1; 16],
+            marker: "1-42-1".into(),
+            epoch: [2; 16],
+            guard: FileIdentity { device: 1, inode: 11 },
+        },
+    };
+    let mut reply = ContextReply { call_attempt: query.call_attempt, context };
+    let bytes = reply.encode().unwrap();
+    assert_eq!(ContextReply::decode(&bytes, &query).unwrap(), reply);
+    assert!(reply.context.may_acquire_initial_cpu(original_root));
+    let mut nested = original_root;
+    nested.pid += 1;
+    assert!(!reply.context.may_acquire_initial_cpu(nested));
+    reply.context.subject = Subject::RegisteredMember { identity: nested, attempt: [8; 16] };
+    assert!(!reply.context.may_acquire_initial_cpu(nested));
+    let member = ContextReply::decode(&reply.encode().unwrap(), &query).unwrap();
+    assert_eq!(member.context.memory.bytes, 1 << 30);
+    assert_eq!(member.context.memory.guard, reply.context.memory.guard);
+    reply.context.subject = Subject::Root { identity: original_root };
+    reply.context.cpu =
+        Cpu::RetainedFixed { units: 28, native_manifest: FileIdentity { device: 1, inode: 10 } };
+    assert!(!reply.context.may_acquire_initial_cpu(original_root));
+    let mut wrong = query.clone();
+    wrong.call_attempt = [7; 16];
+    assert!(ContextReply::decode(&bytes, &wrong).is_err());
+    reply.context.memory.guard.inode = 0;
+    assert!(reply.encode().is_err());
+}
+#[test]
+fn context_routing_and_private_locator_refuse_noncanonical_or_cross_role_input() {
+    let binding = request().binding;
+    let locator = binding.locator().unwrap();
+    assert!(JobBinding::from_locator(&locator).unwrap() == binding);
+    assert!(JobBinding::from_locator(&(locator.clone() + ":extra")).is_err());
+    assert!(JobBinding::from_locator(&locator.replacen("s-abcd", "s-ABCD", 1)).is_err());
+    let query = ContextQuery { binding, call_attempt: [9; 16] };
+    let encoded = query.encode().unwrap();
+    assert!(ContextQuery::decode(&encoded).unwrap() == query);
+    assert!(matches!(Call::decode(&encoded).unwrap(), Call::Context(_)));
+    assert!(Request::decode(&encoded).is_err());
+    assert!(matches!(Call::decode(&request().encode().unwrap()).unwrap(), Call::Member(_)));
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(Call::decode(&trailing).is_err());
+    for end in 0..encoded.len() {
+        assert!(ContextQuery::decode(&encoded[..end]).is_err());
+    }
+}
+
+#[test]
+fn helper_fd_locators_are_canonical_and_disjoint_from_sources_not_targets() {
+    let fds = HelperFds { control: 19, producer: 23 };
+    let args = fds.arguments().unwrap();
+    assert_eq!(HelperFds::parse(&args).unwrap(), Some(fds));
+    assert_eq!(
+        HelperFds::parse(&HELPER_ARGUMENTS.map(Into::into)).unwrap(),
+        Some(HelperFds::default())
+    );
+    assert!(fds.validate_delegations(&request().delegations).is_ok());
+    let mut req = request();
+    req.delegations.cpu.as_mut().unwrap().source = 19;
+    assert!(fds.validate_delegations(&req.delegations).is_err());
+    let mut invalid = args.clone();
+    invalid[2] = "--control-fd=019".into();
+    assert!(HelperFds::parse(&invalid).is_err());
+    let mut invalid = args.clone();
+    invalid[3] = "--producer-fd=19".into();
+    assert!(HelperFds::parse(&invalid).is_err());
+    assert!(HelperFds::parse(&["ordinary-command".into()]).unwrap().is_none());
+    let mut invalid = args;
+    invalid.push("extra".into());
+    assert!(HelperFds::parse(&invalid).is_err());
+}
+
+#[test]
+fn context_unavailable_is_bound_observation_denial_not_execution_refusal() {
+    let query = ContextQuery { binding: request().binding, call_attempt: [9; 16] };
+    let unavailable =
+        ContextUnavailable::for_query(&query, "original custody unavailable".into()).unwrap();
+    let bytes = ContextResponse::Unavailable(unavailable.clone()).encode().unwrap();
+    assert_eq!(
+        ContextResponse::decode(&bytes, &query).unwrap(),
+        ContextResponse::Unavailable(unavailable)
+    );
+    assert!(StatusFrame::decode(&bytes, query.binding.root_attempt, query.call_attempt).is_err());
+    let mut wrong = query.clone();
+    wrong.call_attempt = [8; 16];
+    assert!(ContextResponse::decode(&bytes, &wrong).is_err());
+    let mut extra = bytes;
+    extra.push(0);
+    assert!(ContextResponse::decode(&extra, &query).is_err());
+    assert!(ContextUnavailable::for_query(&query, "".into()).is_err());
+}

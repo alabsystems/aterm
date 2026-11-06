@@ -12,9 +12,11 @@
 //! F21 and F23), the membership log's record capacity (its budgets, the proof reserve and the
 //! crossed fence), re-key convergence (one ranked minter per due, bounded by its graces), and
 //! gap healing (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.2 M5: a missing `Wrap` is a gap a
-//! ranked holder heals, never a revocation), fabric routing and fleet-wide halts (§9
-//! `FabricRouting`: mail's one hop, the proven sender, dedup, revocation both ways, and a halt
-//! lifted on every member; `FabricMoves`: mail shown once per session across key rotations), and the machine-number negotiation
+//! ranked holder heals, never a revocation), the mesh relay (§9 `MeshRelay`: each record appended
+//! once, only current origins, the newest row the highest, every up Mac given every table record),
+//! fabric routing and fleet-wide halts (§9 `FabricRouting`: mail's one hop, the proven sender,
+//! dedup, revocation both ways, and a halt lifted on every member; `FabricMoves`: mail shown once
+//! per session across key rotations), and the machine-number negotiation
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §6.6: who holds a number, the older builds' implied
 //! records and migration, a machine's primary, succession, stripped and opaque entries, and the
 //! automatic pick).
@@ -33,6 +35,7 @@ mod models_keyed_epochs;
 mod models_ledger_publish;
 mod models_machine_number;
 mod models_membership;
+mod models_mesh_relay;
 mod models_peer_replacement;
 mod models_peer_selection;
 mod models_records_capacity;
@@ -64,6 +67,10 @@ pub use models_machine_number::{
     machine_number_succession_model,
 };
 pub use models_membership::membership_model;
+pub use models_mesh_relay::{
+    PRESENCE_FAIR, SETTLES, TABLES_FAIR, every_up_mac_gets_every_table_record_liveness,
+    mesh_relay_model, restarted_mac_reads_up_liveness,
+};
 pub use models_peer_replacement::peer_replacement_model;
 pub use models_peer_selection::peer_selection_model;
 pub use models_records_capacity::records_capacity_model;

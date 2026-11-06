@@ -22,10 +22,10 @@ pub(super) fn entry(scope: &aterm_db::table::Scope, key: &str, provider: Provide
     hash.update(provider.name().as_bytes());
     hash.update([0]);
     hash.update(key.as_bytes());
-    format!(
-        "native-api-key-{}",
-        aterm_codec::hex::encode_lower(&hash.finalize()[..24])
-    )
+    let mut out = String::with_capacity(63);
+    out.push_str("native-api-key-");
+    aterm_codec::hex::push_lower(&mut out, &hash.finalize()[..24]);
+    out
 }
 
 pub(super) fn pending(paths: &Paths) -> Result<bool, String> {
@@ -59,6 +59,16 @@ fn context(config: &Config) -> String {
         field(4, signer);
     }
     aterm_codec::hex::encode_lower(&hash.finalize())
+}
+
+fn hex_eq(text: Option<&str>, expected: &[u8; 32]) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    let mut decoded = [0u8; 32];
+    !text.bytes().any(|b| b.is_ascii_uppercase())
+        && aterm_codec::hex::decode_into(text.as_bytes(), &mut decoded)
+        && decoded == *expected
 }
 
 fn plan(paths: &Paths, deadline: Instant) -> Result<Option<(Value, Secret)>, String> {
@@ -122,11 +132,10 @@ fn plan(paths: &Paths, deadline: Instant) -> Result<Option<(Value, Secret)>, Str
     aterm_db::accounts::validate(&value["value"])
         .map_err(|_| "native input contains an invalid account proposal")?;
     let input = Secret::new(&plain.as_slice()[4 + count..]);
-    if value["commitment"].as_str()
-        != Some(
-            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(input.expose())).as_str(),
-        )
-    {
+    if !hex_eq(
+        value["commitment"].as_str(),
+        &aterm_digest::Sha256::digest(input.expose()),
+    ) {
         return Err("native intake payload differs from its metadata".into());
     }
     Inputs::decode(
@@ -199,9 +208,7 @@ fn recover_locked(
     if !snapshot.history_complete() {
         return Err("native intake proposal history is incomplete; wait for sync repair".into());
     }
-    if plan["table"].as_str()
-        != Some(aterm_codec::hex::encode_lower(&snapshot.scope.digest()).as_str())
-    {
+    if !hex_eq(plan["table"].as_str(), &snapshot.scope.digest()) {
         return Err("native input belongs to another proposal table".into());
     }
     let key = plan["key"].as_str().unwrap();
@@ -228,7 +235,7 @@ fn recover_locked(
             (Some(cell), Some(operation)) => {
                 !cell.stopped
                     && cell.candidates.len() == 1
-                    && operation == aterm_codec::hex::encode_lower(&cell.candidates[0].operation)
+                    && hex_eq(Some(operation), &cell.candidates[0].operation)
             }
             _ => false,
         };
@@ -250,12 +257,12 @@ fn recover_locked(
         let previous_raw = admin
             .native_entry_digest(&entry)
             .map_err(|e| e.to_string())?;
-        let previous = previous_raw
-            .as_ref()
-            .map(|digest| aterm_codec::hex::encode_lower(digest));
         let desired_raw = aterm_digest::Sha256::digest(input.expose());
         if previous_raw != Some(desired_raw) {
-            if plan["previous"].as_str() != previous.as_deref() {
+            if !match previous_raw.as_ref() {
+                Some(digest) => hex_eq(plan["previous"].as_str(), digest),
+                None => plan["previous"].is_null(),
+            } {
                 return Err("native intake entry changed before publication".into());
             }
             allowed()?;
@@ -278,7 +285,7 @@ fn recover_locked(
     }
     let credential = credential.ok_or("native intake publication is not readable yet")?;
     let commitment = aterm_digest::Sha256::digest(credential.value().as_slice());
-    if plan["commitment"].as_str() != Some(aterm_codec::hex::encode_lower(&commitment).as_str()) {
+    if !hex_eq(plan["commitment"].as_str(), &commitment) {
         return Ok(false);
     }
     Inputs::decode(credential.value().as_slice(), provider)?;

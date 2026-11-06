@@ -242,10 +242,11 @@ impl GpuRenderer {
     }
 
     /// Replace `surf`'s chain with a fresh one of the gate's format (the old
-    /// one dropped first: a window takes one flip-model chain at a time).
+    /// one dropped first, which forces its destruction: a window takes one
+    /// flip-model chain at a time).
     /// `Err` leaves the window without a chain and latches the loss, so the
     /// frontend's loss poll downgrades it.
-    fn d3d11_remake_chain(&self, surf: &mut GpuSurface, why: &str) -> Result<(), ()> {
+    pub(super) fn d3d11_remake_chain(&self, surf: &mut GpuSurface, why: &str) -> Result<(), ()> {
         let (w, h) = (surf.neutral.width, surf.neutral.height);
         let Some(dw) = surf.d3d11.as_mut() else {
             return Err(());
