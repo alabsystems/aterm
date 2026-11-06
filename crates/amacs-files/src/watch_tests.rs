@@ -195,12 +195,18 @@ fn the_platform_hears_a_rewrite_and_a_replace_by_rename() {
 
 /// A file deleted under the watch is heard, and so is the file made again at
 /// its path, which only the directory's events can tell (the deleted file's
-/// own events end with it): a buffer whose file went hears it come back.
+/// own events end with it): a buffer whose file went hears it come back. Its
+/// folder deleted too leaves nothing to arm on, and the watch arms again until
+/// the folder is back, so the file made again in it is heard as well; a file
+/// in another folder, whose arm never failed, hears its writes throughout (the
+/// control).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_platform_hears_a_delete_and_the_file_made_again() {
     let dir = scratch("amacs-watch-recreate");
-    let path = dir.path().join("doc.txt");
+    let folder = dir.path().join("nested");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("doc.txt");
     std::fs::write(&path, "one\n").unwrap();
     let (told, heard) = mpsc::channel();
     let arms = Arc::new(Mutex::new(0));
@@ -241,7 +247,141 @@ fn the_platform_hears_a_delete_and_the_file_made_again() {
         Ok(9),
         "the file made again"
     );
+    armed(4);
+
+    // In a folder of its own: a look of it that the folders made and deleted
+    // below touched could race the control's own write.
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let beside = elsewhere.join("beside.txt");
+    std::fs::write(&beside, "one\n").unwrap();
+    watch.watch(10, beside.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(10),
+        "the first look beside"
+    );
+    armed(6);
+    std::fs::remove_dir_all(&folder).unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(9),
+        "the folder deleted with the file"
+    );
+    // The look after that delete found nothing to arm on.
+    armed(7);
+    std::fs::write(&beside, "two, beside\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(10),
+        "the control's write"
+    );
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(&path, "three\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(9),
+        "the file made again in its folder made again"
+    );
     drop(watch);
+}
+
+/// An arm a test refuses while `refuse` holds (the file's folder is gone),
+/// counting the arms it was asked for and keeping each wait's timeout.
+#[derive(Clone, Default)]
+struct Refusing {
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+    arms: Arc<Mutex<usize>>,
+    waits: Arc<Mutex<Vec<Option<Duration>>>>,
+    inert: InertEvents,
+}
+
+impl FileEvents for Refusing {
+    fn arm(&mut self, _key: u64, _path: &Path) -> io::Result<()> {
+        *self.arms.lock().unwrap() += 1;
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn disarm(&mut self, _key: u64) {}
+
+    fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
+        self.waits.lock().unwrap().push(timeout);
+        self.inert.wait(timeout, touched)
+    }
+
+    fn waker(&self) -> Waker {
+        self.inert.waker()
+    }
+}
+
+/// A file no arm took is armed again, every wait bounded meanwhile, until an
+/// arm takes; from then on the watch waits on events alone, with no timeout:
+/// it arms again only while a file is unarmed.
+#[test]
+fn a_file_no_arm_took_is_armed_again_until_one_takes_and_then_waits_untimed() {
+    let dir = scratch("amacs-watch-rearm");
+    let path = dir.path().join("doc.txt");
+    std::fs::write(&path, "one\n").unwrap();
+    let events = Refusing::default();
+    events
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(5, path.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the first look"
+    );
+    // Refused at the watch and at its first look, then armed again unasked.
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "armed again", || {
+        (*events.arms.lock().unwrap() >= 4).then_some(())
+    });
+    let refused_waits = events.waits.lock().unwrap().clone();
+    assert!(
+        refused_waits.iter().all(Option::is_some),
+        "an unarmed file bounds every wait: {refused_waits:?}"
+    );
+    events
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "an untimed wait", || {
+        events
+            .waits
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(Option::is_none)
+            .then_some(())
+    });
+    assert!(
+        heard.try_recv().is_err(),
+        "the look after the arm took found the file unchanged"
+    );
+    drop(watch);
+}
+
+/// inotify's `poll` timeout: none waits for an event, a wait already due
+/// polls without sleeping (it slept a millisecond), and a rest under a
+/// millisecond is one, never a spin at zero.
+#[test]
+fn a_due_wait_polls_at_once_and_a_short_one_never_spins() {
+    assert_eq!(poll_millis(None), -1);
+    assert_eq!(poll_millis(Some(Duration::ZERO)), 0);
+    assert_eq!(poll_millis(Some(Duration::from_micros(1))), 1);
+    assert_eq!(poll_millis(Some(QUIET)), 80);
+    assert_eq!(poll_millis(Some(Duration::MAX)), i32::MAX);
 }
 
 /// Linux's inotify events: one names its watch and entry, so it touches only

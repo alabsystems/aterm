@@ -2916,6 +2916,112 @@ mod tests {
         assert_eq!(w.reset.as_deref(), Some("10:25am"));
     }
 
+    /// A MARK THE GRID KEEPS IN A CELL WIDENS NO PANE: the readers that take the pane's width from
+    /// its widest row ([`crate::question::screen_width`]) read the `⎿` notice the last turn ended
+    /// on in its box to the pane's edge with no slack ([`crate::wrap::transcript_room`]), so one cell
+    /// of the pane decides a wrap. Counted in chars before (KI-1101-3), a row drawn to the pane's
+    /// edge holding characters the grid stores in the cell of the one before them (the two
+    /// combining acutes of a file name macOS spells decomposed) measured the pane two cells wider
+    /// than it is: the measured 26-column 2.1.299 notice's `You've hit your` read as a line of its
+    /// own (15 + 1 + 7 cells fit 23), so no wall and the phase idle, and a `Login successful ·
+    /// account or organization changed` Ink wrapped at that width read as no login back
+    /// (`account or` + 1 + `organization` fit 23). No capture draws such a row, so these screens
+    /// are CONSTRUCTED: the measured 26-column screen after the cancel with a call and its output
+    /// row (read back as aterm's grid stores it) above its first prompt; for the login, that
+    /// screen's last prompt and notice replaced by `❯ /login` and that notice, Ink-wrapped in the
+    /// gutter's room. They read as the screens without the row: the wall (its kind, placement,
+    /// message and reset), the limit notice and the phase; the login back. NEGATIVE CONTROL: an
+    /// output row really two cells past the edge (a pane 28 wide) reads the pane 28 wide, whose
+    /// notice rows are no wrap: no wall.
+    #[test]
+    fn a_mark_the_grid_keeps_in_a_cell_widens_no_pane() {
+        use crate::prompt::fixtures::{WALL_SESSION_AFTER_CANCEL_26_2_1_299, ink_wrap};
+        use crate::question::{cells, read_back, screen_width};
+        const WIDTH: usize = 26;
+        let measured = screen(WALL_SESSION_AFTER_CANCEL_26_2_1_299);
+        assert_eq!(screen_width(&measured), WIDTH, "PRECONDITION: the pane");
+        let marked = read_back("  ⎿  Re\u{301}sume\u{301}.pdf  notes.txt");
+        let marked = crate::text::trim_end(&marked).to_string();
+        assert_eq!(
+            (cells(&marked), marked.chars().count()),
+            (WIDTH, WIDTH + 2),
+            "PRECONDITION: the row runs to the pane's edge, the grid keeping both marks: {marked:?}"
+        );
+        let first = measured
+            .iter()
+            .position(|r| r.starts_with("❯ "))
+            .expect("the first prompt");
+        let with = |screen: &[String], output: &str| {
+            let mut v = screen.to_vec();
+            v.splice(
+                first..first,
+                [
+                    "❯ list my documents",
+                    "",
+                    "⏺ Bash(ls ~/Documents)",
+                    output,
+                    "",
+                ]
+                .map(String::from),
+            );
+            v
+        };
+        let read = |r: &[String]| {
+            (
+                wall(r).map(|w| (w.kind, w.placement, w.message, w.reset)),
+                limit_notice(r),
+                worker_phase(r),
+            )
+        };
+        let wanted = read(&measured);
+        assert!(
+            matches!(
+                wanted.0,
+                Some((WallKind::UsageSession, Placement::Gutter, _, Some(_)))
+            ),
+            "PRECONDITION: the measured wall: {wanted:?}"
+        );
+        assert_eq!(read(&with(&measured, &marked)), wanted, "the wall");
+        let wider = "  ⎿  Resume.pdf  notes-2.txt";
+        assert_eq!(
+            cells(wider),
+            WIDTH + 2,
+            "PRECONDITION: two cells past the edge"
+        );
+        assert_eq!(
+            read(&with(&measured, wider)).0,
+            None,
+            "NEGATIVE CONTROL: a row two cells past the edge"
+        );
+        let last = measured
+            .iter()
+            .rposition(|r| r.starts_with("❯ keep going"))
+            .expect("the last prompt");
+        let done = measured
+            .iter()
+            .rposition(|r| r.starts_with("✻ "))
+            .expect("the done row");
+        let mut login = measured.clone();
+        let notice = ink_wrap(
+            "Login successful · account or organization changed",
+            crate::wrap::transcript_room(5, WIDTH),
+        );
+        let turn = std::iter::once("❯ /login".to_string())
+            .chain(
+                notice
+                    .iter()
+                    .enumerate()
+                    .map(|(k, r)| format!("{}{r}", if k == 0 { "  ⎿  " } else { "     " })),
+            )
+            .chain([String::new()]);
+        login.splice(last..done, turn);
+        assert!(
+            notice.len() == 3 && login_restored(&login) && wall(&login).is_none(),
+            "PRECONDITION: the login back: {login:#?}"
+        );
+        assert!(login_restored(&with(&login, &marked)), "the login back");
+    }
+
     #[test]
     fn a_status_lines_words_are_no_footer_notice() {
         use crate::prompt::fixtures::{

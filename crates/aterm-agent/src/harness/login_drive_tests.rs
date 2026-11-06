@@ -15,6 +15,131 @@ use std::ffi::OsString;
 use super::*;
 use crate::ai::connector::{CODEX_SIGNIN, GROK_SIGNIN, Hosts, KIMI_SIGNIN};
 
+#[cfg(unix)]
+#[test]
+fn uncertain_provider_wait_retains_the_real_signin_lock_and_app_scope() {
+    for fault in [false, true] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let store = super::super::accounts::Store::at(scratch.path());
+        let signin = store.signin_now().unwrap().unwrap();
+        let lifetime = super::super::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let mut command =
+            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")));
+        let child = command.arg("600").process_group(0).spawn().unwrap();
+        let (notice, event) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(scope.wrap(move || {
+                let mut owner = ProviderOwner(child);
+                let mut calls = 0;
+                end_with(&mut owner, |child| {
+                    calls += 1;
+                    if fault && calls == 1 {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    if fault && calls == 2 {
+                        notice.send((false, false)).unwrap();
+                        gate.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                    }
+                    child.wait()
+                });
+                let reaped = owner.is_reaped();
+                drop(owner);
+                drop(signin);
+                notice.send((true, reaped)).unwrap();
+            }))
+            .unwrap();
+        let first = event.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let lock_held = store.signin_now().map(|lock| lock.is_none());
+        let pause = lifetime.pause().unwrap().try_wait();
+        let pending = pause.is_err();
+        let _ = release.send(());
+        worker.join().expect("owned worker retired");
+        let first = first.expect("retry or actual completion");
+        assert_eq!(first.0, !fault);
+        assert_eq!(lock_held.unwrap(), fault);
+        if fault {
+            assert!(pending);
+            assert_eq!(event.recv().unwrap(), (true, true));
+        } else {
+            assert!(first.1);
+        }
+        let drained = match pause {
+            Ok(drained) => drained,
+            Err(pause) => pause.try_wait().unwrap(),
+        };
+        assert!(store.signin_now().unwrap().is_some());
+        assert!(drained.resume().is_ok());
+    }
+}
+
+#[test]
+fn provider_pipe_reader_keeps_the_same_scope_until_its_actual_io_retires() {
+    let lifetime = super::super::account_work::Lifetime::default();
+    let (mut read, write) = std::io::pipe().unwrap();
+    let reader = spawn_reader(lifetime.enter(), move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut read, &mut bytes).unwrap();
+    })
+    .unwrap();
+    let pause = lifetime.pause().unwrap().try_wait();
+    let pending = pause.is_err();
+    drop(write);
+    reader.join().unwrap();
+    let drained = match pause {
+        Ok(drained) => drained,
+        Err(pause) => pause.try_wait().unwrap(),
+    };
+    assert!(
+        pending,
+        "a real open read pipe retains the admitted operation"
+    );
+    assert!(drained.resume().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_approver_unwind_reaps_the_actual_root_before_caller_release() {
+    struct Panicking(super::super::account_work::Scope);
+    impl Approver for Panicking {
+        fn work_scope(&self) -> Option<super::super::account_work::Scope> {
+            Some(self.0.clone())
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("synthetic approver unwind")
+        }
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let lifetime = super::super::account_work::Lifetime::default();
+    let mut approver = Panicking(lifetime.enter().unwrap());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stand_in_drive_in(scratch.path(), "hold 0", &mut approver)
+    }));
+    let pid = std::fs::read_to_string(scratch.path().join("sol+1/pid"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let presence = aterm_uds::process::process_presence(pid);
+    drop(approver);
+    let mut pause = Some(lifetime.pause().unwrap());
+    let drained = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(1),
+        || match pause.take().unwrap().try_wait() {
+            Ok(drained) => Some(drained),
+            Err(held) => {
+                pause = Some(held);
+                None
+            }
+        },
+    )
+    .expect("actual provider readers retired");
+    assert!(result.is_err());
+    assert_eq!(presence, aterm_uds::process::ProcessPresence::Absent);
+    assert!(drained.resume().is_ok());
+}
+
 const KIMI: &str = include_str!("fixtures/signin/kimi-2.3.1-login-global.stderr");
 const GROK: &str = include_str!("fixtures/signin/grok-1.0.67-device-auth.stderr");
 const GROK_NO_DESK: &str = include_str!("fixtures/signin/grok-1.0.70-device-auth-no-desk.stderr");

@@ -7,30 +7,42 @@
 /// `@@ -a,n +b,m @@`, under a `--- path` / `+++ path (planned)` header.
 #[must_use]
 pub fn unified(path: &str, old: &str, new: &str) -> Vec<String> {
+    if old == new {
+        return Vec::new();
+    }
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
-    let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i][j] = if a[i] == b[j] {
-                lcs[i + 1][j + 1] + 1
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let am = &a[prefix..];
+    let bm = &b[prefix..];
+    let width = bm.len() + 1;
+    let mut lcs = vec![0u32; (am.len() + 1) * width];
+    for i in (0..am.len()).rev() {
+        for j in (0..bm.len()).rev() {
+            lcs[i * width + j] = if am[i] == bm[j] {
+                lcs[(i + 1) * width + j + 1] + 1
             } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
             };
         }
     }
-    let mut script = Vec::new();
+    let mut script = Vec::with_capacity(a.len() + bm.len());
+    for k in 0..prefix {
+        script.push((' ', k, k));
+    }
     let (mut i, mut j) = (0, 0);
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            script.push((' ', i, j));
+    while i < am.len() || j < bm.len() {
+        if i < am.len() && j < bm.len() && am[i] == bm[j] {
+            script.push((' ', prefix + i, prefix + j));
             i += 1;
             j += 1;
-        } else if i < a.len() && (j == b.len() || lcs[i + 1][j] >= lcs[i][j + 1]) {
-            script.push(('-', i, j));
+        } else if i < am.len()
+            && (j == bm.len() || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
+        {
+            script.push(('-', prefix + i, prefix + j));
             i += 1;
         } else {
-            script.push(('+', i, j));
+            script.push(('+', prefix + i, prefix + j));
             j += 1;
         }
     }

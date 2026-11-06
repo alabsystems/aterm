@@ -270,21 +270,18 @@ fn decode(kept: &str) -> Option<Spotlit> {
 /// One Spotlight query: the NUL-separated paths named `pattern` under a folder.
 type Query<'a> = dyn Fn(&Path, &str) -> Result<String, String> + Sync + 'a;
 
-/// The two queries, crate files under the home and HTML pages in rustup's home, run at once.
+/// The two queries, crate files under the home and HTML pages in rustup's home, run at once (one
+/// after the other where no thread starts: [`crate::beside`]).
 fn measure(home: &Path, rustup: &Path, query: &Query<'_>) -> Result<Spotlit, String> {
     let real_rustup = std::fs::canonicalize(rustup)
         .ok()
         .filter(|real| real.is_dir());
     let (crates, listed) = std::thread::scope(|scope| {
-        let html = real_rustup
-            .as_deref()
-            .map(|real| scope.spawn(move || query(real, "*.html")));
-        let crates = query(home, "*.rmeta");
-        let listed = html.map(|handle| {
-            handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        let html = real_rustup.as_deref().map(|real| {
+            crate::beside::start(scope, "aterm-spotlight-html", move || query(real, "*.html"))
         });
+        let crates = query(home, "*.rmeta");
+        let listed = html.map(crate::beside::Beside::answer);
         (crates, listed)
     });
     let crates = crates?;
@@ -481,9 +478,15 @@ pub(crate) fn build_root(path: &str) -> String {
     parts[..parts.len().saturating_sub(1)].join("/")
 }
 
+/// `path` with `home`, spelled with or without a trailing `/`, as `~`; a home of `/` is no
+/// home to shorten.
 fn tilde(home: &Path, path: &str) -> String {
     let home = home.to_string_lossy();
-    match path.strip_prefix(home.as_ref()) {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return path.to_owned();
+    }
+    match path.strip_prefix(home) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_owned(),
     }
@@ -606,6 +609,43 @@ mod tests {
         let lit = measure(home.path(), &home.path().join("no-rustup"), &alone).unwrap();
         assert_eq!(lit.rustup, None);
         assert_eq!(*ran_alone.lock().unwrap(), ["*.rmeta"]);
+    }
+
+    /// Where no thread starts, the HTML query runs after the crate query on the caller's own
+    /// thread, and the measure is the one two threads give. NEGATIVE CONTROL: with a thread the
+    /// HTML query runs off the caller's thread.
+    #[test]
+    fn a_measure_refused_a_thread_runs_both_queries_itself() {
+        let home = aterm_tempfile::tempdir().expect("home");
+        let rustup = home.path().join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        let caller = std::thread::current().id();
+        let ran = std::sync::Mutex::new(Vec::new());
+        let query = |dir: &Path, pattern: &str| -> Result<String, String> {
+            ran.lock()
+                .unwrap()
+                .push((pattern.to_owned(), std::thread::current().id() == caller));
+            Ok(match pattern {
+                "*.rmeta" => format!(
+                    "{}/w/target/debug/deps/libx-1.rmeta\0",
+                    home.path().display()
+                ),
+                _ => format!("{}/tmp/report.html\0", dir.display()),
+            })
+        };
+        let threaded = measure(home.path(), &rustup, &query).unwrap();
+        let on_threads = std::mem::take(&mut *ran.lock().unwrap());
+        assert!(
+            on_threads.contains(&("*.html".to_owned(), false)),
+            "{on_threads:?}"
+        );
+        let here =
+            crate::beside::tests::refusing(|| measure(home.path(), &rustup, &query).unwrap());
+        assert_eq!(here, threaded);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [("*.rmeta".to_owned(), true), ("*.html".to_owned(), true)]
+        );
     }
 
     /// A PERSON WHO LEFT RUST IN SPOTLIGHT UNCHECKED KEEPS THE DOCS: indexed rust-docs pages
@@ -857,6 +897,21 @@ mod tests {
         }
         assert_eq!(tilde(Path::new("/U/a"), "/U/a/x"), "~/x");
         assert_eq!(tilde(Path::new("/U/a"), "/U/ab/x"), "/U/ab/x");
+    }
+
+    /// A home spelled with a trailing `/` (`HOME=/U/a/`) shortens as the same home without it,
+    /// and a home of `/` shortens nothing. NEGATIVE CONTROL: a path beside the home, not in it,
+    /// stays whole either way.
+    #[test]
+    fn a_home_with_a_trailing_slash_shortens_as_the_same_home() {
+        for home in ["/U/a", "/U/a/", "/U/a//"] {
+            let home = Path::new(home);
+            assert_eq!(tilde(home, "/U/a/x"), "~/x", "{home:?}");
+            assert_eq!(tilde(home, "/U/a"), "~", "{home:?}");
+            assert_eq!(tilde(home, "/U/ab/x"), "/U/ab/x", "{home:?}");
+        }
+        assert_eq!(tilde(Path::new("/"), "/"), "/");
+        assert_eq!(tilde(Path::new("/"), "/x"), "/x");
     }
 
     #[test]

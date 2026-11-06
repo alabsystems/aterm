@@ -29,12 +29,8 @@ pub(super) const TERM_WRITE: Rule = Rule {
 };
 
 fn term_write(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let test_only = tree.corpus.test_only(GUI);
     for file in tree.corpus.under(&[GUI]) {
-        if tree.corpus.test_code().holds(&file.rel)
-            || test_only.contains(&file.rel)
-            || !file.mentions(&["term", "MutexGuard"])
-        {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&["term", "MutexGuard"]) {
             continue;
         }
         let code = file.shipped_code();

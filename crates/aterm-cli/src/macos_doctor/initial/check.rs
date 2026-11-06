@@ -38,42 +38,77 @@ impl LiveCheck {
     fn prefetch(root: &Path, plan: &Plan) -> Self {
         let check =
             |selected: Selection| execute(&mut NativeHost::selected(selected), root, Action::Check);
+        Self::prefetch_with(plan, check, live_spotlight, || current_vault_rows(plan))
+    }
+
+    /// [`Self::prefetch`] with its checks given: each on a thread of its own, or in the caller
+    /// where no thread starts ([`crate::beside`]). A check that panics reads as its stage's
+    /// error ([`panicked`]), and the others still read.
+    fn prefetch_with(
+        plan: &Plan,
+        check: impl Fn(Selection) -> Result<Report, String> + Copy + Send,
+        spotlight: impl FnOnce() -> Result<Vec<Row>, String> + Clone + Send,
+        vault: impl FnOnce() -> Result<Vec<Row>, String> + Clone + Send,
+    ) -> Self {
         let (prefs, signins) = (preferences(plan.selection), accounts(plan.selection));
         let ws_selected = Stage::Workstation.selected(plan);
         let accounts_selected = Stage::Accounts.selected(plan);
         std::thread::scope(|s| {
             let ws = (ws_selected || accounts_selected).then(|| {
-                s.spawn(move || {
+                crate::beside::start(s, "aterm-check-workstation", move || {
                     (
                         ws_selected.then(|| check(prefs)),
                         accounts_selected.then(|| check(signins)),
                     )
                 })
             });
-            let sp = Stage::Spotlight.selected(plan).then(|| {
-                s.spawn(|| {
-                    aterm_machines::init::run_initial_spotlight(
-                        &aterm_machines::port::Live::new(),
-                        &LiveInitial::live().context()?,
-                        aterm_machines::model::Mode::Plan,
-                    )
-                    .map(item_rows)
-                })
-            });
+            let sp = Stage::Spotlight
+                .selected(plan)
+                .then(|| crate::beside::start(s, "aterm-check-spotlight", spotlight));
             let vault = Stage::Secrets
                 .selected(plan)
-                .then(|| s.spawn(|| current_vault_rows(plan)));
+                .then(|| crate::beside::start(s, "aterm-check-vault", vault));
             let (workstation, accounts) = ws
-                .map(|h| h.join().expect("workstation check thread"))
+                .map(|ws| {
+                    ws.answer_or(|panic| {
+                        let why = panicked(&*panic);
+                        (
+                            ws_selected.then(|| Err(why.clone())),
+                            accounts_selected.then_some(Err(why)),
+                        )
+                    })
+                })
                 .unwrap_or_default();
             Self {
                 workstation,
                 accounts,
-                spotlight: sp.map(|h| h.join().expect("spotlight check thread")),
-                vault: vault.map(|h| h.join().expect("vault check thread")),
+                spotlight: sp.map(|sp| sp.answer_or(|panic| Err(panicked(&*panic)))),
+                vault: vault.map(|vault| vault.answer_or(|panic| Err(panicked(&*panic)))),
             }
         })
     }
+}
+
+/// The error a check that panicked reads as: it read nothing, and its panic's words say why.
+fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
+    let said = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    match said {
+        Some(said) => format!("the check panicked, so it read nothing: {said}"),
+        None => "the check panicked, so it read nothing".into(),
+    }
+}
+
+/// The Spotlight stage's check.
+fn live_spotlight() -> Result<Vec<Row>, String> {
+    aterm_machines::init::run_initial_spotlight(
+        &aterm_machines::port::Live::new(),
+        &LiveInitial::live().context()?,
+        aterm_machines::model::Mode::Plan,
+    )
+    .map(item_rows)
 }
 
 impl InitialCheckHost for LiveCheck {
@@ -90,14 +125,7 @@ impl InitialCheckHost for LiveCheck {
     }
 
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
-        self.spotlight.take().unwrap_or_else(|| {
-            aterm_machines::init::run_initial_spotlight(
-                &aterm_machines::port::Live::new(),
-                &LiveInitial::live().context()?,
-                aterm_machines::model::Mode::Plan,
-            )
-            .map(item_rows)
-        })
+        self.spotlight.take().unwrap_or_else(live_spotlight)
     }
 
     fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String> {
@@ -394,6 +422,91 @@ mod tests {
         }
         fn repositories(&mut self, _: &Plan) -> Result<Vec<Row>, String> {
             self.observe(Stage::Repositories)
+        }
+    }
+
+    /// A check that panics reads as its stage's error, which says the panic, and every other
+    /// check still reads; refused a thread, the checks read the same in the caller. NEGATIVE
+    /// CONTROL: checks that answer read as they answered.
+    #[test]
+    fn a_check_that_panics_reads_as_its_stage_s_error_and_the_others_still_read() {
+        fn read(stage: Stage) -> Vec<Row> {
+            vec![readiness_row(stage.name(), true, "injected".into())]
+        }
+        let plan = Plan::from(Selection::all());
+        let prefs = preferences(plan.selection);
+        let outcome = |checks: &LiveCheck| {
+            let said = |read: Option<Result<&[Row], &String>>| match read {
+                Some(Ok(rows)) => rows[0].name.clone(),
+                Some(Err(why)) => why.clone(),
+                None => "unread".into(),
+            };
+            let rows = |read: &Option<Result<Vec<Row>, String>>| {
+                said(read.as_ref().map(|read| read.as_deref()))
+            };
+            let report = |read: &Option<Result<Report, String>>| {
+                said(
+                    read.as_ref()
+                        .map(|read| read.as_ref().map(|report| report.rows.as_slice())),
+                )
+            };
+            [
+                report(&checks.workstation),
+                report(&checks.accounts),
+                rows(&checks.spotlight),
+                rows(&checks.vault),
+            ]
+        };
+        let fine = [
+            Stage::Workstation.name(),
+            Stage::Accounts.name(),
+            Stage::Spotlight.name(),
+            Stage::Secrets.name(),
+        ];
+        let lost = "the check panicked, so it read nothing: injected panic";
+        for (ws_panics, spotlight_panics, read_as) in [
+            (false, false, fine.map(str::to_owned)),
+            (
+                true,
+                false,
+                [lost, lost, fine[2], fine[3]].map(str::to_owned),
+            ),
+            (
+                false,
+                true,
+                [fine[0], fine[1], lost, fine[3]].map(str::to_owned),
+            ),
+        ] {
+            let check = move |selected: Selection| {
+                assert!(!(ws_panics && selected == prefs), "injected panic");
+                Ok(Report {
+                    action: Action::Check,
+                    rows: read(if selected == prefs {
+                        Stage::Workstation
+                    } else {
+                        Stage::Accounts
+                    }),
+                    manual_steps: Vec::new(),
+                    backup: std::path::PathBuf::new(),
+                    restore: None,
+                    page: None,
+                })
+            };
+            let spotlight = move || {
+                assert!(!spotlight_panics, "injected panic");
+                Ok(read(Stage::Spotlight))
+            };
+            let vault = || Ok(read(Stage::Secrets));
+            let threaded = LiveCheck::prefetch_with(&plan, check, spotlight, vault);
+            assert_eq!(
+                outcome(&threaded),
+                read_as,
+                "{ws_panics} {spotlight_panics}"
+            );
+            let here = crate::beside::tests::refusing(|| {
+                LiveCheck::prefetch_with(&plan, check, spotlight, vault)
+            });
+            assert_eq!(outcome(&here), read_as, "in the caller");
         }
     }
 

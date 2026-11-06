@@ -283,6 +283,132 @@ pub fn admit_on(
     })
 }
 
+/// A CLAIM OF A KNOWN SIZE, MEASURED BY NOBODY: one claim for a whole tree of work whose
+/// caller sized it from its own record of what that work wrote (the release's,
+/// `aterm_release::release_disk`), so nothing is walked to size it before it, while it is held,
+/// or at its end, and nothing is kept when it ends. The work it starts under it is covered by it
+/// ([`Whole::marker`], [`aterm_capacity::DISK_COVER_ENV`]) and claims nothing more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SizedClaim {
+    /// What the work is, as a wait line names it: `release 0.156.0`.
+    pub what: String,
+    /// What it claims, bytes.
+    pub bytes: u64,
+    /// Where its writes land: the claim is on the volume holding it.
+    pub on: PathBuf,
+    /// The directories its relief keeps ([`Reclaim::live`]): those the work is about to write into
+    /// (its build directories), which a pass under pressure would otherwise turn cold.
+    pub keep: Vec<PathBuf>,
+    /// The checkout it runs for, which its record and its wait lines name
+    /// ([`aterm_capacity::Need::checkout`]).
+    pub checkout: Option<String>,
+    /// Give up its wait once every claim it waits behind is held by a holder that has made no
+    /// progress for this long ([`aterm_capacity::Need::ends_when_stuck`]): [`Error::Stuck`].
+    pub stuck_ends: Option<Duration>,
+}
+
+/// A HELD CLAIM OF A KNOWN SIZE ([`SizedClaim`]): it ends when dropped, keeping nothing.
+#[derive(Debug)]
+pub struct Whole {
+    claim: aterm_capacity::Claim,
+    /// How long it waited for room.
+    pub waited: Duration,
+}
+
+impl Whole {
+    /// The claim's name ([`aterm_capacity::Record::cover_marker`]): what its holder hands the work
+    /// it starts as [`aterm_capacity::DISK_COVER_ENV`], so that work is covered by it alone
+    /// ([`aterm_capacity::covering_disk`]).
+    #[must_use]
+    pub fn marker(&self) -> String {
+        self.claim.record().cover_marker()
+    }
+
+    /// The claim as the ledger holds it.
+    #[must_use]
+    pub const fn record(&self) -> &aterm_capacity::Record {
+        self.claim.record()
+    }
+
+    /// The work has written `bytes` so far (its own count, never a walk): a waiter counts only the
+    /// rest of the claim as reserved, since free space has lost those bytes already
+    /// ([`aterm_capacity::Claim::wrote`]).
+    ///
+    /// # Errors
+    /// The claim's file could not be written; the claim stands as it was.
+    pub fn wrote(&mut self, bytes: u64) -> std::io::Result<()> {
+        self.claim.wrote(bytes)
+    }
+}
+
+/// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume
+/// ([`Reclaim::live`], keeping [`SizedClaim::keep`]) before it waits and saying through `say` what it
+/// does and waits for. Nothing is walked to size it; only a wait short of room sizes the
+/// largest holders its lines name, as every wait does ([`Reclaim::live`]).
+///
+/// # Errors
+/// As [`admit`]: [`Error::Never`], [`Error::Ledger`], [`Error::Stopped`], [`Error::Stuck`].
+pub fn admit_sized(
+    run: SizedClaim,
+    mode: Admit,
+    say: &mut dyn FnMut(&str),
+) -> Result<Whole, Error> {
+    let ledger = Ledger::user().ok_or_else(|| {
+        Error::Ledger(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to keep the ledger under",
+        ))
+    })?;
+    let mut relief = Reclaim::live(&run.keep);
+    admit_sized_on(run, &ledger, &Live, mode, Pace::default(), &mut relief, say)
+}
+
+/// [`admit_sized`] in `ledger` on `machine`, relieved by `relief`. A claim that says anything (a
+/// relief, a wait) or is refused first says what it claims (`disk: claims`), since a wait line
+/// names the figure alone; one admitted at once says nothing.
+///
+/// # Errors
+/// As [`admit_sized`].
+pub fn admit_sized_on(
+    run: SizedClaim,
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    mode: Admit,
+    pace: Pace,
+    relief: &mut dyn Relief,
+    say: &mut dyn FnMut(&str),
+) -> Result<Whole, Error> {
+    let mut need = Need::new(run.what.clone()).disk(run.bytes, run.on.clone());
+    if let Some(checkout) = run.checkout {
+        need = need.checkout(checkout);
+    }
+    if let Some(after) = run.stuck_ends {
+        need = need.ends_when_stuck(after);
+    }
+    let why = format!(
+        "disk: claims {} for {} on the volume of {}, sized from its record of its runs, not by \
+         walking its directories",
+        size(run.bytes),
+        run.what,
+        run.on.display()
+    );
+    let mut told = false;
+    let admitted = admit_relieved(ledger, machine, need, mode, pace, relief, &mut |line| {
+        if !std::mem::replace(&mut told, true) {
+            say(&why);
+        }
+        say(line);
+    });
+    if matches!(admitted, Err(Error::Never(_))) && !told {
+        say(&why);
+    }
+    let claim = admitted?;
+    Ok(Whole {
+        waited: claim.waited(),
+        claim,
+    })
+}
+
 /// THE IDENTITY OF A RUN'S DIRECTORIES, kept with each run measured on them
 /// ([`Footprint::dirs`]), so a run measured on other directories is not counted
 /// ([`aterm_capacity::Footprints::need`]): an FNV-1a digest ([`aterm_hash::Fnv1a64`]) of their

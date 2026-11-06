@@ -292,7 +292,7 @@ pub fn time_to_full(free: u64, rate60: Option<f64>, filling_for_ms: i64) -> Opti
 /// below it); `None` without a positive rate. [`time_to_full`] is its `line` 0.
 #[must_use]
 pub fn time_to_line(free: u64, line: u64, rate: Option<f64>) -> Option<f64> {
-    let rate = rate.filter(|r| *r > 0.0)?;
+    let rate = rate.filter(|r| r.is_finite() && *r > 0.0)?;
     Some(free.saturating_sub(line) as f64 / rate)
 }
 
@@ -320,7 +320,7 @@ impl Filling {
 pub fn filling(free: u64, rates: &Rates, ttf: Option<f64>) -> Option<Filling> {
     let burst = rates
         .rate5
-        .filter(|r| *r > 0.0)
+        .filter(|r| r.is_finite() && *r > 0.0)
         .map(|rate| Filling {
             secs: free as f64 / rate,
             rate,
@@ -328,7 +328,8 @@ pub fn filling(free: u64, rates: &Rates, ttf: Option<f64>) -> Option<Filling> {
         })
         .filter(|f| f.secs < URGENT_S);
     let hour = ttf
-        .zip(rates.rate60)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .zip(rates.rate60.filter(|r| r.is_finite() && *r > 0.0))
         .map(|(secs, rate)| Filling {
             secs,
             rate,
@@ -608,6 +609,8 @@ mod tests {
         );
         assert_eq!(time_to_line(free, 0, Some(0.0)), None);
         assert_eq!(time_to_line(free, 0, Some(-1.0)), None);
+        assert_eq!(time_to_line(free, 0, Some(f64::INFINITY)), None);
+        assert_eq!(time_to_line(free, 0, Some(f64::NAN)), None);
         assert_eq!(time_to_line(free, 0, None), None);
     }
 
@@ -660,6 +663,12 @@ mod tests {
             ),
             None
         );
+        let non_finite = Rates {
+            rate5: Some(f64::INFINITY),
+            rate10: None,
+            rate60: Some(f64::NAN),
+        };
+        assert_eq!(filling(free, &non_finite, Some(100.0)), None);
     }
 
     /// NEGATIVE CONTROL: repeated sub-clamp backward steps eventually cross `CLAMP_BACK_S`

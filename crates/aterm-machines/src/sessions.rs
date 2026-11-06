@@ -109,10 +109,16 @@ pub fn parse_aterm_roster_line(
 /// Replace the account's home directory prefix with `~` for compact display.
 #[must_use]
 pub fn shorten_home(path: &str) -> String {
+    let home = aterm_uds::account::home().or_else(aterm_types::dirs::home_dir);
+    shorten_home_with(path, home.as_deref().and_then(Path::to_str).unwrap_or(""))
+}
+
+/// [`shorten_home`] for the home directory `home`, read with or without a trailing `/`; an
+/// empty home, or `/`, shortens nothing.
+fn shorten_home_with(path: &str, home: &str) -> String {
     let trimmed = path.trim();
-    if let Some(home) = aterm_uds::account::home().or_else(aterm_types::dirs::home_dir)
-        && let Some(h) = home.to_str().filter(|h| !h.is_empty())
-    {
+    let h = home.trim_end_matches('/');
+    if !h.is_empty() {
         if trimmed == h {
             return "~".to_owned();
         }
@@ -542,5 +548,22 @@ mod tests {
         let a_dup = parse_aterm_roster_line(0, "0 s-one - alive zsh meta=0").unwrap();
         assert!(!same_hosted_session(&a, &b));
         assert!(same_hosted_session(&a, &a_dup));
+    }
+
+    /// A home read with a trailing `/` shortens as the same home does without it. NEGATIVE
+    /// CONTROL: a sibling that shares its prefix, and a `/` or empty home, shorten nothing.
+    #[test]
+    fn a_home_with_a_trailing_slash_shortens_like_the_same_home_without() {
+        for home in ["/Users//alice", "/Users//alice/"] {
+            assert_eq!(shorten_home_with(" /Users//alice/aterm ", home), "~/aterm");
+            assert_eq!(shorten_home_with("/Users//alice", home), "~");
+            assert_eq!(
+                shorten_home_with("/Users//alice2/aterm", home),
+                "/Users//alice2/aterm"
+            );
+        }
+        assert_eq!(shorten_home_with("/usr/bin", "/"), "/usr/bin");
+        assert_eq!(shorten_home_with("/", "/"), "/");
+        assert_eq!(shorten_home_with("/usr/bin", ""), "/usr/bin");
     }
 }

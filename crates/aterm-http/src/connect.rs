@@ -24,6 +24,24 @@ pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpSt
     }
 }
 
+/// What a nonblocking connect's `select` said, once it returned before its timeout: connected
+/// only where the socket is writable and not in the failed set. A failed or unwritable socket is
+/// an error, its pending one (`pending`, `SO_ERROR`) where it has one and a plain failure where
+/// winsock left none, never a connection.
+/// # Errors
+/// The connect failed, or reading its pending error did.
+#[cfg(any(windows, test))]
+fn selected(
+    writable: u32,
+    failed: u32,
+    pending: impl FnOnce() -> io::Result<Option<io::Error>>,
+) -> io::Result<()> {
+    if failed == 0 && writable == 1 {
+        return Ok(());
+    }
+    Err(pending()?.unwrap_or_else(|| io::Error::other("connection failed")))
+}
+
 /// Winsock, hand-rolled (the house style for flat Win32): aterm-win32 carries
 /// only its consumers' closure of windows-sys, which names none of these.
 #[cfg(windows)]
@@ -262,13 +280,7 @@ mod winsock {
                         "connection timed out",
                     ));
                 }
-                _ => {
-                    if writable.count != 1
-                        && let Some(e) = stream.take_error()?
-                    {
-                        return Err(e);
-                    }
-                }
+                _ => super::selected(writable.count, failed.count, || stream.take_error())?,
             }
         }
         stream.set_nonblocking(false)?;
@@ -297,6 +309,30 @@ mod tests {
             .read_exact(&mut byte)
             .expect("a blocking read waits for it");
         assert_eq!(&byte, b"x");
+    }
+
+    /// A select that returned is a connection only for a writable socket outside the failed set;
+    /// a failed one is an error even where winsock left no pending one. NEGATIVE CONTROL: writable
+    /// and not failed connects without reading the pending error.
+    #[test]
+    fn only_a_writable_unfailed_select_is_a_connection() {
+        let none = || Ok(None);
+        let refused = || Ok(Some(io::Error::from(io::ErrorKind::ConnectionRefused)));
+        assert!(selected(1, 0, || panic!("a connection reads no pending error")).is_ok());
+        for (writable, failed) in [(0, 1), (1, 1), (0, 0)] {
+            let err = selected(writable, failed, none).expect_err("no connection");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::Other,
+                "{writable} {failed}: {err}"
+            );
+            let err = selected(writable, failed, refused).expect_err("no connection");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused,
+                "{writable} {failed}: {err}"
+            );
+        }
     }
 
     #[test]

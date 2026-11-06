@@ -4603,6 +4603,56 @@ impl App {
         apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
         same_image: Option<SameImageHandoff>,
     ) -> Result<(), crate::UpdateHandoffStartError> {
+        if self.account_drain_pending() {
+            return Err(crate::UpdateHandoffStartError::refused(
+                "account work is already draining for a shutdown or update",
+            ));
+        }
+        if self.update_handoff_in_flight() {
+            return self.apply_staged_update_after_accounts(
+                safety_token,
+                mode,
+                apply_attempt,
+                same_image,
+            );
+        }
+        if !self.accounts_drained_before(crate::app_account_work::Continuation::Handoff {
+            mode,
+            attempt: apply_attempt.clone(),
+            same_image,
+            #[cfg(unix)]
+            activity: self.update_handoff_activity_epoch,
+            #[cfg(unix)]
+            next_attempt: self.next_update_handoff_id,
+        }) {
+            return if self.account_drain_unavailable() {
+                Err(crate::UpdateHandoffStartError::failed(
+                    "account work settlement is unavailable; admission remains closed",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        #[cfg(unix)]
+        let account_attempt = self.next_update_handoff_id;
+        let result =
+            self.apply_staged_update_after_accounts(safety_token, mode, apply_attempt, same_image);
+        if result.is_err() {
+            self.resume_drained_accounts();
+        } else {
+            #[cfg(unix)]
+            self.bind_account_handoff(account_attempt);
+        }
+        result
+    }
+
+    fn apply_staged_update_after_accounts(
+        &mut self,
+        safety_token: crate::app_native::NativeUpdateSafetyToken,
+        mode: crate::native_updater_service::ApplyMode,
+        apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
+        same_image: Option<SameImageHandoff>,
+    ) -> Result<(), crate::UpdateHandoffStartError> {
         if self.update_handoff_in_flight() {
             #[cfg(target_os = "macos")]
             if self.launch_record_renewal_in_flight() {
@@ -7642,6 +7692,8 @@ impl App {
                     crate::CloseOutcome::Exit
                 ) {
                     el.exit();
+                } else {
+                    self.resume_drained_accounts();
                 }
             }
             crate::DeferredHandoffTeardown::QuitRequested => {
@@ -7652,7 +7704,11 @@ impl App {
                 generation,
                 confirmed,
             } => {
-                self.resume_native_termination(el, generation, confirmed);
+                if crate::menu::native_termination_is_current(generation) {
+                    self.resume_native_termination(el, generation, confirmed);
+                } else {
+                    self.resume_drained_accounts();
+                }
             }
             crate::DeferredHandoffTeardown::CleanQuitReady => {
                 // A native view or document may have gained unsaved work during the
@@ -8890,6 +8946,10 @@ impl App {
             pending.revoked_by_activity,
         );
         let teardown = pending.teardown;
+        self.returned_account_handoff(
+            _attempt_id,
+            !matches!(teardown, crate::DeferredHandoffTeardown::None),
+        );
         self.release_window_closes_the_teardown_dropped(&teardown);
         if let Some(live) = pending.parked_live.as_deref() {
             self.rollback_overlap(nonce.as_deref(), live);

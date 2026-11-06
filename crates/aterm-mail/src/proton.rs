@@ -86,9 +86,11 @@ impl MessageCache {
 
     fn get(&mut self, id: &str) -> Option<Message> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
-        let message = self.entries.remove(index)?;
-        self.entries.push_front(message.clone());
-        Some(message)
+        if index > 0 {
+            let message = self.entries.remove(index)?;
+            self.entries.push_front(message);
+        }
+        self.entries.front().cloned()
     }
 
     fn insert(&mut self, message: Message) {
@@ -184,7 +186,7 @@ impl AddressList {
             return Self::default();
         };
         let mut list = Self {
-            addresses: Vec::new(),
+            addresses: Vec::with_capacity(entries.len()),
             complete: true,
         };
         for entry in entries {
@@ -683,12 +685,13 @@ impl Proton {
                 )?,
                 None => password.clone(),
             };
+            let private_key = field(key, "PrivateKey")?;
             if let Ok(mut unlocked) =
-                crate::crypto::pgp::unlock(field(key, "PrivateKey")?, derived.expose().as_bytes())
+                crate::crypto::pgp::unlock(private_key, derived.expose().as_bytes())
             {
                 user_keys.append(&mut unlocked);
                 signing_keys.extend(crate::crypto::pgp_signature::signing_keys(
-                    field(key, "PrivateKey")?,
+                    private_key,
                     derived.expose().as_bytes(),
                 )?);
                 legacy_passphrases.push(derived);
@@ -1052,7 +1055,7 @@ impl Mailbox for Proton {
             return Ok(message);
         }
         let (mut message, mime) = self.read_source(id)?;
-        message.text = project_body(&mime, &message.text);
+        message.text = project_body(&mime, message.text);
         if folder != "1" {
             self.cache.insert(message.clone());
         }
@@ -1074,10 +1077,10 @@ impl Mailbox for Proton {
     }
 }
 
-fn project_body(mime: &str, body: &str) -> String {
+fn project_body(mime: &str, body: String) -> String {
     let media = mime.split(';').next().unwrap_or("").trim();
     if media.eq_ignore_ascii_case("text/html") {
-        crate::mime::html_text(body)
+        crate::mime::html_text(&body)
     } else if media
         .get(..10)
         .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"))
@@ -1085,7 +1088,7 @@ fn project_body(mime: &str, body: &str) -> String {
     {
         parsed.text
     } else {
-        body.to_owned()
+        body
     }
 }
 
@@ -1140,11 +1143,17 @@ mod session_tests {
         .unwrap();
         assert_eq!(parsed.to, "primary@proton.me, cc@proton.me, bcc@proton.me");
         assert_eq!(
-            project_body("TEXT/HTML; charset=utf-8", "<p>Code <b>123456</b></p>"),
+            project_body(
+                "TEXT/HTML; charset=utf-8",
+                "<p>Code <b>123456</b></p>".into()
+            ),
             "Code 123456\n"
         );
         let multipart = "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nHello MIME\r\n--b--\r\n";
-        assert_eq!(project_body("multipart/mixed", multipart), "Hello MIME");
+        assert_eq!(
+            project_body("multipart/mixed", multipart.into()),
+            "Hello MIME"
+        );
     }
 
     #[test]

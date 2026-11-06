@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 
 use super::access::ScrollbackAccess;
+use super::iter::Segment;
 use super::{ImageSpan, Line, Scrollback, ScrollbackError, WatermarkLevel};
 
 /// Iterator over scrollback storage lines (oldest to newest).
@@ -30,7 +31,11 @@ impl Iterator for ScrollbackStorageIter<'_> {
                 return None;
             }
             match self.storage.read_segment(self.idx) {
-                Ok(lines) => {
+                Ok(Segment::Line(line)) => {
+                    self.idx = self.idx.saturating_add(1);
+                    return Some(line);
+                }
+                Ok(Segment::Block(lines)) => {
                     if lines.is_empty() {
                         // In-range index with no data (stale count or short
                         // decode): end of data.

@@ -442,12 +442,13 @@ pub fn check_host_key(key: &HostKey, trust: &Trust) -> Result<(), String> {
     }
 }
 
-/// `known_hosts` text with `alias`'s line replaced by `alias <key>` (other lines kept).
+/// `known_hosts` text with every line that pins a key under `alias` ([`inventory::pins`],
+/// which [`inventory::forget_host_key`] drops too) replaced by `alias <key>` (other lines kept).
 #[must_use]
 pub fn known_hosts_with(current: &str, alias: &str, key: Option<&HostKey>) -> String {
     let mut out: String = current
         .lines()
-        .filter(|l| l.split_whitespace().next() != Some(alias))
+        .filter(|l| !inventory::pins(l, alias))
         .map(|l| format!("{l}\n"))
         .collect();
     if let Some(key) = key {
@@ -2183,7 +2184,7 @@ fn first_hello(sys: &dyn System, paths: &Paths, host: &Host) -> Result<Hello, St
         );
     }
     let hello: Hello = aterm_json::from_str(ran.out().trim()).map_err(|e| format!("hello: {e}"))?;
-    if hello.uuid != host.uuid {
+    if !hello.uuid.eq_ignore_ascii_case(&host.uuid) {
         return Err(format!(
             "the forced command answers as {:?}, not {}",
             hello.uuid, host.uuid
@@ -2514,6 +2515,29 @@ mod tests {
         assert_eq!(
             known_hosts_with(&text, uuid, None),
             "OTHER ssh-ed25519 AAAA\n"
+        );
+    }
+
+    /// A line OpenSSH reads as pinning the alias, whatever its case, in a comma list or as
+    /// `[alias]:port`, is replaced too, so a re-pin never leaves an old key beside the new one.
+    /// NEGATIVE CONTROL: a line naming another host, or the alias only as a prefix, is kept.
+    #[test]
+    fn pinning_replaces_every_line_openssh_reads_as_the_alias_s() {
+        let key = HostKey {
+            kind: "ssh-ed25519".into(),
+            blob: VM_KEY.into(),
+            fingerprint: VM_FP.into(),
+        };
+        let lower = "c3396674-fcd3-52e5-a1c1-bd5b9e8f5c43";
+        let upper = lower.to_ascii_uppercase();
+        let current = format!(
+            "{upper} ssh-ed25519 OLD1\na,{upper} ssh-ed25519 OLD2\n[{upper}]:2222 ssh-ed25519 OLD3\n{lower}-x ssh-ed25519 KEEP1\nOTHER ssh-ed25519 KEEP2\n"
+        );
+        assert_eq!(
+            known_hosts_with(&current, lower, Some(&key)),
+            format!(
+                "{lower}-x ssh-ed25519 KEEP1\nOTHER ssh-ed25519 KEEP2\n{lower} ssh-ed25519 {VM_KEY}\n"
+            )
         );
     }
 
@@ -3059,6 +3083,41 @@ mod tests {
     fn ctl() -> Paths {
         Paths {
             root: PathBuf::from(ROOT),
+        }
+    }
+
+    /// The forced command's first hello answers for the Mac being enrolled when its UUID
+    /// differs only in case (the UUID is hex). NEGATIVE CONTROL: another UUID is refused.
+    #[test]
+    fn the_first_hello_matches_the_mac_s_uuid_in_either_case() {
+        let host = Host {
+            name: "lab-01".into(),
+            uuid: VM_UUID.to_ascii_lowercase(),
+            address: "192.168.64.4".into(),
+            user: "admin".into(),
+            baseline: None,
+            users: Vec::new(),
+        };
+        let key = ssh::request_cmd(&ctl(), &Target::of(&host), "hello")
+            .unwrap()
+            .display();
+        for (answers, ok) in [
+            (VM_UUID, true),
+            ("C3396674-FCD3-52E5-A1C1-BD5B9E8F5C44", false),
+        ] {
+            let sys = Fake::root();
+            let hello = Hello {
+                uuid: answers.into(),
+                ..Hello::default()
+            };
+            sys.on(&key, Ran::ok(&aterm_json::to_string(&hello).unwrap()));
+            let got = first_hello(&sys, &ctl(), &host);
+            if ok {
+                assert_eq!(got.unwrap().uuid, VM_UUID);
+            } else {
+                let why = got.unwrap_err();
+                assert!(why.contains("the forced command answers as"), "{why}");
+            }
         }
     }
 

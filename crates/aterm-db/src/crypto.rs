@@ -41,13 +41,23 @@ pub fn public(seed: &[u8; 32]) -> Result<[u8; 32]> {
         .try_into()
         .map_err(|_| Error::new("invalid public key size"))
 }
+const STACK_SIG_CAP: usize = 1024;
+
 pub(crate) fn signed(seed: &[u8; 32], domain: &[u8], body: &[u8]) -> Result<[u8; 64]> {
-    let mut message = Vec::with_capacity(domain.len() + body.len());
-    message.extend_from_slice(domain);
-    message.extend_from_slice(body);
-    pair(seed)?
-        .sign(&message)
-        .as_ref()
+    let key = pair(seed)?;
+    let total = domain.len() + body.len();
+    let sig = if total <= STACK_SIG_CAP {
+        let mut buf = [0u8; STACK_SIG_CAP];
+        buf[..domain.len()].copy_from_slice(domain);
+        buf[domain.len()..total].copy_from_slice(body);
+        key.sign(&buf[..total])
+    } else {
+        let mut message = Vec::with_capacity(total);
+        message.extend_from_slice(domain);
+        message.extend_from_slice(body);
+        key.sign(&message)
+    };
+    sig.as_ref()
         .try_into()
         .map_err(|_| Error::new("invalid signature size"))
 }
@@ -58,11 +68,19 @@ pub(crate) fn verify(key: &[u8; 32], domain: &[u8], body: &[u8], signature: &[u8
     let Ok(signature) = <&[u8; 64]>::try_from(signature) else {
         return Err(Error::new("database signature did not verify"));
     };
-    let mut message = Vec::with_capacity(domain.len() + body.len());
-    message.extend_from_slice(domain);
-    message.extend_from_slice(body);
-    astream_aead::signature::verify(key, &message, signature)
-        .then_some(())
+    let total = domain.len() + body.len();
+    let ok = if total <= STACK_SIG_CAP {
+        let mut buf = [0u8; STACK_SIG_CAP];
+        buf[..domain.len()].copy_from_slice(domain);
+        buf[domain.len()..total].copy_from_slice(body);
+        astream_aead::signature::verify(key, &buf[..total], signature)
+    } else {
+        let mut message = Vec::with_capacity(total);
+        message.extend_from_slice(domain);
+        message.extend_from_slice(body);
+        astream_aead::signature::verify(key, &message, signature)
+    };
+    ok.then_some(())
         .ok_or_else(|| Error::new("database signature did not verify"))
 }
 

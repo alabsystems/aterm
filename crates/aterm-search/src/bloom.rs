@@ -17,6 +17,10 @@ use aterm_hash::{FNV64_OFFSET, FNV64_PRIME};
 
 const K: usize = 7;
 
+// Solving (1 - exp(-K*n/m))^K > 0.5 for n/m with K = 7 gives
+// -ln(1 - 0.5^(1/7))/7. Keep the per-row predicate free of transcendental work.
+const SATURATION_LOAD: f64 = 0.337_360_723_918_581_7;
+
 /// Bloom filter: false positives are possible, false negatives are not.
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
@@ -183,8 +187,12 @@ impl BloomFilter {
     /// Returns `true` when the estimated false positive rate exceeds 50%.
     #[inline]
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "counts near this threshold are below MAX_BITS and exactly representable; larger counts are saturated"
+    )]
     pub fn is_saturated(&self) -> bool {
-        self.estimated_fpr() > 0.5
+        self.count as f64 > self.num_bits as f64 * SATURATION_LOAD
     }
 
     /// Clear all bits.

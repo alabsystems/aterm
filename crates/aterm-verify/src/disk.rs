@@ -31,6 +31,17 @@
 //! (`aterm_capacity::MachineFootprints::cover`): its own selection's run, a wider one's, or those of
 //! selections whose crates together hold its, where that is less than the cold budget less what its
 //! directories hold.
+//!
+//! A run that is part of work holding one disk claim for all of it (the release's, which sizes
+//! that claim from its own record of what its runs wrote) is handed that claim's name
+//! ([`aterm_capacity::DISK_COVER_ENV`], [`crate::EnvSnapshot::disk_cover`]) and covered by it
+//! ([`Disk::Covered`], [`aterm_capacity::covering_disk`]): it walks nothing (no measure before it
+//! builds, no meter while it does, no look at its end), claims nothing and keeps nothing, since
+//! one walk of a release clone's build directory reads every file of hundreds of GiB. Every run
+//! says at its end how its disk was held and how many walks it made ([`event`]). A release run
+//! over the whole workspace that passed keeps the record of what its test compile used of the
+//! build directory, and when it began ([`keep_used`]), which the cache's daily bound reads to take
+//! the units of the workspace's own it superseded (`atpkg::build_cache::stale::USED`).
 
 use std::path::{Path, PathBuf};
 
@@ -220,21 +231,230 @@ pub fn run_of(ctx: &Ctx) -> Option<atpkg::admit_disk::Run> {
     })
 }
 
-/// Claim the run's disk ([`run_of`]) before it builds, saying on stderr what it does and waits
-/// for. `Ok(None)`: nothing to claim, or no ledger to claim in (said, and the run goes on).
+/// How the run's disk is held while it builds ([`admit`]).
+#[derive(Debug)]
+pub enum Disk {
+    /// Its own claim, its writes measured ([`run_of`]).
+    Held(atpkg::admit_disk::Admitted),
+    /// The claim the work it is part of holds, named by [`crate::EnvSnapshot::disk_cover`]: its
+    /// holder's record. Nothing is walked, claimed or kept.
+    Covered(aterm_capacity::Record),
+    /// None: no check it runs builds, or no ledger could take a claim (said).
+    Unclaimed,
+}
+
+impl Disk {
+    /// The word [`event`] says it by.
+    #[must_use]
+    pub const fn mode(&self) -> &'static str {
+        match self {
+            Self::Held(_) => "claimed",
+            Self::Covered(_) => "covered",
+            Self::Unclaimed => "unclaimed",
+        }
+    }
+}
+
+/// Claim the run's disk ([`run_of`]) before it builds, in this user's ledger on the live machine
+/// ([`admit_in`]), saying on stderr what it does and waits for. No ledger to claim in is said, and
+/// the run goes on [`Disk::Unclaimed`].
 ///
 /// # Errors
 /// As [`answer`].
-pub fn admit(
-    ctx: &Ctx,
-    mode: atpkg::admit_disk::Admit,
-) -> Result<Option<atpkg::admit_disk::Admitted>, String> {
-    let Some(run) = run_of(ctx) else {
-        return Ok(None);
+pub fn admit(ctx: &Ctx, mode: atpkg::admit_disk::Admit) -> Result<Disk, String> {
+    if run_of(ctx).is_none() {
+        return Ok(Disk::Unclaimed);
+    }
+    let Some(ledger) = aterm_capacity::Ledger::user() else {
+        eprintln!(
+            "verify: the run's disk is not claimed (no home to keep the ledger under); it runs without a claim"
+        );
+        return Ok(Disk::Unclaimed);
     };
-    answer(atpkg::admit_disk::admit(run, mode, &mut |line| {
-        eprintln!("verify: {line}");
-    }))
+    admit_in(
+        ctx,
+        &ledger,
+        &aterm_capacity::Live,
+        std::process::id(),
+        mode,
+    )
+}
+
+/// [`admit`] in `ledger` on `machine` for the run's process `pid`: [`Disk::Covered`] where the
+/// claim [`crate::EnvSnapshot::disk_cover`] names is held by `pid` or an ancestor and is of disk
+/// ([`aterm_capacity::covering_disk`]), said on stderr, and nothing measured; else the run's own
+/// claim ([`run_of`], relieved by the build cache's live pass, [`atpkg::admit_disk::Reclaim::live`]),
+/// or [`Disk::Unclaimed`] where no check builds.
+///
+/// # Errors
+/// As [`answer`].
+pub fn admit_in(
+    ctx: &Ctx,
+    ledger: &aterm_capacity::Ledger,
+    machine: &dyn aterm_capacity::Machine,
+    pid: u32,
+    mode: atpkg::admit_disk::Admit,
+) -> Result<Disk, String> {
+    let Some(run) = run_of(ctx) else {
+        return Ok(Disk::Unclaimed);
+    };
+    if let Some(marker) = ctx.env.disk_cover.as_deref() {
+        match aterm_capacity::covering_disk(ledger, machine, pid, marker, &run.on) {
+            Ok(Some(by)) => {
+                eprintln!("verify: {}", covered_line(&by));
+                return Ok(Disk::Covered(by));
+            }
+            Ok(None) => eprintln!(
+                "verify: disk: the claim {marker} this run was handed covers nothing here (it \
+                 ended, waits, is not of disk, or is not an ancestor's); it claims for itself"
+            ),
+            Err(e) => eprintln!(
+                "verify: disk: the claim {marker} this run was handed could not be read ({e}); \
+                 it claims for itself"
+            ),
+        }
+    }
+    let mut relief = atpkg::admit_disk::Reclaim::live(&run.dirs);
+    answer(atpkg::admit_disk::admit_on(
+        run,
+        ledger,
+        machine,
+        mode,
+        aterm_capacity::Pace::default(),
+        &mut relief,
+        &mut |line| eprintln!("verify: {line}"),
+    ))
+}
+
+/// The line a covered run says, as it is admitted and in its log at its end: whose claim covers
+/// it.
+#[must_use]
+pub fn covered_line(by: &aterm_capacity::Record) -> String {
+    format!(
+        "disk: covered by {} (claim {}, pid {}); nothing walked or kept",
+        by.need.what,
+        by.cover_marker(),
+        by.pid
+    )
+}
+
+/// The line every run says on stderr at its end: how its disk was held ([`Disk::mode`]) and how
+/// many walks of directories its process made ([`aterm_capacity::walks`]), which the release counts
+/// as its `disk_walks`.
+#[must_use]
+pub fn event(mode: &str, walks: u64) -> String {
+    format!(
+        "verify-event: {}",
+        aterm_json::json!({"schema": 1, "event": "disk", "mode": mode, "walks": walks})
+    )
+}
+
+/// The build directory the main lane's children build in ([`Ctx::main_build_dir`]), where verify
+/// places one.
+fn main_leaf(ctx: &Ctx) -> Option<PathBuf> {
+    ctx.main_build_dir
+        .as_deref()
+        .and_then(|v| build_dir_path(v, &ctx.root))
+}
+
+/// Note what a call of the test compile used of the main lane's build directory
+/// ([`crate::shape::Run::used`]): the packages it built tests of (the workspace's own), and the
+/// unit each artifact's file and each build script's run (`script_runs`, their `out_dir`s) is of,
+/// fresh or built. A file cargo copied out of the build directory into the target (a bin a test
+/// needs) is read as the unit it is a copy of, by its package and the profile it lies under in
+/// the target ([`atpkg::build_cache::stale::Used::add_uplifted`]).
+pub fn note_used(ctx: &Ctx, artifacts: &[crate::shape::Artifact], script_runs: &[String]) {
+    let Some(leaf) = main_leaf(ctx) else {
+        return;
+    };
+    let mut run = ctx
+        .shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let used = &mut run.used;
+    for artifact in artifacts {
+        if artifact.test
+            && let Some(package) = &artifact.package
+        {
+            used.members.insert(package.clone());
+        }
+        for file in artifact.filenames.iter().map(Path::new) {
+            if file.starts_with(&leaf) {
+                used.add(&leaf, file);
+            } else if let (Some(package), Some(profile)) =
+                (artifact.package.as_deref(), uplift_profile(ctx, file))
+            {
+                used.add_uplifted(&leaf, &profile, package, file);
+            }
+        }
+    }
+    for out in script_runs {
+        used.add(&leaf, Path::new(out));
+    }
+}
+
+/// The profile a file cargo copied into the run's target lies under: `debug` for
+/// `<target>/debug/<bin>` and `<target>/debug/examples/<example>`, `<triple>/debug` under a cross
+/// target's; `None` for a file elsewhere.
+fn uplift_profile(ctx: &Ctx, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(&ctx.target_dir).ok()?;
+    let mut parts: Vec<&str> = rel
+        .parent()?
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => n.to_str(),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if parts.last() == Some(&"examples") {
+        parts.pop();
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Keep, for a release run (`release`, or `--as-release`: [`Ctx::checkers_in_tests`]) over the
+/// whole workspace that `passed`, the record of what its test compile used ([`note_used`]) and
+/// when it began ([`Ctx::began`]) at the top of its build directory
+/// (`atpkg::build_cache::stale::USED`), which the cache's daily bound reads to take what it
+/// superseded: the line its log says, or `None` where nothing is kept (another run; one over less
+/// than the workspace, whose graph builds its crates under other features than the release's, so
+/// its record would not name the release's units; one that failed; one whose test compile reported
+/// no unit of a build directory verify places).
+#[must_use]
+pub fn keep_used(ctx: &Ctx, passed: bool) -> Option<String> {
+    if !passed || !ctx.checkers_in_tests || !ctx.scope.is_workspace() {
+        return None;
+    }
+    let leaf = main_leaf(ctx)?;
+    let mut used = ctx
+        .shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .used
+        .clone();
+    used.began_ms = ctx
+        .began
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let units: usize = used
+        .profiles
+        .values()
+        .map(std::collections::BTreeSet::len)
+        .sum();
+    if units == 0 {
+        return None;
+    }
+    Some(match used.keep(&leaf) {
+        Ok(()) => format!(
+            "disk: kept the {units} unit(s) this release run used as {}, which the cache's \
+             bound reads to take what it superseded",
+            leaf.join(atpkg::build_cache::stale::USED).display()
+        ),
+        Err(e) => format!(
+            "disk: the {units} unit(s) this release run used were not kept ({e}); the cache's \
+             bound reads the record before"
+        ),
+    })
 }
 
 /// What the run does with its disk claim's answer: holds the claim while it builds; or, where no
@@ -246,9 +466,9 @@ pub fn admit(
 /// up behind holders that made no progress for [`crate::STUCK_ENDS`], named, and left alone.
 fn answer(
     admitted: Result<atpkg::admit_disk::Admitted, atpkg::admit_disk::Error>,
-) -> Result<Option<atpkg::admit_disk::Admitted>, String> {
+) -> Result<Disk, String> {
     match admitted {
-        Ok(held) => Ok(Some(held)),
+        Ok(held) => Ok(Disk::Held(held)),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(format!(
             "{why}; it can never be admitted there. Fix: point CARGO_TARGET_DIR at a larger volume"
         )),
@@ -260,7 +480,7 @@ fn answer(
         )),
         Err(e) => {
             eprintln!("verify: the run's disk is not claimed ({e}); it runs without a claim");
-            Ok(None)
+            Ok(Disk::Unclaimed)
         }
     }
 }
@@ -382,7 +602,7 @@ mod tests {
             assert!(why.contains(said), "{said:?} in {why}");
         }
         let unusable = atpkg::admit_disk::Error::Ledger(std::io::Error::other("read-only"));
-        assert!(matches!(answer(Err(unusable)), Ok(None)));
+        assert!(matches!(answer(Err(unusable)), Ok(Disk::Unclaimed)));
     }
 
     /// A run's footprints are kept by what it builds: its checks that build, sorted, and the
@@ -598,7 +818,7 @@ mod tests {
             std::fs::write(build.join("unit.rlib"), [0u8; 1 << 16]).expect("the run's writes");
             let log_path = checkout.join("log");
             let mut log = std::fs::File::create(&log_path).expect("the log");
-            crate::let_disk_go(Some(held), passed, Some(&mut log));
+            crate::let_disk_go(Disk::Held(held), passed, Some(&mut log));
             assert_eq!(
                 aterm_capacity::Footprints::load(&checkout.join(FOOTPRINT))
                     .runs()
@@ -629,6 +849,354 @@ mod tests {
         assert!(
             passed.contains("; kept for its scope here; kept for this machine's other checkouts"),
             "{passed}"
+        );
+    }
+
+    /// Set, the test binary is [`standin_a_runs_disk`], its run's directories under this one.
+    const STANDIN: &str = "ATERM_VERIFY_DISK_STANDIN";
+    /// Set with [`STANDIN`], the stand-in holds a release's disk claim and hands its run its name.
+    const COVERED: &str = "ATERM_VERIFY_DISK_STANDIN_COVERED";
+
+    /// The line [`standin_a_runs_disk`] says on stderr for the claim that covered its run: its
+    /// `what`, its name, and the name of the release's claim it holds, as JSON.
+    const STANDIN_COVERED: &str = "standin-covered: ";
+
+    /// Run by [`a_covered_run_walks_nothing_and_keeps_nothing`] in a process of its own, whose walk
+    /// count ([`aterm_capacity::walks`]) nothing else moves: a verify run of `lint`, its build
+    /// directory and target under the stand-in's directory, its disk admitted ([`admit_in`]) in a
+    /// scratch ledger and let go as verify's run does ([`crate::let_disk_go`]), which says its
+    /// `verify-event` disk line on stderr. Where [`COVERED`] is set, it first holds a release's
+    /// disk claim and hands the run its name, as the release does, and says which claim covered
+    /// the run ([`STANDIN_COVERED`]).
+    #[cfg(unix)]
+    #[test]
+    fn standin_a_runs_disk() {
+        let Some(dir) = std::env::var_os(STANDIN).map(PathBuf::from) else {
+            return;
+        };
+        let mut room = aterm_capacity::Reading::of_gib(48, 40, 14);
+        room.volume = Some(aterm_capacity::Volume {
+            mount: dir.clone(),
+            total: 400 * GIB,
+            free: 300 * GIB,
+            floor: 10 * GIB,
+            room: 2 * GIB,
+        });
+        let machine = aterm_capacity::Fixed::new(room);
+        let ledger = aterm_capacity::Ledger::at(dir.join("ledger"));
+        let release = std::env::var_os(COVERED).map(|_| {
+            atpkg::admit_disk::admit_sized_on(
+                atpkg::admit_disk::SizedClaim {
+                    what: "release 0.156.0".to_owned(),
+                    bytes: 39 * GIB,
+                    on: dir.clone(),
+                    keep: Vec::new(),
+                    checkout: None,
+                    stuck_ends: None,
+                },
+                &ledger,
+                &machine,
+                atpkg::admit_disk::Admit::Now,
+                aterm_capacity::Pace::default(),
+                &mut atpkg::admit_disk::Reclaim::of(
+                    Box::new(|_, _| (0, Vec::new(), Vec::new())),
+                    Box::new(|_, _, _| None),
+                    Box::new(|_, _| Vec::new()),
+                ),
+                &mut |_| {},
+            )
+            .expect("the release's claim")
+        });
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).expect("the build directory");
+        std::fs::write(build.join("unit.rlib"), [0u8; 1 << 16]).expect("what it holds");
+        let mut ctx = Ctx::new(
+            dir.clone(),
+            crate::Scope::packages(&["a".to_owned()]),
+            crate::EnvSnapshot {
+                cargo_target_dir: Some(dir.join("target")),
+                disk_cover: release.as_ref().map(atpkg::admit_disk::Whole::marker),
+                ..crate::EnvSnapshot::default()
+            },
+            dir.join("scratch"),
+        )
+        .with_checks(&[Check::Lint]);
+        ctx.main_build_dir = Some(format!("build.build-dir='{}'", build.display()));
+        let held = admit_in(
+            &ctx,
+            &ledger,
+            &machine,
+            std::process::id(),
+            atpkg::admit_disk::Admit::Now,
+        )
+        .expect("the run's disk");
+        if let Disk::Covered(by) = &held {
+            eprintln!(
+                "{STANDIN_COVERED}{}",
+                aterm_json::json!({
+                    "what": by.need.what,
+                    "by": by.cover_marker(),
+                    "release": release.as_ref().map(atpkg::admit_disk::Whole::marker),
+                })
+            );
+        }
+        let mut log = std::fs::File::create(dir.join("log")).expect("the log");
+        crate::let_disk_go(held, true, Some(&mut log));
+        drop(release);
+    }
+
+    /// The stand-in run's `verify-event` disk line, the claim that covered it ([`STANDIN_COVERED`]),
+    /// and whether its record of what its scope wrote was written, run in `dir`, covered or not.
+    #[cfg(unix)]
+    fn a_runs_disk(
+        dir: &Path,
+        covered: bool,
+    ) -> (aterm_json::Value, Option<aterm_json::Value>, bool) {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "--exact",
+            "disk::tests::standin_a_runs_disk",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(STANDIN, dir)
+        .stdin(aterm_uds::spawnfd::Stdio::null());
+        if covered {
+            cmd.env(COVERED, "1");
+        }
+        let out = cmd.output().expect("the stand-in run");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stderr}");
+        let event = stderr
+            .lines()
+            .filter_map(|l| l.strip_prefix("verify-event: "))
+            .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+            .find(|v| v["event"].as_str() == Some("disk"))
+            .unwrap_or_else(|| panic!("no disk event: {stderr}"));
+        let by = stderr
+            .lines()
+            .filter_map(|l| l.strip_prefix(STANDIN_COVERED))
+            .find_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok());
+        let kept = dir.join("target/verify").join(FOOTPRINT).exists();
+        (event, by, kept)
+    }
+
+    /// A RUN THE RELEASE'S DISK CLAIM COVERS WALKS NOTHING AND KEEPS NOTHING: handed the name of a
+    /// held disk claim of its own line, a verify run is covered by that claim (the release's, by
+    /// its name), makes no walk of its directories (none before it builds, none as it ends) and
+    /// writes no record of what its scope wrote, and its disk line says so. NEGATIVE CONTROL: the
+    /// same run handed nothing is covered by none, claims for itself, walks its directories as it
+    /// is admitted and once as it ends (it ran under the meter's pace), and keeps its run.
+    #[cfg(unix)]
+    #[test]
+    fn a_covered_run_walks_nothing_and_keeps_nothing() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("verify-disk-covered-")
+            .tempdir()
+            .expect("scratch");
+        let covered = dir.path().join("covered");
+        std::fs::create_dir_all(&covered).expect("its directory");
+        let (event, by, kept) = a_runs_disk(&covered, true);
+        assert_eq!(
+            (event["mode"].as_str(), event["walks"].as_u64()),
+            (Some("covered"), Some(0)),
+            "{event}"
+        );
+        let by = by.expect("the claim that covered it");
+        assert_eq!(by["what"].as_str(), Some("release 0.156.0"), "{by}");
+        assert!(
+            by["by"].as_str().is_some() && by["by"] == by["release"],
+            "covered by the release's claim: {by}"
+        );
+        assert!(!kept, "its record of what its scope wrote");
+
+        let own = dir.path().join("own");
+        std::fs::create_dir_all(&own).expect("its directory");
+        let (event, by, kept) = a_runs_disk(&own, false);
+        assert_eq!(
+            (event["mode"].as_str(), event["walks"].as_u64()),
+            (Some("claimed"), Some(2)),
+            "{event}"
+        );
+        assert_eq!(by, None, "covered by none");
+        assert!(kept, "its record of what its scope wrote");
+    }
+
+    /// Set, the test binary is [`standin_reads_the_disk_cover`].
+    const CAPTURE: &str = "ATERM_VERIFY_DISK_COVER_CAPTURE";
+    /// What [`standin_reads_the_disk_cover`] says on stderr: the snapshot's cover, as JSON.
+    const CAPTURED: &str = "captured-disk-cover: ";
+
+    /// Run by [`verify_reads_the_disk_cover_from_its_environment`] in a process of its own: the
+    /// disk cover the snapshot of its environment reads ([`crate::EnvSnapshot::capture`]).
+    #[cfg(unix)]
+    #[test]
+    fn standin_reads_the_disk_cover() {
+        if std::env::var_os(CAPTURE).is_none() {
+            return;
+        }
+        eprintln!(
+            "{CAPTURED}{}",
+            aterm_json::json!({ "cover": crate::EnvSnapshot::capture().disk_cover })
+        );
+    }
+
+    /// VERIFY READS THE DISK COVER FROM ITS ENVIRONMENT ([`crate::EnvSnapshot::capture`]): a run
+    /// started with [`aterm_capacity::DISK_COVER_ENV`] set reads that marker as its cover, which is
+    /// how the release's verify runs are covered. NEGATIVE CONTROL: a run started with it blank,
+    /// or without it, reads none.
+    #[cfg(unix)]
+    #[test]
+    fn verify_reads_the_disk_cover_from_its_environment() {
+        let read = |value: Option<&str>| {
+            let mut cmd =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+            cmd.args([
+                "--exact",
+                "disk::tests::standin_reads_the_disk_cover",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CAPTURE, "1")
+            .env_remove(aterm_capacity::DISK_COVER_ENV)
+            .stdin(aterm_uds::spawnfd::Stdio::null());
+            if let Some(value) = value {
+                cmd.env(aterm_capacity::DISK_COVER_ENV, value);
+            }
+            let out = cmd.output().expect("the stand-in run");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{stderr}");
+            stderr
+                .lines()
+                .filter_map(|l| l.strip_prefix(CAPTURED))
+                .find_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+                .unwrap_or_else(|| panic!("nothing captured: {stderr}"))["cover"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        let marker = "0001793900000000-4242-7";
+        assert_eq!(read(Some(marker)), Some(marker.to_owned()));
+        assert_eq!(read(Some("  ")), None, "blank");
+        assert_eq!(read(None), None, "unset");
+    }
+
+    /// THE COVER NEVER REACHES A CHILD: every child's environment loses the disk cover's name
+    /// ([`crate::CHILD_ENV_REMOVED`]), so a test binary a release's verify runs never reads it, and
+    /// the run reads it from its snapshot alone, even where its snapshot holds one.
+    #[test]
+    fn the_disk_cover_never_reaches_a_child() {
+        let ctx = Ctx::new(
+            PathBuf::from("/w/aterm"),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot {
+                disk_cover: Some("0001793900000000-4242-7".to_owned()),
+                ..crate::EnvSnapshot::default()
+            },
+            PathBuf::from("/tmp/x"),
+        );
+        assert!(
+            ctx.exec_env()
+                .remove_env
+                .contains(&aterm_capacity::DISK_COVER_ENV)
+        );
+        assert!(crate::CHILD_ENV_REMOVED.contains(&aterm_capacity::DISK_COVER_ENV));
+    }
+
+    /// A RELEASE RUN OVER THE WHOLE WORKSPACE THAT PASSED KEEPS WHAT ITS TEST COMPILE USED at the
+    /// top of its build directory (`atpkg::build_cache::stale::USED`): each artifact's unit, fresh
+    /// or built, by its profile; the packages it built tests of; and when it began. NEGATIVE
+    /// CONTROLS: an artifact that is no test build names no package of the workspace's own; a file
+    /// cargo copied into the target with no twin in the build directory names no unit; and the same
+    /// run keeps nothing where it is no release's, failed, or is over less than the workspace.
+    #[test]
+    fn a_passing_release_run_keeps_the_units_it_used() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("verify-disk-used-")
+            .tempdir()
+            .expect("scratch");
+        let leaf = dir.path().join("cache/w/.cargo-build");
+        std::fs::create_dir_all(&leaf).expect("the build directory");
+        let unit = |hash: &str| {
+            leaf.join(format!(
+                "debug/build/aterm-grid/{hash}/out/aterm_grid-{hash}"
+            ))
+            .display()
+            .to_string()
+        };
+        let artifact = |filenames: Vec<String>, package: &str, test: bool| crate::shape::Artifact {
+            filenames,
+            fresh: test,
+            package: Some(package.to_owned()),
+            test,
+        };
+        let noted = |scope: crate::Scope| {
+            let mut ctx = Ctx::new(
+                dir.path().join("w"),
+                scope,
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/x"),
+            )
+            .with_checks(&[Check::Test]);
+            ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+            let uplifted = ctx.target_dir.join("debug/aterm");
+            note_used(
+                &ctx,
+                &[
+                    artifact(vec![unit("1111111111111111")], "aterm-grid", true),
+                    artifact(
+                        vec![unit("2222222222222222"), uplifted.display().to_string()],
+                        "aterm",
+                        false,
+                    ),
+                ],
+                &[],
+            );
+            ctx
+        };
+        let record = leaf.join(atpkg::build_cache::stale::USED);
+        assert_eq!(
+            keep_used(&noted(crate::Scope::workspace()), true),
+            None,
+            "no release's run"
+        );
+        let release = |scope| noted(scope).with_checkers_in_tests(true);
+        assert_eq!(
+            keep_used(&release(crate::Scope::workspace()), false),
+            None,
+            "a run that failed"
+        );
+        assert_eq!(
+            keep_used(
+                &release(crate::Scope::packages(&["aterm-grid".to_owned()])),
+                true
+            ),
+            None,
+            "a run over less than the workspace"
+        );
+        assert!(!record.exists());
+        let ctx = release(crate::Scope::workspace());
+        assert!(keep_used(&ctx, true).is_some(), "kept");
+        let kept = atpkg::build_cache::stale::Used::decode(&std::fs::read(&record).expect("kept"))
+            .expect("a record");
+        assert_eq!(
+            kept.profiles
+                .get("debug")
+                .map(|h| h.iter().cloned().collect::<Vec<_>>()),
+            Some(vec![
+                "1111111111111111".to_owned(),
+                "2222222222222222".to_owned()
+            ])
+        );
+        assert_eq!(
+            kept.members,
+            std::collections::BTreeSet::from(["aterm-grid".to_owned()])
+        );
+        assert_eq!(
+            Some(kept.began_ms),
+            ctx.began
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
         );
     }
 }

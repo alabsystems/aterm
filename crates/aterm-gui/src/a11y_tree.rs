@@ -54,6 +54,40 @@ fn row_chunks(line: &str) -> Vec<String> {
     chunks
 }
 
+/// The layout a window's composed cells were cut under.
+///
+/// The cells hold what a frame composed, so a rect of any other layout reads another moment's text,
+/// or another tab's, as if it were that pane's. A view lives in one tab, so the leaves name the tab
+/// and their rects the window's size. Focus is left out: it moves no cell.
+#[derive(Debug, Default)]
+pub(crate) struct ComposedLayout {
+    chrome_rows: u16,
+    leaves: Vec<(crate::tab_model::ViewId, crate::tab_model::LogicalRect)>,
+}
+
+impl ComposedLayout {
+    /// Whether cells cut under this layout can be read by `plan`'s rects below `chrome_rows`.
+    pub(crate) fn holds(&self, plan: &crate::tab_model::VisibleLeafPlan, chrome_rows: u16) -> bool {
+        self.chrome_rows == chrome_rows
+            && self
+                .leaves
+                .iter()
+                .copied()
+                .eq(plan.leaves.iter().map(|leaf| (leaf.view, leaf.rect)))
+    }
+
+    /// Record the layout a frame just composed under; a settled layout allocates nothing.
+    pub(crate) fn record(&mut self, plan: &crate::tab_model::VisibleLeafPlan, chrome_rows: u16) {
+        if self.holds(plan, chrome_rows) {
+            return;
+        }
+        self.chrome_rows = chrome_rows;
+        self.leaves.clear();
+        self.leaves
+            .extend(plan.leaves.iter().map(|leaf| (leaf.view, leaf.rect)));
+    }
+}
+
 /// Minimal valid tree containing only an empty window root.
 pub(crate) fn empty_tree() -> TreeUpdate {
     let mut root = Node::new(Role::Window);

@@ -927,6 +927,72 @@ fn the_second_agents_land_act_is_lands_nudge_at_its_own_back_off() {
     );
 }
 
+/// W5'S LAND ACT IS TIMED, AND ITS STREAK READ, ONLY BY A BACK-OFF NAMED
+/// BEFORE IT: one journaled after the land act, in its answer, times the
+/// next act, not it. NEGATIVE CONTROLS: with the only back-off in the land
+/// act's answer and the act past one short turn's step from the prompt, W5
+/// FAILs at that step's due (+460 s), not the later back-off's; a two-turn
+/// back-off in a timely land act's answer carries no streak into the second
+/// agent, and W5 PASSes.
+#[test]
+fn w5s_land_act_is_timed_by_a_back_off_named_before_it() {
+    let w5 = |s: &Seen| one(Chain::SwitchWall, s, "claude", Scenario::W5);
+    // [`muse_nudged`] with no back-off before its land act, now `shift`
+    // later, whose answer is no landing but `streak` short turns and their
+    // back-off of `min` minutes; Land's next nudge at its due lands
+    let answered_short = |shift: i64, streak: u32, min: i64| {
+        let mut s = muse_nudged();
+        s.journal.truncate(6);
+        let point_at = 354_000 + shift;
+        let next = point_at + 100 + min * 60_000;
+        s.journal.extend([
+            j(
+                350_500 + shift,
+                "CONTINUED seq=10 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(point_at, "EVENT idle seq=11 Implemented the parser"),
+            j(
+                point_at + 100,
+                &format!(
+                    "WAITING seq=11 until=x {streak} short turn(s) in a row: {min} min back-off"
+                ),
+            ),
+            j(
+                next,
+                "CONTINUED seq=11 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(next + 3_900, "EVENT idle seq=12 Nothing left: the parser"),
+            j(next + 3_900, "DONE seq=12 rule=land@v1 x"),
+        ]);
+        s.ledger.truncate(4);
+        s.ledger.extend([
+            typed(350_500 + shift, "land-nudge@v1", LAND_NUDGE),
+            point(point_at, streak),
+            typed(next, "land-nudge@v1", LAND_NUDGE),
+            point(next + 3_900, streak + 1),
+            task_done(next + 3_900),
+        ]);
+        s.status[1].0 = T0 + next + 4_900;
+        s
+    };
+    let (w, why) = w5(&answered_short(120_000, 1, 2));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        !why.contains("THE CHAIN'S RECORDS")
+            && why.contains(
+                "its land act (land-nudge@v1) at +470.5 s came past its due +460.0 s (no back-off \
+                 named; one short turn's)"
+            ),
+        "{why}"
+    );
+    let (w, why) = w5(&answered_short(0, 2, 4));
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("muse's land act at +350.5 s") && why.contains("due by +460.0 s"),
+        "{why}"
+    );
+}
+
 fn claude_held_unread() -> Seen {
     let told = format!(
         "EXCEPTION seq=40 kind=futile when=later {} => Type keep going",
@@ -1367,7 +1433,86 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
     fail(
         &unnamed(661_000),
         "muse",
-        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +661.0 s, 300.0 s after it (no back-off named)",
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +661.0 s, 300.0 s after it (no back-off named; 1 short turn(s)' step)",
+    );
+}
+
+/// W8'S WINDOW FOR CRUISE'S ACT IS WHAT THE RUN READ BEFORE THAT ACT: the
+/// back-off the loop named past the going on and before the act, else the
+/// ladder's step for the streak the last point there named (the point the
+/// act that met the wall was typed on where none was read past the going
+/// on), else, with no streak read at all, the ladder's cap. NEGATIVE
+/// CONTROLS: a back-off journaled after a late act, as each live run's
+/// answer to that act journals one, gives the act no due, and the act past
+/// one short turn's step FAILs; with the point before the wall unread, the
+/// point past the going on still times the act, and the act past its step
+/// FAILs where the cap would have left it UNOBSERVED; with no streak read
+/// anywhere, an act inside the cap is UNOBSERVED, saying only the cap
+/// bounded it, and one past the cap FAILs.
+#[test]
+fn w8s_window_for_cruises_act_is_what_was_read_before_that_act() {
+    let w8 = |s: &Seen| one(Chain::CruiseWall, s, "muse", Scenario::W8);
+    let fail = |s: &Seen, needle: &str| {
+        let (w, why) = w8(s);
+        assert_eq!(w, "FAIL", "{needle}: {why}");
+        assert!(
+            !why.contains("THE CHAIN'S RECORDS") && why.contains(needle),
+            "{needle}: {why}"
+        );
+    };
+    // [`muse_cruise_walled`] with no back-off named before Cruise's act,
+    // moved to `act_at`
+    let unnamed_at = |act_at: i64| {
+        let mut s = muse_cruise_walled();
+        s.journal.remove(7);
+        s.journal[7].0 = T0 + act_at;
+        s.ledger[5].ts = T0 + act_at;
+        s.end_ms = T0 + act_at + 10_000;
+        s
+    };
+    // a back-off after the act, of the act's own answer: two short turns
+    let mut s = unnamed_at(1_500_000);
+    s.journal
+        .push(j(1_505_000, &format!("EVENT idle seq=4 {DONE_CLAIM}")));
+    s.journal.push(j(
+        1_505_100,
+        "WAITING seq=4 until=x 2 short turn(s) in a row: 4 min back-off",
+    ));
+    s.ledger.push(point(1_505_000, 2));
+    s.end_ms = T0 + 1_510_000;
+    fail(
+        &s,
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +1500.0 s, 1139.0 s after it \
+         (no back-off named; 1 short turn(s)' step)",
+    );
+    // the point before the wall unread: the one past the going on times it
+    let mut s = unnamed_at(800_000);
+    s.ledger.remove(0);
+    fail(
+        &s,
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +800.0 s, 439.0 s after it \
+         (no back-off named; 1 short turn(s)' step)",
+    );
+    // no streak read before the act: only the ladder's cap bounds it
+    let unread_at = |act_at: i64| {
+        let mut s = unnamed_at(act_at);
+        s.ledger.remove(4);
+        s.ledger.remove(0);
+        s
+    };
+    let (w, why) = w8(&unread_at(800_000));
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(
+        why.contains(
+            "Cruise went on: continue-done-check@v1 at +800.0 s (439.0 s after; no back-off named \
+             and no streak read, so only the ladder's cap bounds it)"
+        ) && why.contains("so the streak it was typed on is unread"),
+        "{why}"
+    );
+    let past_cap = 361_000 + next_step_ms(u32::MAX, false) + PERSISTENCE_GRACE_MS + 61_000;
+    fail(
+        &unread_at(past_cap),
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at",
     );
 }
 

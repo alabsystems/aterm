@@ -414,14 +414,22 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
     {
         return None;
     }
-    let selection = if alab() {
+    widened_plan(plan, alab())
+}
+
+/// A saved automatic selection only expands: to the whole profile on the ALab signal, or
+/// to include the base plan that every Mac runs. Recovery accepts the same partial expansion.
+fn widened_plan(previous: &Plan, alab: bool) -> Option<Plan> {
+    let selection = if alab {
         Selection::all()
     } else {
-        plan.selection.union(aterm_types::macos_setup::BASE_PLAN)
+        previous
+            .selection
+            .union(aterm_types::macos_setup::BASE_PLAN)
     };
-    (selection != plan.selection).then(|| Plan {
+    (selection != previous.selection).then(|| Plan {
         selection,
-        vault_url: plan.vault_url.clone(),
+        vault_url: previous.vault_url.clone(),
     })
 }
 
@@ -731,7 +739,28 @@ impl UpgradeProgress {
         let follows = pending.revision == next_revision(previous_revision)?
             || (pending.revision > previous_revision
                 && revision::reserved(root, pending.revision)?);
-        if plan.selection != Selection::all()
+        // Only a record of the plan whose run the predecessor is: the plan a put-back
+        // restores must be the one that run belongs to. Partial expansions also need this
+        // provenance to prove they are the base-plan expansion admitted by upgrade_of.
+        let previous_record = value.get("previous_plan");
+        let previous_plan = previous_record
+            .and_then(|record| parse_plan_record(record).ok())
+            .map(|(widened, _)| widened)
+            .filter(|widened| previous.is_some_and(|previous| previous.belongs_to(widened)));
+        let base_expansion = previous_record
+            .is_some_and(|record| record["provisional"].as_bool() == Some(true))
+            && previous_plan
+                .as_ref()
+                .and_then(|previous| widened_plan(previous, false))
+                .is_some_and(|mut expected| {
+                    // prepare_upgrade presents the configured vault before admission. Only
+                    // that captured authority permits its URL to replace the predecessor's.
+                    if matches!(pending.admitted_vault, AdmittedVault::Configured(_)) {
+                        expected.vault_url.clone_from(&plan.vault_url);
+                    }
+                    expected == *plan
+                });
+        if (plan.selection != Selection::all() && !base_expansion)
             || !pending.belongs_to(plan)
             || pending.admitted
             || pending.completed
@@ -742,13 +771,6 @@ impl UpgradeProgress {
         {
             return Err("invalid automatic upgrade recovery".into());
         }
-        // Only a record of the plan whose run the predecessor is: the plan a put-back
-        // restores must be the one that run belongs to.
-        let previous_plan = value
-            .get("previous_plan")
-            .and_then(|record| parse_plan_record(record).ok())
-            .map(|(widened, _)| widened)
-            .filter(|widened| previous.is_some_and(|previous| previous.belongs_to(widened)));
         Ok(Self {
             previous,
             previous_plan,
@@ -1207,6 +1229,40 @@ mod tests {
         history.completed = true;
         save_progress(root, history).unwrap();
         narrow
+    }
+
+    fn permissions_only_provisional(root: &Path) -> Plan {
+        let mut old = Plan {
+            selection: Selection::none(),
+            ..Plan::default()
+        };
+        old.selection.set(Setting::Permissions, true);
+        authorize_at(root, &old).unwrap().unwrap();
+        save_plan_as(root, &old, true).unwrap();
+        let mut history = progress(root).unwrap().unwrap();
+        history.done = Stage::Permissions.bit();
+        history.completed = true;
+        save_progress(root, history).unwrap();
+        old
+    }
+
+    fn interrupted_base_upgrade(root: &Path) -> Plan {
+        interrupted_base_upgrade_in_vault(root, None)
+    }
+
+    fn interrupted_base_upgrade_in_vault(root: &Path, vault: Option<ConfiguredVault>) -> Plan {
+        permissions_only_provisional(root);
+        let (mut ticket, base) = prepare_upgrade(root, || false, || Ok(vault))
+            .unwrap()
+            .unwrap();
+        assert_eq!(base.selection, aterm_types::macos_setup::BASE_PLAN);
+        assert!(
+            ticket
+                .persist_for_watch_test(root, &base, true, Some((0, true)))
+                .is_err(),
+            "the process ended after publishing the plan, before its progress"
+        );
+        base
     }
 
     fn configured() -> ConfiguredVault {
@@ -2267,17 +2323,7 @@ mod tests {
     #[test]
     fn an_older_builds_permissions_only_provisional_plan_reaches_the_base_plan() {
         let root = aterm_tempfile::tempdir().unwrap();
-        let mut old = Plan {
-            selection: Selection::none(),
-            ..Plan::default()
-        };
-        old.selection.set(Setting::Permissions, true);
-        authorize_at(root.path(), &old).unwrap().unwrap();
-        save_plan_as(root.path(), &old, true).unwrap();
-        let mut history = progress(root.path()).unwrap().unwrap();
-        history.done = Stage::Permissions.bit();
-        history.completed = true;
-        save_progress(root.path(), history).unwrap();
+        let old = permissions_only_provisional(root.path());
         let records = observation_at(root.path()).unwrap().records;
         assert!(records.provisional, "precondition: aterm's own plan");
         assert!(
@@ -2328,6 +2374,185 @@ mod tests {
             None,
             "a plan a person shaped stays as it is"
         );
+    }
+
+    #[test]
+    fn an_interrupted_base_upgrade_recovers_and_can_later_widen_on_the_alab_signal() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let base = interrupted_base_upgrade(root.path());
+        let recovered = observation_at(root.path()).unwrap().records;
+        let pending = recovered.progress.unwrap();
+        assert!(pending.belongs_to(&base));
+        assert!(!pending.admitted && !pending.completed && !pending.stopped);
+        assert_eq!(pending.done, Stage::Permissions.bit());
+        assert!(keeps_vault_sync(&recovered));
+        assert!(
+            !owes_secrets_stage(&recovered),
+            "recovery alone admits no effects"
+        );
+
+        // A fresh startup has no ticket from the interrupted process. It admits its recovered
+        // offer through the ordinary automatic path, preserving the already-finished grants.
+        let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        assert_eq!(
+            startup.offer_reading(root.path(), || Ok(None)).unwrap(),
+            base
+        );
+        let admitted = startup
+            .persist_for_watch_test(root.path(), &base, false, None)
+            .unwrap()
+            .expect("the recovered automatic offer is admitted");
+        let records = observation_at(root.path()).unwrap().records;
+        let running = records.progress.unwrap();
+        assert_eq!(running.revision, admitted);
+        assert!(running.admitted && !running.completed && running.belongs_to(&base));
+        assert_eq!(running.done, Stage::Permissions.bit());
+        assert!(keeps_vault_sync(&records) && owes_secrets_stage(&records));
+        assert!(saved_plan_provisional(root.path()).unwrap());
+
+        let (mut upgrade, full) = prepare_upgrade(root.path(), || true, || Ok(None))
+            .unwrap()
+            .expect("membership later widens the recovered base plan");
+        assert_eq!(full.selection, Selection::all());
+        upgrade
+            .upgrade_at(root.path(), &full)
+            .result
+            .unwrap()
+            .unwrap();
+        let full_run = progress(root.path()).unwrap().unwrap();
+        assert!(full_run.admitted && full_run.belongs_to(&full));
+        assert_eq!(full_run.done, Stage::Permissions.bit());
+    }
+
+    #[test]
+    fn an_interrupted_base_upgrade_preserves_its_admitted_configured_vault() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let vault = configured();
+        let base = interrupted_base_upgrade_in_vault(root.path(), Some(vault.clone()));
+        assert_ne!(base.vault_url, Plan::default().vault_url);
+        let recovered = progress(root.path()).unwrap().unwrap();
+        assert!(recovered.belongs_to(&base) && !recovered.admitted);
+        assert_eq!(
+            recovered.admitted_vault,
+            AdmittedVault::Configured(vault.identity())
+        );
+
+        let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        assert_eq!(
+            startup
+                .offer_reading(root.path(), || Ok(Some(vault.clone())))
+                .unwrap(),
+            base
+        );
+        startup
+            .persist_for_watch_test(root.path(), &base, false, None)
+            .unwrap()
+            .unwrap();
+        let admitted = progress(root.path()).unwrap().unwrap();
+        assert!(admitted.admitted && admitted.belongs_to(&base));
+        assert_eq!(
+            admitted.admitted_vault,
+            AdmittedVault::Configured(vault.identity())
+        );
+        assert_eq!(
+            aterm_machines::init_secrets::selected_vault(
+                &base.vault_url,
+                &vault.home,
+                Some(&vault.config),
+            )
+            .unwrap(),
+            Some(&vault.config),
+            "recovery retains the vault configured before the interrupted admission"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_base_upgrade_preserves_stop_and_restore_holds() {
+        for stop in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            interrupted_base_upgrade(root.path());
+            if stop {
+                let pending = progress(root.path()).unwrap().unwrap();
+                request_stop_at(root.path(), pending.revision).unwrap();
+            } else {
+                save_restored_decision(
+                    root.path(),
+                    RestoredState::Applied,
+                    Restored::at_restore(None),
+                )
+                .unwrap();
+            }
+            let held = observation_at(root.path()).unwrap();
+            assert!(
+                prepare_upgrade(
+                    root.path(),
+                    || true,
+                    || panic!("a standing hold reads no vault"),
+                )
+                .unwrap()
+                .is_none(),
+                "stop: {stop}"
+            );
+            assert_eq!(observation_at(root.path()).unwrap(), held);
+        }
+    }
+
+    #[test]
+    fn a_partial_upgrade_recovery_rejects_unproven_or_unadmitted_expansions() {
+        for change in [
+            "missing predecessor",
+            "changed predecessor",
+            "chosen",
+            "extra setting",
+            "unadmitted vault",
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let mut base = interrupted_base_upgrade(root.path());
+            let path = root.path().join("automatic-plan.json");
+            let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let fields = record.as_object_mut().unwrap();
+            let upgrade = fields.get_mut("upgrade").unwrap().as_object_mut().unwrap();
+            match change {
+                "missing predecessor" => {
+                    upgrade.remove("previous_plan");
+                }
+                "changed predecessor" => {
+                    upgrade
+                        .get_mut("previous_plan")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("selection".into(), Value::from(Selection::none().bits()));
+                }
+                "chosen" => {
+                    upgrade
+                        .get_mut("previous_plan")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("provisional".into(), Value::Bool(false));
+                }
+                "extra setting" => {
+                    base.selection.set(Setting::Desktop, true);
+                    let mut pending = parse_progress(upgrade.get("pending").unwrap()).unwrap();
+                    pending.plan = plan_digest(&base);
+                    pending.selection = Some(base.selection);
+                    upgrade.insert("pending".into(), progress_checkpoint(pending));
+                    fields.insert("selection".into(), Value::from(base.selection.bits()));
+                }
+                "unadmitted vault" => {
+                    base.vault_url = "https://substituted.example/v1/team".into();
+                    let mut pending = parse_progress(upgrade.get("pending").unwrap()).unwrap();
+                    assert_eq!(pending.admitted_vault, AdmittedVault::None);
+                    pending.plan = plan_digest(&base);
+                    upgrade.insert("pending".into(), progress_checkpoint(pending));
+                    fields.insert("vault_url".into(), Value::from(base.vault_url));
+                }
+                _ => unreachable!(),
+            }
+            write_json(&path, &record).unwrap();
+            assert!(observation_at(root.path()).is_err(), "{change}");
+        }
     }
 
     /// NEGATIVE CONTROL: widening an older provisional setup carries over its admitted

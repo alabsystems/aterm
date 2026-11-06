@@ -1367,6 +1367,79 @@ fn a_headless_browser_gets_its_grace_before_any_kill() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_uncertain_browser_wait_retains_its_app_scope_and_profile_claim() {
+    use std::sync::{Arc, Mutex, mpsc};
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Retrying,
+        Returned,
+    }
+    for fault in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        aterm_types::fs_restricted::ensure_private_dir(&profile).unwrap();
+        let claimed = super::super::browser_window::ProfileLock::claim(&profile).unwrap();
+        let lifetime = super::super::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let (events, received) = mpsc::channel();
+        let retry = events.clone();
+        let (release, recovery) = mpsc::channel();
+        let reaped = Arc::new(Mutex::new(false));
+        let observed = reaped.clone();
+        let work = scope.wrap(move || {
+            let _profile = claimed;
+            let mut child = BrowserChild::with_grace(spawn_stand_in(&["hang"]), Duration::ZERO);
+            let mut first = true;
+            let result = child.close_with(|child| {
+                if fault && first {
+                    first = false;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                if fault {
+                    retry.send(Event::Retrying).unwrap();
+                    recovery
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                        .unwrap();
+                }
+                child.wait()
+            });
+            *observed.lock().unwrap() = child.child.try_wait().unwrap().is_some();
+            assert_eq!(result.is_err(), fault);
+        });
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                work();
+                let _ = events.send(Event::Returned);
+            })
+            .unwrap();
+        let event = received.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        let held = super::super::browser_window::ProfileLock::claim(&profile);
+        let paused = lifetime.pause().unwrap().try_wait();
+        let _ = release.send(());
+        let joined = worker.join();
+        joined.unwrap();
+        assert!(*reaped.lock().unwrap());
+        if fault {
+            assert_eq!(event.unwrap(), Event::Retrying);
+            assert!(held.is_err());
+            assert!(paused.is_err());
+        } else {
+            assert_eq!(event.unwrap(), Event::Returned);
+            assert!(held.is_ok());
+            assert!(paused.is_ok());
+        }
+        drop(held);
+        let drained = match paused {
+            Ok(drained) => drained,
+            Err(pause) => pause.try_wait().expect("owning browser wait retired"),
+        };
+        assert!(drained.resume().is_ok());
+        assert!(super::super::browser_window::ProfileLock::claim(&profile).is_ok());
+    }
+}
+
 /// The headless browser's environment is the opener's kept variables
 /// ([`super::super::open_url::CHILD_ENV_KEPT`]) and nothing else: no mailbox credential the
 /// opener holds reaches the browser. CONTROL: the opener's home and path do arrive, and the

@@ -80,7 +80,7 @@ fn main() -> ExitCode {
 #[cfg(unix)]
 fn print_line(line: &str) {
     use std::io::Write as _;
-    let mut buf = String::new();
+    let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
     if std::io::stdout().write_all(buf.as_bytes()).is_err() {
@@ -92,7 +92,7 @@ fn print_line(line: &str) {
 #[cfg(unix)]
 fn eprint_line(line: &str) {
     use std::io::Write as _;
-    let mut buf = String::new();
+    let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
     if std::io::stderr().write_all(buf.as_bytes()).is_err() {
@@ -132,8 +132,9 @@ fn verify_signed(argv: &Argv) -> Result<(), String> {
         return Err(USAGE.to_string());
     };
     let read = |p: &str| read_bytes(p).map_err(|e| concat(&["read ", p, ": ", &e.to_string()]));
-    let file_bytes = atpkg_keys::fsio::read_bytes_up_to(file, 64 * 1024 * 1024)
-        .map_err(|e| concat(&["read ", file, ": ", &e.to_string()]))?;
+    let file_bytes =
+        atpkg_keys::fsio::read_bytes_up_to(file, atpkg_keys::fsio::SIGNED_FILE_READ_CAP)
+            .map_err(|e| concat(&["read ", file, ": ", &e.to_string()]))?;
     let now =
         i64::try_from(now_unix()?).map_err(|_| "the system clock is out of range".to_string())?;
     let who = atpkg_keys::verify_signed(
@@ -162,7 +163,8 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
     atpkg_keys::master::forbid_core_dumps();
     let key = key.ok_or("usage: atpkg-keys sign <key-file> <file> [<sig-out>]")?;
     let msg = msg.ok_or("usage: atpkg-keys sign <key-file> <file> [<sig-out>]")?;
-    let bytes = read_bytes(msg).map_err(|e| concat(&["read ", msg, ": ", &e.to_string()]))?;
+    let bytes = atpkg_keys::fsio::read_bytes_up_to(msg, atpkg_keys::fsio::SIGNED_FILE_READ_CAP)
+        .map_err(|e| concat(&["read ", msg, ": ", &e.to_string()]))?;
     let mut pkcs8 = read_key(key)?;
     let sig = atpkg_keys::sign(&pkcs8, &bytes);
     atpkg_keys::master::scrub(&mut pkcs8);
@@ -173,10 +175,15 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
     };
     write_bytes(&path, &sig).map_err(|e| concat(&["write ", &path, ": ", &e.to_string()]))?;
     let shown = match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&concat(&[&home, "/"])) => {
+        Ok(home)
+            if !home.is_empty()
+                && path
+                    .strip_prefix(&home)
+                    .is_some_and(|rest| rest.starts_with('/')) =>
+        {
             concat(&["~", &path[home.len()..]])
         }
-        _ => path.clone(),
+        _ => path,
     };
     eprint_line(&concat(&[
         "atpkg-keys: wrote ",
@@ -262,14 +269,15 @@ fn confirm_transcription(
                 continue;
             }
         };
-        if typed.seed().pubkey_b64()? == want {
+        let typed_seed = typed.seed();
+        if typed_seed.pubkey_b64()? == want {
             return tty.write_line(
                 "atpkg-keys: paper proven. Clear this terminal's scrollback when done.",
             );
         }
         tty.write_line(&concat(&[
             "atpkg-keys: NO MATCH — your paper derives fingerprint ",
-            &typed.seed().fingerprint()?,
+            &typed_seed.fingerprint()?,
             ", the master is ",
             &seed.fingerprint()?,
             ". Fix the paper from the line below, then retype.",
@@ -328,21 +336,22 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
         ])
     })?;
     let now = now_unix()?;
-    let paths = prov::Paths {
-        pins: match flag(argv, "pins") {
-            Some(p) => p.to_string(),
-            None => prov::discover_pins_path()?,
-        },
-        pins_explicit: match flag(argv, "pins") {
-            None => false,
-            Some(p) => match (
+    let (pins, pins_explicit) = match flag(argv, "pins") {
+        Some(p) => {
+            let explicit = match (
                 std::fs::canonicalize(p),
                 prov::discover_pins_path().map(std::fs::canonicalize),
             ) {
                 (Ok(given), Ok(Ok(discovered))) => given != discovered,
                 _ => true,
-            },
-        },
+            };
+            (p.to_string(), explicit)
+        }
+        None => (prov::discover_pins_path()?, false),
+    };
+    let paths = prov::Paths {
+        pins,
+        pins_explicit,
         roster: flag(argv, "roster").unwrap_or(DEFAULT_ROSTER).to_string(),
         key: match flag(argv, "key") {
             Some(p) => p.to_string(),

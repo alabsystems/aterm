@@ -70,14 +70,38 @@ impl Digest {
     /// reaches the digest and the same command keys the same whatever it was run with.
     #[must_use]
     pub fn key(kind: &Kind, what: &str, dir: Option<&str>) -> Self {
-        Self::of(
-            "key/2",
-            &[
-                kind.word().as_bytes(),
-                key_words(what).as_bytes(),
-                dir.unwrap_or("").as_bytes(),
-            ],
-        )
+        let mut words_len = 0usize;
+        for_each_shell_word(what, |word| {
+            if !is_assignment(word) {
+                if words_len > 0 {
+                    words_len += 1;
+                }
+                words_len += word.len();
+            }
+        });
+        let kind_bytes = kind.word().as_bytes();
+        let dir_bytes = dir.unwrap_or("").as_bytes();
+        let mut h = aterm_digest::Sha256::new();
+        h.update(b"aterm-telemetry/key/2\0");
+        h.update((kind_bytes.len() as u64).to_le_bytes());
+        h.update(kind_bytes);
+        h.update((words_len as u64).to_le_bytes());
+        let mut first = true;
+        for_each_shell_word(what, |word| {
+            if !is_assignment(word) {
+                if !first {
+                    h.update(b" ");
+                }
+                first = false;
+                h.update(word.as_bytes());
+            }
+        });
+        h.update((dir_bytes.len() as u64).to_le_bytes());
+        h.update(dir_bytes);
+        let full = h.finalize();
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&full[..8]);
+        Self(out)
     }
 
     /// The digest of a folder's path.
@@ -182,7 +206,7 @@ fn nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn push_hex(s: &mut String, bytes: &[u8]) {
+pub(crate) fn push_hex(s: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);
@@ -466,7 +490,7 @@ pub(crate) fn word_of(text: &str, max: usize) -> String {
     out
 }
 
-fn push_word_of(out: &mut String, text: &str, max: usize) {
+pub(crate) fn push_word_of(out: &mut String, text: &str, max: usize) {
     for c in text.chars().take(max) {
         out.push(if word_char(c) { c } else { '_' });
     }
@@ -549,27 +573,26 @@ fn push_opt_digest(out: &mut String, d: Option<Digest>) {
 }
 
 impl Row {
-    pub(crate) fn body(&self) -> String {
-        let mut b = String::with_capacity(360);
+    pub(crate) fn write_body(&self, b: &mut String) {
         let _ = write!(
             b,
             "schema={SCHEMA} at={} kind={} key=",
             self.at_ms,
             self.kind.word()
         );
-        push_opt_digest(&mut b, self.key);
+        push_opt_digest(b, self.key);
         b.push_str(" dir=");
-        push_opt_digest(&mut b, self.dir);
+        push_opt_digest(b, self.dir);
         b.push_str(" label=");
         let base = self.label.trim().rsplit('/').next().unwrap_or("");
         if base.is_empty() {
             b.push('-');
         } else {
-            push_word_of(&mut b, base, LABEL_MAX);
+            push_word_of(b, base, LABEL_MAX);
         }
         b.push_str(" sid=");
         match self.sid.as_deref() {
-            Some(s) if !s.is_empty() => push_word_of(&mut b, s, 64),
+            Some(s) if !s.is_empty() => push_word_of(b, s, 64),
             _ => b.push('-'),
         }
         b.push_str(" host=");
@@ -577,22 +600,22 @@ impl Row {
         if first.is_empty() {
             b.push('-');
         } else {
-            push_word_of(&mut b, first, 63);
+            push_word_of(b, first, 63);
         }
         b.push_str(" facts=");
-        push_hex(&mut b, &self.facts.0);
+        push_hex(b, &self.facts.0);
         b.push_str(" wall_ms=");
-        push_fig_word(&mut b, &self.wall_ms);
+        push_fig_word(b, &self.wall_ms);
         b.push_str(" cpu_ms=");
-        push_fig_word(&mut b, &self.cpu_ms);
+        push_fig_word(b, &self.cpu_ms);
         b.push_str(" peak_bytes=");
-        push_fig_word(&mut b, &self.peak_bytes);
+        push_fig_word(b, &self.peak_bytes);
         b.push_str(" wait_ms=");
-        push_fig_word(&mut b, &self.wait_ms);
+        push_fig_word(b, &self.wait_ms);
         b.push_str(" cache=");
         match &self.cache {
-            Fig::Known(tier) => push_word_of(&mut b, tier, 32),
-            other => push_fig_word(&mut b, other),
+            Fig::Known(tier) => push_word_of(b, tier, 32),
+            other => push_fig_word(b, other),
         }
         let _ = write!(
             b,
@@ -600,11 +623,16 @@ impl Row {
             self.outcome.word(),
             self.stop.word()
         );
-        push_opt_word(&mut b, self.code);
+        push_opt_word(b, self.code);
         b.push_str(" sig=");
-        push_opt_word(&mut b, self.sig);
+        push_opt_word(b, self.sig);
         b.push_str(" meter=");
         b.push_str(self.meter.word());
+    }
+
+    pub(crate) fn body(&self) -> String {
+        let mut b = String::with_capacity(360);
+        self.write_body(&mut b);
         b
     }
 
@@ -674,6 +702,75 @@ pub fn parse_line(line: &str) -> Option<Line> {
 }
 
 fn parse_row(at_ms: u64, kind: Kind, w: &[(&str, &str)]) -> Option<Row> {
+    let mut key_w = None;
+    let mut dir_w = None;
+    let mut label_w = None;
+    let mut sid_w = None;
+    let mut host_w = None;
+    let mut facts_w = None;
+    let mut wall_ms_w = None;
+    let mut cpu_ms_w = None;
+    let mut peak_bytes_w = None;
+    let mut wait_ms_w = None;
+    let mut cache_w = None;
+    let mut outcome_w = None;
+    let mut stop_w = None;
+    let mut code_w = None;
+    let mut sig_w = None;
+    let mut meter_w = None;
+    for &(k, v) in w {
+        match k {
+            "key" => {
+                key_w.get_or_insert(v);
+            }
+            "dir" => {
+                dir_w.get_or_insert(v);
+            }
+            "label" => {
+                label_w.get_or_insert(v);
+            }
+            "sid" => {
+                sid_w.get_or_insert(v);
+            }
+            "host" => {
+                host_w.get_or_insert(v);
+            }
+            "facts" => {
+                facts_w.get_or_insert(v);
+            }
+            "wall_ms" => {
+                wall_ms_w.get_or_insert(v);
+            }
+            "cpu_ms" => {
+                cpu_ms_w.get_or_insert(v);
+            }
+            "peak_bytes" => {
+                peak_bytes_w.get_or_insert(v);
+            }
+            "wait_ms" => {
+                wait_ms_w.get_or_insert(v);
+            }
+            "cache" => {
+                cache_w.get_or_insert(v);
+            }
+            "outcome" => {
+                outcome_w.get_or_insert(v);
+            }
+            "stop" => {
+                stop_w.get_or_insert(v);
+            }
+            "code" => {
+                code_w.get_or_insert(v);
+            }
+            "sig" => {
+                sig_w.get_or_insert(v);
+            }
+            "meter" => {
+                meter_w.get_or_insert(v);
+            }
+            _ => {}
+        }
+    }
     let opt_digest = |v: &str| -> Option<Option<Digest>> {
         if v == "-" {
             Some(None)
@@ -688,7 +785,7 @@ fn parse_row(at_ms: u64, kind: Kind, w: &[(&str, &str)]) -> Option<Row> {
             v.parse().ok().map(Some)
         }
     };
-    let cache = match find(w, "cache")? {
+    let cache = match cache_w? {
         v if v == "na" || v.starts_with('?') => fig_parse::<String>(v)?,
         v if is_word(v) => Fig::Known(v.to_owned()),
         _ => return None,
@@ -696,25 +793,25 @@ fn parse_row(at_ms: u64, kind: Kind, w: &[(&str, &str)]) -> Option<Row> {
     Some(Row {
         at_ms,
         kind,
-        key: opt_digest(find(w, "key")?)?,
-        dir: opt_digest(find(w, "dir")?)?,
-        label: find(w, "label")?.to_owned(),
-        sid: match find(w, "sid")? {
+        key: opt_digest(key_w?)?,
+        dir: opt_digest(dir_w?)?,
+        label: label_w?.to_owned(),
+        sid: match sid_w? {
             "-" => None,
             s => Some(s.to_owned()),
         },
-        host: find(w, "host")?.to_owned(),
-        facts: Digest::parse(find(w, "facts")?)?,
-        wall_ms: fig_parse(find(w, "wall_ms")?)?,
-        cpu_ms: fig_parse(find(w, "cpu_ms")?)?,
-        peak_bytes: fig_parse(find(w, "peak_bytes")?)?,
-        wait_ms: fig_parse(find(w, "wait_ms")?)?,
+        host: host_w?.to_owned(),
+        facts: Digest::parse(facts_w?)?,
+        wall_ms: fig_parse(wall_ms_w?)?,
+        cpu_ms: fig_parse(cpu_ms_w?)?,
+        peak_bytes: fig_parse(peak_bytes_w?)?,
+        wait_ms: fig_parse(wait_ms_w?)?,
         cache,
-        outcome: Outcome::parse(find(w, "outcome")?)?,
-        stop: Stop::parse(find(w, "stop")?)?,
-        code: opt_i32(find(w, "code")?)?,
-        sig: opt_i32(find(w, "sig")?)?,
-        meter: Meter::parse(find(w, "meter")?)?,
+        outcome: Outcome::parse(outcome_w?)?,
+        stop: Stop::parse(stop_w?)?,
+        code: opt_i32(code_w?)?,
+        sig: opt_i32(sig_w?)?,
+        meter: Meter::parse(meter_w?)?,
     })
 }
 

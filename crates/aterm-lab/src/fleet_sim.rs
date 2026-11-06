@@ -189,7 +189,7 @@ struct Reader {
 /// How the members' `fleet join` went over the one loopback address.
 #[derive(Clone, Copy, Debug, Default)]
 struct Joins {
-    /// Registrations the issuer recorded before each was removed and re-added manually.
+    /// Registrations the issuer recorded: every member's own.
     registered: usize,
 }
 
@@ -233,6 +233,16 @@ impl Sim {
         let ports = world::free_ports(n).map_err(|e| Fail::die(format!("free ports: {e}")))?;
         println!("  starting {n} headless instances…");
         for (i, &port) in ports.iter().enumerate() {
+            // Every member registers from 127.0.0.1, where a LAN gives each its own address:
+            // room for all of them at one address, so each member's own registration fills the
+            // issuer's book as on a LAN.
+            world.extra.insert(
+                world.root_of(i),
+                vec![(
+                    aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM.to_owned(),
+                    n.to_string(),
+                )],
+            );
             let inst = world.start(i, port).map_err(Fail::die)?;
             world.insts.push(inst);
             if (i + 1) % 10 == 0 || i + 1 == n {
@@ -977,15 +987,12 @@ impl Sim {
         let _ = writeln!(
             s,
             "- every member registers from 127.0.0.1, which the issuer records at most \
-             `JOINED_PER_ADDRESS` (4) members from, and a join it does not record writes nothing \
-             of the fleet: it recorded {} registrations, machine 0 taking each out of its book \
-             once its member had joined (`aterm fleet peers rm 127.0.0.1:<port>`) so the next \
-             registered too. Then machine 0 added all {} BY HAND (`aterm fleet peers add \
-             127.0.0.1:<port>`, `Via::Manual`), the loopback override `aterm_net::fleet_member` \
-             names; on a LAN each machine has its own address and the registration alone fills \
-             the book.",
+             `JOINED_PER_ADDRESS` (4) members from in production; each instance here runs with \
+             `{}={n}` (a debug build's seam), so the issuer recorded all {} registrations \
+             from that one address, as on a LAN, where each machine has its own address and the \
+             registration alone fills the book.",
+            aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM,
             self.joins.registered,
-            n - 1
         );
         let _ = writeln!(
             s,
@@ -1004,8 +1011,9 @@ impl Sim {
              as deep as a real one, asked and saying words near the 400-byte excerpt record (a \
              long report with its result at its end): so the read is over its budget, as the \
              end use's is, and the cut is held to the client's fill order — every machine's \
-             header and agent lines, the shells folded first, the asking sessions' words, then \
-             a round robin over the machines — its marks and its use of the budget, and up to \
+             header and agent lines, the shells folded first and each machine's home and \
+             checkout lines next, a line at a time, the asking sessions' words, then a round \
+             robin over the machines — its marks and its use of the budget, and up to \
              {EVERY_TOP_UP_TO} machines every machine's most pressing agent keeps its words; an \
              idle turn's cut `said:` keeps its end.\n",
             peer = hostile_peer(n)
@@ -1385,7 +1393,8 @@ fn reader_of(inst: &Inst) -> Result<Reader, Fail> {
     })
 }
 
-/// Initialize machine 0 as fleet issuer, join all other instances, and register loopback peers manually.
+/// Initialize machine 0 as fleet issuer and join every other instance to it: each member's own
+/// registration puts it in the issuer's book ([`aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM`]).
 fn form_fleet(world: &World) -> Result<Joins, Fail> {
     let issuer = &world.insts[0];
     let out = world.aterm_in(
@@ -1414,8 +1423,7 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
     let code = crate::util::read_regular_text(&issuer.state().join("fleet-join-code"))
         .map_err(|e| Fail::die(format!("the join code: {e}")))?;
     println!(
-        "  fleet init on m00 (issuer); joining {} members (loopback: each registration taken \
-         out, then peers add on the issuer)…",
+        "  fleet init on m00 (issuer); joining {} members, each registering from 127.0.0.1…",
         world.insts.len() - 1
     );
     let mut joins = Joins::default();
@@ -1440,8 +1448,22 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
             Some(&code),
         );
         if out.code != 0 || !inst.state().join("fleet.key").exists() {
+            // Only a debug build reads the per-address seam: an optimized image (`LAB_ATERM`)
+            // records four members from 127.0.0.1, as production does, and refuses the fifth.
+            let quota = [&out.stdout, &out.stderr]
+                .iter()
+                .any(|said| said.contains(" members already"));
+            let seam = if quota {
+                format!(
+                    " (this image ignores {}, which only a debug build of aterm reads: run \
+                     fleet-sim on one)",
+                    aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM
+                )
+            } else {
+                String::new()
+            };
             return Err(Fail::die(format!(
-                "m{i:02} `fleet join` exited {} and did not provision the member: {}{}",
+                "m{i:02} `fleet join` exited {} and did not provision the member{seam}: {}{}",
                 out.code,
                 out.stdout.trim(),
                 out.stderr.trim()
@@ -1449,37 +1471,6 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
         }
         joins.registered += 1;
         world.await_listening(inst).map_err(Fail::die)?;
-        let addr = format!("127.0.0.1:{}", inst.port);
-        let out = world.aterm_in(
-            issuer.root.as_path(),
-            &["fleet", "peers", "rm", &addr],
-            None,
-        );
-        if out.code != 0 {
-            return Err(Fail::die(format!(
-                "m00 `fleet peers rm {addr}` exited {}: {}{}",
-                out.code,
-                out.stdout.trim(),
-                out.stderr.trim()
-            )));
-        }
-        stop::check()?;
-    }
-    for inst in &world.insts[1..] {
-        let addr = format!("127.0.0.1:{}", inst.port);
-        let out = world.aterm_in(
-            issuer.root.as_path(),
-            &["fleet", "peers", "add", &addr],
-            None,
-        );
-        if out.code != 0 {
-            return Err(Fail::die(format!(
-                "m00 `fleet peers add {addr}` exited {}: {}{}",
-                out.code,
-                out.stdout.trim(),
-                out.stderr.trim()
-            )));
-        }
         stop::check()?;
     }
     Ok(joins)

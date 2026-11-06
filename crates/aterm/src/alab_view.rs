@@ -115,8 +115,14 @@ fn settled_in(alab_dir: &Path, table: &[u8; 32]) -> bool {
     let Ok(bytes) = aterm_uds::private_file::read_private(alab_dir, "settled", 256) else {
         return false;
     };
-    std::str::from_utf8(&bytes)
-        .is_ok_and(|held| held.trim() == aterm_codec::hex::encode_lower(table))
+    let Ok(held) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let trimmed = held.trim().as_bytes();
+    let mut decoded = [0u8; 32];
+    !trimmed.iter().any(u8::is_ascii_uppercase)
+        && aterm_codec::hex::decode_into(trimmed, &mut decoded)
+        && &decoded == table
 }
 
 /// Whether `alab_dir` records that a projection of the lab named this Mac ([`note_named`]).
@@ -283,6 +289,20 @@ pub(crate) fn placements(view: &LabView, places: &Places) -> Placements {
 /// `view` as the harness reads it, each address the lab places in a mailbox `logins` names
 /// given that mailbox's login ([`Lab::mailboxes`]).
 pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<String, String>) -> Lab {
+    let placed = if logins.is_empty() {
+        BTreeMap::new()
+    } else {
+        view.mailboxes()
+    };
+    harness_lab_with_placed(view, &placed, settled, logins)
+}
+
+fn harness_lab_with_placed(
+    view: &LabView,
+    placed: &BTreeMap<String, String>,
+    settled: bool,
+    logins: &BTreeMap<String, String>,
+) -> Lab {
     let mut accounts = Vec::with_capacity(view.accounts.len());
     for account in view.accounts.values() {
         let (Some(realm), Some(label), Some(email)) =
@@ -319,7 +339,7 @@ pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<Strin
             preferred,
         });
     }
-    let mailboxes = named_mailboxes(&view.mailboxes(), logins);
+    let mailboxes = named_mailboxes(placed, logins);
     Lab {
         me: view.my_label().map(str::to_owned),
         settled,
@@ -369,7 +389,12 @@ fn look(
             held.inventory = Some(inventory);
             held.placed = view.mailboxes();
             let logins = logins_of(&held.mail, toml_logins);
-            held.lab = Some(Arc::new(harness_lab(&view, settled, &logins)));
+            held.lab = Some(Arc::new(harness_lab_with_placed(
+                &view,
+                &held.placed,
+                settled,
+                &logins,
+            )));
             view.my_label().is_some()
         }
         Ok(Some(LabRead::Unchanged)) => {

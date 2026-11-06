@@ -488,6 +488,14 @@ fn intersect_rect_spans_is_exact() {
             }
         }
     }
+    let far = usize::MAX - 2;
+    let mut out = Vec::new();
+    intersect_rect_spans(&mut out, [far, 2, 5, 3], &[(far + 1, 9), (0, 4)]);
+    assert_eq!(
+        out,
+        [[far + 1, 2, 1, 3]],
+        "a rect and span past usize::MAX meet up to it, without wrapping into the low span"
+    );
 }
 
 fn fixture_renderer() -> Renderer {

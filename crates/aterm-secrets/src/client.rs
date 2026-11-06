@@ -47,6 +47,7 @@ mod join_routing;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod member_routes;
 mod mirrors;
 mod network_observation;
 mod network_refresh;
@@ -167,7 +168,11 @@ pub use retirement::{
 pub use roster::test_unwaited_roster;
 pub(crate) use roster::with_roster_observation;
 pub use roster::{admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
-pub use seat_ask::{Seat, accepts_seat, seat, seat_asks, take_seat};
+#[cfg(any(test, debug_assertions))]
+pub use seat_ask::test_read_dropped;
+pub use seat_ask::{
+    Seat, accepts_seat, dropped, dropped_words, out_since, out_words, seat, seat_asks, take_seat,
+};
 pub(crate) use steward::local_recipient_denial_held;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
@@ -468,9 +473,11 @@ pub enum Membership {
         /// long-poll timeout can advance it; this is not successful network-sync evidence.
         heard: u64,
     },
-    /// It was in, and the latest envelope has no locker for it.
+    /// It was in, and its latest version opens no locker for it: a `Remove` revoked it, or a
+    /// rotation dropped it with no act against it that it can read ([`dropped`]), as an admin's
+    /// revoke of a Mac that never took a seat reads here.
     Revoked {
-        /// The seq that dropped it.
+        /// The newest version this Mac read while out; 0 for one that read only the log.
         seq: u64,
     },
     /// Reading a plain text file at a path.
@@ -2729,8 +2736,16 @@ pub enum MaterializationBlocker {
     UntrustedPin,
     /// The current local state records no admitted vault membership.
     NotAdmitted,
-    /// The current local state records revoked vault membership.
+    /// The current local state records revoked vault membership and [`dropped`] does not hold:
+    /// an act this Mac can read in its log took it out (a `Remove`, a node removal, a superseded
+    /// seat), or its log does not say a rotation left it out on purpose (no trusted log; one that
+    /// still seats or wraps it while it waits on a heal; or one whose newest epoch never knew
+    /// it).
     Revoked,
+    /// The vault let this Mac go with no act against it that it can read ([`dropped`], one-mesh
+    /// E2): a rotation left out its recipient, which no seat bound, so it comes back only as a
+    /// new Mac.
+    Dropped,
     /// The applied state is not bound to the configured source and signing identity.
     SourceChanged,
     /// Apply, signed cache or tracked files are not complete and intact.
@@ -2905,7 +2920,11 @@ fn with_ready_state<T>(
     }
     let state = load_state(paths)?;
     if state.membership == Stored::Revoked {
-        return blocked(Blocker::Revoked);
+        return blocked(if dropped(paths) {
+            Blocker::Dropped
+        } else {
+            Blocker::Revoked
+        });
     }
     if !matches!(state.membership, Stored::In | Stored::Plain) {
         return blocked(Blocker::NotAdmitted);
@@ -3238,7 +3257,11 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     };
     let state = reads.state()?;
     if state.membership == Stored::Revoked {
-        return unavailable(Unavailable::Revoked);
+        return unavailable(if dropped(paths) {
+            Unavailable::Dropped
+        } else {
+            Unavailable::Revoked
+        });
     }
     if state.membership != Stored::In {
         return unavailable(Unavailable::NotAdmitted);
@@ -3648,11 +3671,12 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
         Some(_lock) => {
             expected.check(paths)?;
             let mut files = Vec::new();
-            for (from, name) in [
-                (paths.source_file(), "source.toml"),
-                (paths.state_file(), "state.toml"),
+            // Each file under the bound its own reader keeps ([`config`], [`load_state`]).
+            for (from, name, max) in [
+                (paths.source_file(), "source.toml", 4 << 20),
+                (paths.state_file(), "state.toml", MAX_STATE),
             ] {
-                if let Some(bytes) = fsx::read_private(&from, 4 << 20)? {
+                if let Some(bytes) = fsx::read_private(&from, max)? {
                     files.push((name, bytes));
                 }
             }
@@ -4307,6 +4331,7 @@ fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::
         write_record_file(&records_file_for_write(paths, store)?, |writer| {
             store.write_encoded(writer)
         })?;
+        records_written(paths, store);
         return mark.store();
     }
     if crosses {
@@ -4315,7 +4340,42 @@ fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::
     write_record_file(&records_file_for_write(paths, store)?, |writer| {
         store.write_encoded(writer)
     })?;
+    records_written(paths, store);
     retained_history::acknowledge(paths, store)
+}
+
+/// The records file holds `store` durably: hand it to the process's hook
+/// ([`crate::membership_log::store::on_written`]).
+fn records_written(paths: &Paths, store: &crate::membership_log::Store) {
+    crate::membership_log::store::written(&crate::membership_log::store::Written {
+        paths_dir: &paths.dir,
+        store,
+    });
+}
+
+/// Ingest `records` the mesh delivered into `paths.records_file()` under the client state lock
+/// ([`crate::membership_log::Store::ingest_classified`]), writing the file only where a record
+/// entered the store (held or waiting), and say what became of each one.
+///
+/// # Errors
+/// The state lock cannot be taken, or `paths.records_file()` cannot be read or written.
+pub fn ingest_mesh_records(
+    paths: &Paths,
+    records: Vec<crate::membership_log::Record>,
+) -> crate::Result<
+    Vec<(
+        crate::membership_log::RecordId,
+        crate::membership_log::store::MemberVerdict,
+    )>,
+> {
+    let _lock = StateLock::take(paths)?;
+    let mut store = load_records(paths)?;
+    let before = store.inventory();
+    let verdicts = store.ingest_classified(records);
+    if store.inventory() != before {
+        write_records(paths, &store)?;
+    }
+    Ok(verdicts)
 }
 
 /// Isolate the old regular-file path before publishing custody that an older reader cannot hold.
@@ -4355,6 +4415,9 @@ pub fn records_bound(
     crate::crossing::stated(&crossing_mark(paths), store)
 }
 
+#[cfg(test)]
+#[path = "client/mesh_records_tests.rs"]
+mod mesh_records_tests;
 #[cfg(test)]
 #[path = "client/record_persistence_tests.rs"]
 mod record_persistence_tests;
@@ -7229,6 +7292,8 @@ struct Hearing<'a> {
     /// How it asks ALab's members on the LAN to show this Mac's request while it waits to be
     /// let in ([`ask_members_if_due`]): how many heard it.
     ask: AskMembers<'a>,
+    /// Shared with the independent route listener: one backoff and one member ask at a time.
+    members: std::sync::Mutex<MembersAsked>,
     /// What a round `[swarm] enabled` holds does with the LAN uses that run by themselves between
     /// rounds: the live loop's drops its standing `_alab-vault._tcp` browse
     /// ([`StandingBrowse::stop`]), which the first pass of the ALab vault once sharing is on
@@ -7413,10 +7478,17 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
         bell: &bell,
         routes,
         ask: &ask,
+        members: std::sync::Mutex::new(MembersAsked::default()),
         hold: &hold,
         away: &away,
     };
-    subscriber_loop_until(paths, log, &|| false, &converging, &hearing)
+    let run = || subscriber_loop_until(paths, log, &|| false, &converging, &hearing);
+    match crate::wake::route_changes() {
+        Some(changes) => {
+            member_routes::while_hearing(paths, &hearing.members, &ask, log, changes, run)
+        }
+        None => run(),
+    }
 }
 
 /// The subscriber's standing `_alab-vault._tcp` browse (a `dns-sd -B` child, a Local Network
@@ -7564,7 +7636,6 @@ fn subscriber_loop_until(
         // The first healthy pass once sharing is on starts it.
         converge.failed();
     }
-    let mut members = MembersAsked::default();
     loop {
         if stop() {
             return Ok(());
@@ -7585,7 +7656,15 @@ fn subscriber_loop_until(
         }
         // Whether or not the vault's source answers: the members on this LAN can let this Mac
         // in while it cannot be reached.
-        ask_members_if_due(paths, &mut members, hearing.ask, log);
+        ask_members_if_due(
+            paths,
+            &mut hearing
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            hearing.ask,
+            log,
+        );
         // A verdict kept before this round's long-poll begins does not end it (only a new one
         // does), so it is read first: one that came while this subscriber started, or paused.
         heed_verdict(paths, log);
@@ -7634,7 +7713,11 @@ fn subscriber_loop_until(
                 ask_again_if_due(paths, &config, log);
                 let after = requested();
                 if after != before {
-                    members.asked_again(after);
+                    hearing
+                        .members
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .asked_again(after);
                 }
                 // A verdict that ended the long-poll.
                 heed_verdict(paths, log);
@@ -10577,6 +10660,8 @@ fn default_pin(source: &Source) -> Option<[u8; 32]> {
 }
 
 /// Join a vault: configure the source and machine key, verify, then sync or queue a join request.
+/// The vault that dropped this Mac ([`dropped`]) is not asked again with its key: that join is
+/// refused with [`crate::ErrorKind::Dropped`] and [`dropped_words`], and nothing changes.
 pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutcome> {
     join_live(paths, options, ExpectedConfig::Any)
 }
@@ -10645,6 +10730,27 @@ fn join_with(
     fetch: impl FnOnce(&Source) -> crate::Result<Fetched>,
 ) -> crate::Result<JoinOutcome> {
     join_with_until(paths, options, expected, fetch, None)
+}
+
+/// Whether a join of the vault `name` that `pin` verified (handing off to `pinned`) joins
+/// `previous`, the vault this Mac has configured, again: the same name, signed by a key its pin
+/// admits ([`pin_admitted`]), wherever it is served from (a LAN-probed URL is the same vault).
+fn joins_again(previous: &Config, name: &str, pin: [u8; 32], pinned: [u8; 32]) -> bool {
+    previous.name == name
+        && (pin_admitted(previous, Some(pin)) || pin_admitted(previous, Some(pinned)))
+}
+
+/// Refuse, with [`dropped_words`] and [`crate::ErrorKind::Dropped`], a join of the vault that
+/// dropped this Mac ([`dropped`]): every member that read the rotation refuses its key, and the
+/// join would move it to pending, losing the reading that says how it comes back (one-mesh E2,
+/// f299). A Mac an act took out, or one its log does not judge, joins as before.
+/// # Errors
+/// This Mac was dropped, or its state cannot be read.
+fn refuse_dropped(paths: &Paths) -> crate::Result<()> {
+    match dropped_words(paths, load_state(paths)?.seq) {
+        Some(words) => Err(Error::of_kind(crate::ErrorKind::Dropped, words)),
+        None => Ok(()),
+    }
 }
 
 fn join_with_until(
@@ -10813,6 +10919,14 @@ fn join_with_until(
         let _lock = bounded::take(paths, deadline)?;
         creation::permit_join(paths)?;
         expected.check(paths)?;
+        // Before the reset below clears it, and before this Mac's key is announced or asked
+        // with: the vault that dropped this Mac refuses that key.
+        if previous
+            .as_ref()
+            .is_some_and(|previous| joins_again(previous, &name, pin, pinned))
+        {
+            refuse_dropped(paths)?;
+        }
         let identity = machine_identity(paths)?;
         let mut state = load_state(paths)?;
         if !goes_on {
@@ -12636,14 +12750,9 @@ fn publish_as_with_removal(
                 let mut first_err = None;
                 // Only a refusal before any store proves the envelope is on no server; anything
                 // else (a reply lost after a server took it) keeps the hold.
-                let refused = outcomes.iter().all(|(_, res)| {
-                    res.as_ref().is_err_and(|err| {
-                        matches!(
-                            err.kind(),
-                            crate::ErrorKind::NotStored | crate::ErrorKind::Refused
-                        )
-                    })
-                });
+                let refused = aterm_mesh_core::no_lost_edit::publish_forgets(
+                    outcomes.iter().map(|(_, res)| publish_answer(res)),
+                );
                 if refused {
                     // This version's hold alone: a server that refused it as not newer may hold
                     // an earlier one of this Mac's whose reply was lost.
@@ -12737,12 +12846,7 @@ fn publish_as_with_removal(
                 let _lock = configured_admin_until(paths, &admin.config, deadline)?;
                 transport::publish_until(&admin.config.source, &bytes, deadline)
             };
-            if published.as_ref().is_err_and(|err| {
-                matches!(
-                    err.kind(),
-                    crate::ErrorKind::NotStored | crate::ErrorKind::Refused
-                )
-            }) {
+            if aterm_mesh_core::no_lost_edit::publish_forgets([publish_answer(&published)]) {
                 // This version's hold alone, as above.
                 log_entries::forget_held_draft(paths, seq, &version, deadline);
                 // Outside the state lock, which forgetting the waiting writes takes.
@@ -12789,6 +12893,22 @@ fn publish_as_with_removal(
             Vec::new()
         },
     })
+}
+
+/// A server's answer to a publish as `no_lost_edit`'s kernels read it (one-mesh P3): whether it
+/// stored the version, and whether it refused it before storing (`NotStored` or `Refused`). Only
+/// a publish every answer of which refuses forgets its hold
+/// ([`aterm_mesh_core::no_lost_edit::publish_forgets`]); a lost reply or any other error keeps it.
+fn publish_answer<T>(answer: &crate::Result<T>) -> (bool, bool) {
+    (
+        answer.is_ok(),
+        answer.as_ref().is_err_and(|err| {
+            matches!(
+                err.kind(),
+                crate::ErrorKind::NotStored | crate::ErrorKind::Refused
+            )
+        }),
+    )
 }
 
 /// The servers of a publish's `outcomes` that answered their PUT, or failed it some way other
@@ -14384,6 +14504,27 @@ mod tests {
         keep_config(&fresh, &into).expect("nothing to keep");
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
         assert!(!fresh.dir.exists());
+
+        // A state.toml past source.toml's 4 MiB, within the MAX_STATE its own reader keeps, is
+        // kept whole. Control: one past MAX_STATE is refused, and no copy is made.
+        let large = Paths::for_home(&root.path().join("large"));
+        join_pinned(&large, first.to_str().unwrap(), "large");
+        let state = std::fs::read_to_string(large.state_file()).unwrap();
+        for (padding, kept) in [((4 << 20) + 1024, true), (MAX_STATE, false)] {
+            let big = format!("# {}\n{state}", "x".repeat(padding));
+            fsx::write_atomic(&large.state_file(), big.as_bytes(), 0o600).unwrap();
+            let into = root.path().join(format!("large-kept-{padding}"));
+            if kept {
+                keep_config(&large, &into).expect("a state within MAX_STATE is kept");
+                assert_eq!(
+                    std::fs::read(into.join("state.toml")).unwrap(),
+                    big.as_bytes()
+                );
+            } else {
+                keep_config(&large, &into).expect_err("a state past MAX_STATE");
+                assert!(!into.exists());
+            }
+        }
 
         let signed = root.path().join("signed.vault");
         let admin = Paths::for_home(&root.path().join("admin"));

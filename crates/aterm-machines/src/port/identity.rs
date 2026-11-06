@@ -36,38 +36,68 @@ unsafe fn text(field: *const c_char) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The largest buffer a reentrant account lookup grows to ([`grown`]): an entry that does not
+/// fit in it is an error.
+const LOOKUP_CEILING: usize = 1 << 20;
+
+/// Run the reentrant lookup `call` with a buffer of `start` bytes, doubling it while `call`
+/// answers `ERANGE` (the entry does not fit) up to [`LOOKUP_CEILING`]: `call`'s answer, or the
+/// error code it last returned.
+fn grown<T>(
+    start: usize,
+    mut call: impl FnMut(&mut [u8]) -> Result<T, libc::c_int>,
+) -> Result<T, libc::c_int> {
+    let mut len = start;
+    loop {
+        let mut buf = vec![0_u8; len];
+        match call(&mut buf) {
+            Err(libc::ERANGE) if len < LOOKUP_CEILING => {
+                len = len.saturating_mul(2).min(LOOKUP_CEILING);
+            }
+            answer => return answer,
+        }
+    }
+}
+
 fn account(uid: u32) -> Result<User, String> {
-    // SAFETY: `pw` and `buf` are buffers handed to the reentrant `getpwuid_r`, which writes the
-    // entry's strings into `buf` and points `pw`'s fields at them; the fields are read only when
-    // the call succeeded and found an entry, while `buf` is still alive.
-    let (name, gid, home, shell) = unsafe {
-        let mut pw: libc::passwd = std::mem::zeroed();
-        let mut buf = vec![0u8; 16 * 1024];
-        let mut out: *mut libc::passwd = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(
-            uid,
-            &raw mut pw,
-            buf.as_mut_ptr().cast::<c_char>(),
-            buf.len(),
-            &raw mut out,
-        );
-        if rc != 0 {
-            return Err(format!(
-                "the account database could not be read for uid {uid}: {}",
-                io::Error::from_raw_os_error(rc)
-            ));
+    let found = grown(16 * 1024, |buf| {
+        // SAFETY: `pw` and `buf` are buffers handed to the reentrant `getpwuid_r`, which writes
+        // the entry's strings into `buf` and points `pw`'s fields at them; the fields are read
+        // only when the call succeeded and found an entry, while `buf` is still alive.
+        unsafe {
+            let mut pw: libc::passwd = std::mem::zeroed();
+            let mut out: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(
+                uid,
+                &raw mut pw,
+                buf.as_mut_ptr().cast::<c_char>(),
+                buf.len(),
+                &raw mut out,
+            );
+            if rc != 0 {
+                return Err(rc);
+            }
+            if out.is_null() {
+                return Ok(None);
+            }
+            Ok(Some((
+                text(pw.pw_name),
+                pw.pw_gid,
+                text(pw.pw_dir),
+                text(pw.pw_shell),
+            )))
         }
-        if out.is_null() {
-            return Err(format!(
-                "the account database names no account for uid {uid}"
-            ));
-        }
-        (
-            text(pw.pw_name),
-            pw.pw_gid,
-            text(pw.pw_dir),
-            text(pw.pw_shell),
+    })
+    .map_err(|rc| {
+        format!(
+            "the account database could not be read for uid {uid}: {}",
+            io::Error::from_raw_os_error(rc)
         )
+    })?;
+    let Some((name, gid, home, shell)) = found else {
+        return Err(format!(
+            "the account database names no account for uid {uid}"
+        ));
     };
     let name = name.ok_or_else(|| format!("uid {uid}'s account has no readable name"))?;
     let home = home
@@ -115,48 +145,52 @@ const ADMIN_GROUPS: [&CStr; 2] = [c"sudo", c"wheel"];
 
 /// `group`'s members, as the account database lists them (none without the group).
 fn members(group_name: &CStr) -> Result<Vec<String>, String> {
-    let mut group = GroupRecord {
-        gr_name: std::ptr::null_mut(),
-        gr_passwd: std::ptr::null_mut(),
-        gr_gid: 0,
-        gr_mem: std::ptr::null_mut(),
-    };
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut out: *mut GroupRecord = std::ptr::null_mut();
-    // SAFETY: as in `account`: a record and a buffer handed to the reentrant `getgrnam_r`, which
-    // points the record's fields into `buf`; the name is NUL-terminated.
-    let rc = unsafe {
-        getgrnam_r(
-            group_name.as_ptr(),
-            &raw mut group,
-            buf.as_mut_ptr().cast::<c_char>(),
-            buf.len(),
-            &raw mut out,
-        )
-    };
-    if rc != 0 {
-        return Err(format!(
+    grown(64 * 1024, |buf| {
+        let mut group = GroupRecord {
+            gr_name: std::ptr::null_mut(),
+            gr_passwd: std::ptr::null_mut(),
+            gr_gid: 0,
+            gr_mem: std::ptr::null_mut(),
+        };
+        let mut out: *mut GroupRecord = std::ptr::null_mut();
+        // SAFETY: as in `account`: a record and a buffer handed to the reentrant `getgrnam_r`,
+        // which points the record's fields into `buf`; the name is NUL-terminated.
+        let rc = unsafe {
+            getgrnam_r(
+                group_name.as_ptr(),
+                &raw mut group,
+                buf.as_mut_ptr().cast::<c_char>(),
+                buf.len(),
+                &raw mut out,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        let mut members = Vec::new();
+        if out.is_null() || group.gr_mem.is_null() {
+            return Ok(members);
+        }
+        let mut at = group.gr_mem;
+        // SAFETY: on success `gr_mem` is a null-terminated array of NUL-terminated strings in
+        // `buf`, which lives until this closure returns.
+        unsafe {
+            while !(*at).is_null() {
+                if let Some(member) = text(*at) {
+                    members.push(member);
+                }
+                at = at.add(1);
+            }
+        }
+        Ok(members)
+    })
+    .map_err(|rc| {
+        format!(
             "the {} group could not be read: {}",
             group_name.to_string_lossy(),
             io::Error::from_raw_os_error(rc)
-        ));
-    }
-    let mut members = Vec::new();
-    if out.is_null() || group.gr_mem.is_null() {
-        return Ok(members);
-    }
-    let mut at = group.gr_mem;
-    // SAFETY: on success `gr_mem` is a null-terminated array of NUL-terminated strings in `buf`,
-    // which lives until the end of this function.
-    unsafe {
-        while !(*at).is_null() {
-            if let Some(member) = text(*at) {
-                members.push(member);
-            }
-            at = at.add(1);
-        }
-    }
-    Ok(members)
+        )
+    })
 }
 
 /// The machine word (`arm64`), what `uname -m` prints for this process.
@@ -236,6 +270,43 @@ fn sysctl_text(name: &CStr) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{LOOKUP_CEILING, grown};
+
+    /// An entry larger than the first buffer is read with a doubled one, not refused.
+    /// NEGATIVE CONTROL: one that does not fit even at the ceiling stays an error, after the
+    /// buffer reached the ceiling and no further, and another error ends the lookup at once.
+    #[test]
+    fn a_lookup_that_does_not_fit_grows_its_buffer_up_to_the_ceiling() {
+        let mut tried = Vec::new();
+        let answer = grown(16 * 1024, |buf| {
+            tried.push(buf.len());
+            if tried.len() == 1 {
+                Err(libc::ERANGE)
+            } else {
+                Ok(buf.len())
+            }
+        });
+        assert_eq!(answer, Ok(32 * 1024));
+        assert_eq!(tried, [16 * 1024, 32 * 1024]);
+
+        let mut tried = Vec::new();
+        let answer: Result<(), _> = grown(16 * 1024, |buf| {
+            tried.push(buf.len());
+            Err(libc::ERANGE)
+        });
+        assert_eq!(answer, Err(libc::ERANGE));
+        assert_eq!(tried.first(), Some(&(16 * 1024)));
+        assert_eq!(tried.last(), Some(&LOOKUP_CEILING));
+        assert!(tried.windows(2).all(|w| w[1] == w[0] * 2), "{tried:?}");
+
+        let mut calls = 0;
+        let answer: Result<(), _> = grown(16 * 1024, |_| {
+            calls += 1;
+            Err(libc::EIO)
+        });
+        assert_eq!((answer, calls), (Err(libc::EIO), 1));
+    }
+
     /// Read only: this process's own account and the host's facts, beside what `id`, `uname`
     /// and `sw_vers` (elsewhere `uname -r`) print for them.
     #[test]

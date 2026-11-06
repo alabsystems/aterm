@@ -187,6 +187,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::RecordUnseenKeys => spec("aos.record_unseen", S::View, A::LocalUi, C::Terminal),
         M::ChooseTabTheme => spec("palette.choose_tab_theme", S::View, A::LocalUi, C::Terminal),
         M::ClearTabTheme => spec("terminal.theme.clear", S::View, A::LocalUi, C::Terminal),
+        M::ChangeNickname => spec("machine.nickname.change", S::Process, A::Owner, C::Any),
     }
 }
 

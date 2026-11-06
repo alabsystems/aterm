@@ -338,7 +338,7 @@ fn yes_tokens(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let mut needles: Vec<&str> = TOKENS.iter().map(|t| t.ty).collect();
     needles.extend(TOKENS.iter().map(|t| t.mark));
     needles.extend(TOKENS.iter().map(|t| file_name(t.leaf)));
-    // A test's file too: a name that reads as a test's (`test_path`) is no
+    // A test's file too: a name that reads as a test's (a `_tests.rs`) is no
     // proof the build that ships leaves it out.
     for file in product(tree) {
         if TOKENS.iter().any(|t| t.leaf == file.rel) || !file.mentions(&needles) {

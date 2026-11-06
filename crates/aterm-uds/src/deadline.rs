@@ -161,7 +161,8 @@ pub fn copy_wait_left(home: &std::path::Path, now: std::time::SystemTime) -> Opt
     copy_wait_left_at(home, now, crate::process::awake_ms())
 }
 
-fn copy_wait_left_at(
+/// [`copy_wait_left`] at the awake-clock reading `awake_now` ([`crate::process::awake_ms`]).
+pub(crate) fn copy_wait_left_at(
     home: &std::path::Path,
     now: std::time::SystemTime,
     awake_now: Option<u64>,
@@ -534,9 +535,11 @@ pub const OUTPUT_KEEP: usize = 1024 * 1024;
 /// Runs `cmd` with owned secret input, requiring complete stdout and stderr, each at most
 /// `max_output` bytes. The absolute deadline covers input, child execution and both drains.
 /// Direct exit or refusal closes input and requests termination of the owned process scope
-/// (Unix process group, Windows Job), followed by bounded cleanup that can outlive the deadline.
+/// (Unix process group, Windows Job). Unix cleanup retains this call until its owning root
+/// wait succeeds; the deadline bounds work, not retirement. Windows cleanup remains bounded.
 /// A direct exit's status survives descendant cleanup. Input is scrubbed when sent or stopped.
-/// A process the kernel will not let exit can outlive the termination request.
+/// A process the kernel will not let exit can outlive the termination request; lost Unix
+/// wait custody blocks retirement rather than authorizing another numeric PID operation.
 ///
 /// # Errors
 /// Spawn, input, output or wait errors; `InvalidData` if either output exceeds its bound;
@@ -566,6 +569,25 @@ pub fn output_with_input_until(
     }
 }
 
+/// Complete bounded stdout and stderr, or an explicit external stop on Unix.
+/// `None` supplies no output or no-execution proof. Once a child starts, every return
+/// and unwind retains its owner until a positive owning root wait; cleanup can outlive
+/// the work deadline indefinitely. No descendant-drain guarantee is supplied.
+///
+/// # Errors
+/// As [`output_with_input_until`]. The stop callback runs only on the owning waiter;
+/// an unwind settles that actual root before propagating.
+#[cfg(unix)]
+pub fn output_with_input_until_watching(
+    cmd: &mut Command,
+    input: crate::secret::Secret,
+    deadline: Instant,
+    max_output: usize,
+    stopped: impl FnMut() -> bool,
+) -> io::Result<Option<Output>> {
+    input_unix::output_with_input_until_watching(cmd, input, deadline, max_output, stopped)
+}
+
 /// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at
 /// `deadline`.
 ///
@@ -582,6 +604,18 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
 /// Returns the same errors as [`output_until`].
 pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, RunError> {
     output_until(cmd, saturating_after(Instant::now(), within))
+}
+
+/// [`output_until_from`] with a relative timeout `within` from now.
+///
+/// # Errors
+/// Returns the same errors as [`output_until`].
+pub fn output_within_from(
+    cmd: &mut Command,
+    stdin: Stdio,
+    within: Duration,
+) -> Result<Output, RunError> {
+    output_until_from(cmd, stdin, saturating_after(Instant::now(), within))
 }
 
 /// [`output_until`] with `stdin` attached as the child's standard input.
@@ -630,7 +664,8 @@ pub fn output_until_from_unless(
     )
 }
 
-/// How often [`output_until_from_unless`] reads its stop while the child runs.
+/// How often [`output_until_from_unless`] and [`outputs_until_unless`] read their stop while a
+/// child runs.
 pub const STOP_TICK: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
@@ -1004,6 +1039,30 @@ pub fn outputs_until(
         let _ = reap;
         cmds.iter_mut()
             .map(|cmd| output_until(cmd, deadline))
+            .collect()
+    }
+}
+
+/// [`outputs_until`] that also ends the children still running once `stopped()` reads true:
+/// read at least every [`STOP_TICK`] while any runs, and then each killed with its group and
+/// reaped within `reap`, as at `deadline`. Either end answers [`RunError::TimedOut`] for a child
+/// it ended; the caller tells its stop from its deadline by its own reading.
+#[must_use]
+pub fn outputs_until_unless(
+    cmds: &mut [&mut Command],
+    deadline: Instant,
+    reap: Duration,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Vec<Result<Output, RunError>> {
+    #[cfg(unix)]
+    {
+        children::outputs_until_unless(cmds, deadline, reap, stopped)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = reap;
+        cmds.iter_mut()
+            .map(|cmd| output_until_from_unless(cmd, Stdio::null(), deadline, &mut *stopped))
             .collect()
     }
 }
@@ -1421,6 +1480,34 @@ mod tests {
         }
     }
 
+    /// [`super::output_within_from`] hands its child the stdin it is given, and ends a child
+    /// still reading it `within` from now. CONTROL: the same `cat` whose input ends reads it.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_from_feeds_its_stdin_and_ends_the_child_at_its_bound() {
+        use std::io::Write as _;
+        let cat = || crate::spawnfd::command("/bin/cat");
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"fed\n").expect("write");
+        drop(writer);
+        let out = super::output_within_from(&mut cat(), reader.into(), HANG).expect("cat");
+        assert_eq!(out.stdout, b"fed\n");
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(super::output_within_from(
+                &mut cat(),
+                reader.into(),
+                Duration::from_millis(100),
+            ));
+        });
+        let result = ended
+            .recv_timeout(HANG)
+            .expect("a child still reading ends at its bound within the hang detector");
+        drop(writer);
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+    }
+
     /// A pipe no writer holds is read to its end past the grace, however late its reader
     /// runs: the grace is for a descendant holding the pipe open, and a reader a loaded
     /// test binary left unscheduled lost `ps`'s one line. Negative control: a `collect`
@@ -1815,6 +1902,42 @@ mod tests {
         assert!(
             dead,
             "the child's descendant {grandchild} outlived the call"
+        );
+    }
+
+    /// A stop ends the running children long before their deadline, each killed and reaped
+    /// within `reap` with its group, as the deadline would, and the others keep their answers (a
+    /// tool that could not start is a spawn error): the stop reads true once the wedged child has
+    /// written its pid. Negative control: an `outputs_until_unless` that never reads its stop runs
+    /// to the hang detector's deadline and fails the `waited` check.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_ends_the_running_children_as_the_deadline_does() {
+        let dir = scratch("many-stopped");
+        let pid_file = dir.join("pid");
+        let mut wedged = sh("echo $$ > \"$0\"; exec sleep 600", &[&pid_file]);
+        let mut missing = crate::spawnfd::command("/nonexistent/tool");
+        let began = Instant::now();
+        let mut stopped = || pid_in(&pid_file).is_some();
+        let results = super::outputs_until_unless(
+            &mut [&mut wedged, &mut missing],
+            began + HANG,
+            Duration::from_secs(1),
+            &mut stopped,
+        );
+        let waited = began.elapsed();
+        let child = pid_in(&pid_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(child) = child else {
+            panic!("the shell wrote no pid");
+        };
+        assert!(waited < HANG, "the stop did not end the call: {waited:?}");
+        let mut results = results.into_iter();
+        assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
+        assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
+        assert!(
+            !crate::process::pid_alive(child),
+            "pid {child} outlived the stop"
         );
     }
 

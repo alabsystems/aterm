@@ -495,10 +495,17 @@ pub(crate) mod commons {
     pub(crate) fn historical(
         session: &Session<'_>,
     ) -> impl Fn(&Digest, &Actor) -> Option<[u8; 16]> {
+        let cache = std::cell::RefCell::new(std::collections::BTreeMap::new());
         move |roster, actor| {
-            session
+            let key = (*roster, *actor);
+            if let Some(&cached) = cache.borrow().get(&key) {
+                return cached;
+            }
+            let resolved = session
                 .historical_binding(roster, actor)
-                .map(|binding| *binding.machine())
+                .map(|binding| *binding.machine());
+            cache.borrow_mut().insert(key, resolved);
+            resolved
         }
     }
 }

@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.156.0"
+version = "0.157.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -157,6 +157,7 @@ aterm-diskwalk = { path = "crates/aterm-diskwalk" }
 aterm-durable = { path = "crates/aterm-durable" }
 aterm-db = { path = "crates/aterm-db" }
 aterm-db-core = { path = "crates/aterm-db-core" }
+aterm-mesh-core = { path = "crates/aterm-mesh-core" }
 aterm-effects = { path = "crates/aterm-effects" }
 # First-party sfnt table reader, GSUB shaper, and optional `hint` autohinter.
 # Default features off so only grid-fitting consumers (aterm-render on Linux and
@@ -321,10 +322,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trust_verify)', 'cfg(trust
 all = { level = "warn", priority = -1 }
 ignore_without_reason = "warn"
 
-# Line tables keep file:line backtraces with much smaller test binaries.
-# build-override below matches.
+# Dev and test share dependency units. Omit debug info to bound object files
+# in `deps/` (WindowServer's TCC preflight reads the whole directory).
+# For file:line backtraces, opt in with --config profile.dev.debug="line-tables-only".
 [profile.dev]
-debug = "line-tables-only"
+debug = false
 
 # Test-loop speed overrides. `targo trust check` (`ship trust run`) compiles
 # under its own `trust-lane` profile at opt-level 0 and zeroes every
@@ -488,40 +490,18 @@ opt-level = 2
 [profile.dev.package.aterm-zstd]
 opt-level = 2
 
-# Omit debug info in test executables so per-CGU object files in `deps/` stay
-# under the directory-entry bound (WindowServer's TCC preflight makes `tccd`
-# read the whole `deps/` directory). `targo build|run` keeps `profile.dev`'s
-# line tables; pass `--config profile.test.debug="line-tables-only"` for line
-# numbers in a single test binary.
-#
-# NO KNOB HERE REACHES THE aterm-gui EDIT LOOP. After a one-line aterm-gui edit
-# its lib-test unit, the test compile's critical path, spends its time in the
-# front end: parsing, resolution, the replayed checks and the compiler's
-# once-initializer re-entrancy check (`rustc_mir_transform::
-# trust_once_reentrancy`, on in every lane), which re-borrow-checks every body
-# the incremental replay skipped and so grows with the unit's body count.
-# Codegen units, debuginfo and incremental act only on codegen, LLVM and the
-# link, a few seconds at the end. The split, on a named trustc build:
-# docs/measured/test-compile-tail-2026-10-21.md.
-[profile.test]
-debug = false
-
-# `aterm-effects` at opt-level 2 in the test profile only (`targo build|run`
-# stays at 0): disables `share-generics` so test binaries stop pulling
+# `aterm-effects` at opt-level 2 disables `share-generics` so test binaries stop pulling
 # opt-level-0 std generic instantiations from sibling crates (lib test 41-44 ->
 # 22-23 CPU-s, streak flash test 16-17 -> 5.6-6.1 s).
-[profile.test.package.aterm-effects]
+[profile.dev.package.aterm-effects]
 opt-level = 2
 
-# `aterm-gpu` at opt-level 2 in the test profile only: Metal readback
+# `aterm-gpu` at opt-level 2: Metal readback
 # (`metal_stage_readback`, `frame_from_padded_rgba`) and `gpu_suite`'s own
 # parity scans ran at opt-level 0 (`gpu_suite` 168 -> 81 CPU-s, 12.8 -> 6.7 s;
 # lib test 12.9 -> 1.4 CPU-s). Cost: its units compile in 35 s instead of 13.
-[profile.test.package.aterm-gpu]
+[profile.dev.package.aterm-gpu]
 opt-level = 2
-
-[profile.dev.build-override]
-debug = "line-tables-only"
 
 [profile.release]
 # Fat LTO and symbol stripping for size and speed; `panic = "unwind"` is kept

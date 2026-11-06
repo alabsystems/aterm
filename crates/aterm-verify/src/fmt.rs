@@ -82,8 +82,13 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
 fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
     if !found.unread.is_empty() {
         r.raw(found.unread.join("\n"));
+        // What the run's first red kept from being read says so, as the halt's rows do.
+        let halted = ctx
+            .halted()
+            .filter(|words| found.unread.iter().all(|line| line.contains(words)))
+            .map_or_else(String::new, |words| format!(" — {words}"));
         r.cannot_run(format!(
-            "trustfmt could not read every file: {} error(s) (above)",
+            "trustfmt could not read every file: {} error(s) (above){halted}",
             found.unread.len()
         ));
     }
@@ -785,6 +790,7 @@ mod tests {
             output: output.to_string(),
             code: Some(i32::from(!ok)),
             spawn_error: None,
+            usage: None,
         }
     }
 

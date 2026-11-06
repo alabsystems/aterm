@@ -9,6 +9,105 @@ use crate::jobs::wire::{exe_word, phi_text, verdict_summary};
 use crate::jobs::{Class, Findings, JobRow, JobsView, Verdict};
 use crate::model::Snapshot;
 
+/// Machine measurements beside the jobs: spare CPU is not a reservation, and an old slot
+/// reading is not a promise of admission. Keep the ages and unavailable readings visible.
+#[must_use]
+pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
+    let cpu = s.cpu.as_ref();
+    let slots = match s.slots {
+        Some(crate::model::SlotsView::Read {
+            n,
+            free,
+            discounted,
+            pending,
+            unknown,
+            ..
+        }) => Jv::obj([
+            ("total", Jv::u(u64::from(n))),
+            ("free", Jv::u(u64::from(free.saturating_sub(discounted)))),
+            ("pending", Jv::u(u64::from(pending))),
+            ("unknown", Jv::u(u64::from(unknown))),
+            (
+                "age_ms",
+                Jv::u(age_ms.saturating_add(s.slots_age_ms.unwrap_or(0))),
+            ),
+        ]),
+        Some(crate::model::SlotsView::Unread(why)) => Jv::why(why.word()),
+        None => Jv::why("not_sampled"),
+    };
+    Jv::obj([
+        ("as_of_ms", Jv::u(as_of_ms)),
+        ("age_ms", Jv::u(age_ms)),
+        (
+            "cpu_busy_mc",
+            cpu.and_then(|c| c.current_busy()).map_or_else(
+                || Jv::why("no_counter_delta"),
+                |v| Jv::u(u64::from(crate::events::millicores(v))),
+            ),
+        ),
+        (
+            "cpu_total",
+            cpu.map_or_else(|| Jv::why("not_sampled"), |c| Jv::u(c.total() as u64)),
+        ),
+        (
+            "available_bytes",
+            s.avail.map_or_else(|| Jv::why("not_sampled"), Jv::u),
+        ),
+        (
+            "pressure",
+            s.mem.as_ref().map_or_else(
+                || Jv::why("not_sampled"),
+                |m| Jv::s(m.sample.pressure.word()),
+            ),
+        ),
+        ("slots", slots),
+    ])
+}
+
+/// Human-readable counterpart of [`capacity_json`], with the machine snapshot's own age.
+#[must_use]
+pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> String {
+    let cpu = s.cpu.as_ref().map_or_else(
+        || "unavailable(not_sampled)".to_owned(),
+        |c| {
+            format!(
+                "{}/{} cores busy",
+                c.current_busy().map_or_else(
+                    || "unavailable(no_counter_delta)".to_owned(),
+                    crate::words::cores
+                ),
+                c.total()
+            )
+        },
+    );
+    let available = s
+        .avail
+        .map_or_else(|| "unavailable(not_sampled)".to_owned(), crate::words::mem);
+    let pressure = s
+        .mem
+        .as_ref()
+        .map_or("unavailable(not_sampled)", |m| m.sample.pressure.word());
+    let slots = match s.slots {
+        Some(crate::model::SlotsView::Read {
+            n,
+            free,
+            discounted,
+            pending,
+            unknown,
+            ..
+        }) => format!(
+            "{}/{n} free, {pending} pending, {unknown} unknown, age_ms={}",
+            free.saturating_sub(discounted),
+            age_ms.saturating_add(s.slots_age_ms.unwrap_or(0))
+        ),
+        Some(crate::model::SlotsView::Unread(why)) => format!("unavailable({})", why.word()),
+        None => "unavailable(not_sampled)".to_owned(),
+    };
+    format!(
+        "machine as_of_ms={as_of_ms} age_ms={age_ms} cpu={cpu} · available={available} · pressure={pressure} · build_slots={slots}"
+    )
+}
+
 /// The rows of `view` in the sessions `keys`: live rows before exited ones, then by id.
 #[must_use]
 pub fn rows_in<'a>(view: &'a JobsView, keys: &[u64]) -> Vec<&'a JobRow> {

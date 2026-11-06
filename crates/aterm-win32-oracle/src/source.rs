@@ -203,7 +203,10 @@ fn children(text: &str) -> Vec<(String, String)> {
 }
 fn parse_file(path: &Path, module: &[String]) -> Result<Vec<Item>> {
     let src = read(path)?;
-    let code = aterm_census::rust_source_views(&src).0;
+    parse_source(&src, path, module)
+}
+fn parse_source(src: &str, path: &Path, module: &[String]) -> Result<Vec<Item>> {
+    let code = aterm_census::rust_source_views(src).0;
     let lines: Vec<&str> = src.lines().collect();
     let codes: Vec<&str> = code.lines().collect();
     let mut attrs = vec![];
@@ -385,8 +388,9 @@ impl Upstream {
         Ok(up)
     }
     fn load_module(&mut self, path: Vec<String>, feature: String, file: PathBuf) -> Result<()> {
-        let kids = children(&read(&file)?);
-        let items = parse_file(&file, &path)?;
+        let src = read(&file)?;
+        let kids = children(&src);
+        let items = parse_source(&src, &file, &path)?;
         self.modules.insert(
             path.clone(),
             Module {
@@ -457,41 +461,44 @@ impl Upstream {
         if segments.is_empty() {
             return None;
         }
-        let mut segs = segments.to_vec();
+        let mut i = 0;
         let mut cur = base.to_vec();
-        if ["windows_sys", "aterm_win32", "$crate", "crate"].contains(&segs[0].as_str()) {
+        if ["windows_sys", "aterm_win32", "$crate", "crate"].contains(&segments[0].as_str()) {
             cur.clear();
-            segs.remove(0);
-        } else if segs[0] == "super" {
-            while segs.first().is_some_and(|s| s == "super") {
+            i = 1;
+        } else if segments[0] == "super" {
+            while segments.get(i).is_some_and(|s| s == "super") {
                 cur.pop();
-                segs.remove(0);
+                i += 1;
             }
-        } else if segs[0] == "core" && base != ["core"] {
+        } else if segments[0] == "core" && base != ["core"] {
             return None;
         }
-        while segs.len() > 1
-            && self
-                .modules
-                .contains_key(&[cur.clone(), vec![segs[0].clone()]].concat())
-        {
-            cur.push(segs.remove(0));
+        while i + 1 < segments.len() {
+            cur.push(segments[i].clone());
+            if self.modules.contains_key(&cur) {
+                i += 1;
+            } else {
+                cur.pop();
+                break;
+            }
         }
-        if segs.is_empty() {
+        let rem = &segments[i..];
+        if rem.is_empty() {
             return Some((cur, String::new()));
         }
-        if segs.len() == 1
-            && !self.items.contains_key(&(cur.clone(), segs[0].clone()))
-            && self
-                .modules
-                .contains_key(&[cur.clone(), segs.clone()].concat())
-        {
-            cur.extend(segs);
-            return Some((cur, String::new()));
+        let key = (cur, rem[0].clone());
+        if self.items.contains_key(&key) {
+            return Some(key);
         }
-        self.items
-            .contains_key(&(cur.clone(), segs[0].clone()))
-            .then(|| (cur, segs[0].clone()))
+        let (mut cur, last) = key;
+        if rem.len() == 1 {
+            cur.push(last);
+            if self.modules.contains_key(&cur) {
+                return Some((cur, String::new()));
+            }
+        }
+        None
     }
     pub fn refs(&self, item: &Item) -> BTreeSet<Key> {
         let mut out = BTreeSet::new();

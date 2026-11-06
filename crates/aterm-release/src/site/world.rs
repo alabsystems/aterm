@@ -182,12 +182,12 @@ fn streamed(
     std::thread::spawn(move || {
         use std::io::Read as _;
         let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
         loop {
-            let mut line = Vec::new();
             match (&mut reader).take(1024 * 1024).read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if lines.send(Event::Line(line)).is_err() {
+                    if lines.send(Event::Line(std::mem::take(&mut line))).is_err() {
                         return;
                     }
                 }

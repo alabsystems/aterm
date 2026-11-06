@@ -734,19 +734,25 @@ macro_rules! bind {
                 u32::try_from(origin).unwrap_or(u32::MAX)
             }
 
-            /// Scroll the viewport so absolute `line` is visible near the top.
+            /// Scroll the viewport so absolute `line` is visible near the top, leaving it where it
+            /// is when `line` already shows; either way a jump drops the sub-row scroll residual.
             pub fn scroll_search_line_into_view(&mut self, line: u32) {
+                self.scroll_input.reset();
                 let grid = self.term.grid();
-                let origin = grid
-                    .oldest_absolute_row()
-                    .saturating_add(grid.scrollback_lines() as u64);
                 let scrollback = grid.scrollback_lines();
+                let origin = grid.oldest_absolute_row().saturating_add(scrollback as u64);
                 let current = grid.display_offset();
+                let shown_at = i128::from(line) - i128::from(origin) + current as i128;
+                if (0..i128::try_from(self.rows).unwrap_or(i128::MAX)).contains(&shown_at) {
+                    return;
+                }
                 let want = origin.saturating_sub(u64::from(line));
                 let want = usize::try_from(want).unwrap_or(usize::MAX).min(scrollback);
-                let delta = want as i64 - current as i64;
-                if let Ok(delta) = i32::try_from(delta) {
-                    self.term.scroll_display(delta);
+                let mut remaining = want as i128 - current as i128;
+                while remaining != 0 {
+                    let step = remaining.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32;
+                    self.term.scroll_display(step);
+                    remaining -= i128::from(step);
                 }
             }
 

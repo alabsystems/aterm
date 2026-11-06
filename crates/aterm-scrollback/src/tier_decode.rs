@@ -151,10 +151,11 @@ impl WarmBlock {
         self.logical_suffix(&decompressed, stored_line_count)
     }
 
-    /// Validate a warm page for the cold tier, reusing its LZ4 payload when every
+    /// Validate and drain a warm page for the cold tier, moving its LZ4 payload when every
     /// physical line remains live. A trimmed prefix is decoded and re-encoded so
     /// the cold page contains only its logical suffix.
-    pub(crate) fn to_cold_compressed(&self) -> Result<(Vec<u8>, usize), ScrollbackError> {
+    /// On failure its payload and logical rows remain available for retry or quarantine.
+    pub(crate) fn take_cold_compressed(&mut self) -> Result<(Vec<u8>, usize), ScrollbackError> {
         let result = self.try_cold_serialized_suffix();
         if result.is_err() {
             let failures = self.decompress_failures.get().saturating_add(1);
@@ -162,9 +163,11 @@ impl WarmBlock {
         }
         let compressed = match result? {
             Some(serialized) => crate::encode_cold_block(&serialized)?,
-            None => self.compressed.clone(),
+            None => std::mem::take(&mut self.compressed),
         };
-        Ok((compressed, self.line_count))
+        self.compressed.clear();
+        let line_count = std::mem::take(&mut self.line_count);
+        Ok((compressed, line_count))
     }
 
     /// `None` means the validated original payload already represents every live line.

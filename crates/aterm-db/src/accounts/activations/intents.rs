@@ -59,6 +59,38 @@ pub(super) fn current<'a>(history: &'a History, decision: &Record) -> Result<Opt
     current_request(history, decision.request())
 }
 
+pub(super) fn current_with_statuses<'a>(
+    history: &'a History,
+    statuses: &BTreeMap<Digest, State>,
+    decision: &Record,
+) -> Result<Option<&'a Record>> {
+    let request = decision.request();
+    namespace(history, request)?;
+    let Action::Prepare(preparation) = &request.action else {
+        return Ok(None);
+    };
+    let Some(reference) = preparation.intent else {
+        return Ok(None);
+    };
+    if statuses.get(&reference.account) != Some(&State::Ready(reference.decision)) {
+        return Err(Error::new(
+            "fleet account intent is stopped, changed or unavailable",
+        ));
+    }
+    let intent = &history.records[&reference.decision];
+    let Action::Intent(terms) = &intent.request().action else {
+        return Err(Error::new("account parent is not a fleet intent"));
+    };
+    if reference.device_account(&preparation.device) != request.account
+        || !terms.matches(preparation)
+    {
+        return Err(Error::new(
+            "device preparation differs from its fleet intent",
+        ));
+    }
+    Ok(Some(intent))
+}
+
 pub(super) fn current_request<'a>(
     history: &'a History,
     request: &Request,
@@ -145,7 +177,8 @@ impl Activations {
                         && session
                             .peer_writer(request.requester().actor())
                             .is_ok_and(|binding| &binding == request.requester())
-                        && current(&history, record).is_ok_and(|intent| intent.is_some())
+                        && current_with_statuses(&history, &statuses, record)
+                            .is_ok_and(|intent| intent.is_some())
                 })
                 .cloned()
                 .collect())

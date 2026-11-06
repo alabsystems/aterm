@@ -283,7 +283,7 @@ pub fn intersect_rect_spans(out: &mut Vec<[usize; 4]>, rect: [usize; 4], spans: 
     let [rx, ry, rw, rh] = rect;
     for &(sx, sw) in spans {
         let lo = rx.max(sx);
-        let hi = (rx + rw).min(sx + sw);
+        let hi = rx.saturating_add(rw).min(sx.saturating_add(sw));
         if lo < hi {
             out.push([lo, ry, hi - lo, rh]);
         }

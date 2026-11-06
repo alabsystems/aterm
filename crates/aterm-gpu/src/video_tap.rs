@@ -734,6 +734,9 @@ impl VideoTap {
             .checked_mul(u64::from(src_h))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| "video: staging size overflows usize".to_owned())?;
+        if size == 0 {
+            return Err("video: destination has zero area".to_owned());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
@@ -950,64 +953,11 @@ impl VideoTap {
                 Err(send_err) => {
                     self.worker = None;
                     let raw = send_err.0.raw;
-                    return Some(Self::metal_inline_convert(
-                        &raw,
-                        self.src_w,
-                        self.src_h,
-                        self.padded_row() as usize,
-                        self.format,
-                        capture_encoding,
-                        self.half_res,
-                        seq,
-                        t_us,
-                    ));
+                    return self.convert_inline(&raw, seq, t_us, capture_encoding);
                 }
             }
         }
-        Some(Self::metal_inline_convert(
-            &raw,
-            self.src_w,
-            self.src_h,
-            self.padded_row() as usize,
-            self.format,
-            capture_encoding,
-            self.half_res,
-            seq,
-            t_us,
-        ))
-    }
-
-    /// The inline (no-worker) conversion for a Metal slot's raw bytes.
-    #[cfg(target_os = "macos")]
-    #[allow(clippy::too_many_arguments, reason = "a private conversion tail")]
-    fn metal_inline_convert(
-        raw: &[u8],
-        src_w: u32,
-        src_h: u32,
-        padded: usize,
-        format: crate::device_layer::TexelFormat,
-        capture_encoding: CaptureEncoding,
-        half_res: bool,
-        seq: u64,
-        t_us: u64,
-    ) -> CapturedFrame {
-        let (rgba, width, height) = mapped_to_rgba8(
-            raw,
-            src_w,
-            src_h,
-            padded,
-            format,
-            capture_encoding,
-            half_res,
-        )
-        .expect("VideoTap staging layout is validated at construction");
-        CapturedFrame {
-            seq,
-            t_us,
-            w: width,
-            h: height,
-            rgba,
-        }
+        self.convert_inline(&raw, seq, t_us, capture_encoding)
     }
 
     /// Build a GL-arm tap.
@@ -1025,10 +975,13 @@ impl VideoTap {
         let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
             .map_err(|error| format!("video: {error}"))?;
         let padded = padded_row_bytes(src_w, bpp);
-        let _ = padded
+        let size = padded
             .checked_mul(u64::from(src_h))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| "video: staging size overflows usize".to_owned())?;
+        if size == 0 {
+            return Err("video: destination has zero area".to_owned());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
@@ -1221,7 +1174,7 @@ impl VideoTap {
     }
 
     /// Inline conversion of raw padded bytes; a malformed slot is one drop.
-    #[cfg(any(gl_arm, d3d11_arm))]
+    #[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
     fn convert_inline(
         &mut self,
         raw: &[u8],

@@ -10,13 +10,13 @@ use std::process::Output;
 use std::time::{Duration, Instant};
 
 use super::children::{PollFd, poll};
-use super::{ExitWait, POLL_MAX, deadline_now, reap_within, saturating_after};
+use super::{ExitWait, POLL_MAX, deadline_now};
 use crate::secret::Secret;
 use crate::spawnfd::{Child, Command, Stdio};
 
 const POLLIN: i16 = 0x1;
 const POLLOUT: i16 = 0x4;
-const REAP: Duration = Duration::from_secs(60);
+const REAP_TICK: Duration = Duration::from_millis(20);
 
 struct Capture {
     pipe: Option<File>,
@@ -76,6 +76,54 @@ struct Run {
 }
 
 impl Run {
+    fn settle(&mut self) {
+        self.settle_with(Child::wait);
+    }
+
+    fn settle_with(
+        &mut self,
+        mut wait: impl FnMut(&mut Child) -> io::Result<std::process::ExitStatus>,
+    ) {
+        self.close_input();
+        if self.reaped {
+            return;
+        }
+        if self.child.owns_unreaped() {
+            super::children::kill_group(&mut self.child);
+        }
+        let mut exit = self
+            .child
+            .owns_unreaped()
+            .then(|| ExitWait::new(&self.child));
+        loop {
+            if !self.child.owns_unreaped() && !self.child.is_reaped() {
+                // ECHILD forfeits numeric custody permanently; retain the caller's resources.
+                exit = None;
+                std::thread::sleep(REAP_TICK);
+                continue;
+            }
+            match wait(&mut self.child) {
+                Ok(_) => {
+                    self.reaped = true;
+                    return;
+                }
+                Err(_) => {
+                    if !self.child.owns_unreaped() {
+                        exit = None;
+                    }
+                    let at = Instant::now();
+                    if let Some(exit) = &mut exit {
+                        exit.wait(REAP_TICK);
+                    }
+                    let left = REAP_TICK.saturating_sub(at.elapsed());
+                    if !left.is_zero() {
+                        std::thread::sleep(left);
+                    }
+                }
+            }
+        }
+    }
+
     fn close_input(&mut self) {
         self.input = None;
         self.to_child = None;
@@ -113,15 +161,7 @@ impl Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        self.close_input();
-        if !self.reaped {
-            super::children::kill_group(&mut self.child);
-            reap_within(
-                &mut self.child,
-                None,
-                saturating_after(Instant::now(), REAP),
-            );
-        }
+        self.settle();
     }
 }
 
@@ -131,6 +171,17 @@ pub(super) fn output_with_input_until(
     deadline: Instant,
     max_output: usize,
 ) -> io::Result<Output> {
+    output_with_input_until_watching(cmd, input, deadline, max_output, || false)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "owned capture was stopped"))
+}
+
+pub(super) fn output_with_input_until_watching(
+    cmd: &mut Command,
+    input: Secret,
+    deadline: Instant,
+    max_output: usize,
+    mut stopped: impl FnMut() -> bool,
+) -> io::Result<Option<Output>> {
     if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -139,6 +190,9 @@ pub(super) fn output_with_input_until(
     }
     if deadline_now() >= deadline {
         return Err(timed_out());
+    }
+    if stopped() {
+        return Ok(None);
     }
     let child = cmd
         .process_group(0)
@@ -180,11 +234,20 @@ pub(super) fn output_with_input_until(
             let status = run.child.wait()?;
             run.reaped = true;
             let [stdout, stderr] = streams;
-            return Ok(Output {
+            return Ok(Some(Output {
                 status,
                 stdout: stdout.bytes,
                 stderr: stderr.bytes,
-            });
+            }));
+        }
+        if stopped() {
+            // No output-completion claim accompanies cancellation. Close our own pipes
+            // before retaining this waiter until its actual root is positively reaped.
+            for stream in &mut streams {
+                stream.pipe = None;
+            }
+            run.settle();
+            return Ok(None);
         }
         let left = deadline.saturating_duration_since(deadline_now());
         if left.is_zero() {

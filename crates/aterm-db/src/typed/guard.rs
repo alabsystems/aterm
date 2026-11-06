@@ -107,7 +107,10 @@ const fn token_byte(b: u8) -> bool {
 /// characters.
 pub fn credential_shaped(text: &str) -> bool {
     let bytes = text.as_bytes();
-    for (at, _) in text.char_indices() {
+    for (at, &b) in bytes.iter().enumerate() {
+        if !matches!(b, b'g' | b's' | b'x' | b'A' | b'-' | b'o' | b'y') {
+            continue;
+        }
         let boundary = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         if !boundary {
             continue;
@@ -220,13 +223,27 @@ fn phone_groups(groups: &[(usize, u8)]) -> bool {
 
 /// Whether `word` is base32 in one case (`A`–`Z` or `a`–`z`, and `2`–`7`).
 fn base32(word: &str) -> bool {
-    let upper = word
-        .bytes()
-        .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b));
-    let lower = word
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
-    !word.is_empty() && (upper || lower)
+    if word.is_empty() {
+        return false;
+    }
+    let mut has_upper = false;
+    let mut has_lower = false;
+    for b in word.bytes() {
+        if b.is_ascii_uppercase() {
+            if has_lower {
+                return false;
+            }
+            has_upper = true;
+        } else if b.is_ascii_lowercase() {
+            if has_upper {
+                return false;
+            }
+            has_lower = true;
+        } else if !(b'2'..=b'7').contains(&b) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `text` holds a base32 TOTP seed: one word of at least 16 base32 characters, or at

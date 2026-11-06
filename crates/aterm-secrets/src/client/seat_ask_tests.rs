@@ -176,6 +176,26 @@ fn me(paths: &Paths, of: &Paths) -> MemberId {
         .actor()
 }
 
+/// Why `paths`'s Network State cards read it unusable: its secrets card's blocker
+/// ([`observe_materialization`]) and its accounts card's ([`crate::commons::observe`]).
+fn cards(
+    paths: &Paths,
+) -> (
+    Option<MaterializationBlocker>,
+    Option<crate::commons::Unavailable>,
+) {
+    let configured = config(paths).expect("config").expect("a vault");
+    let secrets = match observe_materialization(paths, &configured, || Ok(())).expect("observed") {
+        MaterializationObservation::Blocked(why) => Some(why),
+        MaterializationObservation::Ready(_) => None,
+    };
+    let accounts = match crate::commons::observe(paths).expect("observed") {
+        crate::commons::Observation::Unavailable(why) => Some(why),
+        _ => None,
+    };
+    (secrets, accounts)
+}
+
 /// A Mac m22's approver let in through the envelope alone holds the vault but no seat: its log
 /// reads it [`Seat::Seatless`], its subscriber's first round asks once, by proof from the home
 /// ALab LAN, and m22 seats it with the very recipient it held (no new identity, no rotation),
@@ -287,6 +307,200 @@ fn a_seatless_recipient_that_asks_nothing_drops_at_the_next_rotation() {
     world.macs.server.stop();
 }
 
+/// A recipient a rotation drops with no `Remove` of it is out, not revoked (one-mesh E2, f204):
+/// the seatless Mac asks nothing, m22's removal of m7 rotates `[everyone]` without it, and its
+/// sync opens no locker ([`Stored::Revoked`]), as a removed Mac's does. Its own log reads it
+/// [`Seat::Out`], [`dropped`] holds, and `aterm secrets status` and its JSON, and Network
+/// State's secrets and accounts cards, say it was dropped, with the way back (a new Mac), where
+/// they said "revoked".
+///
+/// NEGATIVE CONTROL: [`seat_ask::REVOKED_UNJUDGED`] on reads the Mac as before E2:
+/// [`Seat::Unjudged`] and "revoked (out as of seq N)". Its counterpart,
+/// [`a_removed_key_never_gets_a_seat_back`], holds a `Remove`d Mac to "revoked": with
+/// `removed_by_an_act` cut from [`dropped`], it reads "dropped" there and fails.
+#[test]
+fn a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped() {
+    let _answering = ServersAnswering::set();
+    let world = seatless(false);
+    let (m22, s) = (&world.macs.m22, &world.s);
+    let recipient = read_identity(s).unwrap().unwrap().recipient();
+    assert_eq!(seat(s), Seat::Seatless);
+    assert!(!dropped(s), "a Mac that is in was not dropped");
+
+    let (_, actor7, _) = member_key(&world.macs.m7);
+    super::super::remove::remove_actor(m22, actor7).expect("m22 removes m7");
+    post_records_to_servers(m22).expect("m22 posts the rotation");
+    let synced = sync(s, None).expect("s syncs the rotation");
+    assert!(
+        matches!(synced, SyncOutcome::NotIn),
+        "the rotation left s out: {synced:?}"
+    );
+    assert_eq!(load_state(s).unwrap().membership, Stored::Revoked);
+    let rotated = log_of(m22);
+    assert!(!rotated.recipient_is_removed(&recipient), "no act names s");
+    assert!(
+        rotated.audience_left_out_recipient(&EpochAudience::Everyone, &recipient),
+        "the rotation left s's recipient out"
+    );
+    let Membership::Revoked { seq } = status(s).expect("status").membership else {
+        panic!("s reads itself out");
+    };
+
+    // CONTROL: read as before E2.
+    seat_ask::REVOKED_UNJUDGED.with(|cell| cell.set(true));
+    let control = (
+        seat(s),
+        dropped(s),
+        out_words(s, seq),
+        dropped_words(s, seq),
+        cards(s),
+    );
+    seat_ask::REVOKED_UNJUDGED.with(|cell| cell.set(false));
+    assert_eq!(control.0, Seat::Unjudged, "the control judges nothing");
+    assert!(!control.1);
+    assert_eq!(control.2, format!("revoked (out as of seq {seq})"));
+    assert_eq!(control.3, None);
+    assert_eq!(
+        control.4,
+        (
+            Some(MaterializationBlocker::Revoked),
+            Some(crate::commons::Unavailable::Revoked)
+        )
+    );
+
+    assert_eq!(seat(s), Seat::Out, "s's own log reads it out");
+    assert!(dropped(s), "no act took s out");
+    let words = out_words(s, seq);
+    assert!(
+        words.starts_with("dropped: no seat; a rotation left this Mac out with no Remove"),
+        "{words}"
+    );
+    assert!(words.contains("come back as a new Mac"), "{words}");
+    assert!(!words.contains("revoked"), "{words}");
+    assert_eq!(dropped_words(s, seq).as_deref(), Some(words.as_str()));
+    assert_eq!(
+        cards(s),
+        (
+            Some(MaterializationBlocker::Dropped),
+            Some(crate::commons::Unavailable::Dropped)
+        ),
+        "Network State's secrets and accounts cards say dropped"
+    );
+    let json = crate::operational::metadata(s);
+    assert_eq!(
+        json["vault"]["value"]["membership"]["state"].as_str(),
+        Some("dropped"),
+        "{json}"
+    );
+    assert!(
+        !seat_ask::asks_for_seat(s),
+        "a dropped Mac asks for no seat"
+    );
+    world.macs.server.stop();
+}
+
+/// A dropped Mac's join of the vault that dropped it sends no key (one-mesh E2, f299): `aterm
+/// secrets join` is refused under the state lock with [`crate::ErrorKind::Dropped`] and
+/// [`dropped_words`], the vault queues no request with its recipient, and the Mac stays revoked,
+/// so it still reads dropped and says how it comes back.
+///
+/// NEGATIVE CONTROL: [`seat_ask::REVOKED_UNJUDGED`] on (no dropped judgment), the same join goes
+/// on as before f299: it moves the Mac to pending and queues its request with the refused key.
+#[test]
+fn a_dropped_macs_join_sends_no_key_and_keeps_its_way_back() {
+    let _answering = ServersAnswering::set();
+    let world = seatless(false);
+    let (m22, s) = (&world.macs.m22, &world.s);
+    let recipient = read_identity(s).unwrap().unwrap().recipient().to_bech32();
+    let (_, actor7, _) = member_key(&world.macs.m7);
+    super::super::remove::remove_actor(m22, actor7).expect("m22 removes m7");
+    post_records_to_servers(m22).expect("m22 posts the rotation");
+    sync(s, None).expect("s syncs the rotation");
+    assert!(dropped(s), "the rotation dropped s");
+    let Membership::Revoked { seq } = status(s).expect("status").membership else {
+        panic!("s reads itself out");
+    };
+    let source = format!("{}#{}", world.macs.url, world.macs.signer);
+    let join_s = || {
+        join(
+            s,
+            &JoinOptions {
+                source: source.clone(),
+                host: Some("s".to_owned()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+    };
+    let queued = || {
+        requests_for(m22, &config(m22).unwrap().unwrap(), None)
+            .expect("the vault's requests")
+            .iter()
+            .any(|request| request.recipient == recipient)
+    };
+
+    let refused = join_s().expect_err("a dropped Mac's join is refused");
+    assert_eq!(refused.kind(), crate::ErrorKind::Dropped, "{refused}");
+    assert_eq!(Some(refused.to_string()), dropped_words(s, seq));
+    assert_eq!(load_state(s).unwrap().membership, Stored::Revoked);
+    assert!(dropped(s), "s still reads dropped");
+    assert!(!queued(), "no request carries the refused key");
+
+    seat_ask::REVOKED_UNJUDGED.with(|cell| cell.set(true));
+    let control = join_s();
+    seat_ask::REVOKED_UNJUDGED.with(|cell| cell.set(false));
+    assert!(
+        !control
+            .as_ref()
+            .is_err_and(|error| error.kind() == crate::ErrorKind::Dropped),
+        "the control judges nothing: {control:?}"
+    );
+    assert_eq!(load_state(s).unwrap().membership, Stored::Pending);
+    assert!(queued(), "the control's join asks with the refused key");
+    world.macs.server.stop();
+}
+
+/// A join reads the vault this Mac has configured again ([`super::super::joins_again`], where a
+/// dropped Mac's join is refused) by its name and a key its pin admits, never by its address:
+/// the pin the join verified or the key it handed off to, or one the configured vault followed.
+/// Another name or another signer is another vault, which a dropped Mac joins as before.
+#[test]
+fn a_join_reads_the_configured_vault_again_by_name_and_pin_not_address() {
+    let joins_again = super::super::joins_again;
+    let (signer, handed, followed, other) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+    let configured = Config {
+        source: Source::Url("http://192.0.2.1:7/v1/alab".to_owned()),
+        mirrors: Vec::new(),
+        name: "alab".to_owned(),
+        signer: Some(signer),
+        followed: vec![followed],
+        host: "s".to_owned(),
+    };
+    assert!(joins_again(&configured, "alab", signer, signer));
+    assert!(
+        joins_again(&configured, "alab", handed, signer),
+        "the pin verified handed off to the configured key"
+    );
+    assert!(
+        joins_again(&configured, "alab", signer, handed),
+        "the configured key handed off"
+    );
+    assert!(joins_again(&configured, "alab", followed, followed));
+    assert!(
+        !joins_again(&configured, "alab", other, other),
+        "another signer"
+    );
+    assert!(
+        !joins_again(&configured, "team", signer, signer),
+        "another name"
+    );
+}
+
 /// A seatless Mac whose identity a test, a debug build, a lab lane or a VM made founds its own
 /// lab: its rounds ask ALab's members nothing, though its log reads it seatless.
 #[test]
@@ -337,6 +551,28 @@ fn a_removed_key_never_gets_a_seat_back() {
     let removed = log_of(m22);
     assert!(removed.recipient_is_removed(&recipient));
     assert_eq!(super::judge(&removed, &recipient), Seat::Out);
+    // A `Remove` revokes (one-mesh E2): its own log reads it out, and its status says revoked.
+    assert_eq!(seat(s), Seat::Out, "s's own log reads its removal");
+    assert!(!dropped(s), "a removed Mac was revoked, not dropped");
+    let Membership::Revoked { seq } = status(s).expect("status").membership else {
+        panic!("s reads itself out");
+    };
+    assert_eq!(out_words(s, seq), format!("revoked (out as of seq {seq})"));
+    assert_eq!(dropped_words(s, seq), None);
+    assert_eq!(
+        cards(s),
+        (
+            Some(MaterializationBlocker::Revoked),
+            Some(crate::commons::Unavailable::Revoked)
+        ),
+        "a removed Mac's cards say revoked"
+    );
+    let json = crate::operational::metadata(s);
+    assert_eq!(
+        json["vault"]["value"]["membership"]["state"].as_str(),
+        Some("revoked"),
+        "{json}"
+    );
     assert!(
         !seat_asks(s) && !seat_ask::asks_for_seat(s),
         "a removed Mac asks for no seat"

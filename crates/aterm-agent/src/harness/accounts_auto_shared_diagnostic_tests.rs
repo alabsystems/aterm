@@ -98,18 +98,19 @@ impl Fixture {
         }
     }
 
-    fn upkeep(&self, spawn: &SpawnRenewal) {
+    fn upkeep(&self, spawn: &SpawnRenewal<'_>) {
         let factory = self.bed.factory();
         let lines = self.lines.clone();
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
             sync_cooldown: &Mutex::new(None),
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &self.guard,
             find_browser: &|_| false,
-            vault_sync: |_| crate::harness::sign_in_ladder::Vault::NotMember,
-            default_check: |_| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            vault_sync: |_, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
+            default_check: |_, _scope| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
             spawn_vault: &inline,
             mailbox: &|_, _, _| (crate::harness::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(move |line| lines.lock().unwrap().push(line.to_owned())),

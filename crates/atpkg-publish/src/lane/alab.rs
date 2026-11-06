@@ -1645,8 +1645,13 @@ fn write_sync(
     report::write_atomic(&state.dir.join("ALAB-SYNC.md"), &s)
 }
 
+/// How long an installed compiler's `-vV` may take: a version print that has not answered by
+/// then is hung, and the pin's commit goes unread.
+const VERSION_PRINT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The pin's commit and date as its installed compiler reports them:
-/// `<prefix>/store/<program>/<build>/bin/trustc -vV`.
+/// `<prefix>/store/<program>/<build>/bin/trustc -vV`, read only from one that exits 0 within
+/// [`VERSION_PRINT_BOUND`].
 #[must_use]
 pub fn installed_pin_commit(ctx: &Ctx, program: &str, build: Build) -> Option<PinCommit> {
     let trustc = ctx
@@ -1655,14 +1660,26 @@ pub fn installed_pin_commit(ctx: &Ctx, program: &str, build: Build) -> Option<Pi
         .join(program)
         .join(build.to_string())
         .join("bin/trustc");
-    let out = aterm_uds::spawnfd::command(&trustc)
-        .arg("-vV")
-        .output()
-        .ok()?;
-    parse_vv(&String::from_utf8_lossy(&out.stdout))
+    let mut cmd = aterm_uds::spawnfd::command(&trustc);
+    cmd.arg("-vV");
+    let out = aterm_uds::deadline::output_within(&mut cmd, VERSION_PRINT_BOUND).ok()?;
+    out.status
+        .success()
+        .then(|| parse_vv(&String::from_utf8_lossy(&out.stdout)))
+        .flatten()
 }
 
-/// A compiler's `-vV` → its commit (the first 9 hex) and date.
+/// Whether `d` is a `YYYY-MM-DD` date's shape: ASCII digits, with hyphens at bytes 4 and 7.
+fn is_iso_date(d: &str) -> bool {
+    d.len() == 10
+        && d.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// A compiler's `-vV` → its commit (the first 9 hex) and date (the first ten bytes of its
+/// `commit-date:`, where they are a `YYYY-MM-DD`).
 #[must_use]
 pub fn parse_vv(text: &str) -> Option<PinCommit> {
     let field = |key: &str| {
@@ -1675,8 +1692,9 @@ pub fn parse_vv(text: &str) -> Option<PinCommit> {
         return None;
     }
     let date = field("commit-date: ")
-        .filter(|d| d.len() >= 10)
-        .map(|d| d[..10].to_string());
+        .and_then(|d| d.get(..10))
+        .filter(|d| is_iso_date(d))
+        .map(str::to_string);
     Some(PinCommit {
         commit: commit[..9].to_string(),
         date,

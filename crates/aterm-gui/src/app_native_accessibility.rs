@@ -12,6 +12,12 @@ use crate::native_app::{ActionInvocation, AppEvent};
 use crate::tab_model::{View, ViewId};
 use crate::{App, WindowId};
 
+/// A view's compile, and where it sits on its window.
+type NativeAccessibilitySource<'a> = (
+    std::borrow::Cow<'a, crate::native_ui::CompiledUi>,
+    aterm_a11y::model::Affine,
+);
+
 impl App {
     /// Stage accessibility from the same compiled semantic snapshot paint is about to lower.
     pub(crate) fn stage_native_accessibility(
@@ -124,13 +130,16 @@ impl App {
         let projection = match staged {
             Some(staged) => staged.projection,
             None => {
-                match self.retained_native_accessibility_projection(
+                let read = self.native_accessibility_projection_from(
                     wid,
                     &owners,
                     focused_native,
-                    true,
-                    plan,
-                ) {
+                    |owner| {
+                        self.retained_native_accessibility_source(wid, owner, true, plan)
+                            .or_else(|_| self.live_native_accessibility_source(wid, owner, plan))
+                    },
+                );
+                match read {
                     Ok(projection) => projection,
                     Err(error) => return Some(Err(error)),
                 }
@@ -162,26 +171,71 @@ impl App {
         require_presented: bool,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Result<NativeAccessibilityProjection, String> {
+        self.native_accessibility_projection_from(wid, owners, focused_native, |owner| {
+            self.retained_native_accessibility_source(wid, owner, require_presented, plan)
+        })
+    }
+
+    /// `owner`'s compile and place as its last frame left them.
+    fn retained_native_accessibility_source(
+        &self,
+        wid: WindowId,
+        owner: &AccessibilityOwner,
+        require_presented: bool,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Result<NativeAccessibilitySource<'_>, String> {
+        let artifact = self
+            .retained_native_leaf_artifact_from_plan(wid, owner.view, require_presented, plan)
+            .ok_or_else(|| "native accessibility retained leaf is stale".to_string())?;
+        if artifact.generation != owner.generation {
+            return Err("native accessibility retained leaf is stale".to_string());
+        }
+        let transform = self
+            .retained_native_accessibility_transform_for_view(wid, owner.view)
+            .ok_or_else(|| "native accessibility retained placement is invalid".to_string())?;
+        Ok((std::borrow::Cow::Borrowed(artifact.compiled), transform))
+    }
+
+    /// `owner`'s compile and place as the next frame of `plan` will have them.
+    ///
+    /// No frame answers for a page that owes a paint, was released while hidden, or has just
+    /// opened, but a client reads the model, not the glass: its tree must offer what a press can
+    /// reach now. So this compiles at the viewport dispatch compiles at and places the page where a
+    /// frame will, and reads nothing a paint left, which leaves paint and damage as they are. Until
+    /// that frame lands the tree runs ahead of the glass.
+    fn live_native_accessibility_source(
+        &self,
+        wid: WindowId,
+        owner: &AccessibilityOwner,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Result<NativeAccessibilitySource<'_>, String> {
+        let Some(View::Native(native)) = self.view_store.get(owner.view).copied() else {
+            return Err("native accessibility view is gone".to_string());
+        };
+        let viewport = self.native_ui_viewport_in_plan(wid, owner.view, plan)?;
+        let compiled = self.compiled_native_ui_for(wid, native.instance, owner.view, viewport)?;
+        let transform = self
+            .planned_native_accessibility_transform(wid, owner.view, plan)
+            .ok_or_else(|| "native accessibility view is not in its plan".to_string())?;
+        Ok((std::borrow::Cow::Owned(compiled), transform))
+    }
+
+    fn native_accessibility_projection_from<'a>(
+        &'a self,
+        wid: WindowId,
+        owners: &[AccessibilityOwner],
+        focused_native: Option<ViewId>,
+        source: impl Fn(&AccessibilityOwner) -> Result<NativeAccessibilitySource<'a>, String>,
+    ) -> Result<NativeAccessibilityProjection, String> {
         let mut projections = Vec::with_capacity(owners.len());
         for owner in owners {
-            let artifact = self
-                .retained_native_leaf_artifact_from_plan(wid, owner.view, require_presented, plan)
-                .ok_or_else(|| "native accessibility retained leaf is stale".to_string())?;
-            if artifact.generation != owner.generation {
-                return Err("native accessibility retained leaf is stale".to_string());
-            }
+            let (compiled, transform) = source(owner)?;
             let focus = self
                 .native_runtime
                 .view_state(owner.view)
                 .and_then(|state| state.common().last_focus.as_ref());
-            let transform = self
-                .retained_native_accessibility_transform_for_view(wid, owner.view)
-                .ok_or_else(|| "native accessibility retained placement is invalid".to_string())?;
             let projection = project_native_accessibility_for_view_in_container(
-                artifact.compiled,
-                focus,
-                transform,
-                *owner,
+                &compiled, focus, transform, *owner,
             )
             .map_err(|error| format!("native accessibility projection failed: {error:?}"))?;
             projections.push((*owner, projection));
@@ -246,35 +300,33 @@ impl App {
         wid: WindowId,
         view: ViewId,
     ) -> Option<aterm_a11y::model::Affine> {
-        if let Some(transform) = self.retained_native_accessibility_transform_for_view(wid, view) {
-            return Some(transform);
-        }
-        let window = self.windows.get(&wid)?;
-        let plan = self.active_visible_leaf_plan(wid)?;
+        self.retained_native_accessibility_transform_for_view(wid, view)
+            .or_else(|| {
+                let plan = self.active_visible_leaf_plan(wid)?;
+                self.planned_native_accessibility_transform(wid, view, &plan)
+            })
+    }
+
+    /// Where a frame of `plan` puts `view`: a lone page fills the card at the window's edge, and a
+    /// leaf of a composite sits at its layout slot inside the padded card.
+    fn planned_native_accessibility_transform(
+        &self,
+        wid: WindowId,
+        view: ViewId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Option<aterm_a11y::model::Affine> {
         let leaf = plan.leaf(view)?;
-        let (frame_x, frame_y) = self.frame_origin(wid);
+        let card_y = self.native_content_origin_y(wid) as i64;
+        if plan.leaves.len() <= 1 {
+            return self.native_accessibility_transform_at(wid, 0, card_y);
+        }
         let (cw, ch) = self.win_cell_size(wid);
-        let (x, y) = if plan.leaves.len() == 1 {
-            (
-                frame_x,
-                frame_y.saturating_add(self.native_content_origin_y(wid) as i64),
-            )
-        } else {
-            let leaf_x = (leaf.rect.origin.x * cw as f32).round().max(0.0) as usize;
-            let leaf_y = (leaf.rect.origin.y * ch as f32).round().max(0.0) as usize;
-            (
-                frame_x
-                    .saturating_add(self.win_pad(wid) as i64)
-                    .saturating_add(leaf_x as i64),
-                frame_y
-                    .saturating_add(self.native_content_origin_y(wid) as i64)
-                    .saturating_add(leaf_y as i64),
-            )
-        };
-        let scale = window.scale.max(f64::EPSILON);
-        Some(
-            aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(x as f64, y as f64))
-                * aterm_a11y::model::Affine::scale(scale),
+        let leaf_x = (leaf.rect.origin.x * cw as f32).round().max(0.0) as i64;
+        let leaf_y = (leaf.rect.origin.y * ch as f32).round().max(0.0) as i64;
+        self.native_accessibility_transform_at(
+            wid,
+            (self.win_pad(wid) as i64).saturating_add(leaf_x),
+            card_y.saturating_add(leaf_y),
         )
     }
 
@@ -292,14 +344,24 @@ impl App {
         {
             return None;
         }
+        self.native_accessibility_transform_at(
+            wid,
+            i64::from(card.dx).saturating_add(i64::from(raster.presented_x)),
+            i64::from(card.dy).saturating_add(i64::from(raster.presented_y)),
+        )
+    }
+
+    /// The transform of a page `x`, `y` physical pixels inside `wid`'s frame.
+    fn native_accessibility_transform_at(
+        &self,
+        wid: WindowId,
+        x: i64,
+        y: i64,
+    ) -> Option<aterm_a11y::model::Affine> {
         let (frame_x, frame_y) = self.frame_origin(wid);
-        let x = frame_x
-            .saturating_add(i64::from(card.dx))
-            .saturating_add(i64::from(raster.presented_x));
-        let y = frame_y
-            .saturating_add(i64::from(card.dy))
-            .saturating_add(i64::from(raster.presented_y));
-        let scale = window.scale.max(f64::EPSILON);
+        let scale = self.windows.get(&wid)?.scale.max(f64::EPSILON);
+        let x = frame_x.saturating_add(x);
+        let y = frame_y.saturating_add(y);
         Some(
             aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(x as f64, y as f64))
                 * aterm_a11y::model::Affine::scale(scale),
@@ -459,30 +521,58 @@ impl App {
             .take_native_accessibility_update(wid)
             .expect("an accessibility update")
             .expect("a valid accessibility update");
-        let node = crate::native_accessibility::stable_node_id_for_view(
-            view,
-            &crate::native_ui::UiKey::new(key),
-        );
-        let control = &update
-            .nodes
-            .iter()
-            .find(|(id, _)| *id == node)
-            .unwrap_or_else(|| panic!("the tree publishes {key}"))
-            .1;
-        assert!(control.supports_action(action), "{key} takes {action:?}");
-        let context = control.action_context();
-        assert!(context.is_some(), "{key} carries an action context");
+        let request = accessibility_request_on(&update, view, key, action, data);
         self.windows
             .get_mut(&wid)
             .expect("headless window")
             .native_a11y_published = Some(published);
-        aterm_a11y::model::ActionRequest {
-            context,
-            action,
-            target_tree: aterm_a11y::model::TreeId::ROOT,
-            target_node: node,
-            data,
-        }
+        request
+    }
+
+    /// What a client sends for `action` on `view`'s control `key` from the tree it last received:
+    /// nothing is painted or published first, so this is how a client acts between frames.
+    #[cfg(all(test, a11y_tree))]
+    pub(crate) fn request_on_the_sent_tree(
+        &self,
+        wid: WindowId,
+        view: ViewId,
+        key: &str,
+        action: aterm_a11y::model::Action,
+        data: Option<aterm_a11y::model::ActionData>,
+    ) -> aterm_a11y::model::ActionRequest {
+        let update = self.windows[&wid].a11y_sent.last().expect("a sent tree");
+        accessibility_request_on(update, view, key, action, data)
+    }
+}
+
+/// The request a client builds from `update` for `action` on `view`'s control `key`.
+#[cfg(test)]
+fn accessibility_request_on(
+    update: &aterm_a11y::model::TreeUpdate,
+    view: ViewId,
+    key: &str,
+    action: aterm_a11y::model::Action,
+    data: Option<aterm_a11y::model::ActionData>,
+) -> aterm_a11y::model::ActionRequest {
+    let node = crate::native_accessibility::stable_node_id_for_view(
+        view,
+        &crate::native_ui::UiKey::new(key),
+    );
+    let control = &update
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == node)
+        .unwrap_or_else(|| panic!("the tree publishes {key}"))
+        .1;
+    assert!(control.supports_action(action), "{key} takes {action:?}");
+    let context = control.action_context();
+    assert!(context.is_some(), "{key} carries an action context");
+    aterm_a11y::model::ActionRequest {
+        context,
+        action,
+        target_tree: aterm_a11y::model::TreeId::ROOT,
+        target_node: node,
+        data,
     }
 }
 
@@ -1472,6 +1562,443 @@ mod tests {
         }
     }
 
+    /// With the model unmoved, a tree compiled live is the tree the frame published, node for node,
+    /// in every layout: a press's repaint takes the card that placed it, so the live read has to
+    /// work out the same place by itself.
+    #[test]
+    fn a_live_tree_is_the_presented_tree_while_the_model_stands_still() {
+        for scale in [1.0_f64, 2.0] {
+            for layout in ["single", "two native", "side by side", "mixed"] {
+                let mut app = App::headless_for_test();
+                let wid = WindowId(0);
+                app.backend.set_pad((12.0 * scale).round() as usize);
+                app.seed_headless_boot_metrics();
+                {
+                    let window = app.windows.get_mut(&wid).unwrap();
+                    window.cols = 140;
+                    window.rows = 48;
+                    window.scale = scale;
+                }
+                assert!(app.open_settings_tab(SettingsRoute::About));
+                let (instance, view) = app.active_native_view(wid).unwrap();
+                match layout {
+                    "two native" | "side by side" => {
+                        app.split_active_with_native(
+                            wid,
+                            if layout == "two native" {
+                                crate::tab_model::SplitAxis::Vertical
+                            } else {
+                                crate::tab_model::SplitAxis::Horizontal
+                            },
+                            instance,
+                            AppViewState::Settings(Box::new(
+                                crate::native_settings::SettingsViewState::new(&app.config),
+                            )),
+                        )
+                        .unwrap();
+                    }
+                    "mixed" => {
+                        app.split_active_with_stub_terminal(
+                            wid,
+                            crate::tab_model::SplitAxis::Vertical,
+                        );
+                        assert!(
+                            app.windows
+                                .get_mut(&wid)
+                                .and_then(|ws| ws.tab_set.active_mut())
+                                .is_some_and(|tab| tab.set_focus(view))
+                        );
+                        app.sync_window(wid);
+                    }
+                    _ => {}
+                }
+                set_a11y_active(&mut app, wid, true);
+                if layout == "single" {
+                    assert!(app.prepare_native_input_scratch(wid));
+                } else {
+                    assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+                }
+                let (framed, _) = app
+                    .take_native_accessibility_update(wid)
+                    .expect("a native tree")
+                    .expect("the frame's tree");
+
+                app.invalidate_native_ui_cache(wid);
+                app.windows.get_mut(&wid).unwrap().settings_card = None;
+                let (live, _) = app
+                    .take_native_accessibility_update(wid)
+                    .expect("a native tree")
+                    .expect("the live tree");
+
+                assert_eq!(live, framed, "{layout} at {scale}x");
+            }
+        }
+    }
+
+    /// The frame `wid`'s layout calls for, on glass, and the tree it stages.
+    fn framed_tree(app: &mut App, wid: WindowId) -> aterm_a11y::model::TreeUpdate {
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        if plan.leaves.len() == 1 {
+            assert!(app.prepare_native_input_scratch(wid));
+        } else {
+            assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        }
+        let window = app.windows.get_mut(&wid).unwrap();
+        for leaf in &plan.leaves {
+            if let Some(raster) = window
+                .leaf_render_cache
+                .get_mut(&leaf.view)
+                .and_then(|cache| cache.native.as_mut())
+            {
+                raster.presented = true;
+            }
+        }
+        app.take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the frame's tree")
+            .0
+    }
+
+    /// A window that moves before its frame must not leave a client holding the old layout: a
+    /// press goes to the page at the live viewport, and a control only the old one had is dropped.
+    /// So the tree read in that gap is the one the next frame stages, node for node. Each case
+    /// starts from a presented frame, and the move itself is what refuses that frame's read.
+    #[test]
+    fn a_live_tree_is_the_next_frame_when_the_layout_moves_under_it() {
+        for scale in [1.0_f64, 2.0] {
+            for change in [
+                "narrower",
+                "shorter",
+                "a chrome row",
+                "the terminal sibling closes",
+                "a native sibling closes",
+            ] {
+                let mut app = App::headless_for_test();
+                let wid = WindowId(0);
+                app.backend.set_pad((12.0 * scale).round() as usize);
+                app.seed_headless_boot_metrics();
+                {
+                    let window = app.windows.get_mut(&wid).unwrap();
+                    window.cols = 140;
+                    window.rows = 48;
+                    window.scale = scale;
+                }
+                assert!(app.open_settings_tab(SettingsRoute::About));
+                let (instance, view) = app.active_native_view(wid).unwrap();
+                let tab = app.windows[&wid].tab_set.active_id().unwrap();
+                let sibling = match change {
+                    "the terminal sibling closes" => {
+                        app.split_active_with_stub_terminal(
+                            wid,
+                            crate::tab_model::SplitAxis::Vertical,
+                        );
+                        assert!(
+                            app.windows
+                                .get_mut(&wid)
+                                .and_then(|ws| ws.tab_set.active_mut())
+                                .is_some_and(|tab| tab.set_focus(view))
+                        );
+                        app.sync_window(wid);
+                        let plan = app.active_visible_leaf_plan(wid).unwrap();
+                        Some(
+                            plan.leaves
+                                .iter()
+                                .find(|leaf| leaf.view != view)
+                                .unwrap()
+                                .view,
+                        )
+                    }
+                    "a native sibling closes" => Some(
+                        app.split_active_with_native(
+                            wid,
+                            crate::tab_model::SplitAxis::Vertical,
+                            instance,
+                            AppViewState::Settings(Box::new(
+                                crate::native_settings::SettingsViewState::new(&app.config),
+                            )),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => None,
+                };
+                set_a11y_active(&mut app, wid, true);
+                framed_tree(&mut app, wid);
+
+                match change {
+                    "narrower" => app.windows.get_mut(&wid).unwrap().cols = 60,
+                    "shorter" => app.windows.get_mut(&wid).unwrap().rows = 20,
+                    "a chrome row" => {
+                        app.tab_strip_rows = app.tab_strip_rows.saturating_add(1);
+                        app.windows.get_mut(&wid).unwrap().rows = 47;
+                    }
+                    _ => app
+                        .close_view_keeping_front(wid, tab, sibling.unwrap())
+                        .unwrap(),
+                }
+                let moved = app.active_native_view(wid).unwrap().1;
+                let compiles = crate::app_native::native_ui_compile_count();
+                let (live, _) = app
+                    .take_native_accessibility_update(wid)
+                    .expect("a native tree")
+                    .expect("the live tree");
+                assert!(
+                    crate::app_native::native_ui_compile_count() > compiles,
+                    "{change} refused the frame's read"
+                );
+
+                if change == "narrower" {
+                    let carries = |key: &str| {
+                        let node = stable_node_id_for_view(moved, &UiKey::new(key));
+                        live.nodes.iter().any(|(id, _)| *id == node)
+                    };
+                    assert!(
+                        !carries("settings/nav/appearance"),
+                        "a compact page has no rail to press"
+                    );
+                }
+                let framed = framed_tree(&mut app, wid);
+                if change == "a chrome row" {
+                    // The strip's tabs come from the segments a frame lays out, so they join with
+                    // that frame; the page has already moved down for them.
+                    let root = live.tree.as_ref().unwrap().root;
+                    for node in live.nodes.iter().filter(|(id, _)| *id != root) {
+                        assert!(framed.nodes.contains(node), "{change} at {scale}x");
+                    }
+                } else {
+                    assert_eq!(live, framed, "{change} at {scale}x");
+                }
+            }
+        }
+    }
+
+    /// The text of each terminal document in `update`.
+    fn terminal_text(update: &aterm_a11y::model::TreeUpdate) -> Vec<String> {
+        update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == aterm_a11y::model::Role::Terminal)
+            .filter_map(|(_, node)| node.value().map(str::to_string))
+            .collect()
+    }
+
+    /// A window whose terminal tab composed last, with a Settings and terminal tab behind it:
+    /// the app, the window and that tab's index.
+    fn mixed_tab_behind_a_terminal_tab() -> (App, WindowId, usize) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 120;
+            window.rows = 42;
+        }
+        let first = app.front_terminal(wid).unwrap().term.clone();
+        crate::term_lock(&first).process(b"text of the front tab");
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (session, _) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        crate::term_lock(&app.pool.get(session).unwrap().term).process(b"text of the mixed tab");
+        let mixed = app.windows[&wid].tab_set.active_index().unwrap();
+        set_a11y_active(&mut app, wid, true);
+        app.switch_tab_in(wid, 0);
+        let terminal = app.prepare_terminal_capture_grid(wid);
+        assert!(terminal.is_some(), "the front tab's frame composes");
+        assert!(
+            app.windows[&wid]
+                .input_scratch
+                .cells
+                .iter()
+                .flatten()
+                .any(|cell| cell.ch == 't'),
+            "the cells hold the front tab's text"
+        );
+        (app, wid, mixed)
+    }
+
+    /// Cells cut by another tab's rects are that tab's text under this pane's name, so a tab that
+    /// comes back gives its page at once and its terminal only with the frame that composes it.
+    #[test]
+    fn a_tab_brought_back_reads_no_other_tab_s_text_as_its_pane() {
+        let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
+
+        app.switch_tab_in(wid, mixed);
+        let (live, _) = app
+            .take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the page reads from the model");
+
+        assert_eq!(terminal_text(&live), Vec::<String>::new());
+
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let (framed, _) = app
+            .take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the frame's tree");
+        let text = terminal_text(&framed);
+        assert_eq!(text.len(), 1, "the frame brings the pane: {text:?}");
+        assert!(text[0].contains("text of the mixed tab"), "{text:?}");
+    }
+
+    /// The same read serves a tab of terminals, which has no page to give at once.
+    #[test]
+    fn a_terminal_tab_brought_back_reads_no_other_tab_s_text() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let first = app.front_terminal(wid).unwrap().term.clone();
+        crate::term_lock(&first).process(b"text of the first tab");
+        assert!(app.prepare_terminal_capture_grid(wid).is_some());
+        let shown = app.grid_a11y_tree(wid, None).unwrap();
+        assert!(terminal_text(&shown)[0].contains("text of the first tab"));
+
+        let second = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(second));
+        crate::term_lock(&app.pool.get(second).unwrap().term).process(b"text of the second tab");
+
+        let moved = app.grid_a11y_tree(wid, None).unwrap();
+        assert!(
+            !terminal_text(&moved)
+                .iter()
+                .any(|text| text.contains("text of the first tab")),
+            "{:?}",
+            terminal_text(&moved)
+        );
+    }
+
+    /// Cells of the old layout cut by the new rects read columns that were another pane's, and a
+    /// new chrome row puts each row one off.
+    #[test]
+    fn a_moved_layout_holds_a_terminal_pane_back_until_its_frame() {
+        for change in ["narrower", "a chrome row"] {
+            let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
+            app.switch_tab_in(wid, mixed);
+            assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+
+            match change {
+                "narrower" => app.windows.get_mut(&wid).unwrap().cols = 100,
+                _ => app.tab_strip_rows = app.tab_strip_rows.saturating_add(1),
+            }
+            let (live, _) = app
+                .take_native_accessibility_update(wid)
+                .expect("a native tree")
+                .expect("the page reads from the model");
+
+            assert_eq!(terminal_text(&live), Vec::<String>::new(), "{change}");
+        }
+    }
+
+    /// A lone page's frame leaves blank cells, which are no truer of a pane than another tab's.
+    #[test]
+    fn a_tab_brought_back_from_a_lone_page_reads_no_blank_pane() {
+        let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
+        app.switch_tab_in(wid, mixed);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("lone.txt");
+        std::fs::write(&path, "text\n").unwrap();
+        app.open_document_tab_in_window(
+            wid,
+            AppKind::Editor,
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+        )
+        .unwrap();
+        assert!(app.prepare_native_input_scratch(wid));
+
+        app.switch_tab_in(wid, mixed);
+        let (live, _) = app
+            .take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the page reads from the model");
+
+        assert_eq!(terminal_text(&live), Vec::<String>::new());
+    }
+
+    /// Focus moves no cell, so a client's press in the page keeps the terminal beside it.
+    #[test]
+    fn a_focus_move_keeps_the_composed_pane() {
+        let (mut app, wid, mixed) = mixed_tab_behind_a_terminal_tab();
+        app.switch_tab_in(wid, mixed);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let native = plan
+            .leaves
+            .iter()
+            .find(|leaf| !leaf.focused)
+            .expect("the unfocused page")
+            .view;
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.tab_set.active_mut())
+                .is_some_and(|tab| tab.set_focus(native))
+        );
+        app.sync_window(wid);
+        app.invalidate_native_ui_cache(wid);
+
+        let (live, _) = app
+            .take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the live tree");
+
+        let text = terminal_text(&live);
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("text of the mixed tab"), "{text:?}");
+    }
+
+    /// A paint owed by one pane leaves the card, so a sibling whose frame still answers is read,
+    /// not compiled again. An effect that repaints drops the card, and then the sibling compiles.
+    #[test]
+    fn a_publish_compiles_only_the_pane_that_owes_a_paint() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 140;
+            window.rows = 48;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::About));
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        app.split_active_with_native(
+            wid,
+            crate::tab_model::SplitAxis::Vertical,
+            instance,
+            AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
+                &app.config,
+            ))),
+        )
+        .unwrap();
+        set_a11y_active(&mut app, wid, true);
+        framed_tree(&mut app, wid);
+        app.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+        let compiles = crate::app_native::native_ui_compile_count();
+
+        app.take_native_accessibility_update(wid)
+            .expect("a native tree")
+            .expect("the tree");
+
+        assert_eq!(crate::app_native::native_ui_compile_count(), compiles + 1);
+    }
+
+    /// A press that queues work retires the page's review, so its owners move with the press. The
+    /// tree goes out under the new owners, not as a root-only tree.
+    #[test]
+    fn a_press_that_retires_its_review_publishes_the_page() {
+        let (mut app, wid, view, _) = vault_page_with_draft();
+        let press = publish_vault_action(&mut app, wid, view, "system-state/vault/join", None);
+        let owners = |app: &App| {
+            let published = app.windows[&wid].native_a11y_published.as_ref();
+            published.expect("the page routes").owners().to_vec()
+        };
+        let before = owners(&app);
+        app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+        app.on_native_accessibility_action(wid, press);
+
+        assert_ne!(owners(&app), before, "the press retired the review");
+        assert_ne!(
+            app.windows[&wid].a11y_sent.last(),
+            Some(&crate::a11y_tree::empty_tree())
+        );
+    }
+
     #[test]
     fn deferred_vault_join_cannot_run_after_a_same_plan_busy_publication() {
         thread_local! {
@@ -1544,30 +2071,24 @@ mod tests {
                 )
             };
             let before = values(&app);
-            let url = publish_vault_action(
-                &mut app,
-                wid,
-                view,
-                "system-state/url",
-                Some("http://later.invalid:7484/v1/team"),
-            );
-            let password = publish_vault_action(
-                &mut app,
-                wid,
-                view,
-                "system-state/password",
-                Some("different-inert-password"),
-            );
             let idle = crate::SetupStatus {
                 plan: Some(aterm_types::macos_setup::Plan::default()),
                 ..crate::SetupStatus::default()
             };
-            app.publish_system_state(crate::SetupStatus {
-                busy,
-                ..idle.clone()
-            });
-            app.on_native_accessibility_action(wid, url);
-            app.on_native_accessibility_action(wid, password);
+            // Each request is minted on an idle page and delivered past the status. The first
+            // field's publish replaces the routes, so the second mints on its own idle page.
+            for (key, text) in [
+                ("system-state/url", "http://later.invalid:7484/v1/team"),
+                ("system-state/password", "different-inert-password"),
+            ] {
+                app.publish_system_state(idle.clone());
+                let request = publish_vault_action(&mut app, wid, view, key, Some(text));
+                app.publish_system_state(crate::SetupStatus {
+                    busy,
+                    ..idle.clone()
+                });
+                app.on_native_accessibility_action(wid, request);
+            }
             let expected = if busy {
                 before
             } else {

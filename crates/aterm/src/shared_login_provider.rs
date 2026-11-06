@@ -46,8 +46,7 @@ impl Kind {
 pub(super) fn candidate(
     approved: std::sync::Arc<Approved>,
 ) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::Candidate, String> {
-    let row = approved.candidate()?;
-    let prepared = approved.prepared()?;
+    let (row, prepared) = approved.candidate_with_prepared()?;
     let kind = Kind::of(
         prepared.configuration().account(),
         prepared.credential().is_some(),
@@ -83,7 +82,10 @@ impl Provider for Approved {
         staging: &std::path::Path,
         browser: &cli::RenewBrowser,
     ) -> Execution {
-        let prepared = match self.read(row).and_then(|_| self.prepared()) {
+        let prepared = match self
+            .prepared()
+            .and_then(|prepared| self.read_from(&prepared, row).map(|_| prepared))
+        {
             Ok(prepared) => prepared,
             Err(why) => return Execution::NotStarted(why),
         };
@@ -163,7 +165,9 @@ impl Provider for Approved {
     ) -> Result<(), String> {
         match self.execute_attempt(context, row, staging, browser) {
             Execution::Completed => Ok(()),
-            Execution::NotStarted(why) | Execution::Unknown(why) => Err(why),
+            Execution::NotStarted(why) | Execution::Unknown(why) | Execution::Deferred(why) => {
+                Err(why)
+            }
         }
     }
     fn observe(
@@ -172,9 +176,9 @@ impl Provider for Approved {
         row: &accounts::Row,
         staging: &std::path::Path,
     ) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
-        self.read(row).map_err(ObservationError::RecoveryRequired)?;
         let prepared = self
             .prepared()
+            .and_then(|prepared| self.read_from(&prepared, row).map(|_| prepared))
             .map_err(ObservationError::RecoveryRequired)?;
         match Kind::of(
             prepared.configuration().account(),
@@ -257,7 +261,9 @@ fn claude_observe_with_reader(
 }
 
 impl Approved {
-    pub(super) fn candidate(&self) -> Result<accounts::Row, String> {
+    pub(super) fn candidate_with_prepared(
+        &self,
+    ) -> Result<(accounts::Row, aterm_db::accounts::activations::Preparation), String> {
         let prepared = self.prepared()?;
         let value = prepared.configuration().account();
         let email = value["email"]
@@ -293,7 +299,7 @@ impl Approved {
         let row = accounts::Row {
             label: format!(
                 "shared-{}",
-                aterm_codec::hex::encode_lower(&self.account)[..40].to_owned()
+                &aterm_codec::hex::encode_lower(&self.account)[..40]
             ),
             class,
             email: Some(email.to_owned()),
@@ -315,8 +321,8 @@ impl Approved {
             },
             ..Default::default()
         };
-        self.read(&row)?;
-        Ok(row)
+        self.read_from(&prepared, &row)?;
+        Ok((row, prepared))
     }
 
     pub(super) fn prepared(&self) -> Result<aterm_db::accounts::activations::Preparation, String> {
@@ -339,6 +345,14 @@ impl Approved {
 
     pub(super) fn read(&self, row: &accounts::Row) -> Result<Grant, String> {
         let prepared = self.prepared()?;
+        self.read_from(&prepared, row)
+    }
+
+    pub(super) fn read_from(
+        &self,
+        prepared: &aterm_db::accounts::activations::Preparation,
+        row: &accounts::Row,
+    ) -> Result<Grant, String> {
         let record = prepared.decision();
         let configuration = prepared.configuration();
         let value = configuration.account();
@@ -360,7 +374,7 @@ impl Approved {
             .as_str()
             .filter(|s| accounts::email_refusal(s).is_none())
             .ok_or_else(|| "shared renewal requires a direct approved email".to_owned())?;
-        let _ = inputs(&prepared, email)?;
+        let _ = inputs(prepared, email)?;
         let identity = match value
             .get("details")
             .and_then(|d| d.get("provider-identity"))

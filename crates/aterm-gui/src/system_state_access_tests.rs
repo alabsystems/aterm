@@ -451,7 +451,7 @@ fn the_menu_line_names_what_needs_a_person() {
     let one = status(all, vec![observed(dock, Standing::NeedsYou, None)]);
     assert_eq!(
         menu_line(&one, false),
-        line("System State: Dock needs you", None)
+        line("System State: Needs you: Dock", None)
     );
     let two = status(
         all,
@@ -527,12 +527,12 @@ fn the_menu_line_names_what_needs_a_person() {
             &status(all, vec![observed(accessibility, Standing::NeedsYou, None)]),
             false
         ),
-        line("System State: Accessibility needs you", None)
+        line("System State: Needs you: Accessibility", None)
     );
 
     assert_eq!(
         menu_line(&SetupStatus::default(), true),
-        line("System State: Full Disk Access needs you", None),
+        line("System State: Needs you: Full Disk Access", None),
         "a regressed grant shows with no plan"
     );
     assert_eq!(
@@ -540,7 +540,7 @@ fn the_menu_line_names_what_needs_a_person() {
             &status(all, vec![observed(fda, Standing::NeedsYou, None)]),
             true
         ),
-        line("System State: Full Disk Access needs you", None),
+        line("System State: Needs you: Full Disk Access", None),
         "counted once"
     );
 
@@ -550,7 +550,7 @@ fn the_menu_line_names_what_needs_a_person() {
             &status(all, vec![observed(secrets, Standing::NeedsYou, Some(code))]),
             false
         ),
-        line("System State: Secrets vault needs you", Some(code))
+        line("System State: Needs you: Secrets vault", Some(code))
     );
     assert_eq!(
         menu_line(
@@ -736,7 +736,7 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
     let failed = vec![step("Secrets vault", "error")];
     assert_eq!(
         menu_line(&ran(person.clone(), failed.clone(), true), false),
-        line("System State: Full Disk Access needs you", None)
+        line("System State: Needs you: Full Disk Access", None)
     );
     assert_eq!(
         menu_line(&ran(person, failed.clone(), false), false),
@@ -744,7 +744,7 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
     );
     assert_eq!(
         menu_line(&ran(Vec::new(), failed, true), true),
-        line("System State: Full Disk Access needs you", None),
+        line("System State: Needs you: Full Disk Access", None),
         "a grant that reads off"
     );
 }
@@ -2761,7 +2761,7 @@ fn a_regressed_grant_lights_the_menu_line() {
     app.settle_access_steps(now);
     assert_eq!(
         app.system_state_menu_line(),
-        line("System State: Full Disk Access needs you", None)
+        line("System State: Needs you: Full Disk Access", None)
     );
     app.note_fda_regression(false);
     app.settle_access_steps(now);
@@ -2790,7 +2790,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     app.settle_access_steps(now);
     assert_eq!(
         app.system_state_menu_line(),
-        line("System State: Full Disk Access needs you", None),
+        line("System State: Needs you: Full Disk Access", None),
         "the control: no update, no note"
     );
 
@@ -2803,7 +2803,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     assert_eq!(
         app.system_state_menu_line(),
         line(
-            "System State: Full Disk Access needs you",
+            "System State: Needs you: Full Disk Access",
             Some(FDA_AFTER_UPDATE)
         )
     );
@@ -2812,7 +2812,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     app.settle_access_steps(now);
     assert_eq!(
         app.system_state_menu_line(),
-        line("System State: Full Disk Access needs you", None),
+        line("System State: Needs you: Full Disk Access", None),
         "the note ended with the regression it was said of"
     );
 }
@@ -3005,7 +3005,7 @@ fn the_menu_line_follows_publications_not_parks() {
     ));
     assert_eq!(
         app.system_state_menu_line(),
-        line("System State: Dock needs you", None)
+        line("System State: Needs you: Dock", None)
     );
     app.publish_system_state(status(Selection::all(), Vec::new()));
     assert_eq!(app.system_state_menu_line(), None);
@@ -3121,7 +3121,7 @@ fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
     );
     assert_eq!(
         app.system_state_menu_line(),
-        line("System State: Secrets vault needs you", Some(code))
+        line("System State: Needs you: Secrets vault", Some(code))
     );
 }
 
@@ -6483,7 +6483,7 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
         });
         app
     };
-    let names_fda = line("System State: Full Disk Access needs you", None);
+    let names_fda = line("System State: Needs you: Full Disk Access", None);
     set_front(true);
     test_arms::forget_fda_declines();
     let mut app = launch(1);

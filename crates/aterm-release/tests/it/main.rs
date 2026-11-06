@@ -88,6 +88,9 @@ mod interrupt;
 #[path = "../../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
+#[path = "../../src/line.rs"]
+#[allow(dead_code)]
+mod line;
 #[path = "../../src/machines.rs"]
 #[allow(dead_code)]
 mod machines;
@@ -106,6 +109,9 @@ mod publish;
 #[path = "../../src/release.rs"]
 #[allow(dead_code)]
 mod release;
+#[path = "../../src/release_disk.rs"]
+#[allow(dead_code)]
+mod release_disk;
 #[path = "../../src/release_keychain.rs"]
 #[allow(dead_code)]
 mod release_keychain;
@@ -181,9 +187,11 @@ mod machine_roster;
 mod plist_stamp;
 mod publisher_fence_liveness;
 mod publisher_fence_model;
+mod push_hook;
 mod release_fixtures;
 mod release_flow;
 mod release_lease;
+mod release_line;
 mod resume;
 mod signconf;
 mod site_sync;

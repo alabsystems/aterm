@@ -45,7 +45,8 @@ pub struct InAddr {
     pub node: String,
     /// The session the message is addressed to.
     pub sid: String,
-    /// The sender, cap-forced at the broker.
+    /// The sender, cap-forced at the broker; for a person's post another Mac carried, once the
+    /// bridge verified its seal, `<person>@<node>` (§11 C3c, `Bridge::carried_person`).
     pub src: String,
     /// The message kind, the `<kind>` segment astream's [`WakeClass::parse`] read.
     pub kind: WakeClass,

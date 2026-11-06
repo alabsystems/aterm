@@ -47,6 +47,18 @@ aterm ctl @self sys [<view>] since=<cursor>  # what changed since the reply that
 (`phi=` >= 8): an unnamed wait stays `quiet`; `busy` and `slow` are never stuck.
 `no_progress=1` beside `quiet`: the tool call used almost no CPU in that silence.
 
+`sys jobs` also prints a `machine` row (and JSON object): measured busy/total CPU,
+available memory, pressure and build slots. Its own timestamp and age are separate
+from the job engine's age; slot age includes the slot reader's older sample. Free
+slots exclude orphan discounts; pending and unknown slots are never counted free.
+Use these readings before waiting on a long build or proof: if useful independent
+implementation or investigation has its inputs ready, continue it alongside the
+job. Use a separate owned worktree for work that can change a running check's
+inputs, and `build-slot --` for another heavy job. Keep one waiter for the original
+job. A free admission slot is no promise of idle CPU or enough memory for your job;
+low CPU in one job alone does not prove that the machine is idle. Do not invent
+extra checks just to occupy the machine.
+
 ## Wait instead of polling
 
 For a quiet or stuck waiting job, Owner may ask `sys name job=<id>` or `sys name

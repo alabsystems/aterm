@@ -15,11 +15,62 @@ use aterm_uds::{
 };
 use std::{
     collections::BTreeMap,
-    io,
+    fmt, io,
     os::fd::{AsFd as _, BorrowedFd},
     sync::Arc,
     time::{Duration, Instant},
 };
+
+const SETTLEMENT_RETRY: Duration = Duration::from_millis(100);
+
+/// A refusal before dispatch, returning the original admission and resources.
+/// Once installed in the owner, a failed launch keeps its ticket instead.
+pub struct RetainedRefused<T> {
+    error: io::Error,
+    inputs: Box<(Held, T)>,
+}
+
+impl<T> RetainedRefused<T> {
+    pub(super) fn new(error: io::Error, held: Held, retained: T) -> Self {
+        Self {
+            error,
+            inputs: Box::new((held, retained)),
+        }
+    }
+
+    /// Why dispatch refused without consuming the original resource custody.
+    #[must_use]
+    pub const fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    /// Recover the original admission and resource bundle; no target was dispatched.
+    #[must_use]
+    pub fn into_parts(self) -> (io::Error, Held, T) {
+        let (held, retained) = *self.inputs;
+        (self.error, held, retained)
+    }
+}
+
+impl<T> fmt::Debug for RetainedRefused<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedRefused")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> fmt::Display for RetainedRefused<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "retained job admission refused: {}", self.error)
+    }
+}
+
+impl<T> std::error::Error for RetainedRefused<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// An exact attempt in this table. A number or a different table cannot mint it.
 /// Clones remain valid while the same actual table owns the job; removal never
@@ -81,6 +132,12 @@ pub struct JobInfo {
     /// this is not a signal-acceptance or group-drain receipt.
     pub cleanup_reap_allowed: bool,
     pub failure: Option<String>,
+    /// Actual resources stay in this table through unresolved cohort settlement.
+    pub retained_resources: bool,
+    /// Positive owning root reap, distinct from native cohort settlement.
+    pub root_reaped: bool,
+    /// The original claim could not yet establish native drain or exact cancellation.
+    pub settlement_failure: Option<String>,
 }
 
 /// A process-affine bounded table, independent of terminal/global signal fronts.
@@ -132,12 +189,12 @@ impl Jobs {
         }
     }
 
-    /// Number of actual roots still owned, not a claim that all cohorts drained.
+    /// Number of owned roots and retained operations awaiting native settlement.
     #[must_use]
     pub fn len(&self) -> usize {
         self.jobs.len()
     }
-    /// Whether no actual roots remain in this table. Retained budgets can remain.
+    /// Whether no root or retained operation remains. Legacy budgets can remain.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.jobs.is_empty()
@@ -169,6 +226,9 @@ impl Jobs {
                     .mem,
                 cleanup_reap_allowed: job.cleanup_issued,
                 failure: job.failure.as_ref().map(ToString::to_string),
+                retained_resources: job.retained.is_some(),
+                root_reaped: job.usage.is_some(),
+                settlement_failure: job.settlement_failure.as_ref().map(ToString::to_string),
             })
             .collect())
     }
@@ -258,7 +318,7 @@ impl Jobs {
             self.next,
             NativeJob {
                 held: Some(held),
-                owned,
+                owned: Some(owned),
                 meter: Some(meter),
                 cancellation,
                 starting: true,
@@ -266,9 +326,90 @@ impl Jobs {
                 cleanup_issued: false,
                 usage: None,
                 failure,
+                retained: None,
+                settled: false,
+                settlement_retry: None,
+                settlement_failure: None,
             },
         );
         self.next = next;
+        Ok(Ticket { id, cancel })
+    }
+
+    /// Install actual resources before native birth and keep the original claim until drain.
+    /// Every later launch/BIND/observer error remains an owned attempt, including an
+    /// uncertain ARM without a child handle. Completion releases resources only after
+    /// a positive root reap (when there is a child) and successful native settlement.
+    ///
+    /// # Errors
+    /// A preflight refusal returns the untouched admission and resource bundle.
+    /// No command has been dispatched when this method returns `Err`.
+    pub fn submit_retained<T: Send + 'static>(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+        retained: T,
+    ) -> Result<Ticket, RetainedRefused<T>> {
+        self.submit_retained_with(held, command, grace, retained, NativeJob::dispatch)
+    }
+
+    fn submit_retained_with<T: Send + 'static>(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+        retained: T,
+        dispatch: impl FnOnce(&mut NativeJob, &mut spawnfd::Command),
+    ) -> Result<Ticket, RetainedRefused<T>> {
+        let prepared = (|| {
+            self.check_owner()?;
+            if self.jobs.len() == self.limit || !held.cohort {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "retained job needs available native cohort admission",
+                ));
+            }
+            let next = self
+                .next
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("job attempt sequence exhausted"))?;
+            let channel = Cancellation::channel_on(grace, Arc::clone(&self.wake))?;
+            Ok((next, channel))
+        })();
+        let (next, (cancel, cancellation)) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(RetainedRefused::new(error, held, retained)),
+        };
+        let id = JobId {
+            table: Arc::clone(&self.seal),
+            sequence: self.next,
+        };
+        self.next = next;
+        self.jobs.insert(
+            id.sequence,
+            NativeJob {
+                held: Some(held),
+                owned: None,
+                meter: None,
+                cancellation,
+                starting: true,
+                stopped: false,
+                cleanup_issued: false,
+                usage: None,
+                failure: None,
+                retained: Some(Box::new(retained)),
+                settled: false,
+                settlement_retry: None,
+                settlement_failure: None,
+            },
+        );
+        // The table already owns admission and guards if dispatch or metering unwinds.
+        let job = self
+            .jobs
+            .get_mut(&id.sequence)
+            .expect("installed retained job");
+        dispatch(job, command);
         Ok(Ticket { id, cancel })
     }
 
@@ -291,13 +432,20 @@ impl Jobs {
     /// Foreign/stale ID, job not stopped, active cancellation/failure or native refusal.
     pub fn resume_background(&mut self, id: &JobId) -> io::Result<SupervisedEvent> {
         let job = self.find_mut(id)?;
-        if !job.stopped || job.failure.is_some() || job.cancellation.requested() {
+        if !job.stopped
+            || job.failure.is_some()
+            || job.cancellation.requested()
+            || job.usage.is_some()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "job is not resumable",
             ));
         }
-        job.owned.request_group(CohortSignal::Continue)?;
+        job.owned
+            .as_mut()
+            .ok_or_else(|| io::Error::other("job has no owned child"))?
+            .request_group(CohortSignal::Continue)?;
         job.stopped = false;
         Ok(SupervisedEvent::ResumeAccepted { foreground: false })
     }
@@ -328,9 +476,10 @@ impl Jobs {
             {
                 job.failure = Some(error);
             }
-            if job.failure.is_some() && job.usage.is_none() {
+            if job.failure.is_some() && job.usage.is_none() && job.owned.is_some() {
                 if !job.cleanup_issued {
-                    job.cleanup_issued = request_owned_cleanup(&mut job.owned, say);
+                    job.cleanup_issued =
+                        request_owned_cleanup(job.owned.as_mut().expect("owned child"), say);
                 }
                 // Cleanup validates the original scope/seal and tries surviving
                 // members before permitting the owning root reap.
@@ -338,7 +487,11 @@ impl Jobs {
                     let _ = job.observe(&mut policy, false);
                 }
             }
-            if job.usage.is_some() {
+            if if job.retained.is_some() {
+                job.settle_retained(Instant::now())
+            } else {
+                job.usage.is_some()
+            } {
                 complete.push(id);
             }
         }
@@ -384,8 +537,15 @@ impl Jobs {
         ];
         let mut deadline = until;
         for job in self.jobs.values() {
-            fds.push(Watch::new(job.cancellation.inbox(), Interest::Read));
-            if let Some(at) = job.cancellation.deadline() {
+            // A settled leader/uncertain no-handle attempt has no serviced control
+            // path. Watching its unread late intents would busy-wake forever.
+            if job.owned.is_some() && job.usage.is_none() {
+                fds.push(Watch::new(job.cancellation.inbox(), Interest::Read));
+                if let Some(at) = job.cancellation.deadline() {
+                    deadline = deadline.min(at);
+                }
+            }
+            if let Some(at) = job.settlement_retry {
                 deadline = deadline.min(at);
             }
         }
@@ -409,7 +569,7 @@ impl Jobs {
 
 struct NativeJob {
     held: Option<Held>,
-    owned: SupervisedChild,
+    owned: Option<SupervisedChild>,
     meter: Option<TreeMeter>,
     cancellation: Cancellation,
     starting: bool,
@@ -417,9 +577,110 @@ struct NativeJob {
     cleanup_issued: bool,
     usage: Option<Rusage>,
     failure: Option<io::Error>,
+    retained: Option<Box<dyn Send>>,
+    settled: bool,
+    settlement_retry: Option<Instant>,
+    settlement_failure: Option<io::Error>,
 }
 
 impl NativeJob {
+    fn dispatch(&mut self, command: &mut spawnfd::Command) {
+        self.dispatch_with(command, |held, command| launch_held(Some(held), command));
+    }
+
+    fn dispatch_with(
+        &mut self,
+        command: &mut spawnfd::Command,
+        launch: impl FnOnce(
+            &mut Held,
+            &mut spawnfd::Command,
+        ) -> io::Result<(SupervisedChild, Option<io::Error>)>,
+    ) {
+        command.env(
+            aterm_capacity::COVER_ENV,
+            self.held
+                .as_ref()
+                .expect("owned admission")
+                .claim()
+                .record()
+                .cover_marker(),
+        );
+        struct Restore<'a>(&'a mut spawnfd::Command, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.start_suspended(self.1);
+            }
+        }
+        let configured = command.starts_suspended();
+        command.start_suspended(true);
+        let restore = Restore(command, configured);
+        match launch(self.held.as_mut().expect("owned admission"), restore.0) {
+            Ok((owned, error)) => {
+                self.owned = Some(owned);
+                self.failure = error;
+                self.meter = Some(TreeMeter::start(
+                    self.owned.as_mut().expect("owned child").child_mut().id(),
+                ));
+            }
+            Err(error) => {
+                self.starting = false;
+                self.failure = Some(error);
+            }
+        }
+    }
+
+    fn settle_retained(&mut self, now: Instant) -> bool {
+        self.settle_retained_with(now, |held| held.claim.finish_cohort())
+    }
+
+    fn settle_retained_with(
+        &mut self,
+        now: Instant,
+        settle: impl FnOnce(&mut Held) -> io::Result<()>,
+    ) -> bool {
+        if self.settled {
+            return true;
+        }
+        if self.owned.is_some() && self.usage.is_none() {
+            return false;
+        }
+        if self.settlement_retry.is_some_and(|at| now < at) {
+            return false;
+        }
+        // No child handle is not a no-child proof. The original claim must itself
+        // replay any exact cancellation/BIND and establish native scope drain.
+        match settle(self.held.as_mut().expect("owned admission")) {
+            Ok(()) => {
+                self.settled = true;
+                self.settlement_failure = None;
+            }
+            Err(error) => self.settlement_failure = Some(error),
+        }
+        self.settlement_retry = (!self.settled).then(|| now + SETTLEMENT_RETRY);
+        self.settled
+    }
+
+    fn poll_retained_cleanup(&mut self) -> bool {
+        self.poll_retained_cleanup_with(|child| child.try_wait_with_rusage())
+    }
+
+    fn poll_retained_cleanup_with(
+        &mut self,
+        poll: impl FnOnce(&mut spawnfd::Child) -> io::Result<Option<Rusage>>,
+    ) -> bool {
+        if let Some(owned) = self.owned.as_mut().filter(|_| self.usage.is_none()) {
+            if !self.cleanup_issued {
+                self.cleanup_issued = request_owned_cleanup(owned, &mut |_| {});
+            }
+            if self.cleanup_issued
+                && let Ok(Some(usage)) = poll(owned.child_mut())
+            {
+                self.usage = Some(usage);
+            }
+        }
+        self.settle_retained(Instant::now())
+    }
+
     fn phase(&self) -> Phase {
         if self.failure.is_some() {
             Phase::Faulted
@@ -436,8 +697,11 @@ impl NativeJob {
         }
     }
     fn step(&mut self, events: &mut JobEvents<'_>) -> io::Result<()> {
+        let Some(owned) = self.owned.as_mut().filter(|_| self.usage.is_none()) else {
+            return Ok(());
+        };
         if self.starting {
-            let Some(observed) = self.owned.child_mut().try_job_event()? else {
+            let Some(observed) = owned.child_mut().try_job_event()? else {
                 return Ok(());
             };
             match observed.acknowledge()? {
@@ -452,13 +716,13 @@ impl NativeJob {
                     )));
                 }
             }
-            self.cancellation.service(&mut self.owned, events)?;
+            self.cancellation.service(owned, events)?;
             if !self.cancellation.requested() {
-                self.owned.child_mut().resume()?;
+                owned.child_mut().resume()?;
             }
             return Ok(());
         }
-        self.cancellation.service(&mut self.owned, events)?;
+        self.cancellation.service(owned, events)?;
         self.observe(events, true)
     }
 
@@ -466,7 +730,8 @@ impl NativeJob {
         if self.cancellation.exit_observed() && self.cancellation.holds_root() && decisions {
             return Ok(());
         }
-        let Some(observed) = self.owned.child_mut().try_job_event()? else {
+        let owned = self.owned.as_mut().expect("observe an actual child");
+        let Some(observed) = owned.child_mut().try_job_event()? else {
             return Ok(());
         };
         if observed.notice() == ChildNotice::Exited && self.cancellation.holds_root() && decisions {
@@ -482,7 +747,7 @@ impl NativeJob {
                 match events(SupervisedEvent::Stopped(signal))? {
                     JobControl::Wait => Ok(()),
                     JobControl::ResumeBackground => {
-                        self.owned.request_group(CohortSignal::Continue)?;
+                        owned.request_group(CohortSignal::Continue)?;
                         self.stopped = false;
                         if events(SupervisedEvent::ResumeAccepted { foreground: false })?
                             == JobControl::Wait
@@ -495,10 +760,8 @@ impl NativeJob {
                             ))
                         }
                     }
-                    JobControl::TerminateGroup => {
-                        self.cancellation.terminate(&mut self.owned, events)
-                    }
-                    JobControl::KillGroup => self.cancellation.kill(&mut self.owned, events),
+                    JobControl::TerminateGroup => self.cancellation.terminate(owned, events),
+                    JobControl::KillGroup => self.cancellation.kill(owned, events),
                     JobControl::ResumeForeground => Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "headless job has no foreground terminal lease",
@@ -517,9 +780,12 @@ impl NativeJob {
         events: &mut JobEvents<'_>,
         say: &mut dyn FnMut(&str),
     ) -> io::Result<JobOutcome> {
-        let usage = self.usage.expect("only accounted roots finish");
         let mut held = self.held.take().expect("owned admission");
-        let settlement = match held.claim.finish_cohort() {
+        let settlement = match if self.settled {
+            Ok(())
+        } else {
+            held.claim.finish_cohort()
+        } {
             Ok(()) => CohortSettlement::Drained,
             Err(error) => {
                 say(&format!(
@@ -527,6 +793,14 @@ impl NativeJob {
                 ));
                 CohortSettlement::Retained
             }
+        };
+        let Some(usage) = self.usage else {
+            debug_assert!(self.retained.is_some() && self.settled);
+            drop(held);
+            return Err(self
+                .failure
+                .take()
+                .unwrap_or_else(|| io::Error::other("retained attempt started no root")));
         };
         let event = if settlement == CohortSettlement::Drained {
             SupervisedEvent::CohortDrained
@@ -561,17 +835,32 @@ impl NativeJob {
 impl Drop for Jobs {
     fn drop(&mut self) {
         if self.owner != std::process::id() {
+            // A foreign process copy cannot release arbitrary guards belonging to
+            // the original owner, or hand its copied child receipts to a reaper.
+            for (_, job) in std::mem::take(&mut self.jobs) {
+                if job.retained.is_some() {
+                    std::mem::forget(job);
+                }
+            }
             return;
         }
         for job in self.jobs.values_mut() {
-            if !job.owned.child_mut().is_reaped() {
-                job.cleanup_issued |= request_owned_cleanup(&mut job.owned, &mut |_| {});
+            if let Some(owned) = job.owned.as_mut()
+                && !owned.child_mut().is_reaped()
+            {
+                job.cleanup_issued |= request_owned_cleanup(owned, &mut |_| {});
             }
         }
-        for job in self.jobs.values_mut() {
-            if job.cleanup_issued {
-                let _ = job.owned.child_mut().wait();
+        for (_, mut job) in std::mem::take(&mut self.jobs) {
+            if job.retained.is_some() {
+                aterm_uds::reaper::hand_off(move || job.poll_retained_cleanup());
+            } else if job.cleanup_issued {
+                let _ = job.owned.as_mut().expect("legacy child").child_mut().wait();
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "build_admit_retained_tests.rs"]
+mod retained_tests;

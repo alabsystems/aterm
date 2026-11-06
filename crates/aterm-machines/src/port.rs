@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -17,6 +17,11 @@ mod create_new;
 mod github_api;
 pub(crate) mod github_rest;
 mod identity;
+#[cfg(target_os = "macos")]
+mod keyboard_maps;
+pub(crate) mod keyboard_prefix;
+pub use keyboard_prefix::KeyboardPrefix;
+pub(crate) mod keyboard_usage;
 #[cfg(target_os = "macos")]
 mod low_data;
 mod processes;
@@ -538,8 +543,30 @@ pub trait InstallNetworkWatch {
     fn wait(&mut self, revision: Option<u64>, budget: Duration) -> Duration;
 }
 
+/// One exact HID service's checked mapping change. Every mapping for another physical key is
+/// preserved, and the native writer refuses a service whose identity or tables changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardMapChange {
+    /// The service's IORegistryEntryID, rather than its row's order or its device model alone.
+    pub registry: u64,
+    /// Complete upstream mapping state whose Caps passthrough this change relies on.
+    pub before_prefix: KeyboardPrefix,
+    /// Native modifier mappings read before this change.
+    pub before_native: Vec<(i64, i64)>,
+    /// User mappings read before this change.
+    pub before_user: Vec<(i64, i64)>,
+    /// Native modifier mappings to set, if needed.
+    pub native: Option<Vec<(i64, i64)>>,
+    /// User mappings to set, if needed.
+    pub user: Option<Vec<(i64, i64)>>,
+}
+
 /// The operating system, as items see it.
 pub trait System: Sync {
+    /// Keyboard-capable HID service identities, read without events or child processes.
+    fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
+        Err("native keyboard service census is unavailable".into())
+    }
     /// Read one GitHub API endpoint through `agh` as `user` with the admitted development
     /// credential.
     ///
@@ -618,6 +645,18 @@ pub trait System: Sync {
     /// Set natural scrolling in the current macOS login session via the native setter.
     fn set_natural_scrolling(&self, _natural: bool) -> Result<(), String> {
         Err("native scroll direction is not implemented by this backend".into())
+    }
+
+    /// Apply exact HID service changes using an entitlement-free Passive property client.
+    /// The writer checks their model and current tables, and never requests a permission.
+    fn set_keyboard_maps(
+        &self,
+        _target_uid: u32,
+        _vendor: u32,
+        _product: u32,
+        _changes: &[KeyboardMapChange],
+    ) -> Result<(), String> {
+        Err("native keyboard mappings are not implemented by this backend".into())
     }
 
     /// Allocate an exclusively owned temporary directory under `_parent` (or default temp dir).
@@ -721,6 +760,12 @@ pub trait System: Sync {
 
     /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Read this tree's native GNU ELF/libc requirements without starting a child. Other
+    /// operating systems have no GNU libc gate. Unknown capability refuses a managed build.
+    fn admit_runtime(&self, _root: &Path) -> Result<(), String> {
+        Err("native runtime requirements are unavailable".into())
+    }
 
     /// The first `max` bytes of the regular file at `path` (all of it when shorter): a program's
     /// `#!` line without reading the rest of a large executable. Refused where a link lies
@@ -1294,13 +1339,17 @@ fn account_env(user: &User) -> [(String, String); 6] {
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
 }
 
+/// How long [`end_group`] and a relay's close wait to reap a child they killed: one still
+/// there (held in the kernel) is left to its handle's drop, which hands it to the reaper,
+/// rather than holding the caller for ever.
+const REAP_HANG: Duration = Duration::from_secs(1);
+
 fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // `child` is not yet reaped, so its pid and process group id remain valid.
         let _ = aterm_uds::process::kill_group_until_empty(pid);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    aterm_uds::deadline::kill_within(child, REAP_HANG);
 }
 
 fn open_stdin_file(path: Option<&Path>) -> Result<aterm_uds::spawnfd::Stdio, RunFailed> {
@@ -1472,6 +1521,16 @@ pub fn responsible_window() -> Option<String> {
 }
 
 impl System for Live {
+    fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            keyboard_maps::service_ids()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("native keyboard services are available only on macOS".into())
+        }
+    }
     fn github_api(
         &self,
         user: &User,
@@ -1530,6 +1589,24 @@ impl System for Live {
 
     fn set_natural_scrolling(&self, natural: bool) -> Result<(), String> {
         scroll_direction::set(natural)
+    }
+
+    fn set_keyboard_maps(
+        &self,
+        target_uid: u32,
+        vendor: u32,
+        product: u32,
+        changes: &[KeyboardMapChange],
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            keyboard_maps::set(target_uid, vendor, product, changes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (target_uid, vendor, product, changes);
+            Err("native keyboard mappings are available only on macOS".into())
+        }
     }
 
     fn scratch_dir(&self, parent: Option<&Path>, label: &str) -> io::Result<Scratch<'_>> {
@@ -1686,6 +1763,10 @@ impl System for Live {
         self.presence.is_none_or(|present| present())
     }
 
+    fn admit_runtime(&self, root: &Path) -> Result<(), String> {
+        aterm_toolchain::gnu_runtime::admit_tree(root)
+    }
+
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -1753,12 +1834,7 @@ impl System for Live {
     }
 
     fn write_user_file(&self, user: &User, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-        if !path.starts_with(&user.home) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is outside {}'s home", path.display(), user.name),
-            ));
-        }
+        user_file_target(user, path, mode)?;
         if self.euid() != 0 {
             return write_atomic(path, bytes, mode);
         }
@@ -2287,6 +2363,41 @@ impl Staged<'_> {
     }
 }
 
+/// Refuse a [`System::write_user_file`] of `path` as `user` with `mode` unless `path` is an
+/// absolute path with no `..` strictly inside `user`'s home (itself absolute, with no `..`, and
+/// not `/`) and `mode` holds permission bits alone (no setuid, setgid or sticky bit). A
+/// symbolic link along the way is the user's own: a dotfile manager links `~/.config`.
+fn user_file_target(user: &User, path: &Path, mode: u32) -> io::Result<()> {
+    let plain = |p: &Path| {
+        p.is_absolute()
+            && p.components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    };
+    let home = Path::new(&user.home);
+    if !plain(home)
+        || home.parent().is_none()
+        || !plain(path)
+        || !path.starts_with(home)
+        || path == home
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a plain path inside {}'s home",
+                path.display(),
+                user.name
+            ),
+        ));
+    }
+    if mode & !0o777 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("mode {mode:o} sets more than the permission bits (0777)"),
+        ));
+    }
+    Ok(())
+}
+
 /// Write `bytes` to a fresh `0600` file inside an exclusively owned temporary directory.
 pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<'s>> {
     let scratch = Scratch::new(sys, "stdin")?;
@@ -2385,9 +2496,11 @@ mod fake {
         /// held the update boundary ([`Fake::guarded_renames`]).
         guarded_renames: Mutex<Vec<PathBuf>>,
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
+        runtime_refusals: Mutex<BTreeMap<PathBuf, String>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         stat_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        rename_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         list_errors_once: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         directory_flush_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         links: Mutex<BTreeMap<PathBuf, PathBuf>>,
@@ -2481,6 +2594,8 @@ mod fake {
         agh_dirs: Option<agh::config::Dirs>,
         /// What [`System::github_fx`] answers, on every call.
         github_fx: GithubFx,
+        /// Exact native keyboard writes requested by a test; no HID services are touched.
+        keyboard_changes: Mutex<Vec<super::KeyboardMapChange>>,
     }
 
     /// The one simulated effect seam a [`Fake`] hands its agh client, made with the `Fake`, so
@@ -2669,6 +2784,21 @@ mod fake {
     }
 
     impl Fake {
+        /// Keep a managed build's native runtime unavailable, without starting a child.
+        pub fn runtime_unready(&self, root: &Path, why: &str) -> &Self {
+            self.runtime_refusals
+                .lock()
+                .unwrap()
+                .insert(root.to_owned(), why.into());
+            self
+        }
+
+        /// A newly compatible tree has no remaining native runtime blocker.
+        pub fn runtime_ready(&self, root: &Path) -> &Self {
+            self.runtime_refusals.lock().unwrap().remove(root);
+            self
+        }
+
         /// Interleave a filesystem change after an admitted read snapshot was copied.
         pub fn on_owned_read(&self, hook: impl Fn(&Fake, &Path) + Send + Sync + 'static) -> &Self {
             *self.on_owned_read.lock().unwrap() = Some(Arc::new(hook));
@@ -2968,6 +3098,11 @@ mod fake {
             self
         }
 
+        /// Exact HID service changes requested through [`System::set_keyboard_maps`].
+        pub fn keyboard_changes(&self) -> Vec<super::KeyboardMapChange> {
+            self.keyboard_changes.lock().unwrap().clone()
+        }
+
         /// Script `reply` for [`System::tcc_access`] of `clients` (`&[]` for the open check).
         pub fn on_tcc(
             &self,
@@ -3091,6 +3226,15 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(PathBuf::from(path), kind);
+            self
+        }
+
+        /// Make each [`System::rename`] onto `to` fail with `kind`, moving nothing.
+        pub fn rename_fails(&self, to: &str, kind: io::ErrorKind) -> &Self {
+            self.rename_errors
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(to), kind);
             self
         }
 
@@ -3307,6 +3451,23 @@ mod fake {
                     "native scroll direction did not match after applying the setting".into(),
                 );
             }
+            Ok(())
+        }
+
+        fn set_keyboard_maps(
+            &self,
+            target_uid: u32,
+            _vendor: u32,
+            _product: u32,
+            changes: &[super::KeyboardMapChange],
+        ) -> Result<(), String> {
+            if self.euid != target_uid {
+                return Err("keyboard activation actor differs from the target user".into());
+            }
+            self.keyboard_changes
+                .lock()
+                .unwrap()
+                .extend_from_slice(changes);
             Ok(())
         }
 
@@ -3527,6 +3688,13 @@ mod fake {
             status
         }
 
+        fn admit_runtime(&self, root: &Path) -> Result<(), String> {
+            match self.runtime_refusals.lock().unwrap().get(root) {
+                Some(why) => Err(why.clone()),
+                None => Ok(()),
+            }
+        }
+
         fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
             self.files
                 .lock()
@@ -3591,9 +3759,7 @@ mod fake {
             bytes: &[u8],
             mode: u32,
         ) -> io::Result<()> {
-            if !path.starts_with(&user.home) {
-                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
-            }
+            super::user_file_target(user, path, mode)?;
             self.calls.lock().unwrap().push(format!(
                 "{}$ write {} {mode:o}",
                 user.name,
@@ -3811,6 +3977,9 @@ mod fake {
                 .lock()
                 .unwrap()
                 .push(format!("rename {} {}", from.display(), to.display()));
+            if let Some(kind) = self.rename_errors.lock().unwrap().get(to) {
+                return Err(io::Error::from(*kind));
+            }
             {
                 let mut links = self.links.lock().unwrap();
                 if let Some(target) = links.remove(from) {
@@ -4266,6 +4435,82 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user file is written only at a plain path strictly inside the user's home with
+    /// permission bits alone: `..` out of the home, the home itself, a `/` home and a setuid
+    /// mode are refused before anything is written. NEGATIVE CONTROL: a file under a
+    /// symbolically linked `~/.config` (a dotfile manager's) is written with its mode.
+    #[test]
+    fn a_user_file_outside_the_home_or_with_more_than_permission_bits_is_refused() {
+        let fake = Fake::root();
+        let alice = User {
+            name: "alice".into(),
+            uid: 502,
+            gid: 20,
+            home: "/Users//alice".into(),
+            shell: "/bin/zsh".into(),
+            admin: false,
+        };
+        let root_home = User {
+            home: "/".into(),
+            ..alice.clone()
+        };
+        for (user, path, mode, kind) in [
+            (
+                &alice,
+                "/Users//alice/../bob/x",
+                0o600,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                &alice,
+                "/Users//alice",
+                0o600,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                &alice,
+                "Users/alice/x",
+                0o600,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                &alice,
+                "/Users//alice2/x",
+                0o600,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                &root_home,
+                "/etc/sudoers.d/x",
+                0o600,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                &alice,
+                "/Users//alice/x",
+                0o4755,
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                &alice,
+                "/Users//alice/x",
+                0o1777,
+                io::ErrorKind::InvalidInput,
+            ),
+        ] {
+            let refused = fake
+                .write_user_file(user, Path::new(path), b"x", mode)
+                .unwrap_err();
+            assert_eq!(refused.kind(), kind, "{path} {mode:o}: {refused}");
+        }
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        fake.link("/Users//alice/.config", "/Users//alice/dotfiles/config");
+        fake.write_user_file(&alice, Path::new("/Users//alice/.config/x"), b"x", 0o644)
+            .unwrap();
+        assert_eq!(fake.calls(), ["alice$ write /Users//alice/.config/x 644"]);
+        assert_eq!(fake.mode_of("/Users//alice/.config/x"), Some(0o644));
+    }
 
     #[test]
     fn child_failures_preserve_spawn_post_start_and_timeout_phases() {

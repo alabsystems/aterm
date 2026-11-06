@@ -1433,6 +1433,7 @@ fn cli_refuses_invocations_that_would_drop_a_safety_answer() {
         &["cut", "--resume", "--dry-run"],
         &["release", "--bump", "--commit", "a"],
         &["release", "--commit", "a", "--commit", "b"],
+        &["release", "--fix", "a", "--commit", "b"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }

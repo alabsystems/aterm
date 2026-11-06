@@ -11,6 +11,7 @@ use crate::membership_log::{
     Store, encode_records, secure_twins,
 };
 use aterm_digest::Sha256;
+use aterm_mesh_core::no_lost_edit as nle;
 
 #[cfg(test)]
 #[path = "log_entries_commit_tests.rs"]
@@ -19,6 +20,10 @@ mod commit_tests;
 #[cfg(test)]
 #[path = "log_entries/held_draft_tests.rs"]
 mod held_draft_tests;
+
+#[cfg(test)]
+#[path = "log_entries/enrollment_seat_tests.rs"]
+mod enrollment_seat_tests;
 
 const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
 
@@ -2244,6 +2249,23 @@ fn names_one_server(url: &str) -> bool {
     !crate::is_alab_default_url(url)
 }
 
+#[cfg(test)]
+mod one_server_tests {
+    use super::*;
+
+    /// The reach rule's premise on the world (P3's `OneIsFixed`): a URL that may move between
+    /// servers never reads as one server. Each of the ALab vault's compiled-in names moves
+    /// between the Macs that serve it, so none settles a hold or a pending set by reach.
+    #[test]
+    fn no_alab_name_reads_as_one_server() {
+        assert!(!crate::ALAB_DEFAULT_URLS.is_empty());
+        for url in crate::ALAB_DEFAULT_URLS {
+            assert!(!names_one_server(url), "{url} reads as one server");
+        }
+        assert!(names_one_server("http://192.0.2.7:7485/v/one"));
+    }
+}
+
 /// Settle the holds with what a head this Mac adopted proves: the head is of sequence `seq`,
 /// `parents` is its parent spine, and each server of `took` stored it. A hold whose version the
 /// spine names goes: the head descends from it, so a writer drafted the head's line from that
@@ -2261,29 +2283,36 @@ fn settle_held_drafts_locked(paths: &Paths, seq: u64, parents: &[[u8; 32]], took
         return;
     }
     for (held_seq, version, path) in held_drafts(paths) {
-        if parents.contains(&version) {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        if held_seq > seq || took.is_empty() {
-            continue;
+        // The gate and the reach rule are no_lost_edit's kernels (P3): the island proves that a
+        // hold goes only by descent or once each server its publish may have reached names one
+        // server that took the head.
+        match nle::Gate::of(parents.contains(&version), held_seq, seq, !took.is_empty()) {
+            nle::Gate::Descends => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            nle::Gate::Waits => continue,
+            nle::Gate::Reach => {}
         }
         let Ok(Some(held)) = read_held(&path) else {
             continue;
         };
-        if held.reach.iter().any(|url| url == REACH_UNKNOWN) {
-            continue;
-        }
-        let left: Vec<String> = held
-            .reach
-            .iter()
-            .filter(|url| !names_one_server(url) || !took.contains(url))
-            .cloned()
-            .collect();
-        if left.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else if left.len() < held.reach.len() {
-            let _ = write_held(&path, &left, held.records());
+        let reach: Option<Vec<(bool, bool)>> = (!held.reach.iter().any(|url| url == REACH_UNKNOWN))
+            .then(|| {
+                held.reach
+                    .iter()
+                    .map(|url| (names_one_server(url), took.contains(url)))
+                    .collect()
+            });
+        match nle::settle_reach(reach.as_deref()) {
+            nle::Settle::Goes => {
+                let _ = std::fs::remove_file(&path);
+            }
+            nle::Settle::Stays => {}
+            nle::Settle::Narrows(left) => {
+                let left: Vec<String> = left.iter().map(|&i| held.reach[i].clone()).collect();
+                let _ = write_held(&path, &left, held.records());
+            }
         }
     }
     let unversioned = unversioned_held_draft_file(paths);
@@ -2466,11 +2495,12 @@ fn writers_dont_wait() -> bool {
     }
 }
 
-/// Whether a newest epoch of `audience` that `opened` reads still wraps a recipient `log` removed:
-/// a `Remove` here whose rotation there (the remover's own batch, or the ranked tender's re-key or
-/// coalesce, [`Log::rekey_dues`]' `rotation`) has not reached this Mac. A writer here writes no
-/// `[everyone]` value until it has (one-mesh M4, [`Waiting`]), and mints no Commons epoch for the
-/// departure alone.
+/// Whether a newest epoch of `audience` that `opened` reads is due a rotation ([`Log::head_due`],
+/// P1's one rule): a `Remove` here that took out a revoked seat is not in its causal past, or it
+/// wraps a recipient `log` removed, so the rotation (the remover's own batch, or the ranked
+/// tender's re-key or coalesce, [`Log::rekey_dues`]' `rotation`) has not reached this Mac. A
+/// writer here writes no `[everyone]` value until it has (one-mesh M4, [`Waiting`]), and mints no
+/// Commons epoch for the departure alone.
 fn rotation_due(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
@@ -2479,24 +2509,42 @@ fn rotation_due(
     opened
         .maximal_epochs
         .get(audience)
-        .is_some_and(|newest| wraps_removed(opened, newest, &log.removed_recipients()))
+        .is_some_and(|newest| heads_due(log, opened, newest, &log.removed_recipients()))
+}
+
+/// Whether one of the epochs `newest` (an audience's causally newest, as `opened` reads them) is
+/// due a rotation by P1's one rule ([`Log::head_due`]): its gate is shut (a held `Remove` that
+/// took out a revoked seat is not in its causal past), or it still wraps a recipient in
+/// `removed`. A writer's wait ([`rotation_due`]), a writer's seal ([`sealing_epoch`]) and a host
+/// list's rotation ([`rotates_host_list`]) ask it, as [`Log::rekey_dues`]' `rotation` does
+/// ([`owed_audiences`]), over the same epochs cache.
+pub(super) fn heads_due(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    newest: &[RecordId],
+    removed: &BTreeSet<Recipient>,
+) -> bool {
+    newest
+        .iter()
+        .any(|epoch| log.head_due(epoch, opened.wrapped_recipients.get(epoch), removed))
 }
 
 /// Whether one of the epochs `newest` (an audience's causally newest, as `opened` reads them)
-/// still wraps a recipient in `removed`: the one reading of "a held `Remove` made a re-key due"
-/// that a writer's wait ([`rotation_due`]), a host list's rotation ([`rotates_host_list`]), a
-/// removal's reserve ([`super::remove::RemovalFill`]) and a heal's ([`owed_rekeys`]) share, as
-/// [`Log::rekey_dues`]' `rotation` reads it over the same epochs cache.
+/// still wraps a recipient in `removed`, each pair asked of one-mesh proofs P1's `wraps_removed`
+/// kernel: a removal's reserve for its own targets ([`super::remove::RemovalFill`]), whose
+/// `Remove`s the log does not hold yet, so P1's gate ([`heads_due`]) cannot read them; the dues
+/// earlier removals left are [`owed_audiences`].
 pub(super) fn wraps_removed(
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     newest: &[RecordId],
     removed: &BTreeSet<Recipient>,
 ) -> bool {
     newest.iter().any(|epoch| {
-        opened
-            .wrapped_recipients
-            .get(epoch)
-            .is_some_and(|wrapped| !wrapped.is_disjoint(removed))
+        opened.wrapped_recipients.get(epoch).is_some_and(|wrapped| {
+            wrapped.iter().any(|recipient| {
+                aterm_mesh_core::revocation::wraps_removed(removed.contains(recipient), true)
+            })
+        })
     })
 }
 
@@ -2504,9 +2552,9 @@ pub(super) fn wraps_removed(
 mod waiting;
 #[cfg(test)]
 pub(super) use waiting::{
-    BASES_LOG_ONLY, DRAFT_UNCLAIMED, MOVES_WAIT, OVERTAKEN_UNRECORDED, PENDING_BY_COUNT,
-    RACE_UNDEFERRED, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING, Values, pending_reach,
-    waiting_and_pending, waiting_file, waiting_values,
+    BASES_LOG_ONLY, DRAFT_UNCLAIMED, MOVES_WAIT, NAMES_UNMERGED, OVERTAKEN_UNRECORDED,
+    PENDING_BY_COUNT, RACE_UNDEFERRED, SETTLE_UNCARRIED, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING,
+    Values, pending_reach, waiting_and_pending, waiting_file, waiting_values,
 };
 pub use waiting::{Overtaken, Overtaker};
 pub(super) use waiting::{
@@ -2515,7 +2563,9 @@ pub(super) use waiting::{
     sign_waiting_writes, sign_waiting_writes_by, stored_versions, unread_waiting, view_waiting,
     wait_for_key, waiting_pending,
 };
-use waiting::{everyone_edit, moves_wait, read_waiting, standing, unread_as_none};
+use waiting::{
+    everyone_edit, moves_wait, read_waiting, settle_uncarried, standing, unread_as_none,
+};
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
 /// `[everyone]` (unless `readmit` lets it back in, or its `Wrap` may still arrive: `flight`).
@@ -3070,10 +3120,11 @@ fn draft_document_diff_with(
     // departure alone: the rotation reseals the descriptor. An edit that removes a Mac itself (a
     // `code-only` key's `Remove` above) is that removal's batch, and rotates as a remover does.
     let waits_in = |audience: &EpochAudience| {
-        waits_for_key
-            && minted.is_empty()
-            && !writers_dont_wait()
-            && rotation_due(&log, &opened, audience)
+        aterm_mesh_core::capacity::writer_waits(
+            waits_for_key && !writers_dont_wait(),
+            !minted.is_empty(),
+            rotation_due(&log, &opened, audience),
+        )
     };
     let rotation_waits = waits_in(&EpochAudience::Everyone);
     let commons_waits = waits_in(&EpochAudience::Commons);
@@ -3249,7 +3300,8 @@ fn draft_document_diff_with(
     // ([`everyone_edit`]): where the draft's records sign the name, they settle it too.
     let carried = edit.writes.clone();
     let resolving = |aud: &Audience, name: &String| {
-        resolving(aud, name) || (*aud == Audience::Everyone && carried.resolves(name))
+        resolving(aud, name)
+            || (*aud == Audience::Everyone && !settle_uncarried() && carried.resolves(name))
     };
     let everyone = if waits {
         EveryoneWrites {
@@ -4399,7 +4451,8 @@ thread_local! {
 /// The epoch a writer, the Mac of `identity`, seals an audience's next entries under, of
 /// `newest` (its causally newest epochs): its one newest epoch, or the lowest id among
 /// [`secure_twins`]. `None` where they are concurrent with distinct recipient sets (the tender
-/// coalesces them), and where the rest of a batch this log may hold only a prefix of could still
+/// coalesces them), where a newest epoch is due a rotation ([`Log::head_due`]: P1's gate), and
+/// where the rest of a batch this log may hold only a prefix of could still
 /// wrap a recipient outside `plan`, the writer's recipients, and `undecided`, those of its plan
 /// only that batch can decide ([`Log::batch_may_wrap`]: a Mac a `Remove` the minter did not know
 /// took out, or one the person left out of the plan): the writer then mints a fresh epoch. A
@@ -4428,6 +4481,11 @@ fn sealing_epoch(
     };
     #[cfg(test)]
     if FRESH_OVER_PREFIX.with(std::cell::Cell::get) && !log.unsettled(newest).is_empty() {
+        return None;
+    }
+    // P1's gate: a newest epoch due a rotation is sealed under by no writer, whatever `Wrap`s of
+    // it this Mac holds (another Mac may have healed it to a Mac a `Remove` here took out).
+    if heads_due(log, opened, newest, &log.removed_recipients()) {
         return None;
     }
     let mine = identity.recipient();
@@ -5448,7 +5506,7 @@ pub(super) fn rotate_host_lists(
     for (hosts, max_ids) in lists {
         let audience = EpochAudience::Hosts(hosts.clone());
         if only.is_some_and(|only| !only.contains(&audience))
-            || !rotates_host_list(opened, &audience, &max_ids, &removed)
+            || !rotates_host_list(log, opened, &audience, &max_ids, &removed)
         {
             continue;
         }
@@ -5472,9 +5530,10 @@ pub(super) fn rotate_host_lists(
 
 /// Whether [`rotate_host_lists`] mints the host list `audience`, whose newest epochs are
 /// `max_ids`, with the log's removed recipients `removed`: this Mac opens every newest epoch
-/// there, and one of them still wraps a removed recipient, two of them are not
+/// there, and one of them is due a rotation ([`heads_due`]), two of them are not
 /// [`secure_twins`], or this Mac reseals the list ([`reseal_ready`]).
 pub(super) fn rotates_host_list(
+    log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     audience: &EpochAudience,
     max_ids: &[RecordId],
@@ -5486,7 +5545,9 @@ pub(super) fn rotates_host_list(
     let concurrent =
         max_ids.len() > 1 && !secure_twins(max_ids, &opened.wrapped_recipients, removed);
     opens_all
-        && (wraps_removed(opened, max_ids, removed) || concurrent || reseal_ready(opened, audience))
+        && (heads_due(log, opened, max_ids, removed)
+            || concurrent
+            || reseal_ready(opened, audience))
 }
 
 /// [`post_records_best_effort`] on a thread of its own, for a caller inside a bounded exchange:
@@ -5906,7 +5967,8 @@ const fn owed_uncarried() -> bool {
 }
 
 /// The audiences a held `Remove` owes a re-key that some Mac can sign: [`Log::rekey_dues`]'
-/// `rotation` (a newest epoch still wraps a recipient the log removed) with a carrier, a current
+/// `rotation` (a newest epoch is due by P1's one rule, [`Log::head_due`]: its gate is shut or it
+/// still wraps a recipient the log removed) with a carrier, a current
 /// seat that holds every newest epoch (the removers are carriers too, and a due with none ranks
 /// nobody, [`crate::membership_log::RekeyDue::turn`]). A due no seat carries owes no room: nobody
 /// signs it (a host list every holder of which the log removed), or only a heal gives it a
@@ -6087,16 +6149,13 @@ fn plan_log_enrollment(
     if *binding.network() != trust.network || *binding.authority() != trust.authority {
         return Err(Error::new("Commons enrollment has another local root"));
     }
-    let membership = log.membership();
-    if membership.removal(&binding.actor()).is_some()
-        || log.recipient_is_removed(&binding.recipient())
-        || matches!(
-            membership.node(binding.writer()),
-            crate::membership_log::NodeStanding::Removed(_)
-        )
-    {
+    // The one removal predicate the peer check judges by, kin included: a Mac that shares its
+    // actor or recipient with a seat holding a node key a removed Mac bound enrolls no more than
+    // it passes a handshake.
+    if log.seat_removed(binding) {
         return Err(Error::new("Commons enrollment recipient was removed"));
     }
+    let membership = log.membership();
     if let Some((actor, existing)) = membership
         .members()
         .iter()
@@ -8245,5 +8304,92 @@ mod tests {
             .map(|gap| gap.member)
             .collect();
         assert_eq!(healed, BTreeSet::from([seats[2].actor]), "m4 is denied");
+    }
+
+    /// The held-wrap leak (one-mesh review item 4, L1). Founders A, W, S and H. A mints
+    /// `[everyone]` epoch E0 wrapped to A, W and H, leaving S out. H holds E0 but not the
+    /// `Remove` below, so S is a current seat E0 omits and H heals it: H's `Wrap` hands E0's key
+    /// to S. Concurrently A removes S. W holds the `Remove` and E0's batch, but neither H's heal
+    /// nor A's re-key. The `Wrap`s W holds of E0 name no removed Mac, so a gate read from them
+    /// lets W seal under E0, which S reads. P1's causal gate keeps E0 due: the `Remove` that took
+    /// S is not in E0's causal past, so W waits for (and the ranked tender mints) an epoch that
+    /// postdates it.
+    ///
+    /// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=held-wrap-gate` judges a newest epoch by
+    /// the `Wrap`s this Mac holds alone (the rule before PF1): W seals under E0 and the asserts
+    /// fail.
+    #[test]
+    fn a_heal_beside_a_remove_never_lets_a_writer_seal_where_the_removed_mac_reads() {
+        let (seats, entrants): (Vec<Seat>, Vec<Entrant>) = (1..=4).map(Seat::new).unzip();
+        let (a, w, s, h) = (&seats[0], &seats[1], &seats[2], &seats[3]);
+        let recipient = |seat: &Seat| seat.identity.recipient();
+        let genesis = Record::found(&[99; 32], entrants, 1_000).expect("genesis");
+        let mut base = Log::new(genesis).expect("log");
+        let (e0, key) = a.mint(
+            &mut base,
+            1_100,
+            EpochAudience::Everyone,
+            1,
+            &[recipient(a), recipient(w), recipient(h)],
+        );
+
+        let mut h_log = base.clone();
+        let gaps = h_log.wrap_gaps(&h.opened(&h_log), &[SeatAudience::Everyone]);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.epoch == e0 && gap.recipient == recipient(s)),
+            "H heals S's omission from the newest epoch"
+        );
+        let heal = h_log
+            .draft_wrap(&h.actor, 1_200, e0, &key, recipient(s))
+            .expect("wrap")
+            .sign(&h.seed, h.incarnation)
+            .expect("sign");
+        h_log.insert(heal).expect("insert heal");
+        let unwrapped = h_log.unwrap_epochs(&s.identity).expect("unwrap");
+        assert_eq!(
+            unwrapped.get(&e0).map(|k| **k),
+            Some(*key),
+            "S reads E0 through H's heal"
+        );
+
+        let mut a_log = base.clone();
+        let cutoff = *a_log.network();
+        let remove = a.sign(
+            &mut a_log,
+            1_200,
+            crate::membership_log::Body::Remove {
+                member: s.actor,
+                cutoff,
+            },
+        );
+        let mut w_log = base;
+        w_log.insert(remove).expect("insert remove");
+        assert!(w_log.recipient_is_removed(&recipient(s)));
+        let opened = w.opened(&w_log);
+        assert!(
+            rotation_due(&w_log, &opened, &EpochAudience::Everyone),
+            "W waits: the Remove of S is not in E0's past"
+        );
+        assert!(
+            w_log
+                .rekey_dues()
+                .iter()
+                .any(|due| due.audience == EpochAudience::Everyone && due.rotation),
+            "E0 is due a rotation on W"
+        );
+        let flight = Flight::of_reader(&w_log, &recipient(w));
+        assert_eq!(
+            sealing_epoch(
+                &w_log,
+                &opened,
+                &[e0],
+                &w.identity,
+                &w_log.current_recipients(&EpochAudience::Everyone),
+                flight.undecided(&EpochAudience::Everyone),
+            ),
+            None,
+            "W seals nothing under E0"
+        );
     }
 }

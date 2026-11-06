@@ -6,6 +6,85 @@ const EVENTUALLY: std::time::Duration = std::time::Duration::from_secs(60);
 const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
 #[test]
+fn account_service_context_carries_the_apps_epoch_and_browser_policy_to_harmless_services() {
+    const ID: &str = "f950f950f950f950f950f950f950f950";
+    const CALLER: &str = "gui-account-service-context";
+    const URL: &str = "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state";
+    let mut app = crate::App::headless_for_test();
+    let serving = AccountServices {
+        lifetime: app.account_work.clone(),
+        interactive_browser: true,
+    };
+    let headless = AccountServices {
+        lifetime: app.account_work.clone(),
+        interactive_browser: false,
+    };
+    app.account_drain = crate::app_account_work::Drain::for_launch(&app.account_work, true);
+    let start = format!("start={ID}");
+    let challenge = format!(
+        "{start} url={}",
+        aterm_agent::harness::open_url::percent_encode(URL)
+    );
+    let open = std::cell::Cell::new(false);
+    let called = std::cell::Cell::new(0);
+    // These callbacks observe the actual shared epoch and preserve the actual request codecs.
+    // They do not implement admission/dedup or invoke any service Run. Agent Book controls
+    // exercise those separately with harmless work, including regression/mutant cases.
+    let renew =
+        |lifetime: &aterm_agent::harness::account_work::Lifetime, caller: &str, rest: &str| {
+            called.set(called.get() + 1);
+            assert_eq!(caller, CALLER);
+            assert_eq!(rest, start);
+            assert!(matches!(
+                aterm_agent::harness::remote_renew::Request::parse(rest),
+                Ok(aterm_agent::harness::remote_renew::Request::Start(_))
+            ));
+            assert_eq!(lifetime.enter().is_some(), open.get());
+            "harmless renewal effect".to_string()
+        };
+    let browser =
+        |lifetime: &aterm_agent::harness::account_work::Lifetime, caller: &str, rest: &str| {
+            called.set(called.get() + 1);
+            assert_eq!(caller, CALLER);
+            assert_eq!(rest, challenge);
+            assert!(matches!(
+                aterm_agent::harness::challenge_relay::Request::parse(rest),
+                Ok(aterm_agent::harness::challenge_relay::Request::Start(_))
+            ));
+            assert_eq!(lifetime.enter().is_some(), open.get());
+            "harmless browser effect".to_string()
+        };
+    for reopened in [false, true] {
+        if reopened {
+            app.resume_drained_accounts();
+            open.set(true);
+        }
+        assert_eq!(
+            serving.renew_with(CALLER, &start, renew),
+            "harmless renewal effect"
+        );
+        assert_eq!(
+            serving.challenge_with(CALLER, &challenge, browser),
+            "harmless browser effect"
+        );
+        let before = called.get();
+        assert_eq!(
+            headless
+                .challenge_with(CALLER, &challenge, browser)
+                .split_ascii_whitespace()
+                .next(),
+            Some("ERR")
+        );
+        assert_eq!(
+            called.get(),
+            before,
+            "lifecycle reopening never grants browser authority"
+        );
+    }
+    assert_eq!(called.get(), 4);
+}
+
+#[test]
 fn recognized_scoped_connections_cannot_use_owner_or_person_input_adapters() {
     let h = crate::session_store::test_handle_on(7620, -1);
     crate::session_timeline::scoped_input_tests::install(
@@ -6247,6 +6326,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         "LiftHold",
         "ToggleStatsLens",
         "RecordUnseenKeys",
+        "ChangeNickname",
     ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");

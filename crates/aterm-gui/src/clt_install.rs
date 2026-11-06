@@ -77,7 +77,8 @@ pub(crate) enum Install {
 }
 
 impl Install {
-    /// A pass ended waiting on the tools: wanted, unless its tab already opened.
+    /// A fixture injects a revision's want, unless its tab already opened.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn asked(self, revision: u64) -> Self {
         match self {
@@ -99,7 +100,8 @@ impl Install {
         }
     }
 
-    /// A pass no longer waits on them. It cannot withdraw a newer run's request.
+    /// A fixture withdraws a revision's want without withdrawing a newer request.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn withdrawn_by(self, revision: u64) -> Self {
         match self {
@@ -666,17 +668,6 @@ pub(crate) fn read_root_steps() {
         });
     if let Err(error) = read {
         aterm_log::warn!("System State: the elevation's steps were not read: {error}");
-    }
-}
-
-/// Tell the window whether the setup pass that just ended waits on Apple's Command Line Tools
-/// (`wanted`), with that pass's exact `revision`: the setup run's hook
-/// (`aterm_cli::macos_doctor::SetupHooks::developer_tools`), called from its worker.
-pub fn offer_developer_tools_install(revision: u64, wanted: bool) {
-    if !crate::workstation_setup::send_setup_wake(Wake::DeveloperToolsInstall(revision, wanted))
-        && wanted
-    {
-        aterm_log::info!("System State: no window to install the Command Line Tools in");
     }
 }
 
@@ -1529,6 +1520,22 @@ impl App {
         true
     }
 
+    /// The Apple-window card's Go to installer: Apple's own Command Line Tools installer window,
+    /// already open, comes to the front ([`probe::apple_installer_pid`], read at the press). It
+    /// only goes there: it starts no install and asks for no permission. `false` when that window
+    /// is no longer open, or macOS did not bring it forward.
+    pub(crate) fn go_to_developer_tools_installer(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::platform::AppRt as _;
+            probe::apple_installer_pid().is_some_and(|pid| self.apprt.activate_instance(pid))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     /// The launch's first look: what the want keeps ([`Self::settle_developer_tools_want`]: the
     /// account's reading, the Low Data Mode watch, the shim), and a want that is due opens its
     /// tab. A launch that found the tools missing wants them from its setup host's start
@@ -1627,8 +1634,9 @@ impl App {
         !setup.developer_tools_shim.tools_present() || setup.developer_tools_root_owed
     }
 
-    /// A setup pass ended waiting on the Command Line Tools (`wanted`), or not
-    /// ([`offer_developer_tools_install`]).
+    /// Inject a revision-bound want for installer custody and Stop fixtures. Live automatic
+    /// wants come from the launch's tools reading or the independent root-step probe.
+    #[cfg(test)]
     pub(crate) fn want_developer_tools_install(&mut self, revision: u64, wanted: bool) {
         let install = &mut self.workstation_setup.developer_tools;
         *install = if wanted {

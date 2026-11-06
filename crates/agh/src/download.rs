@@ -238,18 +238,30 @@ impl Part {
         })
     }
 
-    fn closed(&self) -> Error {
-        Error::local(format!("{}: the part file is closed", self.path.display()))
+    fn closed(path: &Path) -> Error {
+        Error::local(format!("{}: the part file is closed", path.display()))
     }
 
+    #[cfg(test)]
     fn file(&mut self) -> Result<&mut File> {
-        let closed = self.closed();
-        self.file.as_mut().ok_or(closed)
+        Ok(self.path_and_file()?.1)
+    }
+
+    fn path_and_file(&mut self) -> Result<(&Path, &mut File)> {
+        // Split the borrow by field: stable rustc rejects an early return
+        // that reads `self` while `self.file` is borrowed mutably (Trust's
+        // borrow checker accepts it), and the release's x86_64 slice builds
+        // with stable.
+        let Self { path, file, .. } = self;
+        match file.as_mut() {
+            Some(file) => Ok((path.as_path(), file)),
+            None => Err(Self::closed(path)),
+        }
     }
 
     fn durable(&self) -> Result<()> {
         let Some(file) = &self.file else {
-            return Err(self.closed());
+            return Err(Self::closed(&self.path));
         };
         aterm_durable::durable(file).map_err(|e| local("cannot make durable", &self.path, &e))
     }
@@ -321,10 +333,8 @@ pub(crate) fn stream_to_file(
     refuse_part_name(dest)?;
     refuse_non_file(dest)?;
     let mut part = Part::create(dest)?;
-    let path = part.path.clone();
-    let written = copy(body, part.file()?, seen, &|e| {
-        local("cannot write", &path, e)
-    })?;
+    let (path, file) = part.path_and_file()?;
+    let written = copy(body, file, seen, &|e| local("cannot write", path, e))?;
     part.durable()?;
     refuse_non_file(dest)?;
     part.finish(dest)?;
@@ -553,9 +563,9 @@ fn fetch_inner(
     let mut seen = |chunk: &[u8]| hasher.update(chunk);
     let bytes = match &mut into {
         Dest::File { part, .. } => {
-            let path = part.path.clone();
-            copy(&mut body, part.file()?, &mut seen, &|e| {
-                local("cannot write", &path, e)
+            let (path, file) = part.path_and_file()?;
+            copy(&mut body, file, &mut seen, &|e| {
+                local("cannot write", path, e)
             })?
         }
         Dest::Memory(data) => copy(&mut body, data, &mut seen, &|e| {

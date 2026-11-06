@@ -122,6 +122,10 @@ pub enum PhraseOutcome {
     /// The try stopped before it said what the phrase came to (its worker ended): it may not
     /// have sent the phrase, so the words stay and Join tries again.
     Stopped,
+    /// A rotation dropped this Mac from its vault: no member was asked with its key, which they
+    /// refuse, so no phrase lets it in and none is pressed Allow again for; it comes back as a
+    /// new Mac (one-mesh E2, f299). The words are spent with it.
+    Dropped,
 }
 
 /// What the worker of a phrase typed on the Secrets vault row says of it
@@ -1728,6 +1732,14 @@ impl App {
                 let _ = self.take_system_state_press();
                 if !self.go_to_developer_tools_tab() {
                     aterm_log::info!("system state: Go to tab found no Mac Setup tab");
+                }
+            }
+            SystemStateAction::GoToToolsInstaller => {
+                let _ = self.take_system_state_press();
+                if !self.go_to_developer_tools_installer() {
+                    aterm_log::info!(
+                        "system state: Go to installer brought no Apple installer window forward"
+                    );
                 }
             }
             SystemStateAction::CopyCommand { command, by_person } => {

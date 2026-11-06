@@ -106,8 +106,8 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
 fn intern(s: &str) -> &'static str {
     static NAMES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
         std::sync::OnceLock::new();
-    let mut names = NAMES
-        .get_or_init(Default::default)
+    let interned_names = NAMES.get_or_init(Default::default);
+    let mut names = interned_names
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(found) = names.get(s) {

@@ -221,7 +221,26 @@ fn ensure_identity(dir: &Path) -> Result<([u8; 32], Actor)> {
         Err(PrivateFileError::Missing) => {
             let generated = zeroize::Zeroizing::new(crypto::random::<48>()?);
             private_file::write_private(dir, IDENTITY, &*generated)?;
-            identity(dir)
+            parse_identity(&*generated)
+        }
+        Err(_) => Err(Error::new(
+            "existing database state is not a private regular file",
+        )),
+    }
+}
+fn ensure_identity_in(judged: &private_file::JudgedDir, dir: &Path) -> Result<([u8; 32], Actor)> {
+    match judged.read(IDENTITY, 4096) {
+        Ok(bytes) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            if bytes.len() > 48 {
+                return Err(Error::new("local database identity missing or not private"));
+            }
+            parse_identity(&bytes)
+        }
+        Err(PrivateFileError::Missing) => {
+            let generated = zeroize::Zeroizing::new(crypto::random::<48>()?);
+            private_file::write_private(dir, IDENTITY, &*generated)?;
+            parse_identity(&*generated)
         }
         Err(_) => Err(Error::new(
             "existing database state is not a private regular file",
@@ -323,7 +342,7 @@ pub fn ensure_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<()> {
         }
         return Ok(());
     }
-    let (seed, actor) = ensure_identity(dir)?;
+    let (seed, actor) = ensure_identity_in(&judged, dir)?;
     Credentials {
         capability: Capability::issue(&keys.manifest, &keys.root_seed, actor)?,
         manifest: keys.manifest.clone(),
@@ -555,7 +574,8 @@ impl Database {
             ));
         }
         let opened = crypto::open(&self.credentials.manifest, &self.credentials.key, wire)?;
-        if self.history.wire(&opened.header.id).is_some() {
+        let id = opened.header.id;
+        if self.history.wire(&id).is_some() {
             return Ok(false);
         }
         let mut proposed = self.history.clone();
@@ -598,8 +618,7 @@ impl Database {
             }
         };
         self.history = proposed;
-        self.receipts
-            .insert(aterm_digest::Sha256::digest(wire), (received_at, appended));
+        self.receipts.insert(id, (received_at, appended));
         Ok(true)
     }
     /// Author a durable transaction, retrying its previously stored request identity.
@@ -616,22 +635,22 @@ impl Database {
                 "this dataset has no authority stream, so no member can stop a key for good; delete the row instead",
             ));
         }
+        let control = command.is_control();
+        let control_capability = if control {
+            Some(Capability::control(
+                &self.credentials.manifest,
+                self.credentials.root_seed.as_ref().ok_or_else(|| {
+                    Error::new("this replica does not hold administrative signing authority")
+                })?,
+            )?)
+        } else {
+            None
+        };
+        let actor = control_capability
+            .as_ref()
+            .map_or(self.credentials.capability.actor, |c| c.actor);
+        let mut encoded_command: Option<Vec<u8>> = None;
         loop {
-            let control = command.is_control();
-            let control_capability = if control {
-                Some(Capability::control(
-                    &self.credentials.manifest,
-                    self.credentials.root_seed.as_ref().ok_or_else(|| {
-                        Error::new("this replica does not hold administrative signing authority")
-                    })?,
-                )?)
-            } else {
-                None
-            };
-            let capability = control_capability
-                .as_ref()
-                .unwrap_or(&self.credentials.capability);
-            let actor = capability.actor;
             let view = self.view();
             if let Some(id) = self.history.retry(&actor, &command)? {
                 // A valid debit remains liability evidence when one of its catalog
@@ -741,24 +760,32 @@ impl Database {
                 parents.insert(previous);
             }
             let parents: Vec<_> = parents.into_iter().collect();
-            let plaintext = command.encode()?;
-            if Command::decode(&plaintext)? != command {
-                return Err(Error::new(
-                    "database command encoding would change its meaning",
-                ));
-            }
+            let command_bytes = match &encoded_command {
+                Some(bytes) => bytes.as_slice(),
+                None => {
+                    let bytes = command.encode()?;
+                    if Command::decode(&bytes)? != command {
+                        return Err(Error::new(
+                            "database command encoding would change its meaning",
+                        ));
+                    }
+                    encoded_command.insert(bytes).as_slice()
+                }
+            };
             if let Command::Revoke { actor: revoked, .. } = &command
                 && *revoked == actor
             {
                 return Err(Error::new("authority stream cannot revoke itself"));
             }
+            let merge_bytes;
             let plaintext = if joining {
-                Command::Merge {
+                merge_bytes = Command::Merge {
                     request: crypto::random()?,
                 }
-                .encode()?
+                .encode()?;
+                merge_bytes.as_slice()
             } else {
-                plaintext
+                command_bytes
             };
             let wire = crypto::seal(
                 &self.credentials.manifest,
@@ -771,13 +798,15 @@ impl Database {
                 } else {
                     &self.credentials.seed
                 },
-                capability,
+                control_capability
+                    .as_ref()
+                    .unwrap_or(&self.credentials.capability),
                 crypto::Causal {
                     sequence,
                     previous,
                     parents: &parents,
                 },
-                &plaintext,
+                plaintext,
             )?;
             let id = aterm_digest::Sha256::digest(&wire);
             self.ingest(&wire)?;
@@ -827,10 +856,12 @@ impl Database {
         if !view.causal.ordered.contains(&operation) || view.invalid.contains(&operation) {
             return Err(Error::new("target is pending, refused or quarantined"));
         }
+        let mut keys = Vec::with_capacity(affected.len());
         for change in affected {
+            let key = (change.collection.clone(), change.key.clone());
             let cell = view
                 .cells
-                .get(&(change.collection.clone(), change.key.clone()))
+                .get(&key)
                 .ok_or_else(|| Error::new("target is no longer current"))?;
             if cell.stopped
                 || cell.candidates.len() != 1
@@ -840,21 +871,20 @@ impl Database {
                     "another edit changed an affected key; resolve it before reverting",
                 ));
             }
+            keys.push(key);
         }
         let past = self.history.before(&operation)?;
-        let mut changes = Vec::with_capacity(affected.len());
-        for change in affected {
-            let previous = past
-                .cells
-                .get(&(change.collection.clone(), change.key.clone()));
+        let mut changes = Vec::with_capacity(keys.len());
+        for key in keys {
+            let previous = past.cells.get(&key);
             if previous.is_some_and(|c| c.stopped || c.candidates.len() > 1) {
                 return Err(Error::new(
                     "target's previous value is stopped or conflicted; explicit resolution is required",
                 ));
             }
             changes.push(Change {
-                collection: change.collection.clone(),
-                key: change.key.clone(),
+                collection: key.0,
+                key: key.1,
                 value: previous
                     .and_then(|c| c.candidates.first())
                     .map(|c| c.value.clone())

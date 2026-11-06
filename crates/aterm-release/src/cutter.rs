@@ -642,12 +642,8 @@ fn head(git: &dyn GitRunner) -> Option<String> {
 }
 
 fn dep_info_sources(text: &str, target: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
-    let same = |a: &Path| {
-        matches!(
-            (fs::canonicalize(a), fs::canonicalize(target)),
-            (Ok(a), Ok(target)) if a == target
-        )
-    };
+    let resolved_target = fs::canonicalize(target).ok()?;
+    let same = |a: &Path| fs::canonicalize(a).is_ok_and(|a| a == resolved_target);
     text.lines().find_map(|line| {
         let words = split_escaped(line);
         let (first, rest) = words.split_first()?;
@@ -743,10 +739,14 @@ fn checkout_sources(sources: Vec<PathBuf>, root: &Path, targets: &[&Path]) -> Ve
 fn build_inputs(sources: &[PathBuf], root: &Path) -> Vec<PathBuf> {
     let inside = |folder: &&Path| folder.starts_with(root);
     let own = root.join(OWN_CRATE);
-    let packages = sources.iter().filter_map(|source| {
-        source
+    let parents: BTreeSet<&Path> = sources
+        .iter()
+        .filter_map(|source| source.parent())
+        .filter(inside)
+        .collect();
+    let packages = parents.into_iter().filter_map(|parent| {
+        parent
             .ancestors()
-            .skip(1)
             .take_while(inside)
             .find(|folder| fs::symlink_metadata(folder.join("Cargo.toml")).is_ok())
     });
@@ -928,14 +928,14 @@ fn changed_after(paths: &[PathBuf], since: Since) -> Option<String> {
 /// `since`, so an entry was added to it or removed from it since, which may have been `input`
 /// or a folder that held it.
 fn removed_after(input: &Path, since: Since) -> Option<String> {
-    let Some(folder) = input
+    let Some((folder, meta)) = input
         .ancestors()
         .skip(1)
-        .find(|folder| fs::symlink_metadata(folder).is_ok())
+        .find_map(|folder| Some((folder, fs::symlink_metadata(folder).ok()?)))
     else {
         return Some(format!("no folder above {} is there", input.display()));
     };
-    match fs::symlink_metadata(folder).and_then(|meta| meta.modified()) {
+    match meta.modified() {
         Ok(modified) if modified <= since.at() => None,
         Ok(_) => Some(format!(
             "{} changed after {}, and {} is not there: it may have been removed since",

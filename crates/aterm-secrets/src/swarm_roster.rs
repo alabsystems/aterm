@@ -1154,8 +1154,9 @@ pub struct Newcomer<'a> {
 /// 3. Otherwise inspects `leading_m_label(newcomer.requested_host)`:
 ///    - Never assigns a label in `policy.effective_reserved` (`m3`, stewards), `deny_labels`,
 ///      or already held (as label or alias) by a member.
-///    - If `m<N>` is named in `sheet` and held by no member, assigns provisional `next_free`
-///      and records a 24 h claim on `m<N>`.
+///    - If `m<N>` is named in `sheet`, or a live member (one the vault names, not denied)
+///      claims it, and no member holds it, assigns provisional `next_free` and records a 24 h
+///      claim on `m<N>` (two claimants promote neither: [`promote_due_claims`]).
 ///    - If `m<N>` is completely free, keeps `m<N>`.
 ///    - Otherwise (including non-`m<N>` names like `Mac-mini-M4`), assigns `next_free`
 ///      strictly above every `m<N>` in sheet, members, reserved policy, and `bonjour_hosts`.
@@ -1192,14 +1193,29 @@ pub fn assign_newcomer(
     let active_recipients: BTreeSet<String> =
         doc.machines().into_iter().map(|m| m.recipient).collect();
 
+    let live = |m: &SwarmMember| {
+        !roster.is_member_denied(m)
+            && (active_recipients.contains(&m.recipient) || m.recipient == newcomer.recipient)
+    };
     let held_labels: BTreeSet<String> = roster
         .members
         .iter()
-        .filter(|m| {
-            !roster.is_member_denied(m)
-                && (active_recipients.contains(&m.recipient) || m.recipient == newcomer.recipient)
-        })
+        .filter(|m| live(m))
         .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
+        .collect();
+    // A label a live row claims is under that claim's 24 h hold, whether or not the sheet still
+    // names its number: asking for it joins the claim, as asking for one the sheet names does,
+    // and never takes it outright.
+    let claimed_labels: BTreeSet<String> = roster
+        .members
+        .iter()
+        .filter(|m| live(m))
+        .filter_map(|m| {
+            m.claimed_label
+                .as_deref()
+                .and_then(leading_m_label)
+                .map(|(_, claimed)| claimed)
+        })
         .collect();
 
     let mut claimed_label = None;
@@ -1210,7 +1226,7 @@ pub fn assign_newcomer(
                 && !roster.is_label_denied(&wanted)
                 && !held_labels.contains(&wanted) =>
         {
-            if sheet.numbers.contains(&n) {
+            if sheet.numbers.contains(&n) || claimed_labels.contains(&wanted) {
                 let provisional = next_free_number(roster, doc, &reserved, sheet, bonjour_hosts);
                 claimed_label = Some(wanted);
                 claimed_at_ms = Some(newcomer.now_ms);
@@ -1951,5 +1967,84 @@ email = "one@example.org"
             next_assigned, "m73",
             "denied row's forged claimed_label m999 must not inflate next_free_number: {next_assigned}"
         );
+    }
+
+    /// A label a live row claims under its 24 h hold is not handed to a later Mac that asks for
+    /// it once the sheet no longer names its number: the later Mac joins the claim, and two
+    /// claimants promote neither. Control: the claim of a Mac the vault does not name holds
+    /// nothing, and the later Mac takes the label.
+    #[test]
+    fn a_label_under_a_live_claim_is_joined_not_taken_by_a_later_mac() {
+        let r_admin = Identity::generate().unwrap().recipient().to_bech32();
+        let policy = SwarmPolicy::default();
+        let mut naming_15 = SheetHints::default();
+        naming_15.numbers.insert(15);
+        let not_naming = SheetHints::default();
+        for (live, takes) in [(true, false), (false, true)] {
+            let r_early = Identity::generate().unwrap().recipient().to_bech32();
+            let r_late = Identity::generate().unwrap().recipient().to_bech32();
+            let mut doc = Document::new_vault("m1", &r_admin);
+            if live {
+                doc.add_machine("early", &r_early).unwrap();
+            }
+            doc.add_machine("late", &r_late).unwrap();
+            let mut roster = SwarmRoster {
+                deny_labels: Vec::new(),
+                deny_nodes: Vec::new(),
+                members: vec![SwarmMember {
+                    recipient: r_admin.clone(),
+                    vault_name: "m1".to_owned(),
+                    label: "m1".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    hw_hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: None,
+                }],
+            };
+            let ask = |roster: &mut SwarmRoster, sheet: &SheetHints, recipient: &str, at| {
+                assign_newcomer(
+                    roster,
+                    &doc,
+                    &policy,
+                    sheet,
+                    &[],
+                    Newcomer {
+                        recipient,
+                        requested_host: "m15",
+                        vault_name: if recipient == r_early {
+                            "early"
+                        } else {
+                            "late"
+                        },
+                        now_ms: at,
+                    },
+                )
+            };
+            assert_eq!(ask(&mut roster, &naming_15, &r_early, 5_000), "m16");
+            let claim = |roster: &SwarmRoster, recipient: &str| {
+                roster
+                    .member_by_recipient(recipient)
+                    .unwrap()
+                    .claimed_label
+                    .clone()
+            };
+            assert_eq!(claim(&roster, &r_early).as_deref(), Some("m15"));
+            let late = ask(&mut roster, &not_naming, &r_late, 5_500);
+            assert_eq!(late == "m15", takes, "live {live}: {late}");
+            if live {
+                assert_eq!(claim(&roster, &r_late).as_deref(), Some("m15"));
+                assert!(!promote_due_claims(
+                    &mut roster,
+                    &doc,
+                    &policy,
+                    &not_naming,
+                    5_500 + SHEET_CLAIM_HOLD_MS
+                ));
+            }
+        }
     }
 }

@@ -1242,11 +1242,7 @@ impl App {
         wid: crate::WindowId,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.a11y.is_none() || !ws.a11y_active)
-        {
+        if self.windows.get(&wid).is_none_or(|ws| !ws.a11y_active) {
             return;
         }
         let has_overlay = self
@@ -1280,6 +1276,8 @@ impl App {
         if ws.native_a11y_published.is_none() {
             ws.native_a11y_staged = None;
         }
+        #[cfg(test)]
+        ws.a11y_sent.push(update.clone());
         let Some(adapter) = ws.a11y.as_mut() else {
             return;
         };
@@ -1297,11 +1295,20 @@ impl App {
             .is_none()
             .then(|| self.active_visible_leaf_plan(wid))
             .flatten();
-        let panes = frame_plan
-            .or(initial_plan.as_ref())
+        let plan = frame_plan.or(initial_plan.as_ref());
+        let composed = plan.is_some_and(|plan| self.cells_composed_under(wid, plan));
+        let panes = plan
+            .filter(|_| composed)
             .map(|plan| self.grid_a11y_panes(wid, plan))
             .unwrap_or_default();
-        let snap = if !panes.is_empty() {
+        let snap = if !composed {
+            crate::accessibility::AccessibleSnapshot {
+                text: String::new(),
+                rows: 0,
+                cols: usize::from(self.windows.get(&wid)?.cols),
+                cursor: None,
+            }
+        } else if !panes.is_empty() {
             self.windows
                 .get(&wid)
                 .filter(|ws| !ws.input_scratch.cells.is_empty())
@@ -1455,8 +1462,43 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Note that a frame just composed `wid`'s cells under `plan`.
+    #[cfg(a11y_tree)]
+    pub(crate) fn note_cells_composed(
+        &mut self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        let chrome_rows = self.chrome_rows(wid);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.composed_layout.record(plan, chrome_rows);
+        }
+    }
+
+    #[cfg(not(a11y_tree))]
+    #[inline]
+    pub(crate) fn note_cells_composed(
+        &mut self,
+        _wid: crate::WindowId,
+        _plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+    }
+
+    /// Whether `wid`'s composed cells were cut under `plan`, so its rects read what they name.
+    #[cfg(a11y_tree)]
+    fn cells_composed_under(
+        &self,
+        wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| ws.composed_layout.holds(plan, self.chrome_rows(wid)))
+    }
+
     /// Window `wid`'s mixed-tab tree `update` with the terminal leaves of `plan` beside its
-    /// native leaves, each one terminal document sliced from the composed cells.
+    /// native leaves, each one terminal document sliced from the composed cells. Cells a frame of
+    /// this layout has not composed say nothing of these leaves, which join with that frame.
     #[cfg(a11y_tree)]
     pub(crate) fn with_mixed_terminal_panes(
         &self,
@@ -1464,11 +1506,7 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         mut update: aterm_a11y::model::TreeUpdate,
     ) -> Result<aterm_a11y::model::TreeUpdate, String> {
-        if self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| ws.input_scratch.cells.is_empty())
-        {
+        if !self.cells_composed_under(wid, plan) {
             return Ok(update);
         }
         let panes: Vec<_> = plan

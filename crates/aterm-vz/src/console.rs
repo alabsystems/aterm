@@ -153,12 +153,13 @@ impl Console {
             return None;
         }
         self.lines += 1;
-        if self.seen.insert(key.clone()) {
+        if !self.seen.contains(&key) {
             if self.seen_order.len() == SEEN_LINES
                 && let Some(oldest) = self.seen_order.pop_front()
             {
                 self.seen.remove(&oldest);
             }
+            self.seen.insert(key.clone());
             self.seen_order.push_back(key);
             self.last_progress = Some(now);
         } else {
@@ -168,12 +169,14 @@ impl Console {
         if self.tail.len() == TAIL_LINES {
             self.tail.pop_front();
         }
-        self.tail.push_back(text.clone());
-        if !self.panicked && line.contains(PANIC) {
+        let panic = if !self.panicked && line.contains(PANIC) {
             self.panicked = true;
-            return Some(Seen::Panic(text));
-        }
-        None
+            Some(Seen::Panic(text.clone()))
+        } else {
+            None
+        };
+        self.tail.push_back(text);
+        panic
     }
 
     /// When the last line no earlier line matched arrived.

@@ -31,6 +31,158 @@ fn complete_input_keeps_both_outputs_and_the_direct_status() {
 }
 
 #[test]
+fn scoped_input_capture_preserves_complete_natural_output() {
+    let mut cmd = shell("printf out; printf err >&2; exit 7");
+    let out = output_with_input_until_watching(
+        &mut cmd,
+        Secret::from_vec(Vec::new()),
+        Instant::now() + HANG,
+        16,
+        || false,
+    )
+    .expect("complete capture")
+    .expect("not cancelled");
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout, b"out");
+    assert_eq!(out.stderr, b"err");
+}
+
+#[test]
+fn scoped_input_capture_stops_or_unwinds_only_after_retiring_its_owned_root() {
+    for panic in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "uds-input-stop-{}-{panic}.noindex",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let witness = dir.join("pid");
+        let _ = std::fs::remove_file(&witness);
+        let mut cmd = shell("printf '%s\\n' \"$$\" > \"$0\"; exec \"$1\" 600");
+        cmd.arg(&witness)
+            .arg(super::super::stand_in(std::path::Path::new("/bin/sleep")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            output_with_input_until_watching(
+                &mut cmd,
+                Secret::from_vec(vec![b'z'; 256 * 1024]),
+                Instant::now() + HANG,
+                16,
+                || {
+                    if !std::fs::read_to_string(&witness)
+                        .ok()
+                        .is_some_and(|line| line.trim().parse::<i32>().is_ok())
+                    {
+                        return false;
+                    }
+                    assert!(!panic, "synthetic stop callback unwind");
+                    true
+                },
+            )
+        }));
+        // The witness is from this actual owned child's successful shell execution.
+        let pid = std::fs::read_to_string(&witness)
+            .expect("child executed")
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let presence = crate::process::process_presence(pid);
+        std::fs::remove_dir_all(&dir).unwrap();
+        if panic {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().expect("stopped capture").is_none());
+        }
+        assert_eq!(presence, crate::process::ProcessPresence::Absent);
+    }
+}
+
+#[test]
+fn preclosed_input_scope_never_spawns() {
+    let mut cmd = crate::spawnfd::command("/no-such-owned-input-program");
+    assert!(
+        output_with_input_until_watching(
+            &mut cmd,
+            Secret::from_vec(Vec::new()),
+            Instant::now() + HANG,
+            16,
+            || true,
+        )
+        .expect("closed before spawn")
+        .is_none()
+    );
+}
+
+#[test]
+fn uncertain_input_wait_retains_the_original_caller_lock_until_actual_reap() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    for fault in [false, true] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("caller.lock");
+        let lock = crate::file_lock::LockFile::take(&path, Instant::now(), "busy").unwrap();
+        let retained = Arc::new(AtomicBool::new(true));
+        struct CallerResource(Arc<AtomicBool>);
+        impl Drop for CallerResource {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let resource = CallerResource(retained.clone());
+        let mut command =
+            crate::spawnfd::command(super::super::stand_in(std::path::Path::new("/bin/sleep")));
+        let child = command.arg("600").process_group(0).spawn().unwrap();
+        let (notice, event) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let _lock = lock;
+                let _resource = resource;
+                let mut run = Run {
+                    child,
+                    input: None,
+                    to_child: None,
+                    sent: 0,
+                    reaped: false,
+                };
+                let mut calls = 0;
+                run.settle_with(|child| {
+                    calls += 1;
+                    if fault && calls == 1 {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    if fault && calls == 2 {
+                        notice.send(false).unwrap();
+                        gate.recv_timeout(HANG).unwrap();
+                    }
+                    child.wait()
+                });
+                let reaped = run.reaped && run.child.is_reaped();
+                drop(run);
+                drop(_resource);
+                drop(_lock);
+                notice.send(true).unwrap();
+                reaped
+            })
+            .unwrap();
+        let returned = event.recv_timeout(HANG);
+        let resource_retained = retained.load(Ordering::Acquire);
+        let locked = crate::file_lock::LockFile::take(&path, Instant::now(), "busy").is_err();
+        // Always release the real worker before assertions, including an unexpected early return.
+        let _ = release.send(());
+        let reaped = worker.join().expect("owned worker joined");
+        let returned = returned.expect("wait retry or completion");
+        assert_eq!(returned, !fault);
+        assert_eq!(resource_retained, fault);
+        assert_eq!(locked, fault);
+        assert!(reaped, "the successful wait was the actual Child::wait");
+        assert!(!retained.load(Ordering::Acquire));
+        assert!(crate::file_lock::LockFile::take(&path, Instant::now(), "busy").is_ok());
+    }
+}
+
+#[test]
 fn early_input_close_preserves_the_direct_exit_instead_of_broken_pipe() {
     let mut cmd = shell("exit 67");
     let out = output_with_input_until(

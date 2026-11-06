@@ -63,6 +63,17 @@ pub(super) fn live_client() -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Environment, BUDGET)
 }
 
+/// Whether `endpoint` is one path (and query) on the API origin it is appended to: it starts
+/// with one `/` and holds printable ASCII alone, with no `#` and no `\`, which a URL parser
+/// may read as `/` and so as the start of another host.
+pub(super) fn one_path(endpoint: &str) -> bool {
+    endpoint.starts_with('/')
+        && !endpoint.starts_with("//")
+        && endpoint
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'#' | b'\\'))
+}
+
 /// Send `method endpoint` to `origin` carrying `token`, with `body` as JSON when it is given.
 /// # Errors
 /// An endpoint that is not one absolute path, a request that failed or was cut short, an
@@ -75,12 +86,7 @@ pub(super) fn send(
     endpoint: &str,
     body: Option<&[u8]>,
 ) -> Result<GithubResponse, String> {
-    if !endpoint.starts_with('/')
-        || endpoint.starts_with("//")
-        || endpoint
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'#')
-    {
+    if !one_path(endpoint) {
         return Err("invalid GitHub API endpoint".into());
     }
     let mut header = Vec::with_capacity(7 + token.bytes().len());
@@ -411,6 +417,8 @@ mod tests {
             "/user\r\nX-Injected: 1",
             "/user keys",
             "/user#fragment",
+            "/\\elsewhere.invalid/user",
+            "/user/\u{e9}",
             "user",
             "",
         ];

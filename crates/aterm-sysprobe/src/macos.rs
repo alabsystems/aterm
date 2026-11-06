@@ -593,6 +593,11 @@ pub(crate) fn machine_model() -> Option<String> {
     sysctl_text(c"hw.model")
 }
 
+/// [`crate::os_build`] on macOS: `kern.osversion`.
+pub(crate) fn os_build() -> Option<String> {
+    sysctl_text(c"kern.osversion")
+}
+
 /// [`crate::machine_words`] on macOS: `machdep.cpu.brand_string` and `kern.osproductversion`.
 pub(crate) fn machine_words() -> crate::MachineWords {
     crate::MachineWords {

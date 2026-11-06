@@ -1207,7 +1207,7 @@ const fn setup_word(subject: Subject) -> &'static str {
     }
 }
 
-/// The one quiet signal (§3.6, pure): `System State: <row> needs you`, from the managed rows
+/// The one quiet signal (§3.6, pure): `System State: Needs you: <row>`, from the managed rows
 /// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
 /// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
 /// failed`) once nothing tries it again by itself (§3.5); a Check's result never does, since a
@@ -1277,7 +1277,7 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
     failed.extend(restore);
     let label = match (needs.as_slice(), failed.as_slice()) {
         ([], []) => return None,
-        ([one], []) => format!("System State: {} needs you", one.name()),
+        ([one], []) => format!("System State: Needs you: {}", one.name()),
         ([], [Some(one)]) => format!("System State: {} failed", one.name()),
         ([], [None]) => "System State: 1 step failed".to_owned(),
         (needs, []) => format!("System State: {} need you", needs.len()),

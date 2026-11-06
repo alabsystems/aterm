@@ -83,7 +83,7 @@ impl Fixture {
     fn queue_claude(
         &self,
         guard: &Arc<Mutex<AutoRenewGuard>>,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         run: RunAttempt,
     ) -> RenewalDispatch {
         let opener = self.home.join(".local/bin/aterm-open-url");
@@ -95,9 +95,10 @@ impl Fixture {
         #[cfg(not(unix))]
         fs::write(opener, b"inert opener fixture").unwrap();
         let ladder = LadderCtx {
+            scope: None,
             roster_path: self.path.clone(),
             find_browser: &|_| true,
-            vault_sync: |_| super::super::sign_in_ladder::Vault::NotMember,
+            vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_| panic!("no vault in an explicit selection"),
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::None, None),
             log: Arc::new(|_| {}),
@@ -121,6 +122,7 @@ impl Fixture {
             guard,
             spawn,
             Some(&ladder),
+            None,
         )
     }
 }
@@ -348,6 +350,7 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
             panic!("unreadable sign-in lock cannot dispatch authentication")
         };
         let fx = UpkeepEffects {
+            scope: None,
             renew_guard: &guard,
             spawn_renewal: &refuse,
             ..live_effects()
@@ -510,7 +513,8 @@ fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
                 fixture.request.clone(),
                 NOW,
                 &guard,
-                &spawn
+                &spawn,
+                None,
             ),
             RenewalDispatch::Started
         );

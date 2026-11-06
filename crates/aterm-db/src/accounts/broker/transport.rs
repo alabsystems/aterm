@@ -90,7 +90,8 @@ impl Endpoint {
     }
 
     fn current(&self) -> io::Result<()> {
-        if socket_identity(self.path.parent().ok_or_else(refused)?)? != self.identity {
+        if socket_identity_at(self.path.parent().ok_or_else(refused)?, &self.path)? != self.identity
+        {
             return Err(refused());
         }
         Ok(())
@@ -206,10 +207,11 @@ impl AdapterReply {
 /// about whether an earlier or this request reached the provider.
 pub fn call_until(dir: &Path, call: Call<'_>, deadline: Instant) -> io::Result<Reply> {
     let deadline = cap_deadline(deadline);
-    let identity = socket_identity(dir)?;
-    let mut stream = aterm_uds::connect::until(&dir.join(NAME), deadline)?;
+    let socket_path = dir.join(NAME);
+    let identity = socket_identity_at(dir, &socket_path)?;
+    let mut stream = aterm_uds::connect::until(&socket_path, deadline)?;
     same_user(&stream)?;
-    if socket_identity(dir)? != identity {
+    if socket_identity_at(dir, &socket_path)? != identity {
         return Err(refused());
     }
     stream.set_nonblocking(true)?;
@@ -218,9 +220,14 @@ pub fn call_until(dir: &Path, call: Call<'_>, deadline: Instant) -> io::Result<R
         return Err(timed_out());
     }
     let header = request_header(call.token, call.logical, call.adapter, call.payload, millis)?;
-    write_all(&mut stream, header.as_ref(), deadline)?;
-    write_all(&mut stream, call.adapter.as_bytes(), deadline)?;
-    write_all(&mut stream, call.payload, deadline)?;
+    let mut prefix = Zeroizing::new([0u8; HEADER + 64]);
+    prefix[..HEADER].copy_from_slice(header.as_ref());
+    let prefix_len = HEADER + call.adapter.len();
+    prefix[HEADER..prefix_len].copy_from_slice(call.adapter.as_bytes());
+    write_all(&mut stream, &prefix[..prefix_len], deadline)?;
+    if !call.payload.is_empty() {
+        write_all(&mut stream, call.payload, deadline)?;
+    }
     stream.shutdown(Shutdown::Write)?;
     read_reply(&mut stream, deadline)
 }
@@ -522,7 +529,10 @@ fn write_reply(stream: &mut CtlStream, reply: &Reply, deadline: Instant) -> io::
     header[9] = u8::from(reply.entered);
     header[10..14].copy_from_slice(&(reply.body.len() as u32).to_be_bytes());
     write_all(stream, &header, deadline)?;
-    write_all(stream, reply.body.expose(), deadline)?;
+    let body = reply.body.expose();
+    if !body.is_empty() {
+        write_all(stream, body, deadline)?;
+    }
     // Host retains a cancellation clone until its next poll. Signal exact
     // reply completion now, independently of the host's reaping cadence.
     stream.shutdown(Shutdown::Write)
@@ -559,10 +569,14 @@ fn read_reply(stream: &mut CtlStream, deadline: Instant) -> io::Result<Reply> {
     })
 }
 
+#[cfg(test)]
 fn socket_identity(dir: &Path) -> io::Result<listener::ListenerId> {
+    socket_identity_at(dir, &dir.join(NAME))
+}
+
+fn socket_identity_at(dir: &Path, path: &Path) -> io::Result<listener::ListenerId> {
     private_file::check_private_dir(dir)?;
-    let path = dir.join(NAME);
-    let metadata = std::fs::symlink_metadata(&path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
     if metadata.mode() & 0o777 != 0o600 {
         return Err(refused());
     }

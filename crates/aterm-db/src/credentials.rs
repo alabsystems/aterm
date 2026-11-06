@@ -759,11 +759,17 @@ impl Book {
     }
 
     fn read(log: &Log, context: &Context) -> Self {
-        let entries = log
-            .eligible()
-            .into_iter()
-            .filter_map(|(operation, command)| {
-                record_of(&command).ok().map(|record| Entry {
+        Self::from_eligible(&log.eligible(), context)
+    }
+
+    fn from_eligible(
+        eligible: &[(&crate::documents::log::Operation, &Command)],
+        context: &Context,
+    ) -> Self {
+        let entries = eligible
+            .iter()
+            .filter_map(|&(operation, command)| {
+                record_of(command).ok().map(|record| Entry {
                     actor: operation.header.actor,
                     sequence: operation.header.sequence,
                     id: operation.header.id,
@@ -792,21 +798,14 @@ fn context(
     scope: Scope,
     now_ms: u64,
 ) -> Result<Context> {
+    let (members, writers) = session.members_and_writers()?;
     Ok(Context {
         policy: facts.policy,
         signer: facts.sight.as_ref().map(|sight| sight.signer),
         network: scope.trust().network,
-        members: session
-            .members()?
-            .iter()
-            .map(aterm_secrets::commons::binding::Binding::actor)
-            .collect(),
+        members,
         scope: Some(scope.digest()),
-        writers: session
-            .writers()?
-            .into_iter()
-            .map(|binding| (binding.actor(), binding))
-            .collect(),
+        writers,
         now_ms,
     })
 }
@@ -850,14 +849,15 @@ pub fn observe(paths: &Paths) -> Result<Observation> {
     crate::documents::application::observe_store(paths, descriptor, |session, store, scope| {
         let context = context(&facts, session, scope, at_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
-        let snapshot = log.snapshot();
+        let (eligible, merges) = log.eligible_and_merges();
+        let book = Book::from_eligible(&eligible, &context);
         Ok(Observation {
             observer: session.actor(),
-            members: context.members.clone(),
+            members: context.members,
             at_ms,
-            retained_operations: snapshot.retained,
-            interpreted_operations: snapshot.operations.iter().filter(|op| op.eligible).count(),
-            book: Book::read(&log, &context),
+            retained_operations: log.retained(),
+            interpreted_operations: eligible.len() + merges.len(),
+            book,
         })
     })
 }
@@ -1016,9 +1016,9 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 .threads
                 .get(&key)
                 .filter(|thread| thread.requester == me);
-            if writer && need.posted && !need.state.ended() && thread.is_none() {
-                let (nonce, _) = successor_record(&me, need)?;
-                if let Some(successor) = book
+            let reissued = if writer && need.posted && !need.state.ended() && thread.is_none() {
+                let (nonce, successor) = successor_record(&me, need)?;
+                if let Some(successor_thread) = book
                     .threads
                     .get(&request_key(&me, &nonce))
                     .filter(|thread| thread.requester == me)
@@ -1029,12 +1029,15 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                         need.id,
                         Absorb::Reissued {
                             nonce,
-                            record: successor.operation.to_vec(),
+                            record: successor_thread.operation.to_vec(),
                         },
                     ));
                     continue;
                 }
-            }
+                Some((nonce, successor))
+            } else {
+                None
+            };
             let allowed = context.policy.allows(&need.want);
             let room = open < need::MAX_OPEN;
             match (need.state, thread) {
@@ -1068,7 +1071,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                             "",
                         ),
                     )?;
-                    let (nonce, successor) = successor_record(&me, need)?;
+                    let (nonce, successor) = reissued.expect("computed for unplaced posted need");
                     let receipt = commit(session, store, &log, &request(successor)?)?;
                     moves.push((
                         need.id,
@@ -1407,13 +1410,14 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                     .push((thread.id, "the requester is not a current member".into()));
                 continue;
             };
-            let decided = thread.swept_by_all(&context.members) || thread.window_ended(now_ms);
+            let offer_window_ended = thread.window_ended(now_ms);
+            let decided = thread.swept_by_all(&context.members) || offer_window_ended;
             plans.push(Plan::Copy {
                 id: thread.id,
                 recipient: binding.recipient(),
                 want: thread.want.clone(),
                 offered: !thread.offers.is_empty(),
-                offer_window_ended: thread.window_ended(now_ms),
+                offer_window_ended,
                 decided,
                 asked: thread.needs_person,
             });
@@ -1497,8 +1501,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         let seq = if !changed {
             admin.seq()
         } else {
-            let doc = admin.doc.clone();
-            client::admin_publish(paths, &admin, &doc)
+            client::admin_publish(paths, &admin, &admin.doc)
                 .map_err(crate::table::failure)?
                 .seq
         };

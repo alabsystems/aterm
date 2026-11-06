@@ -1542,6 +1542,90 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ],
         true,
     ),
+    // The owner's occupancy tables: read from the root [harness] table alone
+    // (`OwnerTables::from_doc`), written by hand, and no Reset (a one-key write would change a
+    // grant's input from Manual). A source's name is the owner's own, so its records have no
+    // registered descendants; the agent's reader notes each refused key.
+    manual(
+        "harness.occupancy_source",
+        "Sources the owner's occupancy rules watch",
+        ConfigSchemaKind::Flexible,
+        &[
+            "occupancy",
+            "owner",
+            "rule",
+            "source",
+            "git",
+            "atpkg",
+            "moved",
+        ],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule",
+        "The owner's occupancy rules",
+        ConfigSchemaKind::StructuredList,
+        &["occupancy", "owner", "rule", "when", "tell", "prompt"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.name",
+        "Occupancy rule name",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["occupancy", "rule", "name"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.when",
+        "When an occupancy rule tells",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["occupancy", "rule", "when", "moved", "source"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.scope",
+        "Which sessions an occupancy rule reaches",
+        ConfigSchemaKind::Table,
+        &["occupancy", "rule", "scope"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.scope.jobs_cwd",
+        "Folder of the jobs an occupancy rule reaches",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["occupancy", "rule", "scope", "folder", "cwd", "glob"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.modes",
+        "Autopilot modes an occupancy rule tells under",
+        ConfigSchemaKind::StringList,
+        &["occupancy", "rule", "autopilot", "cruise", "land"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.urgent",
+        "Let an occupancy rule pass the session's pace",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["occupancy", "rule", "urgent", "pace"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.mode",
+        "Tell, or only record, an occupancy rule",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: &["live", "dry-run"],
+        }),
+        &["occupancy", "rule", "live", "dry run"],
+        false,
+    ),
+    manual(
+        "harness.occupancy_rule.text",
+        "The line an occupancy rule tells",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["occupancy", "rule", "text", "line", "tell"],
+        false,
+    ),
     manual(
         "harness.upgrade",
         "Restart Claude Code sessions onto a newer build",
@@ -5497,6 +5581,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
          default, so under approve = \"safe\" every trust dialog goes to a person until you list \
          your own"
             .to_string()
+    } else if setting.key == "harness.occupancy_source" {
+        "tables [harness.occupancy_source.<name>], a name of a-z 0-9 -: kind = \"git-ref\" with \
+         repo or url, remote, ref, path and every, or kind = \"atpkg\" with program and every"
+            .to_string()
     } else {
         match setting.kind {
             ConfigSchemaKind::Scalar(EditKind::Float) => "number".to_string(),
@@ -5718,6 +5806,15 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         "harness.stuck_break_note" => {
             " · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress, and once while macOS's program check holds programs of its calls"
+        }
+        "harness.occupancy_source" | "harness.occupancy_rule" => {
+            " · read from the root [harness] table alone; a copy under any other table grants nothing · a rule is told only under occupancy = \"prompt\" · Settings never writes them"
+        }
+        "harness.occupancy_rule.when" => {
+            " · one source (git(<name>).moved, atpkg(<program>).moved or workflow.returned), and machine or session terms, joined by and"
+        }
+        "harness.occupancy_rule.text" => {
+            " · 1 to 200 characters; no control, bidi or invisible character and no backtick"
         }
         "harness.upgrade_ask" => {
             " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"
@@ -6388,6 +6485,60 @@ pub(crate) mod tests {
         assert_eq!(
             settings_refusal_of("not_a_real_setting"),
             SettingsRefusal::Unknown
+        );
+    }
+
+    /// THE OWNER'S TABLES ARE MANUAL'S, HAND-WRITTEN: Manual names them with no Reset, Settings
+    /// answers that they are written by hand, and the design's table draws no warning, while a key
+    /// no rule takes and a misspelt table still do (NEGATIVE CONTROL: the walker is live there).
+    #[test]
+    fn the_owner_tables_are_hand_written_manual_rows() {
+        for key in [
+            "harness.occupancy_source",
+            "harness.occupancy_rule",
+            "harness.occupancy_rule.when",
+            "harness.occupancy_rule.text",
+        ] {
+            assert_eq!(
+                settings_refusal_of(key),
+                SettingsRefusal::HandWritten,
+                "{key}"
+            );
+            let entry = config_schema_entry(key).unwrap_or_else(|| panic!("{key} is a Manual row"));
+            assert!(
+                !entry.manual_reset_safe && !entry.native_scalar,
+                "{key}: {entry:?}"
+            );
+        }
+        let design = "[harness]\noccupancy = \"prompt\"\n\n\
+             [harness.occupancy_source.trust]\nkind = \"git-ref\"\nrepo = \"$HOME/trust\"\n\
+             remote = \"origin\"\nref = \"refs/heads/main\"\npath = \"src/stage0\"\nevery = \"5m\"\n\n\
+             [harness.occupancy_source.ty]\nkind = \"atpkg\"\nprogram = \"ty\"\n\n\
+             [[harness.occupancy_rule]]\nname = \"release-base-moved\"\nwhen = \"git(trust).moved\"\n\
+             scope = { jobs_cwd = \"~/scratch.noindex/trust-release-*\" }\n\
+             modes = [\"cruise\", \"land\"]\nurgent = true\nmode = \"dry-run\"\n\
+             text = \"Re-read trust main and the atpkg index before any cut, mint or publish goes on.\"\n";
+        let (_, tables, notes) =
+            aterm_agent::supervise::SupervisorConfig::with_owner_tables(design);
+        assert!(notes.is_empty(), "the agent's reader: {notes:?}");
+        assert_eq!((tables.sources().len(), tables.rules().len()), (2, 1));
+        assert_eq!(ignored_key_warnings(design), Vec::<String>::new());
+        assert_eq!(analyze(design).diagnostics, Vec::new());
+
+        let unknown = format!("{design}bogus = 1\n");
+        assert!(
+            ignored_key_warnings(&unknown).iter().any(|warning| warning
+                .contains("harness.occupancy_rule.bogus is unknown in [[harness.occupancy_rule]]")),
+            "{:?}",
+            ignored_key_warnings(&unknown)
+        );
+        let misspelt = "[harness.occupancy_sources.trust]\nkind = \"git-ref\"\n";
+        assert!(
+            ignored_key_warnings(misspelt)
+                .iter()
+                .any(|warning| warning.contains("harness.occupancy_sources")),
+            "{:?}",
+            ignored_key_warnings(misspelt)
         );
     }
 
@@ -7085,9 +7236,10 @@ intensity = 0.25
 
     #[test]
     fn every_registered_enum_accepts_its_runtime_domain_and_aliases() {
+        // A member of a list of records is read inside its record, never as a dotted key.
         let enums = config_schema()
             .iter()
-            .filter(|setting| !setting.key.starts_with("sparkle_words.custom."))
+            .filter(|setting| config_key_record_root(setting.key).is_none())
             .filter_map(|setting| match setting.kind {
                 ConfigSchemaKind::Scalar(EditKind::Enum { options }) => {
                     Some((setting.key, options))
@@ -8447,7 +8599,8 @@ sty"#,
             if is_compatibility_only_key(setting.key) {
                 continue;
             }
-            if setting.key.starts_with("sparkle_words.custom.") {
+            if config_key_record_root(setting.key).is_some() {
+                // A record's member is graded inside its record (`warn_unknown_structured_records`).
                 continue;
             }
             graded += 1;

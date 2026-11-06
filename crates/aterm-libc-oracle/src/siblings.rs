@@ -66,18 +66,23 @@ impl fmt::Display for SiblingFinding {
 /// # Errors
 /// The marker count, when it is not exactly one.
 pub fn body_section(source: &str) -> Result<&str, usize> {
-    let count = source.matches(BODY_MARKER).count();
-    match source.find(BODY_MARKER) {
-        Some(at) if count == 1 => Ok(&source[at..]),
-        _ => Err(count),
+    let mut matches = source.match_indices(BODY_MARKER);
+    let Some((first, _)) = matches.next() else {
+        return Err(0);
+    };
+    let extra = matches.count();
+    if extra == 0 {
+        Ok(&source[first..])
+    } else {
+        Err(1 + extra)
     }
 }
 
 /// Every sibling finding over `sources` (cell source file name -> text).
 #[must_use]
-pub fn compare(sources: &BTreeMap<&str, String>) -> Vec<SiblingFinding> {
+pub fn compare<S: AsRef<str>>(sources: &BTreeMap<&str, S>) -> Vec<SiblingFinding> {
     let section = |file: &str| -> Result<&str, SiblingFinding> {
-        let text = sources.get(file).map_or("", String::as_str);
+        let text = sources.get(file).map_or("", S::as_ref);
         body_section(text).map_err(|count| SiblingFinding::Marker {
             file: file.into(),
             count,

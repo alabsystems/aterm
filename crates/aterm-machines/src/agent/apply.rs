@@ -169,9 +169,15 @@ fn take_artifacts(
             format!("aterm {}", u.version),
         ));
     }
+    if let Some((sha, name)) = wanted.iter().find(|(sha, _)| !super::is_sha256(sha)) {
+        return Err(format!("artifact {name}: {sha:?} is not a SHA-256 digest"));
+    }
     let missing: Vec<&(String, String)> = wanted
         .iter()
-        .filter(|(sha, _)| sys.stat(&layout.cached(sha)).is_err())
+        .filter(|(sha, _)| {
+            !sys.stat(&layout.cached(sha))
+                .is_ok_and(|st| !st.dir && !st.symlink)
+        })
         .collect();
     let mut notes = if missing.is_empty() {
         Vec::new()
@@ -212,7 +218,8 @@ fn prune_cache(sys: &dyn System, layout: &Layout, wanted: &[(String, String)]) -
     notes
 }
 
-/// Copy each `(sha256, name)` from the admin's inbox into the root cache.
+/// Copy each `(sha256, name)` (a digest [`take_artifacts`] checked) from the admin's inbox into
+/// the root cache.
 fn copy_artifacts(
     sys: &dyn System,
     layout: &Layout,
@@ -224,9 +231,6 @@ fn copy_artifacts(
     for (at, (sha, name)) in missing.iter().map(|w| (&w.0, &w.1)).enumerate() {
         if missing[..at].iter().any(|w| w.0 == *sha) {
             continue;
-        }
-        if !super::is_sha256(sha) {
-            return Err(format!("artifact {name}: {sha:?} is not a SHA-256 digest"));
         }
         let from = inbox.join(sha);
         let landing = layout.inbox().join(sha);
@@ -249,8 +253,10 @@ fn copy_artifacts(
                 return Err(format!("artifact {name}: {e}"));
             }
         }
-        sys.rename(&landing, &layout.cached(sha))
-            .map_err(|e| format!("artifact {name}: {e}"))?;
+        if let Err(e) = sys.rename(&landing, &layout.cached(sha)) {
+            let _ = sys.remove(&landing);
+            return Err(format!("artifact {name}: {e}"));
+        }
         let removed = sys.run(
             &Cmd::new("/bin/rm")
                 .args(["-f", "--"])
@@ -1043,6 +1049,69 @@ mod tests {
             .unwrap();
         let job = calls.iter().position(|c| c.starts_with("stage ")).unwrap();
         assert!(log < job, "{calls:#?}");
+    }
+
+    /// A digest that is no SHA-256 never becomes a cache path, even one a file answers at.
+    /// NEGATIVE CONTROL: a directory or a link at a real digest's cache path is no cached
+    /// artifact, so it is taken again (here refused for want of the managed state).
+    #[test]
+    fn an_artifact_digest_is_checked_before_its_cache_path_is_and_only_a_file_is_cached() {
+        let file = Stat {
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+            dir: false,
+            symlink: false,
+            len: 5,
+        };
+        let mut e = opened(5);
+        e.envelope.action = Action::Plan;
+        e.envelope.artifacts = vec![crate::envelope::ArtifactRef {
+            sha256: "../x".into(),
+            name: "app.Evil".into(),
+        }];
+        let fake = Fake::root();
+        fake.stat_of("/A/cache/../x", file);
+        let err = take_artifacts(&fake, &layout(), &e).unwrap_err();
+        assert!(err.contains("\"../x\" is not a SHA-256 digest"), "{err}");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+        e.envelope.artifacts = vec![crate::envelope::ArtifactRef {
+            sha256: HELLO.into(),
+            name: "app.Emacs".into(),
+        }];
+        let fake = Fake::root();
+        fake.stat_of(&format!("/A/cache/{HELLO}"), file);
+        assert_eq!(take_artifacts(&fake, &layout(), &e), Ok(Vec::new()));
+        for not_a_file in [
+            Stat { dir: true, ..file },
+            Stat {
+                symlink: true,
+                ..file
+            },
+        ] {
+            let fake = Fake::root();
+            fake.stat_of(&format!("/A/cache/{HELLO}"), not_a_file);
+            let err = take_artifacts(&fake, &layout(), &e).unwrap_err();
+            assert!(err.contains("managed"), "{not_a_file:?}: {err}");
+        }
+    }
+
+    /// A copy that cannot be renamed into the cache leaves no landing file behind.
+    #[test]
+    fn a_cache_rename_that_fails_removes_its_landing_copy() {
+        let fake = Fake::root();
+        fake.file(&format!("{INBOX}/{HELLO}"), b"hello");
+        fake.rename_fails(
+            &format!("/A/cache/{HELLO}"),
+            std::io::ErrorKind::IsADirectory,
+        );
+        let want = (HELLO.to_owned(), "app.Emacs".to_owned());
+        let err = copy_artifacts(&fake, &layout(), &[&want], &admin()).unwrap_err();
+        assert!(err.starts_with("artifact app.Emacs: "), "{err}");
+        assert!(fake.written(&format!("/A/inbox/{HELLO}")).is_none());
+        assert!(fake.written(&format!("/A/cache/{HELLO}")).is_none());
+        assert!(!fake.calls().iter().any(|c| c.contains("/bin/rm")));
     }
 
     #[test]

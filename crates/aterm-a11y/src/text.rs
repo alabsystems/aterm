@@ -204,16 +204,18 @@ impl<'a> Position<'a> {
             let node_text = node.data().value().unwrap_or_default();
             if node.id() == self.inner.node.id() {
                 let character_lengths = node.data().character_lengths();
-                let slice_end = character_lengths[..self.inner.character_index]
+                let end_char = self.inner.character_index.min(character_lengths.len());
+                let raw_end = character_lengths[..end_char]
                     .iter()
                     .copied()
                     .map(usize::from)
-                    .sum::<usize>();
+                    .fold(0usize, usize::saturating_add);
+                let slice_end = clamp_char_boundary_at_or_before(node_text, raw_end, 0);
                 return total_length + node_text[..slice_end].chars().count();
             }
             total_length += node_text.chars().count();
         }
-        panic!("invalid position")
+        total_length
     }
 
     pub(crate) fn forward_to_character_end(&self) -> Self {
@@ -230,18 +232,22 @@ impl<'a> Position<'a> {
 
     pub(crate) fn forward_to_word_start(&self) -> Self {
         let pos = self.inner.biased_to_start(&self.root_node);
+        let max_len = pos.node.data().character_lengths().len();
         if let Ok(char_idx) = u8::try_from(pos.character_index) {
             let word_starts = pos.node.data().word_starts();
             let index = match word_starts.binary_search(&char_idx) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             };
-            if let Some(start) = word_starts.get(index) {
+            if let Some(start) = word_starts
+                .get(index..)
+                .and_then(|rest| rest.iter().copied().find(|&s| usize::from(s) < max_len))
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: pos.node,
-                        character_index: *start as usize,
+                        character_index: usize::from(start),
                     },
                 };
             }
@@ -257,12 +263,19 @@ impl<'a> Position<'a> {
             if start_pos.is_paragraph_start() {
                 return start_pos;
             }
-            if let Some(start) = node.data().word_starts().first() {
+            let run_len = node.data().character_lengths().len();
+            if let Some(start) = node
+                .data()
+                .word_starts()
+                .iter()
+                .copied()
+                .find(|&s| usize::from(s) < run_len)
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: usize::from(start),
                     },
                 };
             }
@@ -276,6 +289,7 @@ impl<'a> Position<'a> {
 
     pub(crate) fn backward_to_word_start(&self) -> Self {
         {
+            let max_len = self.inner.node.data().character_lengths().len();
             let word_starts = self.inner.node.data().word_starts();
             let index = match u8::try_from(self.inner.character_index) {
                 Ok(char_idx) => match word_starts.binary_search(&char_idx) {
@@ -283,12 +297,16 @@ impl<'a> Position<'a> {
                 },
                 Err(_) => word_starts.len(),
             };
-            if let Some(index) = index.checked_sub(1) {
+            if let Some(start) = word_starts[..index]
+                .iter()
+                .copied()
+                .rfind(|&s| usize::from(s) < max_len)
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node: self.inner.node,
-                        character_index: word_starts[index] as usize,
+                        character_index: usize::from(start),
                     },
                 };
             }
@@ -306,12 +324,19 @@ impl<'a> Position<'a> {
             }
         }
         for node in self.inner.node.preceding_text_runs(&self.root_node) {
-            if let Some(start) = node.data().word_starts().last() {
+            let run_len = node.data().character_lengths().len();
+            if let Some(start) = node
+                .data()
+                .word_starts()
+                .iter()
+                .copied()
+                .rfind(|&s| usize::from(s) < run_len)
+            {
                 return Self {
                     root_node: self.root_node,
                     inner: InnerPosition {
                         node,
-                        character_index: *start as usize,
+                        character_index: usize::from(start),
                     },
                 };
             }
@@ -510,17 +535,18 @@ impl<'a> Range<'a> {
             } else if start_index == 0 && end_index == len {
                 value
             } else {
-                let slice_start = character_lengths[..start_index]
+                let raw_start = character_lengths[..start_index]
                     .iter()
                     .copied()
                     .map(usize::from)
-                    .sum::<usize>();
-                let slice_end = slice_start
-                    + character_lengths[start_index..end_index]
-                        .iter()
-                        .copied()
-                        .map(usize::from)
-                        .sum::<usize>();
+                    .fold(0usize, usize::saturating_add);
+                let slice_start = clamp_char_boundary_at_or_before(value, raw_start, 0);
+                let raw_end = character_lengths[start_index..end_index]
+                    .iter()
+                    .copied()
+                    .map(usize::from)
+                    .fold(slice_start, usize::saturating_add);
+                let slice_end = clamp_char_boundary_at_or_before(value, raw_end, slice_start);
                 &value[slice_start..slice_end]
             };
             f(node, s)
@@ -659,6 +685,23 @@ impl PartialEq for Range<'_> {
 }
 
 impl Eq for Range<'_> {}
+
+fn clamp_char_boundary_at_or_before(text: &str, byte_index: usize, floor: usize) -> usize {
+    let floor = floor.min(text.len());
+    let mut idx = byte_index.min(text.len()).max(floor);
+    while idx > floor && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    if text.is_char_boundary(idx) {
+        idx
+    } else {
+        let mut up = idx;
+        while up < text.len() && !text.is_char_boundary(up) {
+            up += 1;
+        }
+        up
+    }
+}
 
 fn text_node_filter(root_id: NodeId, node: &Node) -> FilterResult {
     if node.id() == root_id || node.role() == Role::TextRun {
@@ -876,10 +919,11 @@ impl<'a> Node<'a> {
                 let index = index - total_length;
                 let mut utf8_length = 0usize;
                 let mut usv_length = 0usize;
-                for (character_index, utf8_char_length) in
-                    node.data().character_lengths().iter().enumerate()
-                {
-                    let new_utf8_length = utf8_length + (*utf8_char_length as usize);
+                let character_lengths = node.data().character_lengths();
+                for (character_index, utf8_char_length) in character_lengths.iter().enumerate() {
+                    let raw_end = utf8_length.saturating_add(usize::from(*utf8_char_length));
+                    let new_utf8_length =
+                        clamp_char_boundary_at_or_before(node_text, raw_end, utf8_length);
                     let char_str = &node_text[utf8_length..new_utf8_length];
                     let usv_char_length = char_str.chars().count();
                     let new_usv_length = usv_length + usv_char_length;
@@ -895,7 +939,13 @@ impl<'a> Node<'a> {
                     utf8_length = new_utf8_length;
                     usv_length = new_usv_length;
                 }
-                panic!("index out of range");
+                return Some(Position {
+                    root_node: *self,
+                    inner: InnerPosition {
+                        node,
+                        character_index: character_lengths.len(),
+                    },
+                });
             }
             total_length = new_total_length;
         }
@@ -1080,5 +1130,52 @@ mod tests {
         let hit = d2.text_position_at_point(Point { x: 35.0, y: 5.0 });
         assert!(hit.inner.character_index <= 2);
         assert_eq!(hit.to_global_usv_index(), 2);
+    }
+
+    /// A run whose character lengths disagree with its text (one ending inside `é`, one past the
+    /// text, word starts past the run, a run with no lengths at all) answers every position,
+    /// word move and range on a char boundary instead of panicking or slicing inside a char.
+    #[test]
+    fn character_lengths_that_disagree_with_the_text_stay_on_char_boundaries() {
+        let mut pub_state = Publication::default();
+        let mut bad_doc = Data::new(Role::Document);
+        bad_doc.set_children(vec![LocalNodeId(11), LocalNodeId(12)]);
+        let mut mid_utf8_run = Data::new(Role::TextRun);
+        mid_utf8_run.set_value("éx");
+        mid_utf8_run.set_character_lengths(vec![1, 50]);
+        mid_utf8_run.set_word_starts(vec![99]);
+        let mut short_len_run = Data::new(Role::TextRun);
+        short_len_run.set_value("tail");
+        short_len_run.set_character_lengths(Vec::new());
+        pub_state.update(TreeUpdate {
+            nodes: vec![
+                (LocalNodeId(10), bad_doc),
+                (LocalNodeId(11), mid_utf8_run),
+                (LocalNodeId(12), short_len_run),
+            ],
+            tree: Some(Tree::new(LocalNodeId(10))),
+            tree_id: TreeId::ROOT,
+            focus: LocalNodeId(10),
+        });
+        let bad_tree = pub_state.tree().unwrap();
+        let bad_root = bad_tree.node_by_id(NodeId(LocalNodeId(10))).unwrap();
+        for idx in 0..=6 {
+            let pos = bad_root.text_position_from_global_usv_index(idx).unwrap();
+            assert!(pos.to_global_usv_index() <= 6);
+            let _ = pos.forward_to_word_start().to_global_usv_index();
+            let _ = pos.backward_to_word_start().to_global_usv_index();
+        }
+        let sub_range = Range::new(
+            bad_root,
+            InnerPosition {
+                node: bad_tree.node_by_id(NodeId(LocalNodeId(11))).unwrap(),
+                character_index: 1,
+            },
+            InnerPosition {
+                node: bad_tree.node_by_id(NodeId(LocalNodeId(11))).unwrap(),
+                character_index: 2,
+            },
+        );
+        assert_eq!(sub_range.text(), "éx");
     }
 }

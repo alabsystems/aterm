@@ -761,6 +761,40 @@ fn working_ai_sessions(sessions: &[crate::protocol::HostedSession]) -> usize {
         .count()
 }
 
+/// One aterm instance's line over its tabs, `dims` its grid: every word the host reported
+/// ([`shown`]), so a window name cannot write to the owner's terminal.
+fn instance_header(pid: u32, tabs: &[&crate::protocol::HostedSession], dims: &str) -> String {
+    let win = tabs
+        .first()
+        .map(|t| t.window.as_str())
+        .filter(|w| !w.is_empty() && *w != "-")
+        .unwrap_or("0");
+    let focused = tabs.iter().any(|t| t.focused);
+    let sup = tabs
+        .iter()
+        .find_map(|t| t.supervisor.as_deref())
+        .filter(|s| !s.is_empty() && *s != "-")
+        .unwrap_or("unsupervised");
+    let sess_ai = tabs
+        .iter()
+        .filter(|s| {
+            s.agent.is_some()
+                || matches!(
+                    s.program.as_deref(),
+                    Some("claude" | "codex" | "agy" | "muse")
+                )
+        })
+        .count();
+    format!(
+        "  \u{2514}\u{2500} aterm-{pid} \u{b7} window {}{} \u{b7} grid {dims} \u{b7} supervisor {} \u{b7} {} open {} \u{b7} {sess_ai} AI CLIs",
+        shown(win),
+        if focused { " (focused)" } else { "" },
+        shown(sup),
+        tabs.len(),
+        if tabs.len() == 1 { "tab" } else { "tabs" }
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_host_tabs_rows(
     host_name: &str,
@@ -826,38 +860,11 @@ fn print_host_tabs_rows(
         );
     }
     for (pid, tabs) in by_instance {
-        let win = tabs
-            .first()
-            .map(|t| t.window.as_str())
-            .filter(|w| !w.is_empty() && *w != "-")
-            .unwrap_or("0");
-        let focused = tabs.iter().any(|t| t.focused);
         let dims = tabs
             .iter()
             .find_map(|t| t.cols.zip(t.rows))
             .map_or_else(|| "-".to_owned(), |(c, r)| format!("{c}\u{d7}{r}"));
-        let sup = tabs
-            .iter()
-            .find_map(|t| t.supervisor.as_deref())
-            .filter(|s| !s.is_empty() && *s != "-")
-            .unwrap_or("unsupervised");
-        let sess_ai = tabs
-            .iter()
-            .filter(|s| {
-                s.agent.is_some()
-                    || matches!(
-                        s.program.as_deref(),
-                        Some("claude" | "codex" | "agy" | "muse")
-                    )
-            })
-            .count();
-        outln!(
-            "  \u{2514}\u{2500} aterm-{pid} \u{b7} window {win}{} \u{b7} grid {dims} \u{b7} supervisor {} \u{b7} {} open {} \u{b7} {sess_ai} AI CLIs",
-            if focused { " (focused)" } else { "" },
-            shown(sup),
-            tabs.len(),
-            if tabs.len() == 1 { "tab" } else { "tabs" }
-        );
+        outln!("{}", instance_header(pid, &tabs, &dims));
         for (idx, s) in tabs.iter().enumerate() {
             let branch = if idx + 1 == tabs.len() {
                 "\u{2514}\u{2500}"
@@ -1854,7 +1861,7 @@ fn ask_hello(env: &Env<'_>, host: &Host) -> Result<Hello, HelloError> {
     }
     let hello: Hello = aterm_json::from_str(ran.out().trim())
         .map_err(|e| HelloError::Answer(format!("hello did not parse: {e}")))?;
-    if hello.uuid != host.uuid {
+    if !hello.uuid.eq_ignore_ascii_case(&host.uuid) {
         return Err(HelloError::Answer(format!(
             "this is not {}: it answers as {} (serial {})",
             host.name, hello.uuid, hello.serial_number
@@ -2167,17 +2174,25 @@ fn seal_all(env: &Env<'_>, bodies: &[Envelope], key: &Path) -> Result<Vec<Vec<u8
         return Ok(Vec::new());
     }
     let how = signing(env, key)?;
-    seal_with(env.sys, bodies, key, how)
+    seal_with(env, bodies, key, how)
 }
 
+/// Seal `bodies` as `how` says, an agent run reaching [`Env::agent_sock`].
 fn seal_with(
-    sys: &dyn System,
+    env: &Env<'_>,
     bodies: &[Envelope],
     key: &Path,
     how: Signing,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let scratch = envelope::fresh_scratch(sys, "seal")?;
-    envelope::seal_batch(sys, bodies, key, how, scratch.path())
+    let scratch = envelope::fresh_scratch(env.sys, "seal")?;
+    envelope::seal_batch(
+        env.sys,
+        bodies,
+        key,
+        how,
+        scratch.path(),
+        env.agent_sock.as_deref(),
+    )
 }
 
 fn put(
@@ -2961,11 +2976,10 @@ fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), 
         "The signing key goes into ssh-agent for this walk (removed when it ends, or after an \
          hour if the walk is interrupted); ssh-add asks its passphrase:"
     );
-    match env.sys.run_tty(
-        &Cmd::new("/usr/bin/ssh-add")
-            .args(["-t", AGENT_KEY_LIFETIME])
-            .arg(key.as_os_str()),
-    ) {
+    match env
+        .sys
+        .run_tty(&ssh_add(&sock, &["-t", AGENT_KEY_LIFETIME]).arg(key.as_os_str()))
+    {
         Ok(Some(0)) => Ok((
             Signing::Agent,
             Some(AgentKey {
@@ -2990,7 +3004,7 @@ impl screen::Remote for LiveRemote<'_> {
     fn exec(&self, exec: &Exec) -> Result<Ran, String> {
         let body = exec_body(self.env, self.host, self.floor, exec.clone())?;
         let wire = seal_with(
-            self.env.sys,
+            self.env,
             std::slice::from_ref(&body),
             &self.env.paths.signing_key(),
             self.how,
@@ -6900,6 +6914,156 @@ mod tests {
         assert_eq!(
             parse_device_info_txt("bytes: 6d 6f 64 65 6c 3d 4d +a 61 63"),
             (Some("Mac".to_owned()), None)
+        );
+    }
+
+    /// A window name a host reports reaches the owner's terminal escaped, as the supervisor
+    /// beside it does. NEGATIVE CONTROL: a plain window name prints as it is.
+    #[test]
+    fn a_host_s_window_name_cannot_write_to_the_owner_s_terminal() {
+        let tab = |window: &str| crate::protocol::HostedSession {
+            instance_pid: 99,
+            window: window.into(),
+            focused: true,
+            ..crate::protocol::HostedSession::default()
+        };
+        let hostile = tab("0\x1b[2J\x1b]52;c;cHdu\x07");
+        let line = instance_header(99, &[&hostile], "80\u{d7}24");
+        assert!(!line.contains('\x1b') && !line.contains('\x07'), "{line:?}");
+        assert!(line.contains("window 0\\u{1b}[2J"), "{line:?}");
+        let plain = tab("3");
+        let line = instance_header(99, &[&plain], "80\u{d7}24");
+        assert!(
+            line.contains("aterm-99 \u{b7} window 3 (focused) \u{b7} grid 80\u{d7}24"),
+            "{line:?}"
+        );
+    }
+
+    /// A host that answers with its UUID in another case is the host its inventory names (the
+    /// UUID is hex). NEGATIVE CONTROL: a host that answers with another UUID is not.
+    #[test]
+    fn hello_matches_the_host_s_uuid_in_either_case() {
+        let host = lab(1, &UUID_1.to_ascii_lowercase());
+        let sys = controller(&[&host], false);
+        let mut hello = hello_of(&host);
+        hello.uuid = UUID_1.to_owned();
+        sys.on(
+            &request(&host, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello).unwrap()),
+        );
+        assert_eq!(ask_hello(&env(&sys), &host).unwrap().uuid, UUID_1);
+
+        let sys = controller(&[&host], false);
+        hello.uuid = UUID_2.to_owned();
+        sys.on(
+            &request(&host, "hello"),
+            Ran::ok(&aterm_json::to_string(&hello).unwrap()),
+        );
+        let refused = ask_hello(&env(&sys), &host).unwrap_err();
+        assert!(
+            matches!(&refused, HelloError::Answer(why) if why.contains(&format!("it answers as {UUID_2}"))),
+            "{refused:?}"
+        );
+    }
+
+    /// The agent socket the walk loads the key into, and every envelope it seals, is
+    /// [`Env::agent_sock`], never this process's own `SSH_AUTH_SOCK`: each run is handed exactly
+    /// the injected socket. NEGATIVE CONTROL: with no socket a walk's key with a passphrase is
+    /// refused before `ssh-add` runs.
+    #[test]
+    fn a_walk_loads_and_seals_through_the_env_s_agent_socket() {
+        let sys = Fake::root();
+        let key = format!("{ROOT}/keys/signing");
+        sys.on(
+            &format!("/usr/bin/ssh-keygen -y -P '' -f {key}"),
+            Ran::exit(
+                255,
+                "Load key: incorrect passphrase supplied to decrypt private key\n",
+            ),
+        );
+        let held = format!("SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -T {key}.pub");
+        sys.on(&held, Ran::exit(1, ""));
+        sys.on(
+            &format!("tty SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -t 3600 {key}"),
+            Ran::ok(""),
+        );
+        sys.on(
+            &format!("SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -d {key}"),
+            Ran::ok(""),
+        );
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&handed);
+        sys.simulate(move |_, cmd| {
+            seen.lock().unwrap().push((cmd.display(), cmd.env.clone()));
+            None
+        });
+        let seen = std::sync::Arc::clone(&handed);
+        sys.tty_model(move |_, cmd| {
+            seen.lock()
+                .unwrap()
+                .push((format!("tty {}", cmd.display()), cmd.env.clone()));
+            None
+        });
+        let mut e = env(&sys);
+        e.agent_sock = Some("/private/walk-agent.sock".into());
+        let (how, loaded) = person_signing(&e).unwrap();
+        assert_eq!(how, Signing::Agent);
+        assert!(loaded.is_some());
+        let sign = format!(
+            "SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-keygen -Y sign -U -f {key}.pub -n aterm-machines"
+        );
+        let body = Envelope {
+            schema: crate::SCHEMA,
+            host: UUID_1.into(),
+            host_name: "lab-01".into(),
+            serial: 1,
+            issued: 10,
+            expires: 10 + ENVELOPE_LIFETIME,
+            action: Action::Plan,
+            disrupt: Disrupt::WhenIdle,
+            idle_secs: 900,
+            baseline: None,
+            artifacts: Vec::new(),
+            exec: None,
+            upgrade: None,
+            rekey: None,
+        };
+        let unsigned = seal_with(&e, &[body], Path::new(&key), how).unwrap_err();
+        assert!(unsigned.contains("did not sign"), "{unsigned}");
+        drop(loaded);
+        let handed = handed.lock().unwrap();
+        let sock = vec![(
+            "SSH_AUTH_SOCK".to_owned(),
+            "/private/walk-agent.sock".to_owned(),
+        )];
+        for want in [
+            held.clone(),
+            format!("tty SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -t 3600 {key}"),
+            sign,
+            format!("SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -d {key}"),
+        ] {
+            let ran: Vec<_> = handed
+                .iter()
+                .filter(|(line, _)| line.starts_with(&want))
+                .collect();
+            assert!(!ran.is_empty(), "{want}: {handed:#?}");
+            assert!(ran.iter().all(|(_, env)| *env == sock), "{want}: {ran:#?}");
+        }
+
+        let sys = Fake::root();
+        sys.on(
+            &format!("/usr/bin/ssh-keygen -y -P '' -f {key}"),
+            Ran::exit(
+                255,
+                "Load key: incorrect passphrase supplied to decrypt private key\n",
+            ),
+        );
+        let refused = person_signing(&env(&sys)).map(|(how, _)| how).unwrap_err();
+        assert!(refused.contains("no ssh-agent"), "{refused}");
+        assert!(
+            !sys.calls().iter().any(|c| c.contains("ssh-add")),
+            "{:?}",
+            sys.calls()
         );
     }
 }

@@ -21,7 +21,7 @@ pub const PROTO: u32 = 2;
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// A frame's header: its kind and its payload's length.
-const HEADER: usize = 5;
+pub(crate) const HEADER: usize = 5;
 
 const EXEC: u8 = 0x01;
 const MOUNT: u8 = 0x02;
@@ -29,8 +29,8 @@ const POWEROFF: u8 = 0x03;
 const STDIN: u8 = 0x04;
 const STDIN_EOF: u8 = 0x05;
 const KILL: u8 = 0x06;
-const OUT: u8 = 0x10;
-const ERR: u8 = 0x11;
+pub(crate) const OUT: u8 = 0x10;
+pub(crate) const ERR: u8 = 0x11;
 const EXIT: u8 = 0x12;
 const HELLO: u8 = 0x20;
 const BOOTING: u8 = 0x21;
@@ -373,7 +373,16 @@ impl Frame {
             }
             Self::Poweroff | Self::StdinEof => HEADER,
             Self::Kill(_) => HEADER + 4,
+            Self::Exit(Exit::Exited(_) | Exit::Signaled(_)) => HEADER + 5,
+            Self::Exit(Exit::NotStarted(why)) => HEADER + 5 + why.len(),
             Self::Beat { .. } | Self::Clock { .. } => HEADER + 8,
+            Self::Hello(h) => HEADER + 84 + h.boot_id.len() + h.kernel.len(),
+            Self::Ready(r) => {
+                HEADER
+                    + 8
+                    + r.state.len()
+                    + r.failed_units.iter().map(|u| 4 + u.len()).sum::<usize>()
+            }
             _ => 64,
         };
         let mut p = Put(Vec::with_capacity(cap));

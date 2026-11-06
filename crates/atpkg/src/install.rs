@@ -137,6 +137,69 @@ pub(crate) const UNSIGNED_SIZE_CAP: u64 = 2u64 << 30;
 
 const STAGING_SCRATCH_MODE: u32 = 0o700;
 
+#[derive(Clone, Copy)]
+enum Purpose {
+    Install(Option<aterm_toolchain::gnu_runtime::Host>),
+    Publication,
+}
+
+impl Purpose {
+    fn install() -> Result<Self, StageError> {
+        aterm_toolchain::gnu_runtime::host()
+            .map(Self::Install)
+            .map_err(StageError::Payload)
+    }
+
+    fn admit(self, artifact: &Artifact, incoming: &Path) -> Result<(), StageError> {
+        use aterm_toolchain::gnu_runtime;
+        let declared = if artifact.kind == "elf-binary" {
+            let arch = artifact
+                .target
+                .strip_suffix("-unknown-linux-gnu")
+                .and_then(gnu_runtime::machine_for_arch)
+                .ok_or_else(|| {
+                    StageError::Payload("elf-binary requires a supported GNU Linux target".into())
+                })?;
+            Some(arch)
+        } else {
+            None
+        };
+        let host = match self {
+            Self::Install(host) => host,
+            Self::Publication => None,
+        };
+        if declared.is_some() && matches!(self, Self::Install(None)) {
+            return Err(StageError::Payload(
+                "a GNU ELF artifact cannot be made ready on a different runtime".into(),
+            ));
+        }
+        if let (Some(declared), Some(host)) = (declared, host)
+            && declared != host.machine
+        {
+            return Err(StageError::Payload(
+                "a GNU ELF artifact cannot be made ready for another CPU architecture".into(),
+            ));
+        }
+        if let Some(machine) = host.map(|host| host.machine).or(declared) {
+            let tree = gnu_runtime::inspect_tree(incoming, machine).map_err(StageError::Payload)?;
+            if declared.is_some() && tree.objects == 0 {
+                return Err(StageError::Payload(
+                    "elf-binary contains no runtime ELF object".into(),
+                ));
+            }
+            if let Some(host) = host
+                && let Some(required) = tree.glibc.filter(|required| *required > host.glibc)
+            {
+                return Err(StageError::Payload(format!(
+                    "requires GNU libc {required}; this host has {}",
+                    host.glibc
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Verify a downloaded `archive` against the signed `artifact` and stage it at `build_dir`.
 pub fn verify_and_stage(
     artifact: &Artifact,
@@ -144,9 +207,62 @@ pub fn verify_and_stage(
     build_dir: &Path,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
+    verify_stage(artifact, archive, build_dir, hooks, Purpose::install()?)
+}
+
+/// Verify and extract a publisher's scratch copy, including `elf-binary`'s declared GNU target,
+/// without claiming it can run on the publication host. This never writes a ready marker.
+/// The destination must be fresh so publication inspection cannot revoke a live install.
+///
+/// # Errors
+/// A sidecar hook is supplied, the destination is occupied, or digest, tree, payload or ELF
+/// inspection refuses it.
+pub fn verify_for_publication(
+    artifact: &Artifact,
+    archive: &Path,
+    build_dir: &Path,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
+    if hooks.sidecars.is_some() {
+        return Err(StageError::Payload(
+            "publication inspection writes no install sidecars".into(),
+        ));
+    }
+    publication_destination(build_dir)?;
+    verify_stage(artifact, archive, build_dir, hooks, Purpose::Publication)
+}
+
+fn publication_destination(build_dir: &Path) -> Result<(), StageError> {
+    let marker = crate::store::ready_marker_path(build_dir).ok_or_else(|| {
+        StageError::Payload("publication staging needs a named destination".into())
+    })?;
+    for path in [build_dir, marker.as_path()] {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StageError::Io(error)),
+            Ok(_) => {
+                return Err(StageError::Payload(
+                    "publication staging needs a fresh destination".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_stage(
+    artifact: &Artifact,
+    archive: &Path,
+    build_dir: &Path,
+    hooks: &StageHooks<'_>,
+    purpose: Purpose,
+) -> Result<String, StageError> {
     check_signed_digest(artifact, archive)?;
 
-    let incoming = open_incoming(build_dir)?;
+    let incoming = match purpose {
+        Purpose::Install(_) => open_incoming(build_dir)?,
+        Purpose::Publication => create_incoming(build_dir)?,
+    };
     let (extracted_root, modes) =
         match stage_payload_modes(artifact, archive, &incoming, hooks.npm_package) {
             Ok(staged) => staged,
@@ -155,7 +271,15 @@ pub fn verify_and_stage(
                 return Err(e);
             }
         };
-    stage_extracted(artifact, build_dir, &incoming, extracted_root, modes, hooks)
+    stage_extracted(
+        artifact,
+        build_dir,
+        &incoming,
+        extracted_root,
+        modes,
+        hooks,
+        purpose,
+    )
 }
 
 /// [`verify_and_stage`] from its tree-root check on, for the tree extracted at `incoming` that
@@ -167,6 +291,7 @@ fn stage_extracted(
     extracted_root: String,
     modes: DeclaredModes,
     hooks: &StageHooks<'_>,
+    purpose: Purpose,
 ) -> Result<String, StageError> {
     let root = if artifact.tree_root.is_empty() {
         extracted_root
@@ -187,7 +312,15 @@ fn stage_extracted(
         }
         got
     };
-    finish_stage(artifact, build_dir, incoming, root, modes, hooks, None)
+    finish_stage(
+        artifact,
+        build_dir,
+        incoming,
+        root,
+        modes,
+        hooks,
+        (None, purpose),
+    )
 }
 
 /// Whether `artifact`'s payload lane extracts a tar stream, so its download can stage as it
@@ -273,12 +406,24 @@ pub(crate) fn finish_streamed(
         modes,
     } = streamed;
     let dir = std::mem::take(&mut incoming.0);
-    stage_extracted(artifact, build_dir, &dir, root, modes, hooks)
+    stage_extracted(
+        artifact,
+        build_dir,
+        &dir,
+        root,
+        modes,
+        hooks,
+        Purpose::install()?,
+    )
 }
 
 /// Sweep `build_dir`'s stage scratch and make a fresh, private `.incoming` beside it.
 fn open_incoming(build_dir: &Path) -> Result<PathBuf, StageError> {
     crate::store::sweep_stage_scratch(build_dir);
+    create_incoming(build_dir)
+}
+
+fn create_incoming(build_dir: &Path) -> Result<PathBuf, StageError> {
     let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
         StageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -374,7 +519,16 @@ pub(crate) fn stage_from_tree(
         Err(_) => return drift(String::from("its copy's executables could not be read")),
     }
     laid();
-    finish_stage(artifact, build_dir, &incoming, root, modes, hooks, None).map(FromTree::Staged)
+    finish_stage(
+        artifact,
+        build_dir,
+        &incoming,
+        root,
+        modes,
+        hooks,
+        (None, Purpose::install()?),
+    )
+    .map(FromTree::Staged)
 }
 
 /// A local authority's held binary uses the ordinary sealed, durable stage tail, never a swap.
@@ -427,7 +581,7 @@ pub(crate) fn stage_local_binary(
         tree.root(),
         modes,
         hooks,
-        Some(&local),
+        (Some(&local), Purpose::install()?),
     )
 }
 
@@ -533,12 +687,15 @@ fn finish_stage(
     root: String,
     mut modes: DeclaredModes,
     hooks: &StageHooks<'_>,
-    #[cfg(unix)] local: Option<&crate::local_harness::fs::Stage<'_>>,
-    #[cfg(not(unix))] _local: Option<()>,
+    #[cfg(unix)] tail: (Option<&crate::local_harness::fs::Stage<'_>>, Purpose),
+    #[cfg(not(unix))] tail: (Option<()>, Purpose),
 ) -> Result<String, StageError> {
+    let (local, purpose) = tail;
+    #[cfg(not(unix))]
+    let _ = local;
     #[cfg(unix)]
     if let Some(local) = local {
-        return finish_local_stage(incoming, root, hooks, local);
+        return finish_local_stage(incoming, root, hooks, local, purpose);
     }
     if let Err(e) = lay_aliases(incoming, hooks.aliases, &mut modes) {
         let _ = crate::store::remove_tree(incoming);
@@ -549,6 +706,10 @@ fn finish_stage(
     {
         let _ = crate::store::remove_tree(incoming);
         return Err(e);
+    }
+    if let Err(error) = purpose.admit(artifact, incoming) {
+        let _ = crate::store::remove_tree(incoming);
+        return Err(error);
     }
     let root = if hooks.aliases.is_empty() {
         root
@@ -594,6 +755,22 @@ fn finish_stage(
         return Err(io_step("flush the staged tree", e));
     }
 
+    if matches!(purpose, Purpose::Publication) {
+        let published = publication_destination(build_dir).and_then(|()| {
+            crate::platform::rename_noreplace(incoming, build_dir)
+                .map_err(|error| io_step("publish the fresh inspection tree", error))
+        });
+        if let Err(error) = published {
+            let _ = crate::store::remove_tree(incoming);
+            return Err(error);
+        }
+        if let Some(parent) = build_dir.parent() {
+            crate::store::sync_dir_ordered(parent)
+                .map_err(|error| io_step("flush the inspection tree's parent", error))?;
+        }
+        return Ok(root);
+    }
+
     if let Err(e) = swap_into_place(build_dir, incoming) {
         let _ = crate::store::remove_tree(incoming);
         return Err(io_step("swap the staged tree into place", e));
@@ -616,7 +793,9 @@ fn finish_stage(
         return Err(io_step("record the declared modes beside the build", e));
     }
 
-    if let Err(e) = crate::store::mark_build_ready(build_dir) {
+    if let Purpose::Install(host) = purpose
+        && let Err(e) = crate::store::mark_build_ready_on(build_dir, host)
+    {
         return Err(io_step("mark the build complete", e));
     }
     // Accepted, failed or not: the marker is the stage's last write, and one a power cut
@@ -636,9 +815,14 @@ fn finish_local_stage(
     root: String,
     hooks: &StageHooks<'_>,
     local: &crate::local_harness::fs::Stage<'_>,
+    purpose: Purpose,
 ) -> Result<String, StageError> {
     if let Some(verify) = hooks.pre_swap {
         verify(incoming)?;
+    }
+    if let Purpose::Install(Some(host)) = purpose {
+        aterm_toolchain::gnu_runtime::admit_open_file(&local.file, host)
+            .map_err(StageError::Payload)?;
     }
     let sidecars = hooks
         .sidecars
@@ -1888,6 +2072,60 @@ mod tests {
         seal(dir.join("slip-18.tar.zst"), tar)
     }
 
+    fn make_gnu_archive(dir: &Path) -> PathBuf {
+        let mut elf = vec![0_u8; 1024];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        let write16 = |bytes: &mut [u8], at, value: u16| {
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes())
+        };
+        let write32 = |bytes: &mut [u8], at, value: u32| {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())
+        };
+        let write64 = |bytes: &mut [u8], at, value: u64| {
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes())
+        };
+        write16(&mut elf, 16, 3);
+        write16(&mut elf, 18, 62);
+        write32(&mut elf, 20, 1);
+        write64(&mut elf, 32, 64);
+        write16(&mut elf, 52, 64);
+        write16(&mut elf, 54, 56);
+        write16(&mut elf, 56, 2);
+        write32(&mut elf, 64, 1);
+        write64(&mut elf, 80, 0x40_0000);
+        write64(&mut elf, 96, 1024);
+        write64(&mut elf, 104, 1024);
+        write32(&mut elf, 120, 2);
+        write64(&mut elf, 128, 256);
+        write64(&mut elf, 136, 0x40_0100);
+        write64(&mut elf, 152, 80);
+        for (index, (tag, value)) in [
+            (5, 0x40_0200),
+            (10, 22),
+            (0x6fff_fffe, 0x40_0280),
+            (0x6fff_ffff, 1),
+            (0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write64(&mut elf, 256 + index * 16, tag);
+            write64(&mut elf, 264 + index * 16, value);
+        }
+        elf[512..534].copy_from_slice(b"\0libc.so.6\0GLIBC_2.39\0");
+        write16(&mut elf, 640, 1);
+        write16(&mut elf, 642, 1);
+        write32(&mut elf, 644, 1);
+        write32(&mut elf, 648, 16);
+        write16(&mut elf, 662, 2);
+        write32(&mut elf, 664, 11);
+        let mut tar = tar_entry("bin/ay", &elf);
+        // tar_entry's mode participates in its checksum; this fixture is deliberately a
+        // non-executable shared-object-shaped input, which still has runtime requirements.
+        tar.extend(tar_entry("BUILD-ORIGIN", b"glibc=2.17\n"));
+        seal(dir.join("gnu-18.tar.zst"), tar)
+    }
+
     struct Bundle {
         dir: crate::testdir::Dir,
         archive: PathBuf,
@@ -1950,6 +2188,165 @@ mod tests {
             std::fs::write(&witness, b"old").unwrap();
             (build, witness)
         }
+    }
+
+    #[test]
+    fn incompatible_gnu_stage_never_replaces_a_live_tree_or_writes_ready() {
+        use aterm_toolchain::gnu_runtime::{Host, Version};
+        let b = bundle_with("gnu-runtime", make_gnu_archive);
+        let mut artifact = b.art.clone();
+        artifact.target = "x86_64-unknown-linux-gnu".into();
+        artifact.kind = "elf-binary".into();
+        let build = b.build();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("witness"), b"prior live data").unwrap();
+        let host = Host {
+            machine: 62,
+            glibc: Version::parse("2.35").unwrap(),
+        };
+        let error = verify_stage(
+            &artifact,
+            &b.archive,
+            &build,
+            &StageHooks::NONE,
+            Purpose::Install(Some(host)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("requires GNU libc 2.39"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(build.join("witness")).unwrap(),
+            b"prior live data"
+        );
+        assert!(!crate::store::ready_marker_path(&build).unwrap().exists());
+        assert!(!build.join("bin/ay").exists());
+        let compatible = b.dir.join("store/ay/19");
+        let host = Host {
+            glibc: Version::parse("2.39").unwrap(),
+            ..host
+        };
+        assert!(
+            verify_stage(
+                &artifact,
+                &b.archive,
+                &compatible,
+                &StageHooks::NONE,
+                Purpose::Install(Some(host))
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::store::ready_marker_path(&compatible)
+                .unwrap()
+                .is_file()
+        );
+        assert!(crate::store::build_is_complete_on(&compatible, Some(host)));
+        let older = Host {
+            glibc: Version::parse("2.35").unwrap(),
+            ..host
+        };
+        assert!(
+            !crate::store::build_is_complete_on(&compatible, Some(older)),
+            "an old ready marker cannot override this host's runtime"
+        );
+        assert!(
+            crate::store::ready_marker_path(&compatible)
+                .unwrap()
+                .is_file(),
+            "a probe preserves the existing tree and marker"
+        );
+    }
+
+    #[test]
+    fn foreign_publication_inspection_never_claims_a_runnable_install() {
+        let b = bundle_with("gnu-publication", make_gnu_archive);
+        let mut artifact = b.art.clone();
+        artifact.target = "x86_64-unknown-linux-gnu".into();
+        artifact.kind = "elf-binary".into();
+        let build = b.build();
+        assert!(verify_for_publication(&artifact, &b.archive, &build, &StageHooks::NONE).is_ok());
+        assert!(build.join("bin/ay").is_file());
+        assert!(!crate::store::ready_marker_path(&build).unwrap().exists());
+        assert!(!crate::store::build_is_complete(&build));
+        assert!(
+            verify_for_publication(&artifact, &b.archive, &build, &StageHooks::NONE).is_err(),
+            "publication inspection cannot replace existing data"
+        );
+        let mut wrong = artifact.clone();
+        wrong.target = "aarch64-unknown-linux-gnu".into();
+        let wrong_build = b.dir.join("store/ay/20");
+        assert!(
+            verify_for_publication(&wrong, &b.archive, &wrong_build, &StageHooks::NONE).is_err()
+        );
+        assert!(
+            !crate::store::ready_marker_path(&wrong_build)
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn publication_preserves_a_destination_and_ready_marker_created_during_inspection() {
+        let b = bundle_with("gnu-publication-conflict", make_gnu_archive);
+        let mut artifact = b.art.clone();
+        artifact.target = "x86_64-unknown-linux-gnu".into();
+        artifact.kind = "elf-binary".into();
+        let build = b.build();
+        let marker = crate::store::ready_marker_path(&build).unwrap();
+        let competing = |_: &Path| {
+            std::fs::create_dir(&build).unwrap();
+            std::fs::write(build.join("witness"), b"other writer's tree").unwrap();
+            std::fs::write(&marker, b"other writer's ready marker").unwrap();
+            Ok(())
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&competing),
+            ..StageHooks::NONE
+        };
+        assert!(verify_for_publication(&artifact, &b.archive, &build, &hooks).is_err());
+        assert_eq!(
+            std::fs::read(build.join("witness")).unwrap(),
+            b"other writer's tree"
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"other writer's ready marker"
+        );
+        assert!(!build.join("bin/ay").exists());
+    }
+
+    #[test]
+    fn publication_never_sweeps_or_recovers_install_scratch() {
+        let b = bundle_with("gnu-publication-scratch", make_gnu_archive);
+        let mut artifact = b.art.clone();
+        artifact.target = "x86_64-unknown-linux-gnu".into();
+        artifact.kind = "elf-binary".into();
+        let build = b.build();
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+        let old = crate::store::superseded_dir(&build).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("witness"), b"parked install").unwrap();
+        assert!(verify_for_publication(&artifact, &b.archive, &build, &StageHooks::NONE).is_ok());
+        assert_eq!(
+            std::fs::read(old.join("witness")).unwrap(),
+            b"parked install"
+        );
+        assert!(!build.join("witness").exists());
+        assert!(!crate::store::ready_marker_path(&build).unwrap().exists());
+
+        let next = b.dir.join("store/ay/19");
+        let occupied = crate::store::incoming_dir(&next).unwrap();
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("witness"), b"another stage").unwrap();
+        assert!(verify_for_publication(&artifact, &b.archive, &next, &StageHooks::NONE).is_err());
+        assert_eq!(
+            std::fs::read(occupied.join("witness")).unwrap(),
+            b"another stage"
+        );
+        assert!(!next.exists());
+        assert!(!crate::store::ready_marker_path(&next).unwrap().exists());
     }
 
     type Want = fn(&StageError) -> bool;

@@ -345,7 +345,7 @@ impl Context {
     fn lock(&self) -> Result<FileLock, String> {
         self.prepare_dir()?;
         let path = self.dir.join("lock");
-        if path.try_exists().map_err(|e| e.to_string())? {
+        if lstat_exists(&path)? {
             checked_file(&path, RECORD_LIMIT, false)?;
         }
         FileLock::acquire_within(&path, Duration::from_millis(500)).map_err(|e| {
@@ -360,7 +360,7 @@ impl Context {
     /// Read the durable state record (named `read_state` rather than `read` to stay distinct from lock helpers).
     fn read_state(&self) -> Result<Option<State>, String> {
         let path = self.dir.join("state.toml");
-        if !path.try_exists().map_err(|e| e.to_string())? {
+        if !lstat_exists(&path)? {
             return Ok(None);
         }
         self.prepare_dir()?;
@@ -485,6 +485,17 @@ fn kept_copy(backup: &Path) -> Result<KeptCopy, String> {
     hash_open_file(file).map(KeptCopy::Digest)
 }
 
+/// Whether an entry stands at `path`, by `lstat`: a symlink, a dangling one included, is an
+/// entry (which [`checked_file`]'s no-follow open then refuses), never an absence; an `lstat`
+/// that fails other than with `NotFound` is the error.
+fn lstat_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 fn read_small(path: &Path) -> Result<Vec<u8>, String> {
     read_bounded(path, RECORD_LIMIT)
 }
@@ -510,7 +521,19 @@ fn ordered_dir(path: &Path) -> Result<(), String> {
     aterm_durable::ordered_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The [`fresh_file`] stem this thread's creates refuse: what a failed create leaves
+    /// behind, for the tests that pin it.
+    static REFUSED_STEM: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn fresh_file(parent: &Path, stem: &str) -> Result<(PathBuf, File), String> {
+    #[cfg(test)]
+    if REFUSED_STEM.with(|refused| refused.get() == Some(stem)) {
+        return Err(format!("a {stem} file is refused on this test's thread"));
+    }
     let nonce = aterm_uds::rand::hex_token::<16>().map_err(|e| e.to_string())?;
     let path = parent.join(format!("{stem}-{nonce}"));
     let file = OpenOptions::new()
@@ -680,6 +703,16 @@ fn verify_binary(
     })
 }
 
+/// A file [`fresh_file`] made for one run, removed when this goes out of scope: on every
+/// return, an early one included, and on an unwind.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Run `update identity` on an authenticated candidate to verify loader viability and compiled release identity.
 fn probe_candidate(
     path: &Path,
@@ -690,8 +723,10 @@ fn probe_candidate(
 ) -> Result<(), String> {
     use aterm_uds::spawnfd::Stdio;
     let (output_path, output) = fresh_file(private_dir, "probe-output")?;
+    let output_path = Scratch(output_path);
     let (error_path, error) = fresh_file(private_dir, "probe-error")?;
-    let result = (|| {
+    let error_path = Scratch(error_path);
+    (|| {
         let mut child = aterm_uds::spawnfd::command(path)
             .args(["update", "identity"])
             .env_clear()
@@ -703,7 +738,7 @@ fn probe_candidate(
             .map_err(|e| format!("authenticated Linux candidate cannot start: {e}"))?;
         let deadline = crate::instant_after(Instant::now(), timeout);
         let status = loop {
-            let oversized = [&output_path, &error_path]
+            let oversized = [&output_path.0, &error_path.0]
                 .into_iter()
                 .any(|path| fs::metadata(path).map_or(true, |md| md.len() > 8192));
             if oversized || Instant::now() >= deadline {
@@ -725,7 +760,7 @@ fn probe_candidate(
             }
         };
         if !status.success() {
-            let said = read_bounded(&error_path, 8192)
+            let said = read_bounded(&error_path.0, 8192)
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default();
             return Err(probe_exit_refusal(
@@ -735,14 +770,11 @@ fn probe_candidate(
                 &said,
             ));
         }
-        let bytes = read_bounded(&output_path, 8192)?;
+        let bytes = read_bounded(&output_path.0, 8192)?;
         let identity: aterm_update_core::linux::BinaryIdentity = aterm_json::from_slice(&bytes)
             .map_err(|e| format!("Linux identity probe returned invalid JSON: {e}"))?;
         identity.verify_against(manifest, target)
-    })();
-    let _ = fs::remove_file(output_path);
-    let _ = fs::remove_file(error_path);
-    result
+    })()
 }
 
 /// Format the refusal reason when a candidate's identity probe exits non-zero.
@@ -920,8 +952,8 @@ fn install_locked(
 impl Proof {
     fn read(dir: &Path) -> Result<Self, String> {
         let policy = match (
-            dir.join(POLICY).try_exists(),
-            dir.join(POLICY_SIG).try_exists(),
+            lstat_exists(&dir.join(POLICY)),
+            lstat_exists(&dir.join(POLICY_SIG)),
         ) {
             (Ok(false), Ok(false)) => None,
             (Ok(true), Ok(true)) => Some((
@@ -1534,12 +1566,7 @@ pub fn apply() -> Result<String, String> {
     if let Some(pending) = awaiting_start(&state) {
         return Err(pending);
     }
-    if !context
-        .dir
-        .join("candidate")
-        .try_exists()
-        .map_err(|e| e.to_string())?
-    {
+    if !lstat_exists(&context.dir.join("candidate"))? {
         return Err(
             "Nothing is downloaded to install \u{2014} `aterm update check` looks for a newer \
              release"

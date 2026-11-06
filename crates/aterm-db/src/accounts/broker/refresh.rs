@@ -130,14 +130,8 @@ impl Broker {
         };
         let policy = Policy::new(
             policy
-                .grants()
-                .map(|grant| {
-                    if grant.id == id {
-                        after.clone()
-                    } else {
-                        grant.clone()
-                    }
-                })
+                .into_grants()
+                .map(|grant| if grant.id == id { after.clone() } else { grant })
                 .collect(),
         )?;
         Ok(Refresh {

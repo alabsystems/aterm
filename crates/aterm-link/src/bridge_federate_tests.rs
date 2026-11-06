@@ -551,3 +551,275 @@ fn the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face() {
         "with the mesh off nothing is named: {rows:?}"
     );
 }
+
+/// How a test's person seals a post (§11 C3c).
+#[derive(Clone, Copy)]
+enum Seal<'a> {
+    /// By the person key in the Mac's own folder, under its certificate.
+    Own,
+    /// Not at all.
+    Bare,
+    /// By the person key in another folder, under the Mac's own certificate.
+    By(&'a std::path::Path),
+    /// By the person key in another folder, under that folder's certificate: another Mac's.
+    Elsewhere(&'a std::path::Path),
+}
+
+/// A post of h-andrew on `mac` to session `s-q` of `dst`, as `aterm fabric post` writes one with
+/// the mesh on (§11 C3c): on the person's own lane, under the person's producer at `seq`, sealed
+/// as `seal` says. Its offset on `mac`'s log.
+fn person_posts(
+    mac: &Mac,
+    keys: &std::path::Path,
+    (dst, seq, kind, text): (&str, u64, &str, &str),
+    seal: Seal<'_>,
+) -> u64 {
+    use crate::person_key::{post_address, read_cert, PersonKey};
+    let person = "h-andrew";
+    let lane = subject::post_lane(FLEET, dst, "s-q", person, kind);
+    let mut body = Body::new(crate::now_ms());
+    body.text = text.to_owned();
+    let sealer = match seal {
+        Seal::Own => Some((keys, keys)),
+        Seal::Bare => None,
+        Seal::By(other) => Some((other, keys)),
+        Seal::Elsewhere(other) => Some((other, other)),
+    };
+    if let Some((key_dir, cert_dir)) = sealer {
+        let key = PersonKey::read(key_dir).expect("reads").expect("made");
+        let cert = read_cert(cert_dir).expect("reads").expect("vouched");
+        key.seal(&cert, &post_address(FLEET, "s-q", person, kind), &mut body);
+    }
+    let mut client = mac.client(
+        mac.key,
+        &[format!("rw,p={person}:/f/{FLEET}/in/*/*/{person}/*")],
+    );
+    client
+        .publish(
+            astream_cap::producer_id_of(person),
+            seq,
+            &lane,
+            &body.encode(),
+        )
+        .expect("the person's post lands")
+        .0
+}
+
+/// **A PERSON'S POST REACHES THE SESSION ON ANOTHER MAC ONCE, AS THE PERSON'S** (§11 C3c): a
+/// person on P posts an ask to `@s-q@<Q>`, sealed by P's person key under the certificate of P's
+/// node key. P's carry verifies the seal and writes the ask on P's own lane to Q, naming the
+/// person, and gives that lane's charge back; P's push carries it to Q's log once; and Q's
+/// bridge verifies the seal again, under the certificate's node key, which names P, and hands it
+/// to s-q once, `from=h-andrew@<P> kind=ask trust=human`. A note to a node whose seat rotated to
+/// Q is carried to Q and handed to s-q the same way. Restarted, the carry carries nothing twice. A post with no seal, one sealed by another Mac's person key under P's certificate, one
+/// under another Mac's certificate, and one to a Mac that is no member are not carried: P's carry
+/// counts each and says why on the person's lane on P, where the person's inbox reads it
+/// (`reason=`), and Q's log holds none of them.
+/// NEGATIVE CONTROLS: with [`crate::federate::UNSEALED_CARRY`] P carries every one but the post to
+/// no member, and Q's bridge refuses each
+/// (`undeliverable … reason=person-unsealed|person-bad-seal|person-not-vouched`), handing s-q
+/// none; with [`TRUST_ANY_PERSON`] on Q too, s-q is handed each as a human's.
+#[test]
+fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
+    use crate::federate::{CARRIER, NOTICE_REASON, UNSEALED_CARRY};
+    use crate::person_key::Refusal;
+    for arm in ["checked", "unsealed-carry", "trust-any-person"] {
+        let (mp, mq) = (Mac::new(51), Mac::new(52));
+        let both = [mp.node.as_str(), mq.node.as_str()];
+        let (kp, kq) = (
+            keys_for(51, Some(&members(&mp, &both))),
+            keys_for(52, Some(&members(&mq, &both))),
+        );
+        let now = crate::now_ms();
+        assert!(crate::person_key::vouch(kp.path(), &[51; 32], now).is_ok());
+        // Another Mac's person key and certificate, which P's node key never signed.
+        let elsewhere = keys_for(53, None);
+        assert!(crate::person_key::vouch(elsewhere.path(), &[53; 32], now).is_ok());
+        let stranger = node_of(&key_of(54));
+        // Q's seat before its key rotated, as P's hand-off says.
+        let retired = node_of(&key_of(55));
+        let mut handoff_p = members(&mp, &both);
+        handoff_p.moved.insert(retired.clone(), mq.node.clone());
+        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
+        let net = Arc::new(Net::default());
+        let start = || {
+            UNSEALED_CARRY.with(|on| on.set(arm != "checked"));
+            let routes = routes_of(&mp, vec![Peer::of(&mq)], &net, false);
+            UNSEALED_CARRY.with(|on| on.set(false));
+            routes.set(&handoff_p, &BTreeSet::new());
+            routes
+        };
+        let from_p = start();
+        TRUST_ANY_PERSON.with(|on| on.set(arm == "trust-any-person"));
+
+        let to = |dst: &str, seq, kind, text, seal| {
+            person_posts(&mp, kp.path(), (dst, seq, kind, text), seal)
+        };
+        let genuine = to(&mq.node, 1, "ask", "genuine", Seal::Own);
+        let bare = to(&mq.node, 2, "note", "bare", Seal::Bare);
+        let forged = to(&mq.node, 3, "note", "forged", Seal::By(elsewhere.path()));
+        let alien = to(
+            &mq.node,
+            4,
+            "note",
+            "alien",
+            Seal::Elsewhere(elsewhere.path()),
+        );
+        let unmet = to(&stranger, 5, "note", "unmet", Seal::Own);
+        to(&retired, 6, "note", "moved", Seal::Own);
+        let carried = if arm == "checked" { 2 } else { 5 };
+        until(&format!("{arm}: P's carry took each post"), || {
+            let status = from_p.carry_status();
+            status.carried + status.refused == 6
+        });
+        let status = from_p.carry_status();
+        assert_eq!(
+            (status.carried, status.refused),
+            (carried, 6 - carried),
+            "{arm}: {status:?}"
+        );
+        let on_p = mp.holds(&format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node));
+        assert_eq!(
+            on_p.iter().map(|row| row.3).collect::<Vec<_>>(),
+            vec![Some((astream_cap::producer_id_of(CARRIER), genuine))],
+            "{arm}: carried once, under the carrier, numbered by the person's post's offset"
+        );
+        let carried_lanes = crate::federate::mail_lanes(&mq.node, &mp.node);
+        let (charged, _) = mp
+            .client(mp.key, &[format!("ro:{carried_lanes}")])
+            .last(&carried_lanes, "", 64)
+            .expect("P's last-value index");
+        assert!(
+            charged.is_empty(),
+            "{arm}: the carry gave back each lane it carried on: {:?}",
+            charged
+                .iter()
+                .map(|(_, subject, _)| subject)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            mp.holds(&format!("/f/{FLEET}/in/{stranger}/>")).len() == 1,
+            "{arm}: the post to no member stays the person's alone"
+        );
+        let on_q = format!("/f/{FLEET}/in/{}/s-q/{}/>", mq.node, mp.node);
+        until(&format!("{arm}: what P carried reaches Q's log"), || {
+            mq.holds(&on_q).len() == carried as usize
+        });
+        let held = mq.holds(&on_q);
+        let by = |raw: &[u8]| {
+            Body::decode(raw)
+                .0
+                .unknown
+                .get(crate::person_key::BY_TOKEN)
+                .cloned()
+        };
+        assert!(
+            held.iter()
+                .all(|(_, _, raw, _)| by(raw).as_deref() == Some("h-andrew")),
+            "{arm}: each names the person"
+        );
+        let notices: Vec<(Option<u64>, Option<String>)> = mp
+            .holds(&format!(
+                "/f/{FLEET}/in/p/h-andrew/{}/undeliverable",
+                mp.node
+            ))
+            .iter()
+            .map(|(_, _, raw, _)| {
+                let body = Body::decode(raw).0;
+                (body.re, body.unknown.get(NOTICE_REASON).cloned())
+            })
+            .collect();
+        let told = |off: u64, why: &str| (Some(off), Some(why.to_owned()));
+        let unmet_told = told(unmet, "fleet-not-member");
+        assert_eq!(
+            notices,
+            if arm == "checked" {
+                vec![
+                    told(bare, Refusal::Unsealed.token()),
+                    told(forged, Refusal::BadSeal.token()),
+                    told(alien, Refusal::NotVouched.token()),
+                    unmet_told,
+                ]
+            } else {
+                vec![unmet_told]
+            },
+            "{arm}: the person's inbox on P says why each was not carried"
+        );
+
+        let last = held.iter().map(|(off, _, _, _)| *off).max().expect("one");
+        assert!(
+            offer_live_record(&mut q, last),
+            "{arm}: Q's bridge reads them"
+        );
+        let deliveries = lane_q.deliveries();
+        let delivered: Vec<&String> = deliveries
+            .iter()
+            .filter(|line| line.starts_with("deliver s-q "))
+            .collect();
+        for (kind, text) in [("ask", "genuine"), ("note", "moved")] {
+            let human = format!("from=h-andrew@{} kind={kind} trust=human", mp.node);
+            assert_eq!(
+                delivered
+                    .iter()
+                    .filter(|line| line.contains(&human) && line.ends_with(&format!("text={text}")))
+                    .count(),
+                1,
+                "{arm}: the person's {kind}, once, as the person's: {delivered:?}"
+            );
+        }
+        let face = subject::session_face(FLEET, &mq.node, "s-q", "ev");
+        let refusals: Vec<String> = evs_on(&q, &face)
+            .into_iter()
+            .filter(|ev| ev.starts_with("undeliverable ") && ev.contains("reason=person-"))
+            .collect();
+        match arm {
+            "checked" => {
+                assert_eq!(delivered.len(), 2, "{arm}: {delivered:?}");
+                assert!(refusals.is_empty(), "{arm}: {refusals:?}");
+            }
+            "unsealed-carry" => {
+                assert_eq!(
+                    delivered.len(),
+                    2,
+                    "{arm}: Q handed s-q none of them: {delivered:?}"
+                );
+                let reasons: Vec<&str> = refusals
+                    .iter()
+                    .filter_map(|ev| ev.rsplit_once("reason=").map(|(_, why)| why))
+                    .collect();
+                assert_eq!(
+                    reasons,
+                    [
+                        Refusal::Unsealed.token(),
+                        Refusal::BadSeal.token(),
+                        Refusal::NotVouched.token()
+                    ],
+                    "{arm}: {refusals:?}"
+                );
+            }
+            _ => {
+                assert_eq!(delivered.len(), 5, "{arm}: {delivered:?}");
+                assert!(
+                    delivered.iter().all(|line| line.contains(" trust=human")),
+                    "{arm}: {delivered:?}"
+                );
+            }
+        }
+        TRUST_ANY_PERSON.with(|on| on.set(false));
+
+        // Restarted, the carry resumes past what it carried: a later post is carried, alone.
+        drop(from_p);
+        let again = start();
+        let later = to(&mq.node, 7, "note", "later", Seal::Own);
+        until(
+            &format!("{arm}: the restarted carry took the later post"),
+            || again.carry_status().carried == 1,
+        );
+        until(&format!("{arm}: the later post reaches Q's log"), || {
+            mq.holds(&on_q).len() == carried as usize + 1
+        });
+        assert_eq!(again.carry_status().refused, 0, "{arm}");
+        assert!(later > unmet);
+        drop(again);
+    }
+}

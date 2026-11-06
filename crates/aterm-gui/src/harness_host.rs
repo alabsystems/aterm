@@ -18507,7 +18507,11 @@ pub(crate) fn window_drive_opts_with_tap(
 }
 
 /// The worker's acts over this instance's own socket.
-fn live_acts(store: Store, sock: String) -> Acts {
+fn live_acts(
+    store: Store,
+    sock: String,
+    account_work: aterm_agent::harness::account_work::Lifetime,
+) -> Acts {
     let own_store = store.clone();
     let workers_store = store.clone();
     let task_sock = sock.clone();
@@ -18525,7 +18529,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let exit_home = home.clone();
     let limit_home = home.clone();
     let account_home = home.clone();
-    let upkeep = live_accounts_upkeep();
+    let upkeep = live_accounts_upkeep(account_work);
     let wall_upkeep = upkeep.clone();
     let screen_wall_store = store.clone();
     let usage_home = home.clone();
@@ -25508,18 +25512,38 @@ pub(crate) enum AccountsUpkeep {
     /// Nothing at all, whatever is configured.
     Inert,
     /// [`maintain_accounts_live`]: the person's own instance's.
-    Live,
+    Live(aterm_agent::harness::account_work::Lifetime),
     /// A test's own, handed each step it is made for.
     #[cfg(test)]
     Made(Arc<dyn Fn(UpkeepStep) + Send + Sync>),
 }
 
 impl AccountsUpkeep {
+    /// Continue an already admitted operation without opening a second epoch admission.
+    pub(crate) fn make_scoped(
+        &self,
+        scope: aterm_agent::harness::account_work::Scope,
+        step: UpkeepStep,
+    ) {
+        if scope.cancelled() {
+            return;
+        }
+        match self {
+            Self::Live(_) => maintain_accounts_live(scope, step),
+            Self::Inert => {}
+            #[cfg(test)]
+            Self::Made(upkeep) => upkeep(step),
+        }
+    }
     /// Make the upkeep's `step`.
     pub(crate) fn make(&self, step: UpkeepStep) {
         match self {
             Self::Inert => {}
-            Self::Live => maintain_accounts_live(step),
+            Self::Live(lifetime) => {
+                if let Some(scope) = lifetime.enter() {
+                    maintain_accounts_live(scope, step);
+                }
+            }
             #[cfg(test)]
             Self::Made(upkeep) => upkeep(step),
         }
@@ -25527,13 +25551,15 @@ impl AccountsUpkeep {
 }
 
 /// [`live_acts`]' accounts' upkeep for this process, and the fact menu's (`crate::fact_menu`).
-pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
+pub(crate) fn live_accounts_upkeep(
+    lifetime: aterm_agent::harness::account_work::Lifetime,
+) -> AccountsUpkeep {
     let not_own = aterm_types::dirs::not_own_account();
     let seam = aterm_types::dirs::test_root().is_none()
         && crate::headless_seam_admits(
             aterm_types::dev_seam!(aterm_agent::harness::accounts_sync::UPKEEP_SEAM).is_some(),
         );
-    let arm = accounts_upkeep_here(not_own, seam);
+    let arm = accounts_upkeep_here(not_own, seam, lifetime.clone());
     if matches!(arm, AccountsUpkeep::Inert) {
         let why = not_own.unwrap_or("it is a debug build");
         aterm_log::info!(
@@ -25541,8 +25567,8 @@ pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
              (no roster is fetched and no sign-in is started, whatever aterm.toml says)"
         );
     }
-    if matches!(arm, AccountsUpkeep::Live) {
-        accounts_on_move();
+    if matches!(arm, AccountsUpkeep::Live(_)) {
+        accounts_on_move(lifetime);
     }
     arm
 }
@@ -25550,7 +25576,7 @@ pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
 /// Start, once per process, the live accounts' answer to each move of this window's network
 /// ([`accounts_moved`]), and the account claims' look every `claims::RECHECK_S` between moves
 /// ([`claims_look`]).
-fn accounts_on_move() {
+fn accounts_on_move(lifetime: aterm_agent::harness::account_work::Lifetime) {
     static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if STARTED.set(()).is_err() {
         return;
@@ -25564,10 +25590,13 @@ fn accounts_on_move() {
             loop {
                 let every = aterm_agent::harness::claims::RECHECK_S.unsigned_abs();
                 let woke = moved.wait(Duration::from_secs(every));
+                let Some(scope) = lifetime.enter() else {
+                    continue;
+                };
                 if woke == crate::network_moved::Woke::Timer {
                     claims_look();
                 } else {
-                    accounts_moved(woke);
+                    accounts_moved(scope, woke);
                 }
             }
         });
@@ -25584,15 +25613,20 @@ fn accounts_on_move() {
 /// the automatic sign-in ladder's waits end, but that of a row a page stopped, and the upkeep runs
 /// now, then the account claims are read again and settled
 /// ([`aterm_agent::harness::claims::touch`]).
-fn accounts_moved(woke: crate::network_moved::Woke) {
+fn accounts_moved(
+    scope: aterm_agent::harness::account_work::Scope,
+    woke: crate::network_moved::Woke,
+) {
     aterm_log::info!(
         "harness: accounts-upkeep: the network moved ({}): the sign-in ladder's waits, but a \
          page's, end, the upkeep runs now, and the account claims are settled again",
         woke.words(),
     );
     aterm_agent::harness::accounts_sync::network_moved();
-    maintain_accounts_live(UpkeepStep::Both);
-    claims_look();
+    maintain_accounts_live(scope.clone(), UpkeepStep::Both);
+    if !scope.cancelled() {
+        claims_look();
+    }
 }
 
 /// Read the account claims and settle them, giving up each claim this Mac no longer uses
@@ -25779,8 +25813,12 @@ fn claims_touch(act: aterm_agent::harness::claims::Act<'_>) {
 }
 
 /// [`accounts_upkeep_arm`] for this build: the arm's `debug` is this build's debug assertions.
-const fn accounts_upkeep_here(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
-    accounts_upkeep_arm(not_own, seam, cfg!(debug_assertions))
+fn accounts_upkeep_here(
+    not_own: Option<&str>,
+    seam: bool,
+    lifetime: aterm_agent::harness::account_work::Lifetime,
+) -> AccountsUpkeep {
+    accounts_upkeep_arm(not_own, seam, cfg!(debug_assertions), lifetime)
 }
 
 /// The live upkeep where a shipped build (`debug` false) runs as its account's own (`not_own` is
@@ -25789,17 +25827,22 @@ const fn accounts_upkeep_here(not_own: Option<&str>, seam: bool) -> AccountsUpke
 /// binary copied under a name that gives it no scratch root
 /// (`aterm_uds::test_binary::is_test_binary`), which reads as its account's own and would start a
 /// real sign-in from a test. `debug` is passed in, so a test reaches the shipped build's answer.
-const fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool, debug: bool) -> AccountsUpkeep {
+fn accounts_upkeep_arm(
+    not_own: Option<&str>,
+    seam: bool,
+    debug: bool,
+    lifetime: aterm_agent::harness::account_work::Lifetime,
+) -> AccountsUpkeep {
     if seam || (not_own.is_none() && !debug) {
-        AccountsUpkeep::Live
+        AccountsUpkeep::Live(lifetime)
     } else {
         AccountsUpkeep::Inert
     }
 }
 
 /// The accounts' upkeep, live ([`AccountsUpkeep::Live`]).
-fn maintain_accounts_live(step: UpkeepStep) {
-    use aterm_agent::harness::accounts_sync::{Upkept, upkeep_live};
+fn maintain_accounts_live(scope: aterm_agent::harness::account_work::Scope, step: UpkeepStep) {
+    use aterm_agent::harness::accounts_sync::{Upkept, upkeep_live_scoped};
     static SAID: Mutex<Option<Upkept>> = Mutex::new(None);
     let Some(home) = aterm_primer::home_dir() else {
         return;
@@ -25816,7 +25859,7 @@ fn maintain_accounts_live(step: UpkeepStep) {
     aterm_agent::harness::accounts_sync::log_sign_ins_to(|line| {
         aterm_log::info!("harness: accounts-upkeep: {line}");
     });
-    let upkept = upkeep_live(&home, &state, &roster, now, step);
+    let upkept = upkeep_live_scoped(scope.clone(), &home, &state, &roster, now, step);
     if let Upkept::Configured { renewal: true, .. } | Upkept::Unconfigured { renewal: true, .. } =
         upkept
     {
@@ -26194,6 +26237,7 @@ pub(crate) fn start_default(
     headless: bool,
     suspended: bool,
     proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
+    account_work: aterm_agent::harness::account_work::Lifetime,
 ) -> HostHandle {
     let words = store.clone();
     let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store.clone());
@@ -26242,7 +26286,7 @@ pub(crate) fn start_default(
             said,
             receipt,
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
-            acts: live_acts(s3, k3),
+            acts: live_acts(s3, k3, account_work),
             backoff: Arc::new(|n| aterm_gui_timing::current().of(restart_backoff(n))),
             pause: Arc::new(|pause| aterm_gui_timing::current().of(pause)),
             carry_clock: Arc::new(MonotonicClock),

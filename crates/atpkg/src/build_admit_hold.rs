@@ -20,8 +20,12 @@
 //! off, never drops it): the front keeps it.
 //!
 //! While the build runs the watch wakes every [`aterm_capacity::tree_meter::READ_EVERY`] too, and
-//! reads the front's pid itself: a kevent that fails (any error but `EINTR`) is no exit, so the
-//! holder then waits by those reads alone until the pid names no live process of its serial.
+//! reads the front's pid itself. A pid that names no live process of its serial is an exit
+//! begun, not read yet: macOS stops reading a dying process's pid before it queues the exit's
+//! event, so the watch waits on for that event and its status, and takes the end for one with no
+//! status only after a minute of such reads in a row (`EXIT_EVENT_WAKES`). A kevent that fails
+//! (any error but `EINTR`) is no exit, so the holder then waits by those reads alone until the
+//! pid names no live process of its serial.
 //!
 //! At the build's end: an exit lets the claim go at once ([`super::Held::let_go`], before the
 //! meter's last read), its peak then kept as the front's would have been ([`super::Ended::keep`]:
@@ -52,6 +56,23 @@ pub const SURVIVORS_IDLE_UNDER: u64 = 64 << 20;
 /// for them to grow.
 #[cfg(unix)]
 pub const SURVIVORS_STALL_WITHIN: std::time::Duration = super::TREE_ENDS_WITHIN;
+
+/// How many of a watch's wakes in a row ([`aterm_capacity::tree_meter::READ_EVERY`] apart, each
+/// with no event: a minute's) read the front's pid gone before its end is taken for one with no
+/// status. macOS stops reading a killed process's pid before it queues the exit's event
+/// (`NOTE_EXIT`): 110 of 110 kills on macOS 27.2.0, the event 1 µs to 1.2 ms later under load. A
+/// watch that took the first such read for the end read a death by a signal as no status, and
+/// so let a killed build's claim go while its survivors worked. The event comes, so this bounds
+/// only one the kernel holds back (it reports a traced process's exit to its debugger first) or
+/// never queues.
+#[cfg(target_os = "macos")]
+const EXIT_EVENT_WAKES: u32 = 120;
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    EXIT_EVENT_WAKES as u128 * aterm_capacity::tree_meter::READ_EVERY.as_millis()
+        == std::time::Duration::from_mins(1).as_millis()
+);
 
 /// TEST SEAM: set in a debug build's environment to a file, a holder appends at each wake of its
 /// watch one line naming what its meter's last read found descended from the front (`reads
@@ -232,18 +253,22 @@ fn hold(words: &Words) -> u8 {
     let Ok(pid) = i32::try_from(words.pid) else {
         return 1;
     };
-    // The watch is on the front's process only while its pid still names it: a front gone
-    // before this read (its pid given anew, or a zombie, which reads none) is never armed for.
-    if aterm_uds::process::process_serial(pid) != Some(words.serial)
-        || arming.write_all(&[1]).is_err()
-    {
+    // The watch and the meter's first read are on the front's process only while its pid still
+    // names it: a front gone before this read (its pid given anew, or a zombie, which reads none)
+    // is never armed for.
+    let Some(meter) = meter_for_front(
+        || aterm_capacity::tree_meter::TreeMeter::start(words.pid),
+        || {
+            aterm_uds::process::process_serial(pid) == Some(words.serial)
+                && arming.write_all(&[1]).is_ok()
+        },
+    ) else {
         return 1;
-    }
+    };
     let Some(claim) = claim.armed() else {
         return 1;
     };
     drop(arming);
-    let meter = aterm_capacity::tree_meter::TreeMeter::start(words.pid);
     #[cfg(any(test, debug_assertions))]
     trace_meter(&meter, words);
     #[cfg(any(test, debug_assertions))]
@@ -289,6 +314,16 @@ fn hold(words: &Words) -> u8 {
         })
     });
     0
+}
+
+/// The front's meter, started (its first read made) before `still_front` reads whether the
+/// front's pid still names it, so that read vouches for the meter's first one as it does for the
+/// watch armed before it; `None`, the meter dropped, where it does not. A meter started after the
+/// read could take its root from a later process given the pid in between.
+#[cfg(target_os = "macos")]
+fn meter_for_front<M>(start: impl FnOnce() -> M, still_front: impl FnOnce() -> bool) -> Option<M> {
+    let meter = start();
+    still_front().then_some(meter)
 }
 
 /// A CLAIM ADOPTED AND NOT YET ARMED FOR: every way the holder leaves before its arming byte (a
@@ -608,23 +643,34 @@ impl Watch {
 
     /// Wait for the exit of the process, `serial` its serial: its status where the kernel gave
     /// one. `tick` runs at each wake, every [`aterm_capacity::tree_meter::READ_EVERY`], when the
-    /// pid is read too: one that names no live process of `serial` ended with no event read (an
-    /// exit's status lost, `End::Unknown`), and a kevent that fails (any error but `EINTR`) is
-    /// waited out by those reads alone, never taken for an exit.
+    /// pid is read too. A pid that names no live process of `serial` is an exit begun, whose
+    /// event the next kevent takes once the kernel queues it ([`EXIT_EVENT_WAKES`]); only that
+    /// many such wakes in a row with no event are an end with no status (`End::Unknown`). A
+    /// kevent that fails (any error but `EINTR`) is waited out by those reads alone, never
+    /// taken for an exit, and there the first read of the pid gone is the end.
     fn wait(&self, serial: u64, tick: &mut dyn FnMut()) -> End {
+        let pid = i32::try_from(self.pid).ok();
+        let mut gone = || pid.and_then(aterm_uds::process::process_serial) != Some(serial);
+        self.wait_reading(&mut gone, EXIT_EVENT_WAKES, tick)
+    }
+
+    /// [`Self::wait`], its process's pid read by `gone` (true where the pid names no live process
+    /// of the watched one's serial), its end taken for one with no status once `gone` said so at
+    /// `wakes` wakes in a row with no exit event.
+    fn wait_reading(
+        &self,
+        gone: &mut dyn FnMut() -> bool,
+        wakes: u32,
+        tick: &mut dyn FnMut(),
+    ) -> End {
         use std::os::fd::AsRawFd as _;
         let every = aterm_capacity::tree_meter::READ_EVERY;
         let nap = libc::timespec {
             tv_sec: 0,
             tv_nsec: libc::c_long::try_from(every.as_nanos()).unwrap_or(500_000_000),
         };
-        let gone = || {
-            i32::try_from(self.pid)
-                .ok()
-                .and_then(aterm_uds::process::process_serial)
-                != Some(serial)
-        };
         let mut failed = false;
+        let mut gone_for = 0u32;
         loop {
             if failed {
                 std::thread::sleep(every);
@@ -659,8 +705,16 @@ impl Watch {
             }
             if rc == 0 {
                 tick();
-                if gone() {
-                    return self.pending().unwrap_or(End::Unknown);
+                // The kernel stops reading a dying process's pid before it queues the exit's
+                // event: a read of it gone is no end yet, and the next kevent takes the event,
+                // and its status, the moment it is queued. A read of it live counts anew.
+                gone_for = if gone() {
+                    gone_for.saturating_add(1)
+                } else {
+                    0
+                };
+                if gone_for >= wakes {
+                    return End::Unknown;
                 }
                 continue;
             }
@@ -669,37 +723,6 @@ impl Watch {
             }
             return Self::status(&event);
         }
-    }
-
-    /// The end an exit event for the process that waits in the queue now names (a look that does
-    /// not wait); `None` for none.
-    fn pending(&self) -> Option<End> {
-        use std::os::fd::AsRawFd as _;
-        let now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let mut event = libc::kevent {
-            ident: 0,
-            filter: 0,
-            flags: 0,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // SAFETY: one event slot and a zero timeout, both live for the call.
-        let rc = unsafe {
-            libc::kevent(
-                self.kq.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                &raw mut event,
-                1,
-                &raw const now,
-            )
-        };
-        (rc == 1 && event.ident == self.pid as usize && event.fflags & libc::NOTE_EXIT != 0)
-            .then(|| Self::status(&event))
     }
 
     /// The end an exit event names.

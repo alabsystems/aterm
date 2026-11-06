@@ -681,6 +681,17 @@ impl Ladder {
         self.invalidate_vault_result();
     }
 
+    /// Retire this uncompleted refresh without recording an authentication failure.
+    pub(super) fn vault_cancelled(&mut self, context: VaultContext) {
+        if self
+            .vault
+            .as_ref()
+            .is_some_and(|run| run.context == context && run.seen.is_none())
+        {
+            self.vault = None;
+        }
+    }
+
     fn invalidate_vault_result(&mut self) {
         match &mut self.vault {
             Some(run) if run.seen.is_none() => run.invalidated = true,

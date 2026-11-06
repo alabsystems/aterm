@@ -193,6 +193,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         dial: Instant::now(),
         rotate: Instant::now() + Duration::from_secs(300),
         versions_at: Instant::now(),
+        bus: Bus::default(),
         scope: Scope::Loopback,
         port: 0,
         contacts: Vec::new(),
@@ -769,6 +770,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         dial: now,
         rotate: now + Duration::from_secs(300),
         versions_at: now,
+        bus: Bus::default(),
         scope: Scope::Loopback,
         port,
         contacts: Vec::new(),
@@ -948,14 +950,19 @@ fn a_round_refused_before_versions_never_hides_the_round_it_lost_to() {
         (after(5), Said::Nothing, after(3))
     );
     // Rounds that all said nothing of their version leave nothing to record apart from the
-    // latest contact, whichever order they finished in.
-    let mut silent = Contact::new([7; 48], after(2), Said::Unknown, None);
-    silent.heard(after(5), Said::Unknown);
-    silent.heard(after(1), Said::Unknown);
-    assert_eq!(
-        (silent.at, silent.said, silent.said_at),
-        (after(5), Said::Unknown, after(5))
-    );
+    // latest contact, whichever order they finished in: each fold carries said_at to the
+    // contact it has just raised, not the one before it.
+    for order in [[5, 1], [1, 5]] {
+        let mut silent = Contact::new([7; 48], after(2), Said::Unknown, None);
+        for ms in order {
+            silent.heard(after(ms), Said::Unknown);
+        }
+        assert_eq!(
+            (silent.at, silent.said, silent.said_at),
+            (after(5), Said::Unknown, after(5)),
+            "silent rounds folded at {order:?}"
+        );
+    }
 }
 
 /// Of the readings a peer's rounds took, a contact keeps the one its latest-authenticated round

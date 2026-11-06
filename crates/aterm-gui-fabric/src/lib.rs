@@ -41,6 +41,19 @@ pub trait FabricSession: Send + Sync {
     fn fleet_mail_ready(&self) -> bool {
         false
     }
+    /// How `node`, another Mac, takes this session's mail with the mesh on (§11 C6). A context
+    /// that cannot say answers [`fleet_mail::PeerMail::Mesh`], the bus route C3 built.
+    fn peer_mail(&self, _node: &str) -> fleet_mail::PeerMail {
+        fleet_mail::PeerMail::Mesh
+    }
+    /// Send `request`, one direct-mail `post` line (no newline) for a session on `node`, to that
+    /// Mac over a fleet drive, and return the one line it answered (§11 C6).
+    /// # Errors
+    /// No drive reached `node`, or it hung up before it answered. A context with no fleet drive
+    /// reaches none.
+    fn fleet_drive(&self, _node: &str, _request: &str) -> Result<String, String> {
+        Err("this session reaches no fleet drive".to_owned())
+    }
 }
 
 impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
@@ -64,6 +77,12 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     }
     fn fleet_mail_ready(&self) -> bool {
         (**self).fleet_mail_ready()
+    }
+    fn peer_mail(&self, node: &str) -> fleet_mail::PeerMail {
+        (**self).peer_mail(node)
+    }
+    fn fleet_drive(&self, node: &str, request: &str) -> Result<String, String> {
+        (**self).fleet_drive(node, request)
     }
 }
 
@@ -91,6 +110,14 @@ pub enum FabricFact<'a> {
     },
     /// A direct arrival was answered or explicitly retired by its recipient.
     FleetMailSeen { id: u64 },
+    /// A post carried by direct fleet mail to a session on a pre-R3 Mac (§11 C6): `id` is in
+    /// that Mac's `fN` namespace, `idem` the key its reply names.
+    FleetMailOut {
+        id: u64,
+        kind: &'a str,
+        to: &'a str,
+        idem: &'a str,
+    },
     /// A row delivered to this session's inbox.
     MailIn {
         kind: &'a str,
@@ -98,10 +125,11 @@ pub enum FabricFact<'a> {
         off: u64,
         inbox: u64,
     },
-    /// `inbox seen <id>`, every one.
+    /// `inbox seen <id>`, every one. `off` is none for a direct fleet message, which names no
+    /// bus record.
     MailSeen {
         inbox: u64,
-        off: u64,
+        off: Option<u64>,
         floor: Option<u64>,
         seen: u64,
         verdict: Option<&'a str>,
@@ -404,6 +432,10 @@ pub struct InboxRow {
     /// A broadcast the delivering bridge offers again, while it is unhandled, to a successor that
     /// keeps this sid.
     pub refill: bool,
+    /// The direct mailbox id (`f<id>`) of a fleet message the mesh imported into this ring
+    /// ([`fleet_mail`], §11 C6), which `post re=f<id>` answers. Such a row names no bus record:
+    /// its `off` is 0 and it is never on the log.
+    pub fleet: Option<u64>,
     on_log: bool,
 }
 
@@ -763,6 +795,10 @@ pub struct Inbox {
     /// saw it under the mailbox's lock: `None` before one, or when it found no file.
     #[cfg(unix)]
     direct_stamp: Option<fleet_mail::Stamp>,
+    /// The direct messages this process imported into [`Self::rows`] with the mesh on, by their
+    /// mailbox identity, so none enters twice, whether or not the ring still holds it.
+    #[cfg(unix)]
+    fleet_imported: BTreeSet<fleet_mail::Imported>,
     pub rows: VecDeque<InboxRow>,
     pub posts: VecDeque<PostRow>,
     outbox_turn: u64,
@@ -1409,6 +1445,40 @@ impl Inbox {
         self.rows.iter().find(|r| r.off == off && r.on_log)
     }
 
+    /// Take the direct message `id`, which `node` sent, into the ring as an unlisted row
+    /// (§11 C6): `from=fleet:<node>`, `trust=agent` (its sender's node key proved the drive it
+    /// came by), no bus record. The caller waited out the update fence ([`InboxRow::fleet`]).
+    #[cfg(unix)]
+    fn import_fleet(&mut self, id: u64, node: &str, kind: &str, text: &str) {
+        self.last_msg_id += 1;
+        let row = InboxRow {
+            id: self.last_msg_id,
+            off: 0,
+            t_ms: now_ms(),
+            from: format!("fleet:{node}"),
+            kind: kind.to_owned(),
+            trust: "agent".to_owned(),
+            re: None,
+            re_id: None,
+            dl: None,
+            late: false,
+            verdict: None,
+            decision: None,
+            demoted: None,
+            via: None,
+            len: text.len(),
+            body: text.to_owned(),
+            topic: None,
+            listed: false,
+            refill: false,
+            fleet: Some(id),
+            on_log: false,
+        };
+        evict_for(self);
+        self.rows.push_back(row);
+        self.arrived = handler_tally::stamp();
+    }
+
     /// The outbound load `post` is refused against.
     pub fn queued_load(&self) -> (usize, usize) {
         self.posts
@@ -1473,6 +1543,20 @@ pub struct SessionFabric {
 impl SessionFabric {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether this session's direct fleet mail enters its ring (§11 C6): the mesh switch as the
+    /// session read it when it was made. Direct fleet mail is Unix's alone.
+    #[must_use]
+    pub fn mesh_imports(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.mesh.enabled
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Run `f` on this session's ring under its lock.
@@ -1551,7 +1635,9 @@ impl SessionFabric {
     }
 
     /// The delivered rows newer than `after` that `want` asks for, the highest id ever delivered
-    /// here, and how many rows above `after` the ring still holds ([`MailSince`]).
+    /// here, and how many rows above `after` the ring still holds ([`MailSince`]). A row the mesh
+    /// imported from direct fleet mail ([`InboxRow::fleet`]) names no bus record, and is not
+    /// among them: [`Self::direct_mail_since`] tells of its arrival by its mailbox id.
     pub fn mail_since(&self, after: u64, want: &MailFilter) -> MailSince {
         let inbox = self.lock();
         if after >= inbox.last_msg_id {
@@ -1565,7 +1651,7 @@ impl SessionFabric {
             rows: inbox
                 .rows
                 .iter()
-                .filter(|r| r.id > after && want.wants(r))
+                .filter(|r| r.id > after && r.fleet.is_none() && want.wants(r))
                 .map(|r| MailLine {
                     id: r.id,
                     off: r.off,
@@ -2224,7 +2310,13 @@ impl SessionFabric {
     pub fn mail_facts(&self) -> aterm_messages::presence::MailFacts {
         let inbox = self.lock();
         let seen = inbox.seen;
-        let mut direct_unread = inbox.direct_mail.rows.iter().filter(|r| !r.replied);
+        // With the mesh on, the ring holds every unread direct message (§11 C6), counted there.
+        let direct = if self.mesh_imports() {
+            &[][..]
+        } else {
+            &inbox.direct_mail.rows[..]
+        };
+        let mut direct_unread = direct.iter().filter(|r| !r.replied);
         let unread = inbox.rows.iter().filter(|r| r.id > seen).count() as u64
             + direct_unread.clone().count() as u64;
         let pending = inbox
@@ -5438,6 +5530,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         topic,
         listed: false,
         refill,
+        fleet: None,
         on_log: true,
     };
     evict_for(&mut inbox);
@@ -5769,10 +5862,17 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
         }
     }
 
-    let (direct, direct_unavailable) = match fleet_mail::view(ctx, rest, true) {
-        Ok(view) => (view, false),
-        Err(_) => (fleet_mail::View::default(), true),
+    // With the mesh on, the ring holds the unread direct fleet mail (§11 C6): no page of the
+    // mailbox follows it.
+    let (direct, mut direct_unavailable) = if ctx.fabric().mesh_imports() {
+        (fleet_mail::View::default(), false)
+    } else {
+        match fleet_mail::view(ctx, rest, true) {
+            Ok(view) => (view, false),
+            Err(_) => (fleet_mail::View::default(), true),
+        }
     };
+    let mut listed_fleet = Vec::new();
     let holder = holder_token(ctx);
     let mut inbox = ctx.fabric().lock();
     let hold_flag = u8::from(inbox.holds.is_held());
@@ -5795,6 +5895,11 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
             body.push('\n');
             sent += 1;
             if !peek {
+                if !row.listed
+                    && let Some(id) = row.fleet
+                {
+                    listed_fleet.push(id);
+                }
                 row.listed = true;
             }
         } else if !row.listed {
@@ -5827,31 +5932,49 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
          dropped={} pending={pending}",
         inbox.seen, inbox.bus_head, inbox.dropped,
     );
-    if direct_unavailable {
-        out.push_str(" fleet_error=unavailable");
-    }
+    let mut gaps = String::new();
     if let Some(g) = inbox.given_up {
-        let _ = write!(out, " given_up=@{}..@{}", g.from, g.to);
+        let _ = write!(gaps, " given_up=@{}..@{}", g.from, g.to);
         if let Some(n) = g.records {
-            let _ = write!(out, " given_up_count={n}");
+            let _ = write!(gaps, " given_up_count={n}");
         }
     }
     if let Some(g) = inbox.lane_given_up {
-        let _ = write!(out, " lane_given_up=@{}..@{}", g.from, g.to);
+        let _ = write!(gaps, " lane_given_up=@{}..@{}", g.from, g.to);
     }
-    out.push('\n');
     drop(inbox);
+    // The listing is the import's mark: written to the sealed mailbox, so no later start imports
+    // these again. One the mailbox refuses stays unlisted there, and the next start offers it
+    // again rather than lose it.
+    direct_unavailable |= fleet_mail::mark_listed(ctx, &listed_fleet).is_err();
+    if direct_unavailable {
+        out.push_str(" fleet_error=unavailable");
+    }
+    out.push_str(&gaps);
+    out.push('\n');
     out.push_str(&body);
     out
 }
 
 fn render_row_into(out: &mut String, row: &InboxRow, meta_only: bool) {
     use std::fmt::Write as _;
-    let _ = write!(
-        out,
-        "msg {} off={} t={} from={} kind={} trust={}",
-        row.id, row.off, row.t_ms, row.from, row.kind, row.trust
-    );
+    match row.fleet {
+        // Direct fleet mail the mesh imported names no bus record: its mailbox id answers it.
+        Some(fleet) => {
+            let _ = write!(
+                out,
+                "msg {} off=- t={} from={} kind={} trust={} fleet=f{fleet}",
+                row.id, row.t_ms, row.from, row.kind, row.trust
+            );
+        }
+        None => {
+            let _ = write!(
+                out,
+                "msg {} off={} t={} from={} kind={} trust={}",
+                row.id, row.off, row.t_ms, row.from, row.kind, row.trust
+            );
+        }
+    }
     if let Some(re) = row.re {
         let _ = write!(out, " re={re}");
         if let Some(re_id) = row.re_id {
@@ -6038,33 +6161,51 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     if let Some(v) = decided {
         let row = &mut inbox.rows[at];
         row.decision = Some(v.to_string());
-        if matches!(row.kind.as_str(), "ask" | "task") {
+        // Direct fleet mail is answered by `post re=f<id>`, which its sender reads on its next
+        // drive: no bus receipt reaches it (§11 C6).
+        if matches!(row.kind.as_str(), "ask" | "task") && row.fleet.is_none() {
             let (kind, from) = (row.kind.clone(), row.from.clone());
             owe_receipt(&mut inbox, off, v, &kind, &from, earlier_log);
         }
     }
     let seen_before = inbox.seen;
     inbox.seen = inbox.seen.max(id);
+    let mut listed_fleet = Vec::new();
     for row in &mut inbox.rows {
         if row.id <= id {
+            if !row.listed
+                && let Some(fleet) = row.fleet
+            {
+                listed_fleet.push(fleet);
+            }
             row.listed = true;
         }
     }
     let seen = inbox.seen;
     let floor_at = addressed_floor(&inbox);
+    // A direct fleet message closes by its own fact, a reply's or a retirement's
+    // (`FleetMailSeen`), as it does with the mesh off: its listing here moves only the bus
+    // messages the watermark passed, so the session log does not close it twice.
+    let bus_passed = inbox
+        .rows
+        .iter()
+        .any(|r| r.id > seen_before && r.id <= id && r.fleet.is_none());
     let row = &inbox.rows[at];
     let fact = FabricFact::MailSeen {
         inbox: id,
-        off,
+        off: row.fleet.is_none().then_some(off),
         floor: floor_at,
         seen,
         verdict: decided,
         kind: &row.kind,
         from: &row.from,
-        moved: seen > seen_before || decided.is_some(),
+        moved: bus_passed || (decided.is_some() && row.fleet.is_none()),
     };
     let _ = ctx.record_fact("inbox-seen", fact);
     drop(inbox);
+    // As `inbox`'s listing does: a mark the mailbox refuses leaves the message for the next
+    // start to offer again.
+    let _ = fleet_mail::mark_listed(ctx, &listed_fleet);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
     format!("OK seen={seen}\n")
@@ -6228,6 +6369,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     {
         return POST_USAGE.to_string();
     }
+    let inline = body.is_none() && declared_len.is_none();
     let body = match (body, declared_len) {
         (Some(bytes), _) => bytes,
         (None, Some(_)) => {
@@ -6254,6 +6396,26 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         return post_body_too_large();
     }
     let body = String::from_utf8_lossy(&body).into_owned();
+
+    // With the mesh on, a session on a Mac that does not speak the mesh mail route (a pre-R3
+    // Mac) is reached the way it reads mail: by direct fleet mail over a fleet drive (§11 C6).
+    if ctx.fabric().mesh_imports()
+        && let Some((sid, node)) = to.strip_prefix('@').and_then(|rest| rest.split_once('@'))
+        && ctx.peer_mail(node) == fleet_mail::PeerMail::Fleet
+    {
+        return fleet_mail::carry(
+            ctx,
+            &fleet_mail::Carry {
+                sid,
+                node,
+                kind: &kind,
+                key: key.as_deref(),
+                text: &body,
+                inline,
+                plain: re.is_none() && dl.is_none() && via.is_none() && wait_ack.is_none(),
+            },
+        );
+    }
 
     let wait = wait.or_else(|| {
         (matches!(kind.as_str(), "ask" | "task") || wait_ack.is_some()).then_some(None)
@@ -6575,21 +6737,24 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         if let Some(reply) = latched(&mut guard, &spans) {
             return reply;
         }
-        let direct = if re.is_none() && topic.is_none() {
-            let epoch = ctx.fabric().direct_epoch.load(Ordering::Acquire);
-            drop(guard);
-            let direct = fleet_mail::pending(ctx, fleet_since, accepts);
-            guard = ctx.fabric().lock();
-            if epoch != ctx.fabric().direct_epoch.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some(reply) = latched(&mut guard, &spans) {
-                return reply;
-            }
-            direct
-        } else {
-            Ok(None)
-        };
+        // With the mesh on, the ring holds the unread direct mail (§11 C6), and its rows latch
+        // above; only a wait on direct mail alone reads the mailbox.
+        let direct =
+            if re.is_none() && topic.is_none() && (direct_only || !ctx.fabric().mesh_imports()) {
+                let epoch = ctx.fabric().direct_epoch.load(Ordering::Acquire);
+                drop(guard);
+                let direct = fleet_mail::pending(ctx, fleet_since, accepts);
+                guard = ctx.fabric().lock();
+                if epoch != ctx.fabric().direct_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let Some(reply) = latched(&mut guard, &spans) {
+                    return reply;
+                }
+                direct
+            } else {
+                Ok(None)
+            };
         let direct = match direct {
             Ok(pending) => pending,
             Err(why) if direct_only => return fleet_mail::refusal(why),
@@ -6697,6 +6862,9 @@ mod test_support {
                 format!("f{id} from={from} kind={kind}")
             }
             FabricFact::FleetMailSeen { id } => format!("f{id} moved=1"),
+            FabricFact::FleetMailOut { id, kind, to, idem } => {
+                format!("f{id} to={} kind={kind} key={idem}", super::pct_encode(to))
+            }
             FabricFact::MailIn {
                 kind,
                 from,
@@ -6717,7 +6885,8 @@ mod test_support {
                     format!(" verdict={v} kind={kind} from={from}")
                 });
                 format!(
-                    "{inbox} off={off} floor={} seen={seen}{tail}",
+                    "{inbox} off={} floor={} seen={seen}{tail}",
+                    or_dash(off),
                     or_dash(floor)
                 )
             }
@@ -8776,6 +8945,54 @@ mod inbox_hold {
         assert!(cmd_inbox(&ctx, "--peek").contains(" seen=0 "));
     }
 
+    /// An imported direct fleet message (§11 C6) closes on the session log by its own fact, a
+    /// reply's or a retirement's, as with the mesh off: its `inbox seen` names no bus offset
+    /// and moves only the bus messages the watermark passed.
+    #[cfg(unix)]
+    #[test]
+    fn a_fleet_rows_seen_names_no_offset_and_closes_only_the_bus_rows_it_passed() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let deliver = |off: u64| {
+            let line = format!("{sid} off={off} from=h-a kind=task trust=human text=BUS");
+            cmd_deliver_waking(&store, &line, &|_| {})
+        };
+        let import = |id: u64| {
+            ctx.fabric
+                .lock()
+                .import_fleet(id, &format!("n-{}", "a".repeat(16)), "ask", "DIRECT");
+        };
+        let seen = |rest: &str| {
+            ctx.timeline.lock().unwrap().facts.clear();
+            assert!(cmd_inbox_seen(&ctx, rest).starts_with("OK seen="), "{rest}");
+            let facts = ctx.timeline.lock().unwrap().facts.clone();
+            assert_eq!(facts.len(), 1, "{rest}: {facts:?}");
+            facts[0].clone()
+        };
+        assert_eq!(deliver(7), "OK 1\n");
+        import(4);
+        // Control: a bus message's seen names its offset and closes it.
+        let bus = seen("1");
+        assert!(
+            bus.contains("off: Some(7)") && bus.contains("moved: true"),
+            "{bus}"
+        );
+        let direct = seen("2 handled");
+        assert!(
+            direct.contains("off: None")
+                && direct.contains("verdict: Some(\"handled\")")
+                && direct.contains("moved: false"),
+            "the direct message waits for its own close: {direct}"
+        );
+        assert_eq!(deliver(8), "OK 3\n");
+        import(5);
+        let passed = seen("4");
+        assert!(
+            passed.contains("off: None") && passed.contains("moved: true"),
+            "the bus message the watermark passed is closed: {passed}"
+        );
+    }
+
     #[test]
     fn every_fabric_site_hands_its_facts_to_the_one_hook() {
         use std::time::Duration;
@@ -8823,9 +9040,9 @@ mod inbox_hold {
                 "post: MailOut { kind: \"ask\", to: \"@s-peer\", post: 1, re: None, dl: None, \
                  via: None, idem: None }",
                 "post-landed: MailLanded { post: 1, off: Some(9), why: None }",
-                "inbox-seen: MailSeen { inbox: 1, off: 7, floor: Some(8), seen: 1, \
+                "inbox-seen: MailSeen { inbox: 1, off: Some(7), floor: Some(8), seen: 1, \
                  verdict: Some(\"handled\"), kind: \"task\", from: \"h-a\", moved: true }",
-                "inbox-seen: MailSeen { inbox: 1, off: 7, floor: Some(8), seen: 1, \
+                "inbox-seen: MailSeen { inbox: 1, off: Some(7), floor: Some(8), seen: 1, \
                  verdict: None, kind: \"task\", from: \"h-a\", moved: false }",
                 "hold: Hold { held: true, bridge: false, origin: \"local\", \
                  hold_origin: \"local\", reason: Some(\"demo\"), carried: false }",

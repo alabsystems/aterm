@@ -13,6 +13,7 @@ pub mod cells;
 pub mod changed;
 pub mod checks;
 pub mod cli;
+pub mod compile_account;
 mod compiler_message;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
 #[cfg(unix)]
@@ -42,6 +43,7 @@ pub mod smoke;
 pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
+pub mod test_history;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;
@@ -107,6 +109,11 @@ pub struct EnvSnapshot {
     pub cargo_home: Option<PathBuf>,
     /// The enabled native package prefix, resolved by the package manager.
     pub native_packages: Option<PathBuf>,
+    /// `ATERM_DISK_COVERED` ([`aterm_capacity::DISK_COVER_ENV`]): the name of the disk claim the
+    /// work this run is part of holds (the release's), which covers the run's disk
+    /// ([`disk::admit`]). Read here alone and removed from every child ([`CHILD_ENV_REMOVED`]),
+    /// so a test binary never sees it.
+    pub disk_cover: Option<String>,
 }
 
 impl EnvSnapshot {
@@ -138,6 +145,9 @@ impl EnvSnapshot {
                 .collect(),
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
             native_packages,
+            disk_cover: std::env::var(aterm_capacity::DISK_COVER_ENV)
+                .ok()
+                .filter(|m| !m.trim().is_empty()),
         }
     }
 }
@@ -559,12 +569,18 @@ pub struct Ctx {
     /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
     /// ([`memory::Book`], VERIFY-MEM); `None` measures nothing and keeps nothing.
     pub memory: Option<memory::Book>,
+    /// Where the run keeps what each test binary took ([`test_history`]), planning data and
+    /// never a verdict; `None` keeps nothing, as every run a test makes does.
+    pub test_history: Option<PathBuf>,
     /// A call of the run's test compile did not pass: every later call of it, and the test
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
     /// Checker-enabled compilation failed; its runtime stage must not retry it.
     pub checkers_compile_failed: std::sync::atomic::AtomicBool,
+    /// What the run's first proven red ends (A3): under `release` and `--fail-fast` the rest of
+    /// the run, which then says NOT RUN with the halt's words; in a bare run nothing.
+    pub halt: sched::Halt,
     /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]): its
     /// `--unit-graph` document, or why not; [`stages::unit_graph`] (resolved, never built) but
     /// in a test.
@@ -572,6 +588,10 @@ pub struct Ctx {
     /// What the run's shaped test compile has built so far, and what the fresh check said
     /// ([`shape::fresh_check`]).
     pub shape_run: Mutex<shape::Run>,
+    /// When the run began (its context was made), which a release run's record of what it used
+    /// names ([`disk::keep_used`]): a unit of the main lane's build directory written since is one
+    /// some compile of the run built.
+    pub began: std::time::SystemTime,
     /// What names a test compile's heavy compiler for its unit's record ([`memory::read_unit`]
     /// but in a test).
     pub unit_reader: memory::UnitReader,
@@ -588,8 +608,20 @@ pub fn parse_build_jobs(raw: Option<&OsStr>) -> Option<u32> {
 /// What `cargo run` hands the verify process about ITSELF (the `verify` alias is `run -q -p aterm-verify`): `aterm_toolchain::build_cache::CARGO_RUN_ENV`.
 pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV;
 
-/// Variables removed from every child's inherited environment.
-pub const CHILD_ENV_REMOVED: [&str; 7] = CARGO_RUN_ENV;
+/// Variables removed from every child's inherited environment: what `cargo run` says of the
+/// verify process ([`CARGO_RUN_ENV`]), and the disk claim that covers this run
+/// ([`aterm_capacity::DISK_COVER_ENV`], [`EnvSnapshot::disk_cover`]), which covers no child's
+/// own claim and which a test binary must never read (a release's children would then run its
+/// tests unlike a developer's).
+pub const CHILD_ENV_REMOVED: [&str; 8] = {
+    let mut all = [aterm_capacity::DISK_COVER_ENV; 8];
+    let mut i = 0;
+    while i < CARGO_RUN_ENV.len() {
+        all[i] = CARGO_RUN_ENV[i];
+        i += 1;
+    }
+    all
+};
 
 /// The run's toolchain, discovered once from `env` under the pin `root` declares and the atpkg prefix atpkg itself would read.
 #[must_use]
@@ -679,10 +711,13 @@ impl Ctx {
             quiet: None,
             runs: None,
             memory: None,
+            test_history: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
             checkers_compile_failed: std::sync::atomic::AtomicBool::new(false),
+            halt: sched::Halt::off(),
             unit_graph: stages::unit_graph,
             shape_run: Mutex::new(shape::Run::default()),
+            began: std::time::SystemTime::now(),
             unit_reader: memory::read_unit,
         };
         ctx.refresh_test_threads();
@@ -729,6 +764,22 @@ impl Ctx {
     pub const fn with_release(mut self, release: bool) -> Self {
         self.release = release;
         self.checkers_in_tests = release;
+        self
+    }
+
+    /// The halt's words once the run's first proven red ended it ([`Ctx::halt`]); none while it
+    /// has not, and none when an interrupt was ending the run before its red, so what that run
+    /// stopped keeps the interrupt's words as its children do ([`exec::group::halt`]).
+    #[must_use]
+    pub fn halted(&self) -> Option<&str> {
+        let words = self.halt.words()?;
+        (!stopping() || exec::halted().is_some()).then_some(words)
+    }
+
+    /// What the run's first proven red ends ([`Ctx::halt`]).
+    #[must_use]
+    pub fn with_halt(mut self, halt: sched::Halt) -> Self {
+        self.halt = halt;
         self
     }
 
@@ -910,6 +961,13 @@ impl Ctx {
     #[must_use]
     pub fn with_head_at_start(mut self, head: Option<String>) -> Self {
         self.head_at_start = head;
+        self
+    }
+
+    /// Keep each test binary's run in the history at `path` ([`Ctx::test_history`]).
+    #[must_use]
+    pub fn with_test_history(mut self, path: Option<PathBuf>) -> Self {
+        self.test_history = path;
         self
     }
 
@@ -1190,8 +1248,48 @@ const fn stopping() -> bool {
     false
 }
 
-/// Why a stage the run's end kept from starting did not run.
+/// What the run's first proven red ends ([`Ctx::halt`]): a release, and a `--fail-fast` run, whose
+/// red stops every child the run started ([`exec::group::halt`]); a bare run, nothing.
+fn halt_of(release: bool, fail_fast: bool) -> sched::Halt {
+    #[cfg(unix)]
+    let end: fn(&str) = exec::group::halt;
+    #[cfg(not(unix))]
+    let end: fn(&str) = |_| {};
+    if release {
+        sched::Halt::at_first_red("the release", end)
+    } else if fail_fast {
+        sched::Halt::at_first_red("the run", end)
+    } else {
+        sched::Halt::off()
+    }
+}
+
+/// End the run at a proven red ([`Ctx::halt`]) once `report`, of a stage `check` owns, holds a
+/// FAIL row: a stage of several children calls it between them, so its first red ends the run
+/// without waiting for the rest. A NOT RUN row never does, nor a `measure` red: the owner may
+/// accept a measure failure once every other release check passed (`aterm-release`'s accepted
+/// measure), so that check runs whole and every other check's verdict stands beside it.
+pub(crate) fn red_now(ctx: &Ctx, check: Check, report: &Report) {
+    if check != Check::Measure
+        && report
+            .outcomes()
+            .any(|(o, _)| o == Outcome::Fail(Severity::GateFailed))
+    {
+        ctx.halt.red(check.name());
+    }
+}
+
+/// Why a stage an interrupt kept from starting did not run.
 const ENDING: &str = "the run was interrupted before this stage started, so it decided nothing";
+
+/// Why the run's end keeps a stage from starting now, if it does: the halt's words once its first
+/// proven red ended it ([`Ctx::halted`]), else [`ENDING`] once an interrupt is ending it
+/// ([`stopping`]).
+fn ended(ctx: &Ctx) -> Option<String> {
+    ctx.halted()
+        .map(str::to_owned)
+        .or_else(|| stopping().then(|| ENDING.to_owned()))
+}
 
 /// What the run's quiet claim did for a timed stage, for its time line (or a browser session's
 /// own, for the session that takes the desk): `first` when the stage's admission made it. A
@@ -1235,7 +1333,9 @@ pub(crate) fn admission(
             "waited {} for a quiet machine (load <= {bound:.1}){how}",
             aterm_capacity::span(claim.waited())
         ),
-        aterm_capacity::Admit::Wait => format!("a quiet machine (load <= {bound:.1})"),
+        aterm_capacity::Admit::Wait | aterm_capacity::Admit::Preemptible => {
+            format!("a quiet machine (load <= {bound:.1})")
+        }
     }
 }
 
@@ -1289,10 +1389,9 @@ fn quietly_with<T>(
     ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
 ) -> Result<(T, Option<String>), String> {
     let Some(mode) = ctx.quiet else {
-        return if stopping() {
-            Err(ENDING.to_owned())
-        } else {
-            Ok((f(), None))
+        return match ended(ctx) {
+            Some(why) => Err(why),
+            None => Ok((f(), None)),
         };
     };
     let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1305,7 +1404,7 @@ fn quietly_with<T>(
     } else {
         None
     };
-    let said = if stopping() {
+    let said = if ended(ctx).is_some() {
         Err(None)
     } else {
         match &q.claim {
@@ -1358,8 +1457,11 @@ fn quietly_with<T>(
             q.passed();
             drop(q);
             let Some(e) = stopped else {
-                return Err(ENDING.to_owned());
+                return Err(ended(ctx).unwrap_or_else(|| ENDING.to_owned()));
             };
+            if let Some(words) = ctx.halted() {
+                return Err(words.to_owned());
+            }
             if matches!(e, aterm_capacity::Error::Stuck { .. }) {
                 eprintln!("verify: {title}: the run's quiet claim {e}; {title} decided nothing");
                 return Err(format!("its quiet claim {e}; it started nothing"));
@@ -1553,7 +1655,7 @@ fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> S
                 aterm_capacity::span(claim.waited())
             )
         }
-        aterm_capacity::Admit::Wait => String::new(),
+        aterm_capacity::Admit::Wait | aterm_capacity::Admit::Preemptible => String::new(),
     };
     if let Some(alone) = claim.alone() {
         how.push_str(", ");
@@ -1590,8 +1692,8 @@ fn claim_memory(
     let Some(book) = ctx.memory.as_ref().filter(|_| spec.mem > 0) else {
         return Ok(None);
     };
-    if stopping() {
-        return Err(ENDING.to_owned());
+    if let Some(why) = ended(ctx) {
+        return Err(why);
     }
     let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
     let budget = book.budget();
@@ -1630,6 +1732,9 @@ fn claim_memory(
                 claim: Arc::new(claim),
                 said: format!("memory: {what}{how}"),
             }))
+        }
+        Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
+            Err(ctx.halted().unwrap_or_default().to_owned())
         }
         Err(e @ aterm_capacity::Error::Stopped { .. }) => {
             eprintln!(
@@ -1690,8 +1795,8 @@ fn staged(
     let run = || {
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
         let _reservation = holding_memory_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
-        if stopping() {
-            return Err(ENDING.to_owned());
+        if let Some(why) = ended(ctx) {
+            return Err(why);
         }
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().map(MemoryClaim::cover));
@@ -1748,8 +1853,17 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
     let names: Vec<&str> = own.iter().map(|c| c.name()).collect();
     let holds = |p: &str| ctx.scope.includes_crate(p);
     let pulled = checks::pulled(&checks::DEV, holds);
+    let is = |set: &[Check]| own.len() == set.len() && set.iter().all(|c| own.contains(c));
     let mut what = if ctx.release {
-        "release".to_string()
+        if is(&checks::RELEASE) {
+            "release".to_string()
+        } else if is(&checks::RELEASE_TREE) {
+            "release --tree".to_string()
+        } else if is(&checks::RELEASE_BUNDLE) {
+            "release --bundle".to_string()
+        } else {
+            format!("release: {}", names.join(" "))
+        }
     } else if own == checks::DEV {
         "dev".to_string()
     } else if !pulled.is_empty() && own == checks::with_pulled(&checks::DEV, false, holds) {
@@ -1871,6 +1985,7 @@ fn run_with(
     sched::run_stages(
         &stages,
         budget,
+        &ctx.halt,
         |spec, held| {
             let i = stages
                 .iter()
@@ -1920,7 +2035,14 @@ fn run_with(
                     } else {
                         String::new()
                     };
-                    let result = report::judge(check, &mine, seconds, &scope, ctx.rerun(check));
+                    let result = report::judge(
+                        check,
+                        &mine,
+                        seconds,
+                        &scope,
+                        ctx.rerun(check),
+                        ctx.halted(),
+                    );
                     let text = report::render(&result, width);
                     if let Ok(mut o) = out.lock() {
                         let _ = o.write_all(text.as_bytes()).and_then(|()| o.flush());
@@ -1929,6 +2051,10 @@ fn run_with(
                         r.push(result);
                     }
                 }
+            }
+            // After its own event and line, so a reader meets the red before what it stopped.
+            if let Some(check) = owners[i] {
+                red_now(ctx, check, &report);
             }
             report
         },
@@ -2321,6 +2447,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_cells(parsed.cells.clone())
         .with_cells_pulled(cells_pulled)
         .with_no_windows(parsed.no_windows)
+        .with_halt(halt_of(parsed.release, parsed.fail_fast))
         .with_cursor_pacing(parsed.cursor_pacing)
         .with_compile_only(parsed.compile_only)
         .with_measure_artifact(measure_artifact)
@@ -2329,6 +2456,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_threads(parsed.test_threads)
         .with_quiet(Some(parsed.admit))
         .with_memory(memory::Book::live())
+        .with_test_history(
+            aterm_types::dirs::account_state_dir()
+                .map(|d| d.join(aterm_capacity::book::TEST_HISTORY)),
+        )
         .with_toolchain_lease(lease_said)
         .with_quiet_tmpdir(&std::env::temp_dir())
         .with_head_at_start(head_at_start);
@@ -2380,7 +2511,12 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     #[cfg(unix)]
-    let_disk_go(disk, code == exit::PASS, log_file.as_mut());
+    {
+        if let Some(line) = disk::keep_used(&ctx, code == exit::PASS) {
+            let _ = log_file.as_mut().map(|f| writeln!(f, "{line}"));
+        }
+        let_disk_go(disk, code == exit::PASS, log_file.as_mut());
+    }
     end_run(&ctx, &scratch);
     code
 }
@@ -2389,24 +2525,38 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
 /// what it took kept for the next run of its scope on its directories and, where it `passed`, in
 /// this machine's record for every checkout (`atpkg::admit_disk::Admitted::finish_whole`; a run
 /// that failed may have stopped short of what its scope writes, so it is kept for its own
-/// directories alone, `atpkg::admit_disk::Admitted::finish_here`), unless an interrupt ended the
-/// run ([`stopping`]), which stopped short of its work and so wrote less than a run of its scope
-/// writes (`atpkg::admit_disk::Admitted::abandon`). The line says which records took it
-/// ([`kept_line`]).
+/// directories alone, `atpkg::admit_disk::Admitted::finish_here`), unless an interrupt or its
+/// first proven red ended the run ([`stopping`]), which stopped short of its work and so wrote
+/// less than a run of its scope writes (`atpkg::admit_disk::Admitted::abandon`). The line says
+/// which records took it ([`kept_line`]). A run the work it is part of covered
+/// ([`disk::Disk::Covered`]) walked and keeps nothing, and its line says whose claim covered it.
+/// Then, whatever the run's disk, it says on stderr how it was held and how many walks of its
+/// directories it made ([`disk::event`]).
 #[cfg(unix)]
-fn let_disk_go(
-    held: Option<atpkg::admit_disk::Admitted>,
-    passed: bool,
-    log: Option<&mut std::fs::File>,
-) {
-    let Some(held) = held else {
-        return;
+fn let_disk_go(held: disk::Disk, passed: bool, log: Option<&mut std::fs::File>) {
+    let mode = held.mode();
+    let held = match held {
+        disk::Disk::Held(held) => held,
+        disk::Disk::Covered(by) => {
+            let _ = log.map(|f| writeln!(f, "{}", disk::covered_line(&by)));
+            eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
+            return;
+        }
+        disk::Disk::Unclaimed => {
+            eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
+            return;
+        }
     };
     let claimed = held.estimate;
     let (took, kept) = if stopping() {
+        let why = if exec::halted().is_some() {
+            "stopped at its first red"
+        } else {
+            "was interrupted"
+        };
         (
             held.abandon(),
-            "; the run was interrupted, so that is not kept for its scope".to_owned(),
+            format!("; the run {why}, so that is not kept for its scope"),
         )
     } else {
         let done = if passed {
@@ -2423,6 +2573,7 @@ fn let_disk_go(
         atpkg::admit_disk::size(took.peak)
     );
     let _ = log.map(|f| writeln!(f, "{line}"));
+    eprintln!("{}", disk::event(mode, aterm_capacity::walks()));
 }
 
 /// What a finished run's disk line says it kept (`let_disk_go`): which of the record beside its
@@ -2587,6 +2738,9 @@ mod quiet_renewal_tests;
 
 #[cfg(all(test, unix))]
 mod interrupt_report_tests;
+
+#[cfg(all(test, unix))]
+mod halt_report_tests;
 
 #[cfg(all(test, unix))]
 mod memory_claim_tests;
@@ -3266,6 +3420,32 @@ mod tests {
         assert_eq!(run_cli(&args(&["list"]), &tmp), exit::PASS);
         assert_eq!(run_cli(&args(&["--help"]), &tmp), exit::PASS);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A release's header names the half it runs, or the checks `--checks` listed, so its log
+    /// says which part of the release it answers for.
+    #[test]
+    fn a_release_header_names_its_half() {
+        let head = |words: &[&str]| {
+            let a = cli::parse(words.iter().copied()).expect("parses");
+            let ctx = Ctx::new(
+                PathBuf::from("/repo"),
+                Scope::workspace(),
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+            .with_checks(&a.wanted(|_| true))
+            .with_release(a.release);
+            header(&ctx, None)
+        };
+        let starts = |words: &[&str], what: &str| {
+            let line = head(words);
+            assert!(line.starts_with(&format!("verify: {what} — ")), "{line}");
+        };
+        starts(&["release", "--app", "a"], "release");
+        starts(&["release", "--tree"], "release --tree");
+        starts(&["release", "--bundle", "--app", "a"], "release --bundle");
+        starts(&["release", "--checks", "test,spec"], "release: test spec");
     }
 
     #[test]

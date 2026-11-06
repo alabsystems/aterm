@@ -16,7 +16,9 @@ use crate::model::{
 };
 use crate::text::{sanitize, shape_detail, shape_path, trim_words};
 use crate::wire::{NoticeRequest, PostRequest, WireGate, apply, parse_read_args};
-use crate::words::{abbreviate_paths_in, date_words, home_abbreviate, relative_words, stamp_words};
+use crate::words::{
+    abbreviate_paths_in, date_words, day_heading, home_abbreviate, relative_words, stamp_words,
+};
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Duration, Instant, LOG_CAP, MAX_ACTIONS, MAX_LIVE, MAX_ROWS,
     PENDING_PERSIST_CAP, TITLE_CAP,
@@ -344,6 +346,10 @@ fn words_never_panic_at_extremes() {
         let _ = relative_words(u64::MAX, at);
         let _ = relative_words(at, u64::MAX);
         let _ = relative_words(0, at);
+    }
+    for (today, day) in [(i64::MAX, i64::MIN), (0, i64::MIN), (i64::MAX, 0), (0, -7)] {
+        assert!(day_heading(today, day, false).contains(", "));
+        assert!(day_heading(today, day, true).contains(", "));
     }
     for (path, home) in [
         ("/Users//w/x", Some("/Users//w/")),

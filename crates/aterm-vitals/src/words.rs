@@ -23,7 +23,8 @@ pub const LOAD_GATE: f32 = 0.04;
 /// Format a CPU core count to one decimal place.
 #[must_use]
 pub fn cores(c: f32) -> String {
-    format!("{:.1}", c.max(0.0))
+    let c = if c.is_finite() { c.max(0.0) } else { 0.0 };
+    format!("{c:.1}")
 }
 
 /// Format memory bytes in binary `MiB` or `GiB`; a nonzero amount that rounds to `0 KiB` is `<1 KiB`.
@@ -358,8 +359,9 @@ fn half_up(v: f64) -> f64 {
 }
 
 fn fixed(v: f64, dec: usize) -> String {
+    let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
     let scale = 10f64.powi(dec as i32);
-    let r = half_up(v.max(0.0) * scale) / scale;
+    let r = half_up(v * scale) / scale;
     format!("{r:.dec$}")
 }
 
@@ -408,7 +410,8 @@ pub fn grouped(n: u64) -> String {
 }
 
 fn rate_figure(v: f64) -> String {
-    let one = half_up(v.max(0.0) * 10.0) / 10.0;
+    let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+    let one = half_up(v * 10.0) / 10.0;
     if one < 100.0 {
         format!("{one:.1}")
     } else {
@@ -417,7 +420,8 @@ fn rate_figure(v: f64) -> String {
 }
 
 fn rate_lone(v: f64) -> String {
-    let one = half_up(v.max(0.0) * 10.0) / 10.0;
+    let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+    let one = half_up(v * 10.0) / 10.0;
     if one < 10.0 {
         format!("{one:.1}")
     } else {
@@ -496,7 +500,7 @@ pub fn parts_of(whole: u64, parts: &[u64]) -> Parts {
 /// Format a token or event count with `k` or `M` suffixes.
 #[must_use]
 pub fn tokens_k(n: f64) -> String {
-    let n = n.max(0.0);
+    let n = if n.is_finite() { n.max(0.0) } else { 0.0 };
     if half_up(n) < 1000.0 {
         return format!("{:.0}", half_up(n));
     }
@@ -516,7 +520,7 @@ pub fn tokens_k(n: f64) -> String {
 /// Format an approximate duration (`~34 min`, `~5 h`, `~2 days`).
 #[must_use]
 pub fn duration_approx(secs: f64) -> String {
-    let secs = secs.max(0.0);
+    let secs = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
     let min = half_up(secs / 60.0).max(1.0);
     if min < 60.0 {
         return format!("~{min:.0} min");
@@ -566,7 +570,10 @@ pub fn up_words(age_ms: Option<u64>, partial: bool) -> Option<String> {
 /// Format a `[0.0, 1.0]` share for the `%` column (`0%`, `<1%`, `12%`).
 #[must_use]
 pub fn pct(share: Option<f32>) -> String {
-    let Some(p) = share.map(|s| f64::from(s) * 100.0).filter(|p| !p.is_nan()) else {
+    let Some(p) = share
+        .filter(|s| s.is_finite())
+        .map(|s| f64::from(s) * 100.0)
+    else {
         return "–".into();
     };
     if p <= 0.0 {
@@ -2900,6 +2907,11 @@ mod tests {
         assert_eq!(disk(9_400_000_000), "9.4 GB");
         assert_eq!(gib_total(32 << 30), "32");
         assert_eq!(cores(-0.2), "0.0");
+        assert_eq!(cores(f32::INFINITY), "0.0");
+        assert_eq!(pct(Some(f32::INFINITY)), "–");
+        assert_eq!(tokens_k(f64::INFINITY), "0");
+        assert_eq!(duration_approx(f64::INFINITY), "~1 min");
+        assert_eq!(rate_mb(f64::INFINITY), "0.0 MB/s");
     }
 
     use crate::explain::{ActivityId, CoalLane, DeckCause, WhyFacts};

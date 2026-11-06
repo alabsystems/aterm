@@ -60,6 +60,10 @@ pub const VERIFY_RECORD: &str = "verify/stage-memory.json";
 /// Plain `targo` builds' records, beside verify's ([`VERIFY_RECORD`]).
 pub const TARGO_RECORD: &str = "verify/targo-memory.json";
 
+/// Verify's test binaries' run history (`aterm_verify::test_history`), beside its stages' memory
+/// records ([`VERIFY_RECORD`]).
+pub const TEST_HISTORY: &str = "verify/test-binaries.json";
+
 /// The lock beside the record at `path` (`stage-memory.json.lock`), which a writer holds from its
 /// read of the record to its write of it ([`Records::update`]).
 #[must_use]
@@ -67,6 +71,92 @@ pub fn lock_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
     PathBuf::from(name)
+}
+
+/// The text of the regular file at `path`, at most `max` bytes: `None` where it is absent. Any
+/// other refusal (a symlink, a directory, a FIFO, text past `max`, bytes that are not UTF-8, an
+/// I/O error) is an error, never an empty record: a writer must not replace evidence it could
+/// not read ([`update_text`]).
+///
+/// # Errors
+/// As above.
+pub fn read_text(path: &Path, max: u64) -> io::Result<Option<String>> {
+    match crate::read_regular_text(path, max) {
+        Ok(text) => Ok(Some(text)),
+        Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(why) => Err(why),
+    }
+}
+
+/// THE BOOK'S ATOMIC WRITE: `bytes` written to `path` staged in a private folder beside it (named
+/// `prefix`…, removed after), in a file made new (`0600`, never through a symlink), then renamed
+/// over `path`, so a reader finds the old file or the new one whole and a failed write leaves
+/// the old one standing. The directory is made private (`0700`) if absent and must be a real
+/// directory. `bytes` past `max`, the bound its readers read ([`read_text`]), are refused before
+/// anything is written: a record no reader could read back is no record.
+///
+/// # Errors
+/// `bytes` exceed `max` (`FileTooLarge`), the directory could not be made or is not one, or the
+/// write or the rename failed: the file kept before stands.
+pub fn write_staged(path: &Path, bytes: &[u8], prefix: &str, max: u64) -> io::Result<()> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "the encoded record exceeds its read bound; the one kept before stands",
+        ));
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::ledger::ensure_dir(dir)?;
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(dir)?;
+    let staged = stage.path().join("data");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(&staged)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    file.write_all(bytes)?;
+    drop(file);
+    std::fs::rename(&staged, path)
+}
+
+/// THE BOOK'S LOCKED UPDATE: read the text at `path` ([`read_text`], `None` where absent), let
+/// `change` answer the text to write, and write it ([`write_staged`]) when it answers one,
+/// holding the record's lock ([`lock_path`]) from the read to the write, so two writers at once,
+/// in this process or another, each read what the other wrote and neither loses a change. A
+/// refused read never invokes `change` and never replaces the file. Whether it wrote.
+///
+/// # Errors
+/// The directory or the lock could not be made or taken, the existing file could not be read
+/// ([`read_text`]), or as [`write_staged`].
+pub fn update_text(
+    path: &Path,
+    max: u64,
+    prefix: &str,
+    change: impl FnOnce(Option<&str>) -> Option<String>,
+) -> io::Result<bool> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::ledger::ensure_dir(dir)?;
+    let lock = crate::ledger::open_rendezvous(&lock_path(path))?;
+    let _held = aterm_toolchain::record_lock::RecordLock::lock(lock, 0)?;
+    let text = read_text(path, max)?;
+    let Some(next) = change(text.as_deref()) else {
+        return Ok(false);
+    };
+    write_staged(path, next.as_bytes(), prefix, max).map(|()| true)
 }
 
 /// WHAT A RECORD IS KEPT FOR: a kind of work, the checkout it ran in, its crate selection,
@@ -382,83 +472,42 @@ impl Records {
     /// preserves a read-refused existing file and reports the refusal.
     #[must_use]
     pub fn load(path: &Path) -> Records {
-        Self::read(path).unwrap_or_default()
+        read_text(path, BOOK_MAX_BYTES)
+            .ok()
+            .flatten()
+            .map(|text| Self::decode(&text))
+            .unwrap_or_default()
     }
 
-    /// An absent book starts empty. Existing decode/schema compatibility stays with
-    /// [`Self::decode`], but an I/O, type, text or size refusal is not an empty book to a writer.
-    fn read(path: &Path) -> io::Result<Records> {
-        match crate::read_regular_text(path, BOOK_MAX_BYTES) {
-            Ok(text) => Ok(Self::decode(&text)),
-            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(why) => Err(why),
-        }
-    }
-
-    /// Write the records to `path`: staged in a private folder beside it, then renamed over it,
-    /// so a reader finds the old file or the new one whole. Two writers at once can lose one of
-    /// their peaks, unless each reads and writes under the record's lock ([`Self::update`]);
-    /// neither leaves a torn file.
+    /// Write the records to `path` ([`write_staged`]), so a reader finds the old file or the new
+    /// one whole. Two writers at once can lose one of their peaks, unless each reads and writes
+    /// under the record's lock ([`Self::update`]); neither leaves a torn file.
     ///
     /// # Errors
-    /// The encoded book exceeds the read bound, its directory could not be made, or the
-    /// write failed: the records kept before stand.
+    /// As [`write_staged`]: the records kept before stand.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let encoded = self.encode();
-        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > BOOK_MAX_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "memory book exceeds its read bound; previous records retained",
-            ));
-        }
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::ledger::ensure_dir(dir)?;
-        let stage = aterm_tempfile::Builder::new()
-            .prefix(".stage-memory-")
-            .tempdir_in(dir)?;
-        let staged = stage.path().join("data");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = options.open(&staged)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-        file.write_all(encoded.as_bytes())?;
-        drop(file);
-        std::fs::rename(&staged, path)
+        write_staged(
+            path,
+            self.encode().as_bytes(),
+            ".stage-memory-",
+            BOOK_MAX_BYTES,
+        )
     }
 
     /// Read the records at `path`, let `change` add to them, and write them back whole
-    /// ([`Self::save`]) when it says to, holding the record's lock ([`lock_path`]) from the read to
-    /// the write: two writers at once, in this process or another (a verify run's stages, another
-    /// checkout's run, a plain build), each read what the other wrote, and neither loses a peak or
-    /// a row. Whether it wrote. An absent book starts empty; a refused existing read never
-    /// invokes `change` or replaces that file.
+    /// ([`Self::save`]) when it says to, under the record's lock from the read to the write
+    /// ([`update_text`]): two writers at once, in this process or another (a verify run's
+    /// stages, another checkout's run, a plain build), each read what the other wrote, and
+    /// neither loses a peak or a row. Whether it wrote. An absent book starts empty; a refused
+    /// existing read never invokes `change` or replaces that file.
     ///
     /// # Errors
-    /// The existing book could not be read, the lock could not be made or taken, or as
-    /// [`Self::save`].
+    /// As [`update_text`].
     pub fn update(path: &Path, change: impl FnOnce(&mut Records) -> bool) -> io::Result<bool> {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::ledger::ensure_dir(dir)?;
-        let lock = crate::ledger::open_rendezvous(&lock_path(path))?;
-        let _held = aterm_toolchain::record_lock::RecordLock::lock(lock, 0)?;
-        let mut records = Records::read(path)?;
-        if !change(&mut records) {
-            return Ok(false);
-        }
-        records.save(path).map(|()| true)
+        update_text(path, BOOK_MAX_BYTES, ".stage-memory-", |text| {
+            let mut records = text.map(Records::decode).unwrap_or_default();
+            change(&mut records).then(|| records.encode())
+        })
     }
 
     /// Keep `bytes`, measured at `at_ms`, under `key` in the file at `path`: read, pushed

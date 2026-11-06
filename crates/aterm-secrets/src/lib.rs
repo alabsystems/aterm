@@ -45,6 +45,8 @@ pub mod discover;
 #[cfg(unix)]
 pub mod fsx;
 #[cfg(unix)]
+pub mod git_setup;
+#[cfg(unix)]
 pub mod heard;
 #[cfg(unix)]
 pub mod home_lan;
@@ -297,6 +299,13 @@ pub enum ErrorKind {
     /// make is, and the join would ask the live ALab: refused before anything was dialed. A lab
     /// identity founds its own lab, or joins one by its URL; asked again, it is refused again.
     LabIdentity,
+    /// A join of the vault that dropped this Mac ([`client::dropped`]: a rotation left it out
+    /// with no `Remove`), refused under the vault's state lock before its key went anywhere:
+    /// every member that read the rotation refuses that key, and the ask would have moved this
+    /// Mac to pending, losing the reading that says how it comes back (one-mesh E2, f299). The
+    /// message is [`client::dropped_words`]. Asked again while this Mac still reads dropped, it
+    /// is refused again; with its vault folder set aside it joins as a new Mac.
+    Dropped,
 }
 
 impl Error {

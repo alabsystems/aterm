@@ -130,15 +130,14 @@ pub fn secret_digest(
                 .is_some_and(|c| matches!(c.ty, Ty::Secret))
             {
                 part(b"secret");
-                let candidates: Vec<&Value> = match field {
-                    cell::Field::Value(c) => vec![&c.value.x],
-                    cell::Field::Conflict { candidates, .. } => {
-                        candidates.iter().map(|c| &c.value.x).collect()
-                    }
+                let candidates: &[cell::Candidate] = match field {
+                    cell::Field::Value(c) => std::slice::from_ref(c),
+                    cell::Field::Conflict { candidates, .. } => candidates.as_slice(),
                     cell::Field::Set(_) => return Err(Error::new("a secret is not a set")),
                 };
                 let mut values: Vec<Zeroizing<Vec<u8>>> = Vec::with_capacity(candidates.len());
-                for value in candidates {
+                for candidate in candidates {
+                    let value = &candidate.value.x;
                     if value.is_null() {
                         values.push(Zeroizing::new(vec![0]));
                         continue;
@@ -178,29 +177,33 @@ pub fn secret_digest(
                 }
             } else {
                 part(b"value");
-                let mut encoded: Vec<Vec<u8>> = match field {
-                    cell::Field::Value(c) => vec![
-                        aterm_json::to_vec(&c.value.x)
-                            .map_err(|_| Error::new("cannot encode digest field"))?,
-                    ],
-                    cell::Field::Conflict { candidates, .. } => candidates
-                        .iter()
-                        .map(|c| aterm_json::to_vec(&c.value.x))
-                        .collect::<std::result::Result<_, _>>()
-                        .map_err(|_| Error::new("cannot encode digest field"))?,
+                match field {
+                    cell::Field::Value(c) => {
+                        let bytes = aterm_json::to_vec(&c.value.x)
+                            .map_err(|_| Error::new("cannot encode digest field"))?;
+                        part(&1u64.to_le_bytes());
+                        part(&bytes);
+                    }
+                    cell::Field::Conflict { candidates, .. } => {
+                        let mut encoded: Vec<Vec<u8>> = candidates
+                            .iter()
+                            .map(|c| aterm_json::to_vec(&c.value.x))
+                            .collect::<std::result::Result<_, _>>()
+                            .map_err(|_| Error::new("cannot encode digest field"))?;
+                        encoded.sort();
+                        encoded.dedup();
+                        part(&(encoded.len() as u64).to_le_bytes());
+                        for value in encoded {
+                            part(&value);
+                        }
+                    }
                     cell::Field::Set(_) => {
                         let members: Vec<_> = field.members().into_iter().collect();
-                        vec![
-                            aterm_json::to_vec(&members)
-                                .map_err(|_| Error::new("cannot encode digest field"))?,
-                        ]
+                        let bytes = aterm_json::to_vec(&members)
+                            .map_err(|_| Error::new("cannot encode digest field"))?;
+                        part(&1u64.to_le_bytes());
+                        part(&bytes);
                     }
-                };
-                encoded.sort();
-                encoded.dedup();
-                part(&(encoded.len() as u64).to_le_bytes());
-                for value in encoded {
-                    part(&value);
                 }
             }
         }
@@ -499,24 +502,31 @@ impl View {
     pub(crate) fn read(table: &Table, session: &Session<'_>, log: &Log) -> Self {
         let (eligible, merges) = log.eligible_and_merges();
         let ops: Vec<Op> = eligible
-            .iter()
+            .into_iter()
             .filter_map(|(operation, command)| Op::from_eligible(0, operation, command))
             .collect();
         let quota = owned::quota(table, &ops, &merges);
-        let within: Vec<Op> = ops
-            .iter()
-            .filter(|op| !quota.over.contains(&op.id))
-            .cloned()
-            .collect();
+        let filtered;
+        let within: &[Op] = if quota.over.is_empty() {
+            &ops
+        } else {
+            filtered = ops
+                .iter()
+                .filter(|op| !quota.over.contains(&op.id))
+                .cloned()
+                .collect::<Vec<Op>>();
+            &filtered
+        };
         let resolve = owned::commons::historical(session);
-        let cells = log.cells_without(&quota.over);
-        let archived = archived_ops(table, session, &within);
+        let awaited = log.awaited(session.actor());
+        let (cells, refused) = log.cells_and_refused(&quota.over, &awaited);
+        let archived = archived_ops(table, session, within);
         let owned = table
             .collections
             .iter()
             .filter(|collection| collection.kind == typed::Kind::Owned)
             .map(|collection| {
-                let mut read = owned::read_owned(collection, &within, &resolve);
+                let mut read = owned::read_owned(collection, within, &resolve);
                 // A row a Mac wrote in this generation outranks the one a roll carried for it.
                 let carried = owned::read_owned(collection, &archived, &resolve);
                 read.inert += carried.inert;
@@ -525,17 +535,6 @@ impl View {
                 }
                 (collection.name, read)
             })
-            .collect();
-        let awaited = log.awaited(session.actor());
-        let refused = log
-            .snapshot()
-            .operations
-            .iter()
-            .filter(|op| {
-                (!op.available || !op.catalog_eligible || op.refusal.is_some())
-                    && !awaited.contains(&op.header.id)
-            })
-            .map(|op| op.header.id)
             .collect();
         // A later generation is whole only once a roll's cover row is here: before that its
         // history is still arriving from the Macs that restated it.
@@ -667,41 +666,43 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
 /// # Errors
 /// One row alone passes a record's limits.
 pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
-    let fits = |changes: &mut Vec<Change>| {
-        if changes.len() > MAX_WRITES {
-            return false;
-        }
-        let command = Command::Write {
-            request: [0; 16],
-            changes: std::mem::take(changes),
-        };
-        let ok = command
-            .encode()
-            .is_ok_and(|payload| payload.len() <= crate::crypto::MAX_BODY);
-        let Command::Write {
-            changes: restored, ..
-        } = command
-        else {
-            unreachable!()
-        };
-        *changes = restored;
-        ok
-    };
+    // `Command::Write::encode()` wraps the serialized `changes` JSON array (`[...]`) in the
+    // fixed 78-byte envelope `{"changes":...,"kind":"write","request":"<32-hex>","v":1}`.
+    const WRITE_ENVELOPE_BYTES: usize = 78;
     let mut records: Vec<Vec<Change>> = Vec::new();
-    for mut row in rows {
-        if !fits(&mut row) {
+    let mut last_cmd_bytes = 0usize;
+    for row in rows {
+        if row.len() > MAX_WRITES {
+            return Err(Error::new("one typed row passes a record's limits"));
+        }
+        let row_json_len = aterm_json::to_vec(&row)
+            .map_err(|_| Error::new("one typed row passes a record's limits"))?
+            .len();
+        let row_cmd_bytes = WRITE_ENVELOPE_BYTES + row_json_len;
+        if row_cmd_bytes > crate::crypto::MAX_BODY {
             return Err(Error::new("one typed row passes a record's limits"));
         }
         match records.last_mut() {
             Some(last) if last.len() + row.len() <= MAX_WRITES => {
-                let prev_len = last.len();
-                last.extend(row);
-                if !fits(last) {
-                    let row = last.split_off(prev_len);
+                let combined_cmd_bytes = if last.is_empty() {
+                    row_cmd_bytes
+                } else if row.is_empty() {
+                    last_cmd_bytes
+                } else {
+                    last_cmd_bytes + row_json_len - 1
+                };
+                if combined_cmd_bytes <= crate::crypto::MAX_BODY {
+                    last.extend(row);
+                    last_cmd_bytes = combined_cmd_bytes;
+                } else {
+                    last_cmd_bytes = row_cmd_bytes;
                     records.push(row);
                 }
             }
-            _ => records.push(row),
+            _ => {
+                last_cmd_bytes = row_cmd_bytes;
+                records.push(row);
+            }
         }
     }
     Ok(records)
@@ -816,11 +817,20 @@ pub(crate) fn sealer<'s>(
 ) -> Result<impl typed::secret::Sealer + 's> {
     let epoch = session.secret_basis();
     let key = session.secret_key(scope, &epoch)?;
+    let cache: std::cell::RefCell<BTreeMap<Digest, zeroize::Zeroizing<[u8; 32]>>> =
+        std::cell::RefCell::new(BTreeMap::new());
     Ok(typed::secret::Keyed {
         table: name,
         epoch,
         key,
-        resolve: move |basis: &Digest| session.secret_key(scope, basis),
+        resolve: move |basis: &Digest| {
+            if let Some(cached) = cache.borrow().get(basis) {
+                return Ok(cached.clone());
+            }
+            let resolved = session.secret_key(scope, basis)?;
+            cache.borrow_mut().insert(*basis, resolved.clone());
+            Ok(resolved)
+        },
     })
 }
 
@@ -1059,7 +1069,7 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 session.writer()?;
-                let mut log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
                 if !view.complete {
@@ -1102,10 +1112,7 @@ impl Handle {
                     applied.records += 1;
                     applied.cells += count;
                     applied.operations.push(receipt.id);
-                    // Re-read before admitting another append (`Log::append_records_bound`).
-                    log = Log::read_with(session, store, scope, decode)?;
                 }
-                drop(log);
                 Ok(applied)
             },
         )
@@ -1217,6 +1224,7 @@ impl Handle {
     ) -> Result<Vec<Option<typed::secret::Secret>>> {
         let table = self.compiled.name();
         application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
+            let mut keys: BTreeMap<Digest, Option<zeroize::Zeroizing<[u8; 32]>>> = BTreeMap::new();
             cells
                 .iter()
                 .map(|&(collection, row, column, token)| {
@@ -1226,12 +1234,17 @@ impl Handle {
                         row,
                         column,
                     };
-                    let Ok(key) = typed::secret::epoch(token)
-                        .and_then(|epoch| session.secret_key(scope, &epoch))
+                    let Ok(epoch) = typed::secret::epoch(token) else {
+                        return Ok(None);
+                    };
+                    let Some(key) = keys
+                        .entry(epoch)
+                        .or_insert_with(|| session.secret_key(scope, &epoch).ok())
+                        .as_ref()
                     else {
                         return Ok(None);
                     };
-                    let Ok(plain) = typed::secret::open(token, &key, cell) else {
+                    let Ok(plain) = typed::secret::open(token, key, cell) else {
                         return Ok(None);
                     };
                     crate::alab::secret::record_reveal(journal, cell, surface, when_ms)?;
@@ -1267,7 +1280,9 @@ impl Handle {
                 }
                 let (planned, rows) = derive(&view, &sealer(&name, session, scope)?)?;
                 let mut applied = Applied::default();
-                for changes in pack(rows)? {
+                let packed = pack(rows)?;
+                let packed_len = packed.len();
+                for (index, changes) in packed.into_iter().enumerate() {
                     let count = changes.len();
                     let request = if random {
                         crate::crypto::random()?
@@ -1284,10 +1299,11 @@ impl Handle {
                     applied.records += 1;
                     applied.cells += count;
                     applied.operations.push(receipt.id);
-                    // Re-read before admitting another append (`Log::append_records_bound`).
-                    log = Log::read_with(session, store, scope, decode)?;
+                    if !random && index + 1 < packed_len {
+                        // Re-read before checking retry on another append.
+                        log = Log::read_with(session, store, scope, decode)?;
+                    }
                 }
-                drop(log);
                 Ok((planned, applied))
             },
         )
@@ -1339,7 +1355,9 @@ impl Handle {
                 let mut log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let mut written = 0;
-                for changes in pack(schema_rows(table, &View::read(table, session, &log)))? {
+                let packed = pack(schema_rows(table, &View::read(table, session, &log)))?;
+                let packed_len = packed.len();
+                for (index, changes) in packed.into_iter().enumerate() {
                     let request = typed::request_id(table.application, table.role, &changes)?;
                     let command = Command::Write { request, changes };
                     if log.retry(session.actor(), &command)?.is_some() {
@@ -1347,7 +1365,9 @@ impl Handle {
                     }
                     application::append(session, store, &command.encode()?)?;
                     written += 1;
-                    log = Log::read_with(session, store, scope, decode)?;
+                    if index + 1 < packed_len {
+                        log = Log::read_with(session, store, scope, decode)?;
+                    }
                 }
                 Ok(written)
             },

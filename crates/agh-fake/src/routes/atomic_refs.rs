@@ -41,10 +41,10 @@ pub(super) fn update(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let Some(node) = input.get("repositoryId").and_then(Value::as_str) else {
         return refused("Missing repository ID");
     };
-    let Some(index) = state
-        .repos
-        .iter()
-        .position(|r| node == format!("R_{}", r.id))
+    let Some(index) = node
+        .strip_prefix("R_")
+        .and_then(crate::parse_uint::<u64>)
+        .and_then(|id| state.repo_by_id(id))
     else {
         return Answer::not_found();
     };
@@ -63,7 +63,7 @@ pub(super) fn update(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
         return refused("Missing mutation ID");
     };
     let mut seen = BTreeSet::new();
-    let mut staged = Vec::new();
+    let mut staged = Vec::with_capacity(updates.len());
     for update in updates {
         let (Some(name), Some(before), Some(after)) = (
             update.get("name").and_then(Value::as_str),
@@ -83,13 +83,13 @@ pub(super) fn update(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
         {
             return refused("Invalid or forced ref update");
         }
-        if repo.ref_sha(name).as_deref().unwrap_or(ZERO) != before {
+        if repo.ref_sha(name).unwrap_or(ZERO) != before {
             return refused("Expected OID differs");
         }
-        staged.push((name.to_string(), after.to_string()));
+        staged.push((name, after));
     }
     for (name, after) in staged {
-        state.repos[index].set_ref(&name, &after);
+        state.repos[index].set_ref(name, after);
     }
     Answer::json(
         200,

@@ -1113,13 +1113,198 @@ clean {
         Not (Or (And ((0:UInt8) = 1) ((1:UInt8) = 1)) (And ((2:UInt8) = 1) (And ((0:UInt8) = 0) ((1:UInt8) = 0)))) := by
       decide
 
+    -- 7. ONE REMOVAL PREDICATE (binding 4). Log::seat_removed computes four verdicts of the
+    -- evaluator, which stays opaque here: an effective Remove of the seat's actor (a), its
+    -- recipient bound to a Mac now out (r), its writer key a removed Mac's (w), and a seat sharing
+    -- its actor or recipient that holds a node key a removed Mac bound (k). The kernel joins them.
+    def seatOut (a r w k : Bool) : Bool := a || (r || (w || k))
+
+    -- The sheet: a, then r, then w, then k, each false then true.
+    def bitDigit (b : Bool) : Char := digit (if b then 1 else 0)
+    def overBool (f : Bool -> List Char) : List Char := List.append (f false) (f true)
+    def sheetSeatOut : String := String.mk (overBool (fun a => overBool (fun r => overBool (fun w =>
+      overBool (fun k => [bitDigit (seatOut a r w k)])))))
+    theorem sheet_seat_out_answers : sheetSeatOut = "0111111111111111" := rfl
+
+    -- A15 immunity: an actor that is out takes its seat out, whatever its recipient, writer key and
+    -- kin say. The superseded seat of a Mac rebuilt with its node key kept is out though its
+    -- recipient and node key are now the new seat's, so the handshake never relied on the
+    -- evaluator listing that recipient as removed.
+    theorem removal_by_actor_needs_no_recipient (r w k : Bool) : seatOut true r w k = true := rfl
+
+    -- Each other verdict alone takes the seat out too.
+    theorem removal_by_recipient (a w k : Bool) : seatOut a true w k = true := by
+      cases a <;> rfl
+    theorem removal_by_writer (a r k : Bool) : seatOut a r true k = true := by
+      cases a <;> cases r <;> rfl
+    theorem removal_by_kin (a r w : Bool) : seatOut a r w true = true := by
+      cases a <;> cases r <;> cases w <;> rfl
+
+    -- And nothing else does: a seat no verdict takes out stays in.
+    theorem no_verdict_keeps_the_seat : seatOut false false false false = false := rfl
+
+    -- The predicate without its actor disjunct, as a copy that dropped it would be.
+    def seatOutNoActor (a r w k : Bool) : Bool := r || (w || k)
+
+    -- It keeps a seat whose actor is out and whose other verdicts are clear ...
+    theorem no_actor_keeps_a_removed_actor : seatOutNoActor true false false false = false := rfl
+
+    -- ... so it breaks the A15 immunity law.
+    theorem ne_false_true : Not (false = true) := by decide
+    theorem no_actor_breaks_the_actor_law : Not (forall r w k, seatOutNoActor true r w k = true) :=
+      fun h => ne_false_true (h false false false)
+
+    -- 8. THE SEAT SCAN (P4-handshake.md section 4). The verdicts over the membership's projection,
+    -- with the seats a list of any length. The evaluator's answers stay opaque: removal is
+    -- Membership::removal, recipOut recipient_removed, nodeOut a node key's standing Removed. The
+    -- kin verdict is the scan: kin is Membership::kin_removed over the members, held to it by
+    -- membership_log's seat_removed property test. Node key 0 stands for no key and for the zero
+    -- key, which binds nothing.
+    structure Seat where
+      actor : Nat
+      recip : Nat
+      node : Nat
+    structure Mship where
+      removal : Nat -> Bool
+      recipOut : Nat -> Bool
+      nodeOut : Nat -> Bool
+      members : List Seat
+    structure PeerBinding where
+      actor : Nat
+      recip : Nat
+      writer : Nat
+
+    -- A seat is kin of the peer when it shares its actor or recipient, and takes the peer out when
+    -- it holds a node key a removed Mac bound.
+    def kinSeat (m : Mship) (b : PeerBinding) (s : Seat) : Bool :=
+      (decide (s.actor = b.actor) || decide (s.recip = b.recip)) && (!(decide (s.node = 0)) && m.nodeOut s.node)
+    def kin (m : Mship) (b : PeerBinding) : List Seat -> Bool
+      | [] => false
+      | s :: rest => kinSeat m b s || kin m b rest
+    def removedIn (m : Mship) (b : PeerBinding) : Bool :=
+      seatOut (m.removal b.actor) (m.recipOut b.recip) (m.nodeOut b.writer) (kin m b m.members)
+    -- A seat of a list: its head, or a seat of the rest.
+    def SeatIn (s : Seat) : List Seat -> Prop
+      | [] => False
+      | t :: rest => Or (t = s) (SeatIn s rest)
+
+    -- The Bool and decide facts the scan's proofs cite.
+    theorem bor_left (x y : Bool) (h : x = true) : (x || y) = true := by
+      subst h
+      rfl
+    theorem bor_right (x y : Bool) (h : y = true) : (x || y) = true := by
+      subst h
+      cases x <;> rfl
+    theorem band_intro (x y : Bool) (hx : x = true) (hy : y = true) : (x && y) = true := by
+      subst hx
+      subst hy
+      rfl
+    theorem bnot_intro (x : Bool) (h : x = false) : (!x) = true := by
+      subst h
+      rfl
+    theorem decide_true_of {p : Prop} [d : Decidable p] (h : p) : decide p = true := by
+      cases hd : decide p with
+      | true => rfl
+      | false => exact absurd h (of_decide_eq_false hd)
+    theorem decide_false_of {p : Prop} [d : Decidable p] (h : Not p) : decide p = false := by
+      cases hd : decide p with
+      | false => rfl
+      | true => exact absurd (of_decide_eq_true hd) h
+    theorem seat_out_of_actor (a r w k : Bool) (h : a = true) : seatOut a r w k = true := by
+      subst h
+      exact removal_by_actor_needs_no_recipient r w k
+    theorem seat_out_of_kin (a r w k : Bool) (h : k = true) : seatOut a r w k = true := by
+      subst h
+      exact removal_by_kin a r w
+
+    -- A seat sharing the peer's actor or recipient and holding a removed Mac's node key is kin.
+    theorem kin_seat_of (m : Mship) (b : PeerBinding) (s : Seat)
+        (hshare : Or (s.actor = b.actor) (s.recip = b.recip)) (hnode : Not (s.node = 0))
+        (hout : m.nodeOut s.node = true) : kinSeat m b s = true := by
+      show ((decide (s.actor = b.actor) || decide (s.recip = b.recip)) && (!(decide (s.node = 0)) && m.nodeOut s.node)) = true
+      exact band_intro _ _
+        (Or.elim hshare (fun h => bor_left _ _ (decide_true_of h)) (fun h => bor_right _ _ (decide_true_of h)))
+        (band_intro _ _ (bnot_intro _ (decide_false_of hnode)) hout)
+
+    -- The scan finds a kin seat wherever it stands, in a list of any length ...
+    theorem kin_of_mem (m : Mship) (b : PeerBinding) (s : Seat) (hs : kinSeat m b s = true) :
+        forall (ms : List Seat), SeatIn s ms -> kin m b ms = true := by
+      intro ms
+      induction ms with
+      | nil => intro h; exact False.elim h
+      | cons t rest ih =>
+        intro h
+        have h1 : Or (t = s) (SeatIn s rest) := h
+        show (kinSeat m b t || kin m b rest) = true
+        exact Or.elim h1
+          (fun e => bor_left _ _ (Eq.mpr (congrArg (fun x => kinSeat m b x = true) e) hs))
+          (fun h2 => bor_right _ _ (ih h2))
+
+    -- ... and answers true only for one: a kin verdict names a seat of the list that is kin.
+    theorem kin_names_a_seat (m : Mship) (b : PeerBinding) :
+        forall (ms : List Seat), kin m b ms = true -> Exists (fun s => And (SeatIn s ms) (kinSeat m b s = true)) := by
+      intro ms
+      induction ms with
+      | nil => intro h; exact Bool.noConfusion h
+      | cons t rest ih =>
+        intro h
+        cases ht : kinSeat m b t with
+        | true =>
+          have hin : SeatIn t (t :: rest) := Or.inl rfl
+          exact Exists.intro t (And.intro hin ht)
+        | false =>
+          have h2 : (kinSeat m b t || kin m b rest) = true := h
+          rw [ht] at h2
+          exact Exists.elim (ih h2) (fun s hs => Exists.intro s (And.intro (Or.inr hs.1) hs.2))
+
+    -- KIN AT ANY SIZE: a member sharing the peer's actor or recipient, holding a node key (not
+    -- the zero key) a removed Mac bound, takes the peer out, however many seats the log holds.
+    theorem kin_any_size (m : Mship) (b : PeerBinding) (s : Seat) (hmem : SeatIn s m.members)
+        (hshare : Or (s.actor = b.actor) (s.recip = b.recip)) (hnode : Not (s.node = 0))
+        (hout : m.nodeOut s.node = true) : removedIn m b = true := by
+      show seatOut (m.removal b.actor) (m.recipOut b.recip) (m.nodeOut b.writer) (kin m b m.members) = true
+      exact seat_out_of_kin _ _ _ _ (kin_of_mem m b s (kin_seat_of m b s hshare hnode hout) m.members hmem)
+
+    -- A15 IMMUNITY over the membership: an actor that is out takes its seat out whatever the
+    -- evaluator says of its recipient (rr free), so the handshake never relied on
+    -- removed_recipients listing a superseded seat's recipient.
+    theorem removed_in_by_actor_needs_no_recipient (m : Mship) (b : PeerBinding) (rr : Nat -> Bool)
+        (h : m.removal b.actor = true) : removedIn (Mship.mk m.removal rr m.nodeOut m.members) b = true := by
+      show seatOut (m.removal b.actor) (rr b.recip) (m.nodeOut b.writer) (kin (Mship.mk m.removal rr m.nodeOut m.members) b m.members) = true
+      exact seat_out_of_actor _ _ _ _ h
+
+    -- The zero key binds nothing: a kin seat holding it is no verdict, whatever the standings say.
+    theorem the_zero_key_binds_nothing :
+        kin (Mship.mk (fun _ => false) (fun _ => false) (fun _ => true) [Seat.mk 1 7 0]) (PeerBinding.mk 1 7 5) [Seat.mk 1 7 0] = false := rfl
+
+    -- The removal predicate without its actor disjunct, over the membership.
+    def removedInNoActor (m : Mship) (b : PeerBinding) : Bool :=
+      seatOutNoActor (m.removal b.actor) (m.recipOut b.recip) (m.nodeOut b.writer) (kin m b m.members)
+
+    -- A15's superseded seat: the old seat (actor 1, recipient 7, writer key 5) is out by its actor
+    -- alone; its recipient and its node key 9 are now the new seat's (actor 2), a member in good
+    -- standing, and the evaluator lists no recipient as removed.
+    def supersededLog : Mship := Mship.mk (fun a => decide (a = 1)) (fun _ => false) (fun _ => false) [Seat.mk 2 7 9]
+    def oldSeat : PeerBinding := PeerBinding.mk 1 7 5
+    theorem the_superseded_seat_is_out : removedIn supersededLog oldSeat = true := rfl
+
+    -- The copy without the actor disjunct lets it in ...
+    theorem no_actor_lets_the_superseded_seat_in : removedInNoActor supersededLog oldSeat = false := rfl
+
+    -- ... so it breaks the A15 immunity law over the membership.
+    theorem no_actor_breaks_removed_in_by_actor :
+        Not (forall (m : Mship) (b : PeerBinding) (rr : Nat -> Bool), m.removal b.actor = true ->
+          removedInNoActor (Mship.mk m.removal rr m.nodeOut m.members) b = true) :=
+      fun h => ne_false_true (h supersededLog oldSeat (fun _ => false) rfl)
+
     end PeerCheck
     end AtermDbCore
 
     -- The names the kernels' clauses in lib.rs cite (`ensures result == peer_check_next_spec(..)`):
-    -- a clause reads a bare island identifier, so these four stand outside the namespace.
+    -- a clause reads a bare island identifier, so these five stand outside the namespace.
     def peer_check_start_spec (c : UInt8) : UInt8 := AtermDbCore.PeerCheck.start c
     def peer_check_next_spec (c s o : UInt8) (w : Bool) : UInt8 := AtermDbCore.PeerCheck.next c s o w
     def peer_check_roster_spec (c r d : UInt8) : UInt8 := AtermDbCore.PeerCheck.roster c r d
     def peer_check_view_spec (c o : UInt8) : UInt8 := AtermDbCore.PeerCheck.view c o
+    def seat_out_spec (a r w k : Bool) : Bool := AtermDbCore.PeerCheck.seatOut a r w k
 }

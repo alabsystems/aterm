@@ -29,6 +29,12 @@ const PORT: u16 = 41384;
 const WORKERS: usize = 4;
 /// How often every link sends its beacon, after the first one each sends as it opens.
 const BEACON: Duration = Duration::from_secs(5);
+/// How often the seats' advertised builds and `Bus` speakers are read again.
+const SEATS: Duration = Duration::from_secs(2);
+
+/// What says a peer's fleet node key speaks `Bus` ([`super::Runtime::speaks_bus`]), shared so a
+/// host can install it after its runtime started; `None` names no peer.
+pub(super) type Bus = Arc<Mutex<Option<super::SpeaksBus>>>;
 
 #[derive(Default)]
 struct Channel {
@@ -351,6 +357,8 @@ pub(super) struct Transport {
     dial: Instant,
     rotate: Instant,
     versions_at: Instant,
+    /// Which peers speak `Bus`, read with the advertised builds ([`Hints::bus_speakers`]).
+    bus: Bus,
     scope: Scope,
     /// The group's port: [`PORT`] on a LAN, an isolated test attachment's own on loopback.
     port: u16,
@@ -439,6 +447,12 @@ impl Transport {
         std::mem::take(&mut self.finished_rounds)
     }
 
+    /// This transport with `bus` as its `Bus` predicate, read at each seats refresh.
+    pub(super) fn hearing_bus(mut self, bus: Bus) -> Self {
+        self.bus = bus;
+        self
+    }
+
     pub(super) fn open(endpoint: Endpoint, addresses: &[SocketAddr]) -> Result<Self> {
         Self::open_mode(Some(endpoint), addresses)
     }
@@ -474,6 +488,7 @@ impl Transport {
             dial: now,
             rotate: now + Duration::from_secs(300),
             versions_at: now,
+            bus: Bus::default(),
             scope,
             port,
             contacts: Vec::new(),
@@ -582,9 +597,9 @@ impl Transport {
         std::mem::take(&mut self.contacts)
     }
 
-    /// Push `table`: dial every verified peer now ([`Hints::hurry`]); the rounds this side begins
-    /// repair `table` first while the endpoint's push names it (`crate::replica::First`). How many
-    /// peers it hurried; with none there is no push.
+    /// Push `table`: dial every verified peer that does not speak `Bus` now ([`Hints::hurry`]); the
+    /// rounds this side begins repair `table` first while the endpoint's push names it
+    /// (`crate::replica::First`). How many peers it hurried; with none there is no push.
     pub(super) fn hurry(&mut self, table: astream_wire::sync::Digest, now: Instant) -> usize {
         let hurried = self.hints.hurry(now);
         self.push = (hurried > 0).then_some(Push {
@@ -714,7 +729,12 @@ impl Transport {
     }
     pub(super) fn tick(&mut self, now: Instant) -> io::Result<()> {
         if now >= self.versions_at {
-            self.versions_at = now + Duration::from_secs(2);
+            self.versions_at = now + SEATS;
+            let speaks = self.bus.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            self.hints.bus_speakers(match (speaks, &self.endpoint) {
+                (Some(speaks), Some(endpoint)) => endpoint.bus_actors(&*speaks),
+                _ => std::collections::BTreeSet::new(),
+            });
             // This reads a local cache only: Commons never polls the fleet for versions.
             // Isolated attachments and unit tests must not consult the live lab.
             #[cfg(not(test))]

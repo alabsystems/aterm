@@ -23,8 +23,6 @@ pub(super) fn run(
 /// What a Repositories stage [`run_reading`] ran came to.
 pub(super) struct Ran {
     pub rows: Vec<Row>,
-    /// It stopped for want of Apple's Command Line Tools ([`want_developer_tools`]).
-    pub developer_tools: bool,
     /// The reason a part that failed gives ([`failure_note`]).
     pub failure: Option<&'static str>,
     /// It stopped for want of a GitHub token to sign in with ([`want_token`]).
@@ -64,7 +62,6 @@ pub(super) fn run_reading_guarded(
                 detail: why,
                 elapsed_ms: None,
             }],
-            developer_tools: false,
             failure: None,
             token: false,
         });
@@ -75,7 +72,6 @@ pub(super) fn run_reading_guarded(
 fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
     match rows {
         Some(rows) => Ran {
-            developer_tools: want_developer_tools(&rows),
             failure: failure_note(&rows),
             token: want_token(&rows),
             rows: item_rows(rows),
@@ -86,7 +82,6 @@ fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
                 false,
                 "the selected secrets vault changed or is still syncing; repository inputs wait for a complete version".into(),
             )],
-            developer_tools: false,
             failure: None,
             token: false,
         },
@@ -98,15 +93,6 @@ fn reading(rows: Option<Vec<aterm_machines::model::ItemReport>>) -> Ran {
 /// engine's English, which `aterm doctor` and the log keep (System State design §3.6).
 pub(super) fn failure_note(rows: &[aterm_machines::model::ItemReport]) -> Option<&'static str> {
     aterm_machines::init_observe::failure_note(&rows.iter().collect::<Vec<_>>())
-}
-
-/// Whether the repositories' item `rows` stopped for want of Apple's Command Line Tools: the
-/// reading their probe took, never the engine's English (System State design §3.3). A vault
-/// still syncing reads no item, so it never asks for them.
-pub(super) fn want_developer_tools(rows: &[aterm_machines::model::ItemReport]) -> bool {
-    use aterm_machines::init_observe::{Reading, Wait};
-    rows.iter()
-        .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::CommandLineTools)))
 }
 
 /// Whether the repositories' item `rows` stopped because this Mac has no GitHub token to sign in
@@ -449,7 +435,10 @@ mod tests {
         use aterm_machines::init_observe::Wait;
         use aterm_types::macos_setup::Standing;
 
-        for wait in [Wait::Token, Wait::CommandLineTools] {
+        for (wait, standing) in [
+            (Wait::Token, Standing::NeedsYou),
+            (Wait::GitReadiness, Standing::Waiting),
+        ] {
             let root = aterm_tempfile::tempdir().unwrap();
             let source = root.path().join("team.secrets");
             let home = root.path().join("home");
@@ -461,16 +450,15 @@ mod tests {
             let (sys, ctx) = fake(&home);
             let missing = match wait {
                 Wait::Token => home.join(".secrets/gh_access_token"),
-                Wait::CommandLineTools => {
+                Wait::GitReadiness => {
                     Path::new(aterm_machines::items::github::CLT_GIT).to_path_buf()
                 }
                 _ => unreachable!(),
             };
             sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
             let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
-            // Each needs a person (a token in the vault, Apple's tools): never a wait the run
-            // retries (System State design §3.6).
-            assert_eq!(seen.standing, Standing::NeedsYou, "{wait:?}");
+            // A missing token needs its vault entry; Git readiness is retried automatically.
+            assert_eq!(seen.standing, standing, "{wait:?}");
             assert_eq!(seen.note.as_deref(), Some(wait.note()), "{wait:?}");
             assert!(
                 !sys.calls()

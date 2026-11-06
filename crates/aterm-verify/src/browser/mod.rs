@@ -1397,6 +1397,12 @@ fn desk_claim(
             let said = crate::admission(&claim, mode, true);
             Ok(Some((std::sync::Arc::new(claim), said)))
         }
+        Err(aterm_capacity::Error::Stopped { .. }) if crate::exec::halted().is_some() => {
+            Err(format!(
+                "{}; it started nothing",
+                crate::exec::halted().unwrap_or_default()
+            ))
+        }
         Err(e @ aterm_capacity::Error::Stopped { .. }) => {
             #[cfg(unix)]
             crate::exec::group::stop_run();

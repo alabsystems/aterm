@@ -5,9 +5,11 @@
 //! codex-alab's headless capacity and account-quota recovery (its `alab/CAPACITY_RECOVERY.md`,
 //! and its `alab-core` glue `responses_quota_retry.rs`) on the REAL package's `codex exec`, in
 //! the proof's jail ([`super::policy`]: one loopback port, the owner's homes fenced), against a
-//! loopback model of this lane's own. Every case of codex-alab's `alab/smoke/capacity_exec.py`
-//! (its default run, `--quota`, `--quota-no-reset` and `--quota-terminals`), which runs
-//! `codex exec` with the Internet open, by its name ([`CASES`]):
+//! loopback model of this lane's own. Every case codex-alab's standalone smoke ran (its
+//! `alab/smoke/capacity_exec.py` as of codex-alab `767a333a16`, which every `capacity_exec.py`
+//! below names: its default run, `--quota`, `--quota-no-reset` and `--quota-terminals`), by its
+//! name ([`CASES`]); that run had `codex exec` reach its model with the Internet open, and this
+//! lane replaces it:
 //!
 //! - the package's records agree (version, target, an exact source commit, `bin/codex` inside
 //!   the package), `codex exec --help` names the flags this lane passes, and `codex --version`
@@ -20,9 +22,10 @@
 //!   completed, the reply completed, exit 0, and the retry asked no sooner than `Retry-After`
 //!   after the wall's headers began (their emission bracketed within
 //!   [`HEADER_EMISSION_LIMIT_S`], or the timing is inconclusive). The wall is `503
-//!   server_is_overloaded`; or `429 usage_limit_reached` naming a reset 2 s on (rounded up to the
-//!   second), which the retry may not precede; or that `429` with no reset, after which codex-alab
-//!   polls no sooner than [`QUOTA_POLL_S`] later;
+//!   server_is_overloaded`; or `429 usage_limit_reached` naming a reset a second or more past
+//!   `Retry-After` ([`RESET_PAST_RETRY_S`], rounded up to the second), which the retry may not
+//!   precede; or that `429` with no reset, after which codex-alab polls no sooner than
+//!   [`QUOTA_POLL_S`] later;
 //! - REFUSAL (`permanent-refusal`, `quota-permanent-refusal`, `quota-no-reset-refusal`,
 //!   `quota-terminal-<kind>`): a `403` with the overloaded or the quota body (with or without its
 //!   reset), or a `429` with the quota body, its reset and `x-codex-rate-limit-reached-type` one of
@@ -35,8 +38,8 @@
 //! sampled with `lsof` ([`crate::sampler::endpoints`]), on a clock and by the model at each
 //! request before it answers (codex waits on that connection then, so the witness must see
 //! it: measured live, codex holds no connection between requests, and a clock alone saw none):
-//! no endpoint off loopback, each request's connection seen, and the canary untouched after
-//! the run.
+//! no endpoint off loopback, the sample at each request seeing the tree's connection to the
+//! model's port, and the canary untouched after the run.
 //!
 //! AN INTERRUPT ENDS IT: a first `INT`, `TERM` or `HUP` ([`stop`]) ends the run going (its whole
 //! group killed, [`end_with_group`]) and the lane with [`Stopped`]; a second, which ends the lab
@@ -63,8 +66,13 @@ pub(super) const CALL_ID: &str = "capacity-smoke-plan";
 pub(super) const PLAN: &str = "Completed work survives a capacity retry";
 /// The reply after the retry.
 pub(super) const ANSWER: &str = "Headless capacity recovery succeeded.";
-/// `Retry-After` on the wall's answer, in seconds; a quota wall's reset is as far on.
+/// `Retry-After` on the wall's answer, in seconds.
 const RETRY_AFTER_S: u64 = 2;
+/// How far a quota wall's reset lies past `Retry-After` at least, in seconds: the wall names the
+/// moment it was asked, rounded up to the second, this much past `Retry-After`, so a retry that
+/// keeps `Retry-After` alone comes a second or more before the reset, whatever the fraction of
+/// the second it was asked at, and only one that keeps the reset passes the reset's row.
+const RESET_PAST_RETRY_S: u64 = 1;
 /// The most the wall's headers may take to write and still time the retry.
 const HEADER_EMISSION_LIMIT_S: f64 = 0.050;
 /// How long codex-alab waits before it asks again past a quota wall that names no reset
@@ -164,10 +172,10 @@ impl Case {
     fn waits(self) -> Duration {
         match self {
             Self::QuotaNoResetRecovery => Duration::from_secs(QUOTA_POLL_S),
-            // The reset is up to a second past `Retry-After`: rounded up to the second.
-            Self::CapacityRecovery | Self::QuotaResetRecovery => {
-                Duration::from_secs(RETRY_AFTER_S + 1)
-            }
+            Self::CapacityRecovery => Duration::from_secs(RETRY_AFTER_S),
+            // The reset is [`RESET_PAST_RETRY_S`] past `Retry-After`, and up to a second more:
+            // rounded up to the second.
+            Self::QuotaResetRecovery => Duration::from_secs(RETRY_AFTER_S + RESET_PAST_RETRY_S + 1),
             _ => Duration::ZERO,
         }
     }
@@ -270,6 +278,8 @@ pub(super) struct Taken {
 struct Model {
     case: Case,
     clock: Instant,
+    /// The loopback port it listens on, which each request's connection is to.
+    port: u16,
     taken: Mutex<Vec<Taken>>,
     /// Sampled at each request it takes, before its answer: the client is waiting on its
     /// connection then, so a witness that is not blind sees that connection.
@@ -292,11 +302,14 @@ struct Seen {
     samples: usize,
     /// Samples taken at a request, while the client waited for its answer.
     at_requests: usize,
+    /// Samples taken at a request that saw the tree connected to the model's port then.
+    connected_at_requests: usize,
 }
 
 impl Witness {
-    /// Sample the tree once (`at_request`: while the client waits on the model).
-    fn sample(&self, at_request: bool) {
+    /// Sample the tree once (`request_to`: the model's port, sampled at a request while the
+    /// client waits on it for the answer).
+    fn sample(&self, request_to: Option<u16>) {
         let Some(root) = *self
             .root
             .lock()
@@ -315,21 +328,31 @@ impl Witness {
         else {
             return;
         };
-        let found = crate::sampler::endpoints(&String::from_utf8_lossy(&out.stdout));
-        let mut seen = self
-            .seen
+        self.seen
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.pids.extend(pids);
-        seen.endpoints.extend(found);
-        seen.samples += 1;
-        if at_request {
-            seen.at_requests += 1;
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&pids, &String::from_utf8_lossy(&out.stdout), request_to);
     }
 }
 
 impl Seen {
+    /// Record one sample of the tree `pids`, `lsof -F pcPtn`'s output `lsof_f`, taken at a
+    /// request to the model on `request_to` (else on the clock): its endpoints, and whether that
+    /// request's sample saw one of `pids` connected to the model's port.
+    fn record(&mut self, pids: &[i32], lsof_f: &str, request_to: Option<u16>) {
+        let found = crate::sampler::endpoints(lsof_f);
+        if let Some(port) = request_to {
+            self.at_requests += 1;
+            let log: String = found.iter().map(|l| format!("{l}\n")).collect();
+            if crate::agy_proof::talked(&log, pids, &port.to_string()) {
+                self.connected_at_requests += 1;
+            }
+        }
+        self.pids.extend(pids);
+        self.endpoints.extend(found);
+        self.samples += 1;
+    }
+
     /// Its socket log: each endpoint seen, a line each.
     fn log(&self) -> String {
         self.endpoints.iter().map(|l| format!("{l}\n")).collect()
@@ -351,12 +374,13 @@ impl Seen {
 
     /// THE EGRESS VERDICT on a run whose model on `port` took `requests`: no socket of the tree
     /// off loopback, a sample at each request (and at least one request, so the witness saw
-    /// something it had to), the tree's connection to the model seen, and the canary untouched
-    /// (`canary_touched`).
+    /// something it had to), each of those samples seeing the tree connected to the model, that
+    /// connection to `port`, and the canary untouched (`canary_touched`).
     fn egress_held(&self, port: u16, requests: usize, canary_touched: bool) -> bool {
         self.external().is_empty()
             && requests > 0
             && self.at_requests == requests
+            && self.connected_at_requests == requests
             && self.talked(port)
             && !canary_touched
     }
@@ -386,7 +410,8 @@ pub(super) struct Answer {
 /// since the epoch), as `capacity_exec.py`'s model does: the plan call, the case's wall with
 /// `Retry-After`, the reply, then a refusal of any extra request; a refused case meets its wall
 /// at every request. A quota wall that names its reset names `now` rounded up to the second,
-/// [`RETRY_AFTER_S`] on.
+/// [`RETRY_AFTER_S`] and [`RESET_PAST_RETRY_S`] on (the smoke's named it [`RETRY_AFTER_S`] on,
+/// which a retry that kept `Retry-After` alone could reach).
 pub(super) fn answer(case: Case, number: usize, now: f64) -> Answer {
     let ok = |body| Answer {
         status: 200,
@@ -397,8 +422,8 @@ pub(super) fn answer(case: Case, number: usize, now: f64) -> Answer {
         resets_at: None,
     };
     if case.refused() || number == 2 {
-        let resets_at =
-            (case.quota() && case.names_reset()).then(|| now.ceil() as i64 + RETRY_AFTER_S as i64);
+        let resets_at = (case.quota() && case.names_reset())
+            .then(|| now.ceil() as i64 + (RETRY_AFTER_S + RESET_PAST_RETRY_S) as i64);
         let error = if case.quota() {
             let mut error = J::obj([
                 ("type", J::s("usage_limit_reached")),
@@ -514,7 +539,7 @@ fn serve_one(conn: TcpStream, model: &Model) {
             });
             taken.len()
         };
-        model.witness.sample(true);
+        model.witness.sample(Some(model.port));
         let Answer {
             status,
             content_type,
@@ -984,7 +1009,7 @@ fn end_with_group(
             }
             return Ok(if ended { status.code() } else { None });
         }
-        witness.sample(false);
+        witness.sample(None);
         stopped = stop::sleep(SAMPLE_EVERY).err();
     }
 }
@@ -1013,7 +1038,9 @@ fn reaches(profile: &str, port: u16) -> bool {
 }
 
 /// Whether anything connected to the canary since it was bound (`canary` is nonblocking, so the
-/// accept answers at once).
+/// accept answers at once). A loopback `connect` can return before the listener's queue holds
+/// its connection, so `false` means untouched only where nothing can still be on its way, as
+/// after a probe whose connect failed ([`jail_holds`]).
 fn canary_touched(canary: &TcpListener) -> bool {
     !matches!(aterm_uds::kept_out(|| canary.accept()), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
 }
@@ -1102,6 +1129,7 @@ fn run_case(
     let model = Arc::new(Model {
         case,
         clock: Instant::now(),
+        port,
         taken: Mutex::new(Vec::new()),
         witness: Arc::clone(&witness),
     });
@@ -1181,17 +1209,14 @@ fn run_case(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = crate::util::write_fresh(&root.join("sockets.log"), seen.log());
     // Each request was sampled while codex waited on its connection for the answer, so a
-    // witness that is not blind saw that connection.
+    // witness that is not blind saw that connection at each.
     check(
         format!(
-            "no socket of codex exec's tree left loopback ({} sample(s), {} at a request; its connection to the model {}; external: {:?}), and the canary took nothing",
+            "no socket of codex exec's tree left loopback ({} sample(s), {} at a request of {}; its connection to the model seen at {}; external: {:?}), and the canary took nothing",
             seen.samples,
             seen.at_requests,
-            if seen.talked(port) {
-                "seen"
-            } else {
-                "not seen"
-            },
+            taken.len(),
+            seen.connected_at_requests,
             seen.external()
         ),
         seen.egress_held(port, taken.len(), canary_touched(&canary)),
@@ -1432,7 +1457,8 @@ mod tests {
         )
     }
 
-    /// The smoke's own timing rows (`alab/tests/test_capacity_exec.py`): a retry two
+    /// The smoke's own timing rows (`alab/tests/test_capacity_exec.py` at codex-alab
+    /// `767a333a16`, which held them while the smoke ran on its own): a retry two
     /// seconds after the headers began passes, measured from the headers; one that request
     /// handling before them would have excused, or a fifty-millisecond shortfall, is a bypass;
     /// a bracket of header emission past the limit, backwards, or missing is no measure.
@@ -1731,6 +1757,7 @@ mod tests {
         let model = Arc::new(Model {
             case,
             clock: Instant::now(),
+            port,
             taken: Mutex::new(Vec::new()),
             witness: Arc::new(Witness::default()),
         });
@@ -1860,14 +1887,17 @@ mod tests {
         }
     }
 
-    /// EACH QUOTA WALL AS `capacity_exec.py`'s MODEL ANSWERS IT: `usage_limit_reached`, with
+    /// EACH QUOTA WALL AS THE LANE'S MODEL ANSWERS IT: `usage_limit_reached`, with
     /// `Retry-After: 2`; a reset case names the moment it was asked, rounded up to the second,
-    /// 2 s on, and no type; a no-reset case names no reset; a `403` case meets its wall at every
+    /// 3 s on (`Retry-After` and [`RESET_PAST_RETRY_S`]), and no type, so asked at any fraction of
+    /// a second its reset is a second or more past `Retry-After` (a retry that keeps
+    /// `Retry-After` alone, less than a second late, still comes before it) and within what the case
+    /// waits by design; a no-reset case names no reset; a `403` case meets its wall at every
     /// request, with or without its reset; a terminal case meets a `429` typed with its kind at
     /// every request, naming its reset. The case table holds ten cases of distinct names, every
     /// terminal kind once among them, and seven refusals.
     #[test]
-    fn the_lanes_model_answers_each_quota_wall_as_the_smokes_did() {
+    fn the_lanes_model_answers_each_quota_wall_past_what_retry_after_alone_reaches() {
         let error = |a: &Answer| J::parse(&a.body).expect("JSON").get("error").cloned();
         let reset_of = |a: &Answer| error(a).and_then(|e| e.get("resets_at")?.as_i64());
         let typed = |a: &Answer| {
@@ -1879,11 +1909,27 @@ mod tests {
         let wall = answer(Case::QuotaResetRecovery, 2, UNIX_AT);
         assert_eq!((wall.status, wall.retry_after), (429, Some(2)));
         assert_eq!(typed(&wall), "usage_limit_reached");
-        assert_eq!(wall.resets_at, Some(1_800_000_003), "rounded up, 2 s on");
+        assert_eq!(wall.resets_at, Some(1_800_000_004), "rounded up, 3 s on");
         assert_eq!(reset_of(&wall), wall.resets_at, "the body names it");
         assert_eq!(wall.reached_type, None);
         let on_the_second = answer(Case::QuotaResetRecovery, 2, 1_800_000_000.0);
-        assert_eq!(on_the_second.resets_at, Some(1_800_000_002));
+        assert_eq!(on_the_second.resets_at, Some(1_800_000_003));
+        let retry_after = RETRY_AFTER_S as f64;
+        let waits = Case::QuotaResetRecovery.waits().as_secs_f64();
+        for fraction in [0.0, 0.001, 0.25, 0.5, 0.997, 0.999_999] {
+            let asked = 1_800_000_000.0 + fraction;
+            let reset = answer(Case::QuotaResetRecovery, 2, asked)
+                .resets_at
+                .expect("a reset") as f64;
+            assert!(
+                reset >= asked + retry_after + 1.0,
+                "asked at {asked}: a retry under a second past Retry-After reaches the reset {reset}"
+            );
+            assert!(
+                reset <= asked + waits,
+                "asked at {asked}: the reset {reset} past the case's wait {waits}"
+            );
+        }
         assert_eq!(answer(Case::QuotaResetRecovery, 1, UNIX_AT).status, 200);
         assert!(
             answer(Case::QuotaResetRecovery, 3, UNIX_AT)
@@ -1898,7 +1944,7 @@ mod tests {
         assert_eq!(answer(Case::QuotaNoResetRecovery, 3, UNIX_AT).status, 200);
 
         for (case, reset) in [
-            (Case::QuotaPermanentRefusal, Some(1_800_000_003)),
+            (Case::QuotaPermanentRefusal, Some(1_800_000_004)),
             (Case::QuotaNoResetRefusal, None),
         ] {
             for number in [1, 2] {
@@ -1915,7 +1961,7 @@ mod tests {
                 assert_eq!((a.status, a.retry_after), (429, Some(2)), "{kind}");
                 assert_eq!(typed(&a), "usage_limit_reached", "{kind}");
                 assert_eq!(a.reached_type, Some(kind));
-                assert_eq!(reset_of(&a), Some(1_800_000_003), "{kind}: its reset");
+                assert_eq!(reset_of(&a), Some(1_800_000_004), "{kind}: its reset");
             }
         }
         for case in [Case::CapacityRecovery, Case::PermanentRefusal] {
@@ -2096,7 +2142,7 @@ mod tests {
         assert!(judge(Case::CapacityRecovery, Some(0), &ok, &good).is_ok());
     }
 
-    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.
+    /// The `sleep` a run left: the pid its script wrote to `root/left.pid`.
     fn left(root: &Path) -> i32 {
         crate::util::read_regular_text(&root.join("left.pid"))
             .expect("the run wrote its sleep's pid")
@@ -2299,27 +2345,47 @@ mod tests {
         );
     }
 
-    /// The witness's view of a run, from `lsof -F pcPtn` output.
-    fn seen(lsof: &str, pids: &[i32], at_requests: usize) -> Seen {
-        Seen {
-            endpoints: crate::sampler::endpoints(lsof),
-            pids: pids.iter().copied().collect(),
-            samples: at_requests + 2,
-            at_requests,
+    /// The witness's view of a run of the tree `pids`: two samples on the clock that saw no
+    /// socket, then one at each request to the model on port 5000, each seeing `lsof` (that
+    /// request's `lsof -F pcPtn` output).
+    fn seen_at(lsof: &[&str], pids: &[i32]) -> Seen {
+        let mut seen = Seen::default();
+        for _ in 0..2 {
+            seen.record(pids, "", None);
         }
+        for each in lsof {
+            seen.record(pids, each, Some(5000));
+        }
+        seen
+    }
+
+    /// The same, `at_requests` requests each sampled seeing `lsof`.
+    fn seen(lsof: &str, pids: &[i32], at_requests: usize) -> Seen {
+        seen_at(&vec![lsof; at_requests], pids)
     }
 
     /// THE EGRESS VERDICT (review F1): a tree seen only on loopback, sampled at each of the
-    /// model's requests, its connection to the model seen and the canary untouched, holds; a
-    /// socket off loopback, a request the witness did not sample at, a run with no request at
-    /// all, a connection to another port or by a pid outside the tree, and a touched canary each
-    /// fail it.
+    /// model's requests, its connection to the model seen at each and the canary untouched,
+    /// holds; a socket off loopback, a request the witness did not sample at or whose sample did
+    /// not see its connection (review R2: one connection seen for three requests was enough), a
+    /// run with no request at all, a connection to another port or by a pid outside the tree,
+    /// and a touched canary each fail it.
     #[test]
     fn the_egress_verdict_holds_a_loopback_tree_seen_at_every_request_alone() {
         let conn = "p4100\nccodex\nPTCP\nn127.0.0.1:61000->127.0.0.1:5000\n";
         let good = seen(conn, &[4100], 3);
         assert!(good.egress_held(5000, 3, false));
         assert_eq!(good.log(), "codex[4100] TCP conn 127.0.0.1:5000\n");
+        assert_eq!((good.samples, good.at_requests), (5, 3));
+        let listening = "p4100\nccodex\nPTCP\nn127.0.0.1:61002\n";
+        for unseen in [[conn, "", conn], [conn, listening, conn], ["", "", conn]] {
+            let missed = seen_at(&unseen, &[4100]);
+            assert!(missed.talked(5000), "{unseen:?}");
+            assert!(
+                !missed.egress_held(5000, 3, false),
+                "a request whose connection was not seen: {unseen:?}"
+            );
+        }
 
         let out = seen(
             &format!("{conn}n192.168.1.9:61001->17.253.144.10:443\n"),
@@ -2369,9 +2435,7 @@ mod tests {
         let open = format!("{jail}(allow network-outbound (remote ip \"localhost:*\"))");
         let (canary, _) = listen();
         assert!(!jail_holds(&open, port, &canary), "a jail open to loopback");
-        until_within(MUST_HAPPEN, "the open jail's probe reached it", || {
-            canary_touched(&canary).then_some(())
-        });
+        reached(&canary, "the open jail's probe reached it");
         let (canary, _) = listen();
         assert!(
             !jail_holds("(version 1)(allow default)(deny network*)", port, &canary),
@@ -2382,11 +2446,24 @@ mod tests {
         assert!(!canary_touched(&canary));
         let _conn = aterm_uds::kept_out(|| TcpStream::connect(("127.0.0.1", canary_port)))
             .expect("a connection");
-        // A loopback connect can return before the listener's queue holds the connection: the
-        // accept that finds it is waited for, as a hang detector.
-        until_within(MUST_HAPPEN, "a connection to it", || {
-            canary_touched(&canary).then_some(())
-        });
+        reached(&canary, "a connection to it");
+    }
+
+    /// Reads `canary` touched once the connection that must reach it is in its queue. A loopback
+    /// `connect` (a probe's too) returns once its SYN-ACK is in, while the handshake's last ACK
+    /// can still wait behind other loopback traffic, so a nonblocking accept straight after it
+    /// can find nothing. A listener turns readable when a connection waits to be accepted, which
+    /// this waits for in `poll(2)` under the one-minute hang detector.
+    #[track_caller]
+    fn reached(canary: &TcpListener, what: &str) {
+        use std::os::fd::AsFd as _;
+        let ready = aterm_uds::ready::until(
+            canary.as_fd(),
+            aterm_uds::ready::Interest::Read,
+            Instant::now() + MUST_HAPPEN,
+        );
+        assert!(ready.is_ok(), "{what}: the canary's queue ({ready:?})");
+        assert!(canary_touched(canary), "{what}");
     }
 
     /// THE CLI CHECKS (review F1): `exec --help` holds only on exit 0 with every flag the cases

@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use super::{Clock, Host};
+use super::{Clock, Host, Own};
 use crate::memory::{Meter, StageKey as _};
 
 const GIB: u64 = 1 << 30;
@@ -166,6 +166,112 @@ fn a_stage_that_started_no_child_keeps_that_it_held_nothing() {
     book.keep(&doctests, &key, none.held().expect("held nothing"))
         .expect("kept");
     assert_eq!(book.need(&doctests, &key).bytes, GIB, "the margin alone");
+}
+
+/// One member read at `cpu_ms` of CPU, twice that runnable, holding `held` GiB.
+fn member(pid: u32, start: u64, cpu_ms: u64, held: u64) -> aterm_sysprobe::MemberUsage {
+    aterm_sysprobe::MemberUsage {
+        pid,
+        start,
+        cpu_ns: cpu_ms * 1_000_000,
+        runnable_ns: cpu_ms * 2_000_000,
+        footprint: held * GIB,
+        peak_footprint: held * GIB,
+        ..aterm_sysprobe::MemberUsage::default()
+    }
+}
+
+/// A CHILD'S RUN CARRIES ITS OWN TREE'S USE, BOOKED ON ITS STAGE METER'S READS (A1): two
+/// children of one stage, each read first as it starts (the early read) and then as its clock
+/// reads its tree, book into the stage's meter and each into its own, so their CPU sums to the
+/// stage's observed CPU exactly. Each counts a process incarnation (pid, start) once, at the most
+/// it was read at: the first child's leader read at 10 then 30 ms and its helper at 5 ms is
+/// 35 ms over two processes, held 3 GiB together at its heaviest read; a pid reused with a new
+/// start is a process of its own. NEGATIVE CONTROL: a clock that keeps no account of its child
+/// (`owning` never called) books its stage's meter alone, and the sum falls short by its CPU.
+#[test]
+fn a_childs_run_carries_its_own_trees_cpu_peak_and_processes() {
+    let stage = Meter::new();
+    let reads_of = |reads: Vec<Vec<aterm_sysprobe::MemberUsage>>| {
+        Scripted::of(reads.into_iter().map(Some).collect())
+    };
+    let first = reads_of(vec![
+        vec![member(100, 1, 10, 1)],
+        vec![member(100, 1, 30, 2), member(101, 1, 5, 1)],
+        vec![member(100, 1, 20, 1)],
+    ]);
+    let second = reads_of(vec![vec![member(200, 1, 7, 1)], vec![member(200, 2, 4, 1)]]);
+    let (a, b) = (Own::default(), Own::default());
+    let usage = |host: &Scripted, own: &Own, pgid: u32, owned: bool| {
+        let n = host
+            .reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let clock = Clock::new(None, host, pgid, Some(Arc::clone(&stage)));
+        let mut clock = if owned { clock.owning(own) } else { clock };
+        clock.tick();
+        for _ in 1..n {
+            clock.read_usage();
+        }
+        own.usage(&clock, Duration::from_secs(1))
+    };
+    let ua = usage(&first, &a, 100, true).expect("the first child was read");
+    let ub = usage(&second, &b, 200, true).expect("the second child was read");
+    assert_eq!(ua.cpu, Duration::from_millis(35));
+    assert_eq!(ua.runnable, Duration::from_millis(70));
+    assert_eq!((ua.processes, ua.peak_bytes), (2, 3 * GIB));
+    assert_eq!((ub.cpu, ub.processes), (Duration::from_millis(11), 2));
+    let observed = stage.observed_cpu().expect("the stage was read");
+    assert_eq!(
+        ua.cpu + ub.cpu,
+        Duration::from_nanos(observed.nanoseconds),
+        "the children sum to their stage"
+    );
+    assert_eq!(ua.processes + ub.processes, observed.processes);
+
+    let unowned = Own::default();
+    let third = reads_of(vec![vec![member(300, 1, 9, 1)]]);
+    assert_eq!(usage(&third, &unowned, 300, false), None, "never owned");
+    let observed = stage.observed_cpu().expect("the stage was read");
+    assert_eq!(
+        Duration::from_nanos(observed.nanoseconds) - (ua.cpu + ub.cpu),
+        Duration::from_millis(9),
+        "an unowned child's CPU is its stage's alone"
+    );
+}
+
+/// A CHILD'S USAGE CARRIES ITS CLOCK'S WAITS AND ITS WALL: the time its clock left out of its
+/// work as a wait for a core (`starved`) and as a marked wait for admission or a lock
+/// (`waited`), and the wall it was given, beside what its reads found. NEGATIVE CONTROL: a clock
+/// that left nothing out gives zeros for both, never the other clock's.
+#[test]
+fn a_childs_usage_carries_its_clocks_waits_and_its_wall() {
+    let usage = |starved: Duration, waited: Duration| {
+        let host = Scripted::of(vec![Some(vec![member(400, 1, 3, 1)])]);
+        let own = Own::default();
+        let mut clock = Clock::new(None, &host, 400, None).owning(&own);
+        clock.read_usage();
+        clock.starved = starved;
+        clock.waited = waited;
+        own.usage(&clock, Duration::from_secs(2))
+            .expect("the child was read")
+    };
+    let waits = usage(Duration::from_millis(40), Duration::from_millis(250));
+    assert_eq!(
+        (waits.cpu, waits.starved, waits.waited, waits.wall),
+        (
+            Duration::from_millis(3),
+            Duration::from_millis(40),
+            Duration::from_millis(250),
+            Duration::from_secs(2)
+        )
+    );
+    let none = usage(Duration::ZERO, Duration::ZERO);
+    assert_eq!(
+        (none.starved, none.waited),
+        (Duration::ZERO, Duration::ZERO)
+    );
 }
 
 /// Selects the memory hog's stand-in: set, this test binary touches that many MiB, says

@@ -13,11 +13,12 @@ use zeroize::Zeroizing;
 mod encrypt;
 pub use encrypt::{EncryptedBody, Recipient, public_keys};
 
+pub(super) const CURVE25519_OID: [u8; 10] = [43, 6, 1, 4, 1, 151, 85, 1, 5, 1];
+
 pub struct Key {
     id: [u8; 8],
     fingerprint: [u8; 20],
     scalar: Zeroizing<[u8; 32]>,
-    oid: Vec<u8>,
     hash: u8,
     cipher: u8,
     public: [u8; 32],
@@ -45,7 +46,7 @@ pub fn unlock(armored: &str, password: &[u8]) -> Result<Vec<Key>, String> {
     if armored.len() > 1024 * 1024 {
         return Err("Private key exceeds limit".into());
     }
-    let bytes = armor(armored, "PRIVATE KEY BLOCK")?;
+    let bytes = Zeroizing::new(armor(armored, "PRIVATE KEY BLOCK")?);
     let mut rest = bytes.as_slice();
     let mut keys = Vec::new();
     while !rest.is_empty() {
@@ -56,7 +57,7 @@ pub fn unlock(armored: &str, password: &[u8]) -> Result<Vec<Key>, String> {
         }
         let oid_len = usize::from(body[6]);
         let oid = body.get(7..7 + oid_len).ok_or("Truncated key curve")?;
-        if oid != [43, 6, 1, 4, 1, 151, 85, 1, 5, 1] {
+        if oid != CURVE25519_OID {
             continue;
         }
         let (public, parameters) = mpi(body.get(7 + oid_len..).ok_or("Truncated public key")?)?;
@@ -95,7 +96,6 @@ pub fn unlock(armored: &str, password: &[u8]) -> Result<Vec<Key>, String> {
             id: fingerprint[12..].try_into().map_err(|_| "Invalid key ID")?,
             fingerprint,
             scalar: raw,
-            oid: oid.to_vec(),
             hash: kdf[2],
             cipher: kdf[3],
             public: public[1..].try_into().map_err(|_| "Invalid public key")?,
@@ -212,7 +212,7 @@ pub fn decrypt(armored: &str, keys: &[Key]) -> Result<Zeroizing<Vec<u8>>, String
         let (tag, body, tail) = owned_packet(rest)?;
         rest = tail;
         match tag {
-            1 if body.len() >= 10 && body[0] == 3 && body[9] == 18 => {
+            1 if session.is_none() && body.len() >= 10 && body[0] == 3 && body[9] == 18 => {
                 for key in keys
                     .iter()
                     .filter(|key| body[1..9] == key.id || body[1..9] == [0u8; 8])
@@ -261,8 +261,8 @@ fn session_key(bytes: &[u8], key: &Key) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut digest = ring::digest::Context::new(hash(key.hash)?);
     digest.update(&[0, 0, 0, 1]);
     digest.update(shared.as_ref());
-    digest.update(&[key.oid.len() as u8]);
-    digest.update(&key.oid);
+    digest.update(&[CURVE25519_OID.len() as u8]);
+    digest.update(&CURVE25519_OID);
     digest.update(&[18, 3, 1, key.hash, key.cipher]);
     digest.update(b"Anonymous Sender    ");
     digest.update(&key.fingerprint);

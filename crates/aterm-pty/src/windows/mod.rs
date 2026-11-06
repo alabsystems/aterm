@@ -61,8 +61,9 @@ struct WinSession {
 
 impl Drop for WinSession {
     fn drop(&mut self) {
-        let signal = std::mem::replace(&mut *self.signal.lock_or_recover(), 0);
-        let reference = std::mem::replace(&mut *self.reference.lock_or_recover(), 0);
+        // The pseudoconsole too: a session dropped before its waiter closed it (the waiter thread
+        // failed to start) held its HPCON, and with it conhost, to the end of the process.
+        close_pseudoconsole(self);
         for h in [
             self.input,
             self.output,
@@ -70,8 +71,6 @@ impl Drop for WinSession {
             self.conhost,
             self.job,
             self.close_evt,
-            signal,
-            reference,
         ] {
             if h != 0 {
                 // SAFETY: handles are exclusively owned by this session entry and closed once on `Drop`.
@@ -88,6 +87,8 @@ static NEXT_KEY: AtomicI32 = AtomicI32::new(0x4000_0000);
 #[cfg(test)]
 thread_local! {
     static REGISTERED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Each `HPCON` [`close_pseudoconsole`] closed on this thread.
+    static CLOSED_PSEUDOCONSOLES: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn register(session: &Arc<WinSession>) -> i32 {
@@ -156,12 +157,17 @@ fn conhost_children() -> Vec<u32> {
     out
 }
 
+/// Close what hangs the session's console up, each at most once (a swap to 0 under its lock):
+/// an inbox session's `HPCON`, an OpenConsole session's signal pipe and reference handle, a
+/// handoff's signal pipe. A session holds an `HPCON` or those handles, never both, and this
+/// closes whatever it holds.
 fn close_pseudoconsole(s: &WinSession) {
     let hpc = std::mem::replace(&mut *s.hpc.lock_or_recover(), 0);
     if hpc != 0 {
+        #[cfg(test)]
+        CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow_mut().push(hpc));
         // SAFETY: atomic swap to 0 makes this thread the sole closer of the `HPCON`.
         unsafe { ffi::ClosePseudoConsole(hpc) };
-        return;
     }
     let signal = std::mem::replace(&mut *s.signal.lock_or_recover(), 0);
     if signal != 0 {
@@ -2090,6 +2096,46 @@ mod tests {
 
     fn registered_here() -> u64 {
         REGISTERED_HERE.with(std::cell::Cell::get)
+    }
+
+    /// A session dropped before its waiter hung its console up (the waiter thread failed to
+    /// start) closes its `HPCON` as it drops, once. NEGATIVE CONTROL: a drop that closes only the
+    /// session's handles leaves the pseudoconsole, and its conhost, open.
+    #[test]
+    fn a_dropped_session_closes_its_pseudoconsole() {
+        let (pcon, pipes) = create_pseudoconsole(coord(80, 24), OsStr::new("cmd.exe"), false)
+            .expect("an inbox pseudoconsole");
+        let Pseudoconsole::Inbox { hpc, conhost } = pcon else {
+            panic!("a pseudoconsole that may not use OpenConsole is the inbox one");
+        };
+        let hpc = hpc.release();
+        assert_ne!(hpc, 0, "CreatePseudoConsole names its HPCON");
+        // Nothing reads its output: closed first, conhost's last frame cannot block the close.
+        drop(pipes);
+        CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow_mut().clear());
+        drop(WinSession {
+            hpc: Mutex::new(hpc),
+            signal: Mutex::new(0),
+            reference: Mutex::new(0),
+            host: ConsoleHostKind::Inbox,
+            input: 0,
+            output: 0,
+            process: 0,
+            conhost: conhost.into_raw(),
+            job: 0,
+            outside_job_ended: Mutex::new(false),
+            close_evt: 0,
+            pid: 0,
+            exit_code: Mutex::new(None),
+            resize_guard: ResizeGuard::new(None, ConsoleHostKind::Inbox),
+            input_severed: AtomicBool::new(false),
+            leave_client: Mutex::new(None),
+            input_writes: std::sync::atomic::AtomicU64::new(0),
+        });
+        assert_eq!(
+            CLOSED_PSEUDOCONSOLES.with(|closed| closed.borrow().clone()),
+            [hpc]
+        );
     }
 
     #[test]

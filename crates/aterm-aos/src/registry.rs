@@ -58,6 +58,28 @@ impl From<&Verdict> for Judged {
     }
 }
 
+/// `s` as one word of a row: whitespace and controls become `_`, so a value never splits its
+/// row or the line, and an empty value is `-`.
+fn token_word(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.is_empty() {
+        return std::borrow::Cow::Borrowed("-");
+    }
+    if !s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if c.is_whitespace() || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
+
 impl Judged {
     /// Whether this is a failing judgement (a fault to keep).
     #[inline]
@@ -71,8 +93,8 @@ impl Judged {
     pub fn token(&self) -> String {
         match self {
             Judged::Pass => "pass".to_owned(),
-            Judged::Fail { law, cursor } => format!("fail:{law}@{cursor}"),
-            Judged::Unjudged(why) => format!("unjudged:{}", why.replace(' ', "_")),
+            Judged::Fail { law, cursor } => format!("fail:{}@{cursor}", token_word(law)),
+            Judged::Unjudged(why) => format!("unjudged:{}", token_word(why)),
         }
     }
 }
@@ -126,16 +148,17 @@ impl Row {
                 judged,
                 kept,
             } => format!(
-                "segment cause={} code={code} log_epoch={log_epoch} range={from}..{to} judged={} kept={}",
+                "segment cause={} code={} log_epoch={log_epoch} range={from}..{to} judged={} kept={}",
                 cause.word(),
+                token_word(code),
                 judged.token(),
                 kept.map_or_else(|| "no".to_owned(), |k| k.to_string())
             ),
-            Row::Detached { why } => format!("detached why={}", why.replace(' ', "_")),
+            Row::Detached { why } => format!("detached why={}", token_word(why)),
             Row::Unseen { on, why } => format!(
                 "unseen={} why={}",
                 if *on { "on" } else { "off" },
-                why.replace(' ', "_")
+                token_word(why)
             ),
         }
     }
@@ -246,8 +269,8 @@ impl Listing {
              waiting={} kept={} rows={} dropped={}",
             self.slot,
             self.kind.word(),
-            self.task,
-            self.code,
+            token_word(&self.task),
+            token_word(&self.code),
             self.attached,
             self.paused,
             self.revision,
@@ -298,7 +321,13 @@ impl Registry {
     /// `tasks=<n>`, then each listing's line followed by its rows (`slot=<s> row=<k> …`), oldest first.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!("tasks={}", self.listings.len())];
+        let total = 1 + self
+            .listings
+            .iter()
+            .map(|l| 1 + l.timeline.len())
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.push(format!("tasks={}", self.listings.len()));
         for l in &self.listings {
             out.push(l.line());
             for (k, row) in l.timeline.rows().enumerate() {

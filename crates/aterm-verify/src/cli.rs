@@ -9,15 +9,21 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::checks::{CHECKS, Check, DEV, RELEASE, Word, lookup};
+use crate::checks::{CHECKS, Check, DEV, RELEASE, RELEASE_BUNDLE, RELEASE_TREE, Word, lookup};
 
 /// What the command line asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Args {
     /// The checks to run, in [`CHECKS`] order, without repeats.
     pub checks: Vec<Check>,
-    /// `release` was named: whole workspace, `--app` required, a skip is exit 3.
+    /// `release` was named: whole workspace, `--app` exactly when `measure` runs, a skip is exit
+    /// 3, and its first proven red ends the run ([`crate::sched::Halt`]). `--tree` and
+    /// `--bundle` narrow it to its halves ([`RELEASE_TREE`], [`RELEASE_BUNDLE`]), `--checks` to
+    /// some of its checks; each is still a release's run of them.
     pub release: bool,
+    /// `--fail-fast`: the run's first proven red ends it, as it ends a release; a bare run keeps
+    /// its whole sweep.
+    pub fail_fast: bool,
     /// `list`: print the table of checks and run nothing.
     pub list: bool,
     pub help: bool,
@@ -99,8 +105,10 @@ impl Usage {
 ///
 /// # Errors
 /// An unknown word or flag, a flag without its value, a value that is not one,
-/// options that contradict each other or the checks named, or `release` without
-/// `--app`.
+/// options that contradict each other or the checks named, `--tree`, `--bundle` or `--checks`
+/// without `release`, a `--checks` name that is no check of the release (or of the half named),
+/// `--fix` under `release`, or a release run of `measure` without `--app`, or of no `measure`
+/// with one.
 pub fn parse<I, S>(args: I) -> Result<Args, Usage>
 where
     I: IntoIterator<Item = S>,
@@ -108,6 +116,8 @@ where
 {
     let mut a = Args::default();
     let mut words: Vec<Word> = Vec::new();
+    let (mut tree, mut bundle) = (false, false);
+    let mut listed: Vec<String> = Vec::new();
     let mut it = args.into_iter().map(Into::into);
     let usage = |s: String| Err(Usage::new(s));
     while let Some(arg) = it.next() {
@@ -138,6 +148,10 @@ where
             "--cursor-pacing" => a.cursor_pacing = true,
             "--compile-only" => a.compile_only = true,
             "--as-release" => a.as_release = true,
+            "--fail-fast" => a.fail_fast = true,
+            "--tree" => tree = true,
+            "--bundle" => bundle = true,
+            "--checks" => listed.push(value("--checks")?),
             "--admit" => {
                 let v = value("--admit")?;
                 match aterm_capacity::Admit::parse(&v) {
@@ -173,12 +187,14 @@ where
         return usage("`list` takes no check or set beside it".to_string());
     }
     a.release = words.contains(&Word::Release);
+    // A help parse is Ok whatever `--checks` names, so its checks fall back to the whole release.
+    let release = release_checks(tree, bundle, &listed);
     let mut wanted: Vec<Check> = Vec::new();
     for w in &words {
         match w {
             Word::Check(c) => wanted.push(*c),
             Word::Dev => wanted.extend(DEV),
-            Word::Release => wanted.extend(RELEASE),
+            Word::Release => wanted.extend(release.as_deref().unwrap_or(&RELEASE)),
             Word::List => {}
         }
     }
@@ -193,9 +209,14 @@ where
     if a.help || a.list {
         return Ok(a);
     }
+    if (tree || bundle || !listed.is_empty()) && !a.release {
+        return usage("--tree, --bundle and --checks narrow `release`; name it".to_string());
+    }
+    release?;
     // The fix rewrites sources in place, so no other check may be reading
-    // them: a compile beside it would judge half-written files.
-    if a.fix && a.checks != [Check::Fmt] {
+    // them: a compile beside it would judge half-written files. A release
+    // judges the tree as it is, so never rewrites it.
+    if a.fix && (a.release || a.checks != [Check::Fmt]) {
         return usage("--fix rewrites sources; run it alone: verify fmt --fix".to_string());
     }
     if !a.cells.is_empty() {
@@ -248,13 +269,56 @@ where
             );
         }
         a.all = true;
-        if a.app.is_none() {
+        let measures = a.checks.contains(&Check::Measure);
+        if measures && a.app.is_none() {
             return usage(
                 "`release` needs the bundle `measure` judges: --app <path to aterm.app>".into(),
             );
         }
+        if !measures && a.app.is_some() {
+            return usage(
+                "this release runs no `measure`, which alone reads --app; drop it".into(),
+            );
+        }
     }
     Ok(a)
+}
+
+/// The checks `release` runs: its tree half under `--tree`, its bundle half under `--bundle`
+/// (both, with both), else all of [`RELEASE`]; of those, only the ones `--checks` lists
+/// (comma-separated, repeatable), when it lists any.
+fn release_checks(tree: bool, bundle: bool, listed: &[String]) -> Result<Vec<Check>, Usage> {
+    let halves: Vec<Check> = if tree || bundle {
+        let tree = RELEASE_TREE.iter().filter(|_| tree);
+        tree.chain(RELEASE_BUNDLE.iter().filter(|_| bundle))
+            .copied()
+            .collect()
+    } else {
+        RELEASE.to_vec()
+    };
+    if listed.is_empty() {
+        return Ok(halves);
+    }
+    let mut chosen = Vec::new();
+    for name in listed.iter().flat_map(|l| l.split(',')) {
+        match lookup(name) {
+            Some(Word::Check(c)) if halves.contains(&c) => chosen.push(c),
+            Some(Word::Check(_)) => {
+                let of: Vec<&str> = halves.iter().map(|c| c.name()).collect();
+                return Err(Usage::new(format!(
+                    "--checks: `{name}` is not one of this release's checks ({})",
+                    of.join(" ")
+                )));
+            }
+            _ => {
+                return Err(Usage {
+                    why: format!("--checks: unknown check `{name}`"),
+                    hint: "verify list names every check",
+                });
+            }
+        }
+    }
+    Ok(chosen)
 }
 
 /// A note when `-p` or `--base` was given and no selected check reads a
@@ -302,6 +366,14 @@ pub fn usage() -> String {
     checks.push_str(line.trim_end());
     let reserve = aterm_capacity::span(aterm_capacity::QUIET_PATIENCE.reserve);
     let start = aterm_capacity::span(aterm_capacity::QUIET_PATIENCE.start);
+    let half = |checks: &[Check]| {
+        checks
+            .iter()
+            .map(|c| c.name())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (tree, bundle) = (half(&RELEASE_TREE), half(&RELEASE_BUNDLE));
     format!(
         "targo --unverified verify [CHECK|SET ...] [OPTIONS]
 
@@ -312,6 +384,9 @@ Run aterm's checks in place, alone or in any combination.
   verify test --all               every crate's tests (+ wasm-smoke)
   verify fmt --fix                rewrite what fmt finds unformatted
   verify release --app <APP>      everything publication requires
+  verify release --tree           its tree half: no bundle, nothing timed
+  verify release --bundle --app <APP>
+                                  its bundle half, after the build and the tree
   verify list                     every check: sets, needs, what it runs
   verify perf [LANE...]           the performance lanes (`verify perf --list`)
   verify soak [--ledger PATH]     the crash restore's soak (keeper P4): this
@@ -336,7 +411,9 @@ Sets:
            one cell per other OS that builds a selected crate, and one of
            this OS for a lint with debug assertions off, which shipped code
            calling a debug-only seam fails
-  release  every check `ship release` requires; --all implied, --app required
+  release  every check `ship release` requires; --all implied, --app with measure;
+           its tree half (--tree): {tree}
+           its bundle half (--bundle): {bundle}
 
 Checks:
 {checks}
@@ -355,6 +432,13 @@ Options:
                           test (--compile-only: what release's test stage compiles)
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
+      --tree              with release: only its tree half
+      --bundle            with release: only its bundle half (--app)
+      --checks <a,b,..>   with release: only these of its checks (a resume),
+                          each as the release runs it
+      --fail-fast         end the run at its first failure, as release does:
+                          what it stopped reads NOT RUN (a check that could
+                          not run, its machine's fault, never ends it)
       --admit <wait|now>  wait for room for the disk the run will write, for
                           each stage's memory before it starts (held until
                           it ends, beside other runs' claims), and for a
@@ -429,6 +513,62 @@ mod tests {
         assert!(parse(["release", "cells", "--app", "a", "--cell", "win"]).is_err());
     }
 
+    /// `release --tree` and `release --bundle --app A` run its halves, both its whole set, and
+    /// `--checks` some of its checks; each is a release (whole workspace, its halt), `--app` goes
+    /// exactly with `measure`. Controls: each flag without `release`, a listed check outside the
+    /// release or its half, an unknown one, and `--app` beside no `measure`, are usage errors.
+    #[test]
+    fn release_narrows_to_its_halves_and_to_the_checks_listed() {
+        let in_order = |set: &[Check]| -> Vec<Check> {
+            CHECKS
+                .iter()
+                .map(|s| s.check)
+                .filter(|c| set.contains(c))
+                .collect()
+        };
+        let tree = ok(&["release", "--tree"]);
+        assert!(tree.release && tree.all && tree.app.is_none());
+        assert_eq!(tree.checks, in_order(&RELEASE_TREE));
+        let bundle = ok(&["release", "--bundle", "--app", "a"]);
+        assert!(bundle.release && bundle.all);
+        assert_eq!(bundle.checks, in_order(&RELEASE_BUNDLE));
+        assert_eq!(
+            ok(&["release", "--tree", "--bundle", "--app", "a"]).checks,
+            ok(&["release", "--app", "a"]).checks
+        );
+        let resume = ok(&["release", "--checks", "spec,test", "--checks=fmt"]);
+        assert!(resume.release && resume.all);
+        assert_eq!(resume.checks, [Check::Fmt, Check::Test, Check::Spec]);
+        assert_eq!(
+            ok(&["release", "--bundle", "--checks", "appkit"]).checks,
+            [Check::Appkit],
+            "appkit reads no bundle"
+        );
+        assert_eq!(
+            ok(&["release", "--checks", "measure", "--app", "a"]).checks,
+            [Check::Measure]
+        );
+        // Help and list are Ok before any refusal, as they were.
+        assert!(ok(&["release", "--tree", "--help"]).help);
+        assert_eq!(ok(&["release", "--tree", "--help"]).checks, tree.checks);
+        assert!(ok(&["list", "--tree"]).list);
+        for args in [
+            &["--tree"][..],
+            &["lint", "--bundle"],
+            &["test", "--checks", "test"],
+            &["release", "--checks", "cells"],
+            &["release", "--tree", "--checks", "appkit"],
+            &["release", "--checks", "tset"],
+            &["release", "--checks", "test,"],
+            &["release", "--tree", "--app", "a"],
+            &["release", "--checks", "lint", "--app", "a"],
+            &["release", "--bundle"],
+            &["release", "--checks", "fmt", "--fix"],
+        ] {
+            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn contradictions_and_unknowns_are_usage_errors() {
         for args in [
@@ -493,6 +633,8 @@ mod tests {
         assert_eq!(a.timeout, Some(None));
         assert_eq!(a.log.as_deref(), Some(std::path::Path::new("/tmp/x.log")));
         assert!(a.no_windows);
+        assert!(!a.fail_fast, "a bare run keeps its whole sweep");
+        assert!(ok(&["test", "--fail-fast"]).fail_fast);
         assert_eq!(a.base.as_deref(), Some("main"));
         assert_eq!(a.admit, aterm_capacity::Admit::Wait, "wait by default");
         assert_eq!(

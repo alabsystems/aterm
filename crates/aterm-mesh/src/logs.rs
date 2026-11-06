@@ -63,7 +63,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 /// The folder under the state dir that holds both logs.
@@ -77,7 +77,7 @@ pub const SOCKET: &str = "sock";
 
 /// The bytes a socket path may take (`sun_path`, `aterm_link::enable::SUN_PATH_MAX`): a longer
 /// one is not served, and the log is reached through the node service alone.
-const SUN_PATH_MAX: usize = 104;
+pub(crate) const SUN_PATH_MAX: usize = 104;
 
 /// A guard secret's length.
 const GUARD_LEN: usize = 32;
@@ -385,15 +385,18 @@ impl Verdict {
                 let next = classes.len();
                 let class = *classes.entry(class(key)).or_insert(next);
                 let name = astream_broker::identity_principal(key);
-                let principal = *principal_of.entry(name.clone()).or_insert_with(|| {
+                let principal = principal_of.get(&name).copied().unwrap_or_else(|| {
+                    let idx = names.len();
+                    principal_of.insert(name.clone(), idx);
                     names.push(name);
-                    names.len() - 1
+                    idx
                 });
+                let gone = read.removed.contains(key) || read.retired.contains(key);
                 aterm_mesh_core::relay::Key {
                     class,
                     principal,
-                    current: read.is_current(key),
-                    gone: read.removed.contains(key) || read.retired.contains(key),
+                    current: !gone && read.current.contains(key),
+                    gone,
                 }
             })
             .collect();
@@ -437,15 +440,21 @@ pub struct MeshConfig {
     pub watch_every: Duration,
     /// Where the relays report what they did, beside the node service's journal.
     pub observe: Option<Observe>,
+    /// The stores whose records the mesh moves (§11 B7b): with them, the egress, the ingest
+    /// consumer and the `Inventory` exchanges run ([`crate::flow`]); with `None`, the logs relay
+    /// only what is published on them.
+    pub stores: Option<Arc<dyn crate::stores::Stores>>,
 }
 
 /// This Mac as the mesh knows it: the node key's seed (held scrubbed on drop), its public key,
-/// its principal and the producer id its records carry.
+/// its principal, the producer id its records carry, and aterm's state folder the key is in,
+/// where the person key it vouches for lives too (§11 C3c).
 pub(crate) struct Me {
     pub(crate) seed: Secret,
     pub(crate) key: [u8; 32],
     pub(crate) principal: String,
     pub(crate) pid: u64,
+    pub(crate) dir: PathBuf,
 }
 
 impl Me {
@@ -491,6 +500,7 @@ impl Me {
             key,
             principal,
             pid,
+            dir: state_dir.to_path_buf(),
         })
     }
 
@@ -547,20 +557,43 @@ fn refused(refusal: &at_rest::Refused) -> io::Error {
 /// The log's guard secret: read, or minted once where none is. A guard is never replaced: the
 /// grants a neighbour holds were minted under it.
 fn guard_secret(dir: &Path) -> io::Result<Secret> {
-    let path = dir.join(GUARD_SECRET);
-    if std::fs::symlink_metadata(&path).is_err() {
-        let mut fresh = [0u8; GUARD_LEN];
-        if let Err(e) = aterm_uds::rand::fill(&mut fresh) {
-            aterm_uds::secret::scrub(&mut fresh);
-            return Err(e);
+    use std::os::unix::fs::MetadataExt as _;
+    if let Ok(bytes) = aterm_uds::private_file::read_private(dir, GUARD_SECRET, GUARD_LEN + 1) {
+        let held = Secret::from_vec(bytes);
+        if held.len() != GUARD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{GUARD_SECRET} is not {GUARD_LEN} bytes"),
+            ));
         }
-        let wrote =
-            aterm_uds::private_file::write_private_new(dir, GUARD_SECRET, &fresh, |_| Ok(()));
-        aterm_uds::secret::scrub(&mut fresh);
-        wrote?;
+        return Ok(held);
     }
-    // A crash inside the write leaves the temporary as the name's second link.
-    aterm_uds::atomic_file::sweep_temps_beside(&path, Duration::ZERO)?;
+    let path = dir.join(GUARD_SECRET);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if meta.nlink() > 1 {
+                // A crash inside the write leaves the temporary as the name's second link.
+                aterm_uds::atomic_file::sweep_temps_beside(&path, Duration::ZERO)?;
+            }
+        }
+        Err(_) => {
+            let mut fresh = [0u8; GUARD_LEN];
+            if let Err(e) = aterm_uds::rand::fill(&mut fresh) {
+                aterm_uds::secret::scrub(&mut fresh);
+                return Err(e);
+            }
+            let wrote =
+                aterm_uds::private_file::write_private_new(dir, GUARD_SECRET, &fresh, |_| Ok(()));
+            if wrote.is_ok() {
+                let held = Secret::from_vec(fresh.to_vec());
+                aterm_uds::secret::scrub(&mut fresh);
+                return Ok(held);
+            }
+            aterm_uds::secret::scrub(&mut fresh);
+            wrote?;
+            aterm_uds::atomic_file::sweep_temps_beside(&path, Duration::ZERO)?;
+        }
+    }
     let bytes = aterm_uds::private_file::read_private(dir, GUARD_SECRET, GUARD_LEN + 1)
         .map_err(|e| io::Error::other(format!("{GUARD_SECRET}: {e}")))?;
     let held = Secret::from_vec(bytes);
@@ -639,23 +672,20 @@ impl Hosted {
         Ok(Arc::new(ours))
     }
 
-    /// A client of this log's broker under this Mac's own key, holding `grants`, each read and
+    /// A client of this log's broker under this Mac's own key, holding `grant`, each read and
     /// write bounded by `within` (`None`: unbounded).
     pub(crate) fn client(
         &self,
         me: &Me,
-        grants: &[String],
+        grant: &str,
         within: Option<Duration>,
     ) -> io::Result<AnyClient> {
-        let caps = grants
-            .iter()
-            .map(|grant| self.mint(grant))
-            .collect::<io::Result<Vec<_>>>()?;
+        let cap = self.mint(grant)?;
         let link = self.adopt(me.key)?;
         link.set_read_timeout(within)?;
         link.set_write_timeout(within)?;
         let (mut client, _closer) = astream_broker::connect_stream(link);
-        client.attach_all(caps.iter().map(|cap| (cap.filter.as_str(), &cap.tag[..])))?;
+        client.attach_all([(cap.filter.as_str(), &cap.tag[..])])?;
         Ok(client)
     }
 
@@ -664,9 +694,13 @@ impl Hosted {
     /// rebuilt Mac finds the high water this Mac holds of it. Both are bound to the peer, so only
     /// its own stream can use them.
     pub(crate) fn grants_for(&self, peer: &str) -> io::Result<Vec<Capability>> {
+        let own = match self.log {
+            MeshLog::Tables => format!("ro,p={peer}:/t/*/{peer}"),
+            MeshLog::Metrics => format!("ro,p={peer}:/m/{peer}/shared/>"),
+        };
         Ok(vec![
             self.mint(&format!("rw,relay,p={peer}:{}", self.log.filter()))?,
-            self.mint(&format!("ro,p={peer}:{}", self.log.own_filter(peer)))?,
+            self.mint(&own)?,
         ])
     }
 
@@ -690,15 +724,11 @@ impl Hosted {
     ) -> io::Result<(u64, bool)> {
         let mut local = self.local.lock_or_recover();
         if local.is_none() {
-            *local = Some(self.client(
-                me,
-                &[format!(
-                    "rw,p={}:{}",
-                    me.principal,
-                    self.log.publish_filter(&me.principal)
-                )],
-                Some(relay::IO_WITHIN),
-            )?);
+            let grant = match self.log {
+                MeshLog::Tables => format!("rw,p={0}:/t/*/{0}", me.principal),
+                MeshLog::Metrics => format!("rw,p={0}:/m/{0}/>", me.principal),
+            };
+            *local = Some(self.client(me, &grant, Some(relay::IO_WITHIN))?);
         }
         let client = local
             .as_mut()
@@ -730,6 +760,8 @@ struct Applied {
     read: Option<Standings>,
     /// What every broker was given of them: the origins, and the keys and principals revoked.
     verdict: Verdict,
+    /// The other current seats' keys (`verdict.origins` less this Mac's), keyed by principal.
+    seats_by_principal: BTreeMap<String, [u8; 32]>,
     /// The `Removed` keys whose rows were retired.
     retired: BTreeSet<[u8; 32]>,
     /// The `Removed` keys whose rows could not be retired yet, each said once.
@@ -745,6 +777,7 @@ struct Applied {
 /// The mesh of one node service: both logs, this Mac's node key, and the membership log's verdict.
 pub struct Mesh {
     pub(crate) me: Me,
+    state_dir: PathBuf,
     pub(crate) tables: Hosted,
     pub(crate) metrics: Hosted,
     applied: Mutex<Applied>,
@@ -760,6 +793,13 @@ pub struct Mesh {
     pub(crate) arrived: Mutex<BTreeSet<[u8; 32]>>,
     stopped: AtomicBool,
     watcher: Mutex<Option<(Arc<Bell>, std::thread::JoinHandle<()>)>>,
+    /// The egress, the ingest consumer and the `Inventory` exchanges, where the mesh moves tables.
+    pub(crate) flow: Mutex<Option<crate::flow::Flow>>,
+    /// Bumped, and rung, each time a tables relay's neighbour acks a burst.
+    pub(crate) acks: (Mutex<u64>, Condvar),
+    /// The neighbours a tables relay follows now, by principal: each one's node key and how many
+    /// such relays run.
+    pub(crate) heard: Mutex<BTreeMap<String, ([u8; 32], usize)>>,
     /// The job's bus slot this mesh joined, which it leaves as it closes.
     joined: Mutex<Option<Arc<BusSlot>>>,
     /// Held through each close, so a second caller (the orderly quit, racing the job's own close)
@@ -802,8 +842,10 @@ impl Mesh {
         aterm_uds::private_file::ensure_private_dir(&mesh_dir)?;
         let tables = Hosted::open(&mesh_dir, MeshLog::Tables, &cfg, &me)?;
         let metrics = Hosted::open(&mesh_dir, MeshLog::Metrics, &cfg, &me)?;
+        let stores = cfg.stores.clone();
         let mesh = Arc::new(Self {
             me,
+            state_dir: cfg.state_dir.clone(),
             tables,
             metrics,
             applied: Mutex::new(Applied::default()),
@@ -816,6 +858,9 @@ impl Mesh {
             arrived: Mutex::new(BTreeSet::new()),
             stopped: AtomicBool::new(false),
             watcher: Mutex::new(None),
+            flow: Mutex::new(None),
+            acks: (Mutex::new(0), Condvar::new()),
+            heard: Mutex::new(BTreeMap::new()),
             joined: Mutex::new(None),
             closing: Mutex::new(()),
             presence: Mutex::new(Weak::new()),
@@ -824,6 +869,16 @@ impl Mesh {
         // starts its watcher closes them too.
         *QUIT_MESH.lock_or_recover() = Arc::downgrade(&mesh);
         let read = mesh.follow().is_some();
+        if let Some(stores) = stores {
+            let flow = crate::flow::Flow::start(&mesh, stores);
+            match flow {
+                Ok(flow) => *mesh.flow.lock_or_recover() = Some(flow),
+                Err(e) => {
+                    mesh.close();
+                    return Err(e);
+                }
+            }
+        }
         if let Some(changed) = cfg.changed {
             let bell = Arc::new(Bell::default());
             let weak = Arc::downgrade(&mesh);
@@ -858,6 +913,24 @@ impl Mesh {
             mesh_dir.display()
         );
         Ok(mesh)
+    }
+
+    /// The node service's state dir.
+    #[must_use]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// The folder `log` lives in.
+    #[must_use]
+    pub fn log_dir(&self, log: MeshLog) -> PathBuf {
+        self.state_dir.join(MESH_DIR).join(log.word())
+    }
+
+    /// The file of `log`.
+    #[must_use]
+    pub fn log_file(&self, log: MeshLog) -> PathBuf {
+        self.log_dir(log).join(log.file())
     }
 
     /// This Mac's principal (`n-` and the first eight bytes of its node key in hex).
@@ -897,7 +970,7 @@ impl Mesh {
         within: Option<Duration>,
     ) -> io::Result<AnyClient> {
         self.hosted(log)
-            .client(&self.me, &[format!("ro:{filter}")], within)
+            .client(&self.me, &format!("ro:{filter}"), within)
     }
 
     /// Publish `payload` on `subject` of `log` as this Mac: signed by its node key and numbered
@@ -923,18 +996,8 @@ impl Mesh {
     pub fn holders(&self) -> BTreeSet<String> {
         let presence = self.presence.lock_or_recover().upgrade();
         presence
-            .map(|presence| presence.seats())
+            .map(|presence| presence.holders())
             .unwrap_or_default()
-            .into_iter()
-            .filter(|seat| {
-                !seat.me
-                    && seat
-                        .row
-                        .as_ref()
-                        .is_some_and(|(_, row)| !row.topics.is_empty())
-            })
-            .map(|seat| seat.principal)
-            .collect()
     }
 
     /// The standings applied, `None` before the first read.
@@ -1012,8 +1075,15 @@ impl Mesh {
             );
         }
         let alone = verdict.origins.len() == 1;
+        applied.seats_by_principal = verdict
+            .origins
+            .iter()
+            .filter(|&&key| key != self.me.key)
+            .map(|&key| (astream_broker::identity_principal(&key), key))
+            .collect();
         applied.verdict = verdict;
         applied.read = Some(read);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         drop(applied);
         self.retire_due();
         if alone {
@@ -1022,8 +1092,11 @@ impl Mesh {
                 hosted.origin.lock_or_recover().settle_alone();
             }
         }
-        self.generation.fetch_add(1, Ordering::AcqRel);
         self.poke();
+        // A writer seated now may be one a waiting table record names.
+        if let Some(ingest) = self.ingest() {
+            ingest.kick();
+        }
         true
     }
 
@@ -1036,29 +1109,27 @@ impl Mesh {
             let Some(read) = applied.read.as_ref() else {
                 return;
             };
-            let gone = |key: &&[u8; 32]| {
-                applied
-                    .verdict
-                    .principals
-                    .contains(&astream_broker::identity_principal(key))
-            };
-            let due: Vec<[u8; 32]> = read
-                .removed
-                .iter()
-                .filter(gone)
-                .filter(|key| !applied.retired.contains(*key))
-                .copied()
-                .collect();
-            let bus_due: Vec<[u8; 32]> = match applied.bus.as_ref() {
-                Some(_) => read
-                    .removed
-                    .iter()
-                    .filter(gone)
-                    .filter(|key| !applied.bus_retired.contains(*key))
-                    .copied()
-                    .collect(),
-                None => Vec::new(),
-            };
+            let has_bus = applied.bus.is_some();
+            let mut due = Vec::new();
+            let mut bus_due = Vec::new();
+            for key in &read.removed {
+                let need_metrics = !applied.retired.contains(key);
+                let need_bus = has_bus && !applied.bus_retired.contains(key);
+                if (!need_metrics && !need_bus)
+                    || !applied
+                        .verdict
+                        .principals
+                        .contains(&astream_broker::identity_principal(key))
+                {
+                    continue;
+                }
+                if need_metrics {
+                    due.push(*key);
+                }
+                if need_bus {
+                    bus_due.push(*key);
+                }
+            }
             (due, bus_due)
         };
         for key in bus_due {
@@ -1099,7 +1170,7 @@ impl Mesh {
         let filter = MeshLog::retired_filter(&principal);
         let hosted = &self.metrics;
         let mut client =
-            hosted.client(&self.me, &[format!("rw:{filter}")], Some(relay::IO_WITHIN))?;
+            hosted.client(&self.me, &format!("rw:{filter}"), Some(relay::IO_WITHIN))?;
         let (rows, _) = client.last_all(&filter)?;
         for (_, subject, _) in rows {
             client.retire_subject(pid, &subject)?;
@@ -1210,12 +1281,29 @@ impl Mesh {
 
     /// The other current seats' keys, the origins but this Mac's ([`Verdict`]): `None` before the
     /// standings were read.
+    #[cfg(test)]
     pub(crate) fn seats(&self) -> Option<BTreeSet<[u8; 32]>> {
         let applied = self.applied.lock_or_recover();
         applied.read.as_ref()?;
         let mut seats = applied.verdict.origins.clone();
         seats.remove(&self.me.key);
         Some(seats)
+    }
+
+    /// The other current seats' keys (`Verdict::origins` less this Mac's), keyed by principal:
+    /// `None` before the standings were read.
+    pub(crate) fn seats_by_principal(&self) -> Option<BTreeMap<String, [u8; 32]>> {
+        let applied = self.applied.lock_or_recover();
+        applied.read.as_ref()?;
+        Some(applied.seats_by_principal.clone())
+    }
+
+    /// The current seat key for `principal` (excluding this Mac): `None` before the standings
+    /// were read or where `principal` is not an uncontested current seat.
+    pub(crate) fn seat_key(&self, principal: &str) -> Option<[u8; 32]> {
+        let applied = self.applied.lock_or_recover();
+        applied.read.as_ref()?;
+        applied.seats_by_principal.get(principal).copied()
     }
 
     /// The origin keys every broker holds now ([`Verdict`]): this Mac's alone before the first read.
@@ -1234,11 +1322,8 @@ impl Mesh {
     pub(crate) fn still_seats(&self, owner: &str) -> bool {
         let applied = self.applied.lock_or_recover();
         applied.read.is_none()
-            || applied
-                .verdict
-                .origins
-                .iter()
-                .any(|key| astream_broker::identity_principal(key) == owner)
+            || owner == self.me.principal
+            || applied.seats_by_principal.contains_key(owner)
     }
 
     /// Serve a `Bus` stream a neighbour opened on its link: refused `unserved` for a log the mesh
@@ -1339,6 +1424,13 @@ impl Mesh {
 
     /// Report `event` to the observer.
     pub(crate) fn report(&self, event: &Event) {
+        if let Event::Settled { log, .. } = event
+            && *log == MeshLog::Tables
+            && let Some(egress) = self.egress()
+        {
+            // The lease numbers records now: what the egress held back goes.
+            egress.ring();
+        }
         if let Some(observe) = &self.observe {
             observe(event);
         }
@@ -1358,6 +1450,9 @@ impl Mesh {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
+        // A push waiting for a relay ack sees the stop now, not at its deadline.
+        drop(self.acks.0.lock_or_recover());
+        self.acks.1.notify_all();
         if let Some((bell, thread)) = self.watcher.lock_or_recover().take() {
             bell.ring();
             if thread.thread().id() != std::thread::current().id() {
@@ -1365,6 +1460,10 @@ impl Mesh {
             }
         }
         self.poke();
+        let flow = self.flow.lock_or_recover().take();
+        if let Some(mut flow) = flow {
+            flow.stop();
+        }
         let joined = self.joined.lock_or_recover().take();
         if let Some(slot) = joined {
             let mut inner = slot.inner.lock_or_recover();
@@ -1662,20 +1761,17 @@ impl BusHost {
     }
 
     /// A client of this broker under `key` (this Mac's node key, which is never revoked here),
-    /// holding `grants` minted under the mint secret, each read and write bounded by
+    /// holding `grant` minted under the mint secret, each read and write bounded by
     /// [`relay::IO_WITHIN`].
-    fn client(&self, key: [u8; 32], grants: &[String]) -> io::Result<AnyClient> {
-        let caps = grants
-            .iter()
-            .map(|grant| self.mint(grant))
-            .collect::<io::Result<Vec<_>>>()?;
+    fn client(&self, key: [u8; 32], grant: &str) -> io::Result<AnyClient> {
+        let cap = self.mint(grant)?;
         let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
         drop(self.broker.serve_stream(Arc::new(theirs), key)?);
         let link: Arc<dyn StreamLink> = Arc::new(ours);
         link.set_read_timeout(Some(relay::IO_WITHIN))?;
         link.set_write_timeout(Some(relay::IO_WITHIN))?;
         let (mut client, _closer) = astream_broker::connect_stream(link);
-        client.attach_all(caps.iter().map(|cap| (cap.filter.as_str(), &cap.tag[..])))?;
+        client.attach_all([(cap.filter.as_str(), &cap.tag[..])])?;
         Ok(client)
     }
 
@@ -1687,7 +1783,7 @@ impl BusHost {
             return Err(io::Error::other("a test refused the retirement"));
         }
         let filter = format!("/f/*/halt/{principal}");
-        let mut client = self.client(key, &[format!("rw:{filter}")])?;
+        let mut client = self.client(key, &format!("rw:{filter}"))?;
         let pid = astream_broker::producer_id_of(principal);
         let (rows, _) = client.last_all(&filter)?;
         for (_, subject, _) in rows {

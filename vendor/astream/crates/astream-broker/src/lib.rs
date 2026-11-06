@@ -148,6 +148,8 @@ mod relay_floor;
 #[cfg(feature = "retention")]
 pub mod retention;
 pub mod sharded;
+#[cfg(any(test, debug_assertions))]
+mod sim_device;
 pub mod sticky_fence;
 mod storage;
 pub mod store;
@@ -246,6 +248,8 @@ pub use retention::{parse_rule_line, parse_rules, record_bytes, Class, Keep, Ret
 pub use sharded::{sharded_clamp_index, sharded_count_nonzero, ShardedBroker, ShardedHandle};
 #[cfg(unix)]
 pub use sharded::{ShardedClient, ShardedEvent, ShardedSubscription};
+#[cfg(any(test, debug_assertions))]
+pub use sim_device::SimDevice;
 pub use sticky_fence::{
     format_gap_fenced_msg, parse_gap_fenced_seq, sticky_fence_admits, sticky_fence_admits_code,
     sticky_fence_min_seq, sticky_fence_seq_allowed, sticky_fence_table_within_cap,

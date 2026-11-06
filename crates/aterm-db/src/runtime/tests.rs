@@ -15,7 +15,7 @@ fn a_later_expired_push_cannot_replace_a_pending_table_or_acknowledge_it() {
         let caller = thread::spawn(move || first.push_until([1; 32], deadline));
         // Observe registration without letting the runtime take the first table yet.
         loop {
-            if board.desk().ask.is_some() {
+            if board.desk.lock_or_recover().ask.is_some() {
                 break;
             }
             assert!(Instant::now() < deadline, "first push never registered");
@@ -31,6 +31,44 @@ fn a_later_expired_push_cannot_replace_a_pending_table_or_acknowledge_it() {
             "an expired caller replaced the pending table"
         );
         assert_eq!(first_result, Pushed::Reached);
+    }
+}
+
+/// A neighbour's acknowledgement on the mesh's relay is a reached push at once: no ask reaches
+/// the owner and no round runs. NEGATIVE CONTROL: a relay that answers `None` hands the push to
+/// the rounds, where the owner takes the ask and its answer (here no peer) is the caller's, as
+/// before the mesh.
+#[test]
+fn a_relay_ack_reaches_a_push_with_no_round() {
+    for acked in [true, false] {
+        let pusher = Pusher::default();
+        let board = pusher.0.clone();
+        let _serving = board.serving();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let heard = asked.clone();
+        pusher.relay(Arc::new(move |table, _deadline| {
+            heard.lock().unwrap().push(table);
+            acked.then_some(Pushed::Reached)
+        }));
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let caller = pusher.clone();
+        let caller = thread::spawn(move || caller.push_until([3; 32], deadline));
+        if acked {
+            assert_eq!(caller.join().unwrap(), Pushed::Reached);
+            let desk = board.desk.lock_or_recover();
+            assert_eq!(desk.asked, 0, "a relay ack asked the owner for a round");
+            assert!(desk.ask.is_none() && desk.active.is_none());
+        } else {
+            let ask = next_push(&board, deadline);
+            assert_eq!(ask.table, [3; 32]);
+            board.settle(ask.id, Pushed::NoPeers);
+            assert_eq!(caller.join().unwrap(), Pushed::NoPeers);
+        }
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![[3; 32]],
+            "the relay is asked first"
+        );
     }
 }
 
@@ -60,7 +98,7 @@ fn concurrent_pushes_get_their_own_result_and_ignore_stale_completion() {
     let second = next_push(&board, deadline);
     assert_eq!(second.table, [2; 32]);
     board.settle(first.id, Pushed::TimedOut);
-    let priority = *board.first();
+    let priority = *board.first.lock_or_recover();
     board.settle(second.id, Pushed::NoPeers);
     assert_eq!(second_caller.join().unwrap(), Pushed::NoPeers);
     assert_eq!(
@@ -75,7 +113,7 @@ fn an_abandoned_push_round_releases_its_priority_after_a_later_caller_expires() 
     let board = Board::default();
     let _serving = board.serving();
     {
-        let mut desk = board.desk();
+        let mut desk = board.desk.lock_or_recover();
         desk.asked = 1;
         desk.ask = Some(Ask {
             id: 1,
@@ -86,15 +124,15 @@ fn an_abandoned_push_round_releases_its_priority_after_a_later_caller_expires() 
     let first = board.take().unwrap();
     // Caller one expired while its round ran. Caller two then registered and expired
     // before the owner took its request. Only round one's priority remains active.
-    board.desk().asked = 2;
+    board.desk.lock_or_recover().asked = 2;
     board.settle(first.id, Pushed::Reached);
     assert_eq!(
-        *board.first(),
+        *board.first.lock_or_recover(),
         None,
         "the abandoned round left its table prioritized"
     );
     assert!(
-        board.desk().settled.is_none(),
+        board.desk.lock_or_recover().settled.is_none(),
         "round one cannot answer caller two"
     );
 }
@@ -124,7 +162,7 @@ fn a_rapid_restart_cancels_unfinished_pushes_and_keeps_completed_results() {
         let first = pusher.clone();
         let caller = thread::spawn(move || first.push_until([1; 32], deadline));
         loop {
-            if board.desk().ask.is_some() {
+            if board.desk.lock_or_recover().ask.is_some() {
                 break;
             }
             assert!(Instant::now() < deadline, "push never registered");
@@ -134,13 +172,13 @@ fn a_rapid_restart_cancels_unfinished_pushes_and_keeps_completed_results() {
         // Hold the desk across the production stop/start transitions so the waiting
         // caller cannot observe the brief false value between service generations.
         {
-            let mut desk = board.desk();
+            let mut desk = board.desk.lock_or_recover();
             if stage == 2 {
                 // The owner had already completed this request before it stopped.
                 desk.settled = Some((taken.unwrap().id, Pushed::Reached));
             }
             desk.stop();
-            *board.first() = None;
+            *board.first.lock_or_recover() = None;
             desk.start();
         }
         board.changed.notify_all();
@@ -160,7 +198,7 @@ fn a_rapid_restart_cancels_unfinished_pushes_and_keeps_completed_results() {
         assert_eq!(next.join().unwrap(), Pushed::Reached);
         drop(serving);
         assert!(
-            board.desk().serving,
+            board.desk.lock_or_recover().serving,
             "an old guard stopped the replacement service"
         );
     }
@@ -704,6 +742,61 @@ fn delayed_worker_completion_does_not_refresh_old_authentication() {
 }
 
 #[test]
+fn the_hearing_ledger_keeps_a_version_at_its_round_and_the_contact_that_came_after() {
+    use aterm_secrets::commons::{
+        hearing::{Entry, Version},
+        journal::Trust,
+    };
+    let mut ledger = Ledger::new(Trust {
+        network: [7; 16],
+        authority: [11; 32],
+        genesis: [13; 32],
+    });
+    let start = Instant::now();
+    let after = |s| start + Duration::from_secs(s);
+    let now = after(5);
+    // A crossed dial: the round that traded versions authenticated 5s ago, the loser 1s ago,
+    // refused before versions were traded. Seconds apart, so neither time can pass for the other.
+    let crossed = transport::Contact {
+        actor: [7; 48],
+        at: after(4),
+        said: Said::Version(Version::own()),
+        said_at: after(0),
+        clock: None,
+        clock_at: after(4),
+    };
+    // A peer whose rounds all ended before versions were traded.
+    let silent = transport::Contact {
+        actor: [8; 48],
+        at: after(3),
+        said: Said::Unknown,
+        said_at: after(3),
+        clock: None,
+        clock_at: after(3),
+    };
+    let contacts = [crossed, silent];
+    assert!(record_contacts(&mut ledger, &contacts, 100_000, now));
+    assert_eq!(
+        ledger.entry(&crossed.actor),
+        Some(&Entry {
+            at_ms: 99_000,
+            version: Some(Version::own()),
+            said_ms: 95_000,
+        })
+    );
+    assert_eq!(
+        ledger.entry(&silent.actor),
+        Some(&Entry {
+            at_ms: 98_000,
+            version: None,
+            said_ms: 0,
+        })
+    );
+    // The same contacts again add no member and change no version.
+    assert!(!record_contacts(&mut ledger, &contacts, 100_000, now));
+}
+
+#[test]
 fn missing_configuration_is_default_on_but_never_bootstraps_a_vault() {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
@@ -1099,6 +1192,47 @@ fn a_background_owner_yields_to_a_window_before_asking_its_gate() {
     );
     assert!(!crate::network_state::history_exists(&config));
     runtime.stop();
+}
+
+/// With the one-mesh transport on, `aterm node serve` is the one owner: a window's claim no
+/// longer holds it back, and the first thing it waits at is its own gate. NEGATIVE CONTROL: with
+/// the mesh off (the switch read into [`Network::mesh`]), the same claim holds it waiting for the
+/// window with no look, as before the mesh.
+#[test]
+fn with_the_mesh_on_a_background_owner_does_not_yield_to_a_window() {
+    for mesh in [true, false] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        let config = home.path().join("aterm.toml");
+        let claim = owner::WindowClaim::acquire(&crate::network_state::directory(&config)).unwrap();
+        let turn = Arc::new(Mutex::new(LanTurn::Held(HELD)));
+        let (lan, looks) = test_gate(&turn);
+        let (observe, wait) = statuses();
+        let runtime = Runtime::start_background_on(
+            paths.clone(),
+            config.clone(),
+            observe,
+            Network {
+                lan,
+                mesh,
+                ..Network::default()
+            },
+        )
+        .unwrap();
+        if mesh {
+            wait(Status::LanHeld);
+            assert_eq!(
+                looks.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+                LanTurn::Held(HELD),
+                "the mesh's owner asks its own gate while a window runs"
+            );
+        } else {
+            wait(Status::Waiting);
+            assert!(looks.try_recv().is_err(), "a window owns Commons: no look");
+        }
+        runtime.stop();
+        drop(claim);
+    }
 }
 
 /// The gate's refusal stands as a try's does ([`Refusals`]). `aterm node serve`, refused at its

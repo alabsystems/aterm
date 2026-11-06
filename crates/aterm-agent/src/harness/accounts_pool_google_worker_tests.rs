@@ -103,6 +103,32 @@ impl World {
 }
 
 #[test]
+fn a_cancelled_app_preparation_never_reaches_native_google_account_work() {
+    let world = World::new(Some([1; 32]));
+    let before = world.seat().store(Cli::Agy).load(NOW).unwrap().0;
+    let lifetime = super::super::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let pause = lifetime.pause().unwrap();
+    assert!(
+        prepare_google_worker_scoped(
+            scope,
+            &world.seat(),
+            Path::new("/not-an-executable"),
+            world.starter()
+        )
+        .is_err()
+    );
+    assert_eq!(world.seat().store(Cli::Agy).load(NOW).unwrap().0, before);
+    assert!(
+        pause
+            .try_wait()
+            .expect("all actual work has retired")
+            .resume()
+            .is_ok()
+    );
+}
+
+#[test]
 fn native_google_worker_rechecks_selection_after_its_local_check() {
     for change in 0..6 {
         let world = World::new(Some([1; 32]));

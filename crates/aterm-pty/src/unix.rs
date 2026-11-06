@@ -3657,6 +3657,11 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
 }
 
 /// Creates a non-blocking, close-on-exec `(read_end, write_end)` wake pipe.
+///
+/// Off Linux, where no `pipe2` sets the flags at creation, the pipe is made and flagged inside
+/// [`aterm_uds::kept_out`]. On Apple that holds every spawn off between the pipe's creation and
+/// its last flag, so no child copies an end before it is close-on-exec, and keeps each end out of
+/// children (`FD_CLOFORK`, where the kernel keeps that mark).
 pub fn make_wake_pipe() -> Option<(i32, i32)> {
     #[cfg(target_os = "linux")]
     {
@@ -3667,29 +3672,33 @@ pub fn make_wake_pipe() -> Option<(i32, i32)> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a valid 2-int out-array for pipe(2).
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        let (rd, wr) = (fds[0], fds[1]);
-        // SAFETY: rd/wr are freshly-created pipe fds; these fcntls only read/set flags.
-        let configured = unsafe {
-            let rd_flags = libc::fcntl(rd, libc::F_GETFL);
-            let wr_flags = libc::fcntl(wr, libc::F_GETFL);
-            libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-                && libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-                && rd_flags >= 0
-                && wr_flags >= 0
-                && libc::fcntl(rd, libc::F_SETFL, rd_flags | libc::O_NONBLOCK) != -1
-                && libc::fcntl(wr, libc::F_SETFL, wr_flags | libc::O_NONBLOCK) != -1
-        };
-        if !configured {
-            close_fd(rd);
-            close_fd(wr);
-            return None;
-        }
-        Some((rd, wr))
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+        let (rd, wr) = aterm_uds::kept_out(|| {
+            let mut fds = [0i32; 2];
+            // SAFETY: `fds` is a valid 2-int out-array for pipe(2).
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: pipe(2) just opened both ends and nothing else owns them, so each is
+            // closed when its owner drops, a failed flag included.
+            let ends = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            for end in [&ends.0, &ends.1] {
+                let fd = end.as_raw_fd();
+                // SAFETY: `fd` is an end this call owns; these fcntls only read and set flags.
+                let configured = unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
+                        && flags >= 0
+                        && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+                };
+                if !configured {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(ends)
+        })
+        .ok()?;
+        Some((rd.into_raw_fd(), wr.into_raw_fd()))
     }
 }
 
@@ -4222,8 +4231,9 @@ fn bridge_poll(master: i32, wake_rd: i32, proc_rd: i32, timeout_ms: i32) -> Brid
 }
 
 fn idle_refill_wait(master: i32, wake_rd: i32, proc_rd: i32, wait_us: u32) -> BridgeWait {
-    // select cannot represent fds >= FD_SETSIZE — deliver, same as knob-off.
-    if master >= libc::FD_SETSIZE as i32
+    // select cannot represent a negative fd or one >= FD_SETSIZE (FD_SET would index outside the
+    // set), and a wait with no master has nothing to refill from — deliver, same as knob-off.
+    if !(0..libc::FD_SETSIZE as i32).contains(&master)
         || wake_rd >= libc::FD_SETSIZE as i32
         || proc_rd >= libc::FD_SETSIZE as i32
     {
@@ -4235,7 +4245,8 @@ fn idle_refill_wait(master: i32, wake_rd: i32, proc_rd: i32, wait_us: u32) -> Br
     let (r, set) = loop {
         // SAFETY: an all-zero fd_set is the empty set FD_ZERO produces.
         let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
-        // SAFETY: both fds were bounds-checked against FD_SETSIZE above.
+        // SAFETY: `master` is in 0..FD_SETSIZE (checked above), and the others are below
+        // FD_SETSIZE and set only when not negative.
         unsafe {
             libc::FD_SET(master, &mut set);
             if wake_rd >= 0 {

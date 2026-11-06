@@ -2018,11 +2018,12 @@ pub(crate) mod world {
     /// A "binary" in this platform's native executable format, distinct per `tag`.
     pub(crate) fn native_exe(tag: &str) -> Vec<u8> {
         let mut bytes = if cfg!(target_os = "macos") {
-            0xCFFA_EDFEu32.to_be_bytes().to_vec()
+            let mut bytes = 0xCFFA_EDFEu32.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&[0u8; 60]);
+            bytes
         } else {
-            b"\x7fELF".to_vec()
+            crate::testdir::elf_fixture()
         };
-        bytes.extend_from_slice(&[0u8; 60]);
         bytes.extend_from_slice(tag.as_bytes());
         bytes
     }

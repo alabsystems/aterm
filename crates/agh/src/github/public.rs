@@ -47,8 +47,8 @@ fn web_path(slug: &Slug, tag: &str, asset: &str) -> Result<String> {
         .map_err(|e| e.with_repo(slug.to_string()))?;
     Ok(format!(
         "/{}/{}/releases/download/{}/{}",
-        path::segment(slug.owner()),
-        path::segment(slug.repo()),
+        slug.owner(),
+        slug.repo(),
         path::segment(tag),
         path::segment(asset)
     ))

@@ -565,6 +565,64 @@ mod tests {
         plan(ctx).into_iter().map(|s| s.id).collect()
     }
 
+    /// The run `verify <words>` plans, built from its parse as the CLI builds it.
+    fn parsed(words: &[&str]) -> Ctx {
+        let a = crate::cli::parse(words.iter().copied()).expect("parses");
+        let checks = a.wanted(|p| Scope::Workspace.includes_crate(p));
+        let app = a
+            .app
+            .as_ref()
+            .map(|app| crate::MeasureArtifact::unnamed(app.clone()));
+        ctx(&checks, Scope::workspace())
+            .with_release(a.release)
+            .with_checkers_in_tests(a.release || a.as_release)
+            .with_measure_artifact(app)
+    }
+
+    /// B3's plan identity: `verify release` plans the stages of `release --tree` and of
+    /// `release --bundle` together, but the measuring benches' own compile, which its test compile
+    /// builds, as the tree half's does. The tree half plans no timed stage and judges no bundle.
+    /// Negative control: a tree half short of one check (spec) leaves its stage out of the union.
+    #[test]
+    fn a_release_plans_its_tree_half_and_its_bundle_half_together() {
+        use std::collections::BTreeSet;
+        let set = |c: &Ctx| {
+            ids(c)
+                .into_iter()
+                .map(|id| id as u8)
+                .collect::<BTreeSet<u8>>()
+        };
+        let release = parsed(&["release", "--app", "/release/aterm.app"]);
+        let tree = parsed(&["release", "--tree"]);
+        let bundle = parsed(&["release", "--bundle", "--app", "/release/aterm.app"]);
+        assert!(folds_measuring(&release) && folds_measuring(&tree));
+        assert!(!folds_measuring(&bundle) && ids(&bundle).contains(&StageId::MeasurePrebuild));
+        assert!(ids(&tree).into_iter().all(|id| !id.timed()));
+        let union = |tree: &Ctx| {
+            let mut halves: BTreeSet<u8> = set(tree).union(&set(&bundle)).copied().collect();
+            halves.remove(&(StageId::MeasurePrebuild as u8));
+            halves
+        };
+        assert_eq!(set(&release), union(&tree));
+        assert_eq!(
+            ids(&parsed(&[
+                "release",
+                "--tree",
+                "--bundle",
+                "--app",
+                "/release/aterm.app"
+            ])),
+            ids(&release)
+        );
+
+        let short = parsed(&["release", "--checks", "fmt,lint,test,doc,census,forge,libc"]);
+        assert_ne!(
+            set(&release),
+            union(&short),
+            "spec's stage is in neither half"
+        );
+    }
+
     fn every_check() -> Vec<Check> {
         CHECKS.iter().map(|s| s.check).collect()
     }
@@ -1200,6 +1258,7 @@ mod tests {
         let reports = crate::sched::run_stages(
             &stages,
             u64::MAX,
+            &crate::sched::Halt::off(),
             |stage, _| {
                 seen.lock().unwrap().push(stage.id);
                 let mut report = crate::ladder::Report::new(stage.title.clone());

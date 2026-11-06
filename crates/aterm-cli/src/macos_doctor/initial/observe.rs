@@ -235,6 +235,11 @@ enum VaultRead {
     /// has stayed down past launchd's restart window. Nothing starts it again by itself: the
     /// Secrets stage installs it, so Set up now does.
     Stopped,
+    /// Its vault let it go with no act against it that it can read: a rotation left it out
+    /// ([`aterm_secrets::client::dropped`], one-mesh E2). Every member that read the rotation
+    /// refuses its key, so the Secrets stage plans no join, and it comes back only as a new Mac,
+    /// its vault folder set aside: a person's step, never Set up now's.
+    Dropped,
     /// A member with no subscriber installed and no record that the person turned it off. The
     /// Secrets stage installs it, so Set up now does.
     NotSetUp,
@@ -414,6 +419,7 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
         (None, _) => VaultRead::OtherVault,
         (Some(_), Membership::Pending) if client::password_refused(&paths) => VaultRead::Refused,
         (Some(_), Membership::Pending) => pending_read(&paths, &status, join_place_now),
+        (Some(_), Membership::Revoked { .. }) if client::dropped(&paths) => VaultRead::Dropped,
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
         (Some(config), Membership::In { .. } | Membership::Plain) => member_read(
             client::materialization_ready_for(&paths, config).map_err(|error| error.to_string())?,
@@ -560,6 +566,11 @@ const ALLOWED: &str = aterm_types::macos_setup::VAULT_ALLOWED_NOTE;
 /// again (no note, so `vault_shown` opens them).
 const WRONG_PASSWORD: &str = "Wrong password";
 
+/// A dropped Mac's note ([`VaultRead::Dropped`]): the way back, naming no path, which the page
+/// never shows (`aterm secrets status` names the folder).
+const DROPPED: &str = "A rotation left this Mac out; set its vault folder aside to join again as \
+                       a new Mac (aterm secrets status says where)";
+
 /// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault, Out of sync,
 /// Not syncing, Not set up, Local cache ready, or Sync off (the person's choice, so in place). A stopped or
 /// uninstalled subscriber differs, with a note only on a row `selection` manages. `here` is the
@@ -660,6 +671,8 @@ fn vault_observation(
             Some(ALLOWED.to_owned()),
         ),
         VaultRead::Refused => (person, WRONG_PASSWORD, None),
+        // Set up now's Secrets stage joins nothing here: the way back is a person's.
+        VaultRead::Dropped => (person, "Dropped", Some(DROPPED.to_owned())),
         // No ALab vault answered: aterm's own join has none to join, so the row waits on nothing
         // on any plan, while the Secrets stage still asks again by itself. A join the person
         // typed a password for waits for that vault.
@@ -1057,6 +1070,7 @@ mod tests {
             },
             VaultRead::Allowed,
             VaultRead::Revoked,
+            VaultRead::Dropped,
             VaultRead::Member { cache_ready: false },
             VaultRead::Stopped,
             VaultRead::NotSetUp,
@@ -1201,6 +1215,7 @@ mod tests {
             },
             VaultRead::Fleeting,
             VaultRead::Revoked,
+            VaultRead::Dropped,
             VaultRead::Refused,
         ] {
             for selection in [Selection::all(), BASE_PLAN, Selection::none()] {
@@ -1265,6 +1280,28 @@ mod tests {
                 assert_eq!(seen.note.as_deref(), Some(note.as_str()));
             }
         }
+    }
+
+    /// A Mac a rotation dropped with no `Remove` (one-mesh E2) needs a person on a row Set up now
+    /// manages, with the way back as a new Mac, and never reads Not joined, which Set up now's
+    /// Secrets stage, planning no join for it, would not change.
+    /// CONTROL: a revoked Mac's row reads Not joined, as before.
+    #[test]
+    fn a_dropped_vault_row_needs_a_person_and_says_how_it_comes_back() {
+        let seen = vault_observation(&VaultRead::Dropped, Selection::all(), None, false);
+        assert_eq!(
+            (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
+            (Standing::NeedsYou, Some("Dropped"), Some(DROPPED))
+        );
+        assert_eq!(
+            vault_observation(&VaultRead::Dropped, Selection::none(), None, false).standing,
+            Standing::Differs
+        );
+        let revoked = vault_observation(&VaultRead::Revoked, Selection::all(), None, false);
+        assert_eq!(
+            (revoked.standing, revoked.now.as_deref()),
+            (Standing::Differs, Some("Not joined"))
+        );
     }
 
     /// A member whose subscriber cannot run from a disk image needs the person to move aterm; a

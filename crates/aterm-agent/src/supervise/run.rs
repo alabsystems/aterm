@@ -2495,6 +2495,21 @@ pub struct Session<'a, C: Ctl> {
     /// the landing's `DONE` note ([`Self::task_edge_with`]), which read it there before.
     landing_read_ms: Option<i64>,
     task_seeded: bool,
+    /// THE TASK RECORD'S READ AHEAD OF THE POINT IN HAND WAS LOST ([`Self::task_ahead`]): the
+    /// point was judged as a session with no record is, and one it rests is decided again soon,
+    /// reading the record again ([`turn_end_loop::RECORD_UNREAD`]).
+    record_unread: bool,
+    /// THE POINT IN HAND IS THIS LOOP'S FIRST ([`Self::turn_end_at_point`]), the one a decision
+    /// made again at it ([`Self::turn_end_now`]) judges too: where the host's record of the
+    /// conversation can trail a worker's task ([`Self::record_trails_task`]).
+    point_first: bool,
+    /// THE HOST'S RECORD OF THE CONVERSATION READ THE POINT IN HAND AS ONE NOBODY ASKED
+    /// ([`IdleHost::taskless`]) WHILE ITS SCREEN SHOWS A CONVERSATION it does not read fresh: that
+    /// record can trail the screen, so the point, decided to do nothing, is decided again once,
+    /// soon ([`turn_end_loop::RECORD_TRAILS`]).
+    record_contradicted: bool,
+    /// Whether the point in hand was decided again for [`Self::record_contradicted`], once per point.
+    record_looked_again: bool,
     /// Whether this loop tracks task records ([`SuperviseOpts::tasks`]), as its start set it.
     tasks_tracked: bool,
     /// Whether a line's write read the task record before the loop's first fold did
@@ -2825,6 +2840,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             receipt_note: None,
             landing_read_ms: None,
             task_seeded: false,
+            record_unread: false,
+            point_first: false,
+            record_contradicted: false,
+            record_looked_again: false,
             tasks_tracked: false,
             managed_read: false,
             needs_told: None,

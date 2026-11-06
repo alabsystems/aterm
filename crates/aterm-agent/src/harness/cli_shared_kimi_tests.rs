@@ -222,6 +222,29 @@ fn replaced_config_credential_link_and_empty_configs_fail_closed() {
     );
 }
 
+/// A `credentials` entry that is a dangling link is a staged login this check cannot read,
+/// not an absent one; no `credentials` entry at all is the control.
+#[test]
+fn a_dangling_credentials_link_fails_closed_where_an_absent_one_is_no_login() {
+    let dir = home();
+    std::fs::remove_dir_all(dir.path().join("credentials")).expect("remove credentials");
+    assert!(
+        verify_with(dir.path(), Region::Global, EMAIL, 1000, |_, _| panic!(
+            "an absent login must not leave the machine"
+        ))
+        .expect("an absent credentials directory reads")
+        .is_none()
+    );
+    std::os::unix::fs::symlink("missing-credentials", dir.path().join("credentials"))
+        .expect("dangling credentials link");
+    assert!(
+        verify_with(dir.path(), Region::Global, EMAIL, 1000, |_, _| panic!(
+            "a dangling credentials link must not leave the machine"
+        ))
+        .is_err()
+    );
+}
+
 #[test]
 fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
     struct Host(bool);

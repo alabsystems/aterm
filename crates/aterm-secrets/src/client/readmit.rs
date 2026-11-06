@@ -510,7 +510,7 @@ pub(super) fn seat_move_refusal(
         |audience, newest, gone| {
             let mints = match audience {
                 EpochAudience::Hosts(_) => {
-                    log_entries::rotates_host_list(opened, audience, newest, gone)
+                    log_entries::rotates_host_list(log, opened, audience, newest, gone)
                 }
                 EpochAudience::Everyone | EpochAudience::Commons => {
                     log_entries::opens_newest(opened, audience)

@@ -40,6 +40,19 @@ impl Home {
     }
 }
 
+#[cfg(unix)]
+fn short_home() -> Home {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("ipc-")
+        .suffix(".noindex")
+        .tempdir_in("/tmp")
+        .expect("short private socket fixture");
+    Home {
+        path: std::fs::canonicalize(tmp.path()).expect("resolved short home"),
+        _tmp: tmp,
+    }
+}
+
 fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
 }
@@ -163,6 +176,168 @@ fn custody_created_by_the_journal_is_rechecked_before_any_removal() {
     });
     assert!(outcomes[0].refused());
     assert_eq!(std::fs::read(path.join("blob")).unwrap(), vec![7u8; 4096]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cache_with_a_bound_unix_socket_is_kept_whole() {
+    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let home = short_home();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let dir = home.cache(".cache/tool", 4096);
+    let socket = dir.join("s");
+    let listener = UnixListener::bind(&socket).expect("scratch socket");
+    let (outcomes, rows) = free(std::slice::from_ref(&dir), false, &w);
+    assert!(
+        matches!(outcomes[0].verdict, Verdict::Refused(_)),
+        "{outcomes:?}; cache exists={}",
+        dir.exists()
+    );
+    assert_eq!(
+        std::fs::read(dir.join("blob")).expect("kept cache"),
+        vec![7u8; 4096]
+    );
+    assert!(
+        std::fs::symlink_metadata(&socket)
+            .expect("kept socket")
+            .file_type()
+            .is_socket()
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["action"], Value::from("refused"));
+    let _client = UnixStream::connect(&socket).expect("socket still reachable");
+    let _server = listener.accept().expect("socket still accepts");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cache_with_a_fifo_is_kept_whole() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let dir = home.cache(".cache/tool", 4096);
+    let fifo = dir.join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path");
+    // SAFETY: the NUL-terminated path remains live and names an owned scratch entry.
+    let created = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(created, 0, "{}", std::io::Error::last_os_error());
+    let (outcomes, rows) = free(std::slice::from_ref(&dir), false, &w);
+    assert!(
+        matches!(outcomes[0].verdict, Verdict::Refused(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("blob")).expect("kept cache"),
+        vec![7u8; 4096]
+    );
+    assert!(
+        std::fs::symlink_metadata(fifo)
+            .expect("kept FIFO")
+            .file_type()
+            .is_fifo()
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["action"], Value::from("refused"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_added_after_admission_is_kept_and_partial_allocation_is_actual() {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let home = short_home();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let control = home.cache(".cache/control", 4096);
+    let admitted = judge(&control, &w).expect("ordinary cache");
+    let mut boundaries = 0;
+    let removed = super::super::target::remove_unmanaged_tree(&control, admitted.id, &mut || {
+        boundaries += 1;
+        Ok(())
+    })
+    .expect("clean control");
+    assert_eq!(removed.units, [control]);
+    assert!(boundaries > 0);
+    for inject_at in 1..=boundaries {
+        let dir = home.cache(&format!(".cache/tool-{inject_at}"), 4096);
+        let blob = dir.join("blob");
+        let allocation = std::fs::symlink_metadata(&blob).expect("blob").blocks() * 512;
+        let admitted = judge(&dir, &w).expect("ordinary cache");
+        let mut calls = 0;
+        let mut listener = None;
+        let mut fixture_removed_payload = false;
+        let removed = super::super::target::remove_unmanaged_tree(&dir, admitted.id, &mut || {
+            calls += 1;
+            if calls == inject_at {
+                match std::fs::remove_file(&blob) {
+                    Ok(()) => fixture_removed_payload = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("replace fixture payload: {error}"),
+                }
+                listener = Some(UnixListener::bind(&blob).expect("replacement socket"));
+            }
+            Ok(())
+        })
+        .expect("removal reports what it retained");
+        assert!(dir.is_dir(), "boundary {inject_at}");
+        assert!(removed.units.is_empty());
+        assert!(!removed.trouble.is_empty());
+        assert_eq!(
+            removed.bytes,
+            if fixture_removed_payload {
+                0
+            } else {
+                allocation
+            }
+        );
+        assert!(
+            std::fs::symlink_metadata(&blob)
+                .expect("kept socket")
+                .file_type()
+                .is_socket()
+        );
+        let _client = UnixStream::connect(&blob).expect("socket still reachable");
+        let _server = listener
+            .as_ref()
+            .expect("injection ran")
+            .accept()
+            .expect("still accepts");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_cache_file_allocation_needs_no_payload_read_permission() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let dir = home.cache(".cache/tool", 64 << 10);
+    let blob = dir.join("blob");
+    let bytes = std::fs::symlink_metadata(&blob).expect("blob").blocks() * 512;
+    assert!(bytes > 0);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).expect("no read bits");
+    let (outcomes, rows) = free(std::slice::from_ref(&dir), false, &w);
+    assert_eq!(
+        outcomes[0].verdict,
+        Verdict::Removed {
+            bytes,
+            partial: false
+        }
+    );
+    assert!(!dir.exists());
+    assert_eq!(
+        rows.last().expect("completion")["bytes"],
+        Value::from(bytes)
+    );
 }
 
 #[cfg(unix)]
@@ -464,6 +639,103 @@ fn a_path_a_process_uses_or_cannot_rule_out_stays() {
 }
 
 #[test]
+fn a_process_use_that_appears_after_intent_keeps_the_cache() {
+    use std::cell::Cell;
+
+    for how in ["cwd", "exe", "map", "fd"] {
+        let home = Home::new();
+        let mounts = whole();
+        let dir = home.cache(".cache/tool", 4096);
+        let after_intent = Cell::new(false);
+        let processes = |dirs: &[PathBuf], _: &[u32]| {
+            assert_eq!(dirs, std::slice::from_ref(&dir));
+            let mut scan = PathScan::default();
+            if after_intent.get() {
+                scan.users.push(PathUse {
+                    pid: 4242,
+                    how,
+                    path: dir.join("blob"),
+                });
+            }
+            Ok(scan)
+        };
+        let w = world(&home, &processes, &mounts);
+        let mut rows = Vec::new();
+        let outcomes = run(std::slice::from_ref(&dir), false, &w, &mut |line| {
+            let row = aterm_json::from_str::<Value>(line).expect("row");
+            if row["action"].as_str() == Some("removing") {
+                after_intent.set(true);
+            }
+            rows.push(row);
+            true
+        });
+        assert!(
+            refusal(&outcomes[0]).contains("4242"),
+            "{how}: {outcomes:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("blob")).expect("kept cache"),
+            vec![7u8; 4096]
+        );
+        let actions: Vec<_> = rows
+            .iter()
+            .map(|row| row["action"].as_str().expect("action"))
+            .collect();
+        assert_eq!(actions, ["removing", "refused"], "{how}");
+        assert_eq!(outcomes[0].bytes(), 0);
+    }
+}
+
+#[test]
+fn post_intent_process_discovery_must_still_rule_out_every_user() {
+    use std::cell::Cell;
+
+    for state in ["unavailable", "unreadable", "clear"] {
+        let home = Home::new();
+        let mounts = whole();
+        let dir = home.cache(".cache/tool", 4096);
+        let after_intent = Cell::new(false);
+        let rechecked = Cell::new(false);
+        let processes = |_: &[PathBuf], _: &[u32]| {
+            if !after_intent.get() {
+                return Ok(PathScan::default());
+            }
+            rechecked.set(true);
+            match state {
+                "unavailable" => Err(std::io::Error::other("late process scan unavailable")),
+                "unreadable" => Ok(PathScan {
+                    unreadable: vec![(4242, None)],
+                    ..PathScan::default()
+                }),
+                _ => Ok(PathScan::default()),
+            }
+        };
+        let w = world(&home, &processes, &mounts);
+        let outcomes = run(std::slice::from_ref(&dir), false, &w, &mut |line| {
+            let row = aterm_json::from_str::<Value>(line).expect("row");
+            if row["action"].as_str() == Some("removing") {
+                after_intent.set(true);
+            }
+            true
+        });
+        assert!(rechecked.get(), "a fresh scan followed the intent: {state}");
+        if state == "clear" {
+            assert!(matches!(outcomes[0].verdict, Verdict::Removed { .. }));
+            assert!(!dir.exists());
+        } else {
+            assert!(
+                matches!(outcomes[0].verdict, Verdict::Refused(_)),
+                "{state}: {outcomes:?}"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("blob")).expect("kept cache"),
+                vec![7u8; 4096]
+            );
+        }
+    }
+}
+
+#[test]
 fn a_mount_under_it_or_a_mount_table_not_read_whole_refuses() {
     let home = Home::new();
     let dir = home.cache(".cache/vm", 1024);
@@ -547,6 +819,44 @@ fn with_the_grant_off_everything_is_refused_but_a_dry_run_still_says_what_would_
 }
 
 #[test]
+fn cleanup_intent_starts_a_separate_record_after_an_interrupted_journal_row() {
+    use crate::supervise::journal::Journal;
+
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let cache = home.cache(".cache/tool", 4096);
+    let ledger = home.path.join("disk.jsonl");
+    let interrupted = b"{\"interrupted\":";
+    std::fs::write(&ledger, interrupted).expect("interrupted earlier write");
+    let mut journal = Journal::open(Some(&ledger), Some(w.sid), &mut Vec::new());
+    let outcomes = run(std::slice::from_ref(&cache), false, &w, &mut |row| {
+        journal.append_raw(row, &mut Vec::new())
+    });
+    assert!(
+        matches!(outcomes[0].verdict, Verdict::Removed { .. }),
+        "{outcomes:?}"
+    );
+    assert!(!cache.exists());
+    let bytes = std::fs::read(&ledger).expect("ledger");
+    assert!(
+        bytes.starts_with(interrupted),
+        "prior evidence stays intact"
+    );
+    let actions: Vec<_> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| aterm_json::from_slice::<Value>(line).ok())
+        .filter(|row| row["kind"] == Value::from(KIND))
+        .map(|row| row["action"].as_str().expect("action").to_owned())
+        .collect();
+    assert_eq!(
+        actions,
+        ["removing", "removed"],
+        "every accepted intent is its own JSON record"
+    );
+}
+
+#[test]
 fn a_journal_that_cannot_write_refuses_the_removal() {
     let home = Home::new();
     let mounts = whole();
@@ -560,6 +870,84 @@ fn a_journal_that_cannot_write_refuses_the_removal() {
     assert_eq!(refusal(&outcomes[0]), UNJOURNALLED);
     assert!(dir.join("blob").is_file(), "nothing unjournalled goes");
     assert!(tried[0].contains("\"removing\""), "{tried:?}");
+}
+
+#[test]
+fn an_unrecorded_completion_fails_the_command_but_keeps_actual_removal_facts() {
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let dir = home.cache(".cache/tool", 64 << 10);
+    let bytes = judge(&dir, &w).expect("eligible").bytes;
+    assert!(bytes > 0);
+    let mut attempted = Vec::new();
+    let mut recorded = Vec::new();
+    let outcomes = run(std::slice::from_ref(&dir), false, &w, &mut |line| {
+        let row = aterm_json::from_str::<Value>(line).expect("journal row");
+        let accepted = row["action"].as_str() == Some("removing");
+        attempted.push(row.clone());
+        if accepted {
+            recorded.push(row);
+        }
+        accepted
+    });
+    assert!(!dir.exists(), "the physical removal completed");
+    assert_eq!(outcomes[0].verdict, Verdict::Unrecorded { bytes });
+    assert_eq!(attempted.len(), 2);
+    assert_eq!(attempted[0]["action"], Value::from("removing"));
+    assert_eq!(attempted[1]["action"], Value::from("removed"));
+    assert_eq!(recorded.len(), 1, "only the intent reached the ledger");
+    assert!(outcomes[0].refused(), "the command must exit nonzero");
+    assert_eq!(
+        Summary::from_outcomes(&outcomes),
+        Summary {
+            successful: 0,
+            refused: 1,
+            bytes,
+            bytes_partial: false
+        }
+    );
+    let json = outcomes[0].to_json(false, w.grant());
+    assert_eq!(json["removed"], Value::from(true));
+    assert_eq!(json["bytes"], Value::from(bytes));
+    assert_eq!(json["bytes_partial"], Value::from(false));
+    assert!(json["refused"].as_str().is_some_and(|why| !why.is_empty()));
+}
+
+#[test]
+fn a_partial_removal_keeps_both_the_removal_and_completion_record_failure() {
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let dir = home.cache(".cache/tool", 64 << 10);
+    let admitted = judge(&dir, &w).expect("eligible");
+    for journalled in [false, true] {
+        let done = super::super::Removed {
+            bytes: 7,
+            trouble: vec!["retained child".to_owned()],
+            ..super::super::Removed::default()
+        };
+        let mut attempted = Vec::new();
+        let verdict = record_removal(
+            &admitted,
+            Ok(done),
+            &w,
+            &mut |line| {
+                attempted.push(aterm_json::from_str::<Value>(line).expect("row"));
+                journalled
+            },
+            "fixture removal",
+        );
+        let Verdict::Failed { freed, why } = verdict else {
+            panic!("{verdict:?}");
+        };
+        assert_eq!(freed, 7);
+        assert!(why.contains("retained child"));
+        assert_eq!(why.contains(UNRECORDED_COMPLETION), !journalled);
+        assert_eq!(attempted.len(), 1);
+        assert_eq!(attempted[0]["action"], Value::from("failed"));
+        assert_eq!(attempted[0]["bytes"], Value::from(7u64));
+    }
 }
 
 #[cfg(unix)]
@@ -598,7 +986,6 @@ fn the_json_object_names_each_field() {
     assert_eq!(json["removed"], Value::from(false));
     assert_eq!(json["bytes"], Value::from(0u64));
     assert_eq!(json["refused"], Value::from("why"));
-    assert_eq!(o.line(), "refused /h/.npm/x: why");
     let o = Outcome {
         path: PathBuf::from("/h/.npm/x"),
         verdict: Verdict::Removed {
@@ -606,8 +993,72 @@ fn the_json_object_names_each_field() {
             partial: true,
         },
     };
-    assert_eq!(o.line(), "removed /h/.npm/x (at least 2.0 KiB)");
     assert_eq!(o.to_json(false, true)["removed"], Value::from(true));
+    assert_eq!(o.to_json(false, true)["bytes"], Value::from(2048u64));
+    assert_eq!(o.to_json(false, true)["bytes_partial"], Value::from(true));
+}
+
+#[test]
+fn summary_keeps_partial_counts_and_failed_removal_allocation() {
+    let outcome = |verdict| Outcome {
+        path: PathBuf::from("cache"),
+        verdict,
+    };
+    let outcomes = [
+        outcome(Verdict::Removed {
+            bytes: 7,
+            partial: false,
+        }),
+        outcome(Verdict::Would {
+            bytes: 11,
+            partial: true,
+        }),
+        outcome(Verdict::Failed {
+            freed: 13,
+            why: "retained part".to_owned(),
+        }),
+        outcome(Verdict::Refused("held".to_owned())),
+    ];
+    assert_eq!(
+        Summary::from_outcomes(&outcomes),
+        Summary {
+            successful: 2,
+            refused: 2,
+            bytes: 31,
+            bytes_partial: true,
+        }
+    );
+}
+
+#[test]
+fn summary_marks_a_saturated_total_as_a_lower_bound() {
+    let outcomes = [
+        Outcome {
+            path: PathBuf::from("cache-a"),
+            verdict: Verdict::Removed {
+                bytes: u64::MAX,
+                partial: false,
+            },
+        },
+        Outcome {
+            path: PathBuf::from("cache-b"),
+            verdict: Verdict::Failed {
+                freed: 1,
+                why: "retained part".to_owned(),
+            },
+        },
+    ];
+    let summary = Summary::from_outcomes(&outcomes);
+    assert_eq!(summary.bytes, u64::MAX);
+    assert!(summary.bytes_partial);
+    assert_eq!((summary.successful, summary.refused), (1, 1));
+    assert_eq!(Summary::from_outcomes(&[]), Summary::default());
+    let exact = Summary::from_outcomes(&outcomes[..1]);
+    assert_eq!(exact.bytes, u64::MAX);
+    assert!(
+        !exact.bytes_partial,
+        "the largest exact count remains exact"
+    );
 }
 
 /// `--dry-run` with no path lists what the roots hold that may go, largest first, removing and

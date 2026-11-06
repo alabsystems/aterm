@@ -78,16 +78,24 @@ pub struct RawOutcome {
     pub pages: u32,
 }
 
+/// Percent-decodes `segment`, borrowing when no `%` is present.
+fn decoded_segment(segment: &str) -> std::borrow::Cow<'_, str> {
+    if segment.contains('%') {
+        std::borrow::Cow::Owned(aterm_codec::pct::decode(segment))
+    } else {
+        std::borrow::Cow::Borrowed(segment)
+    }
+}
+
 /// The path's segments, without its query, each percent-decoded: GitHub reads
 /// `/repos/fixture%2Ddev/app` as `fixture-dev/app`, so the scope is judged on what it reads.
-fn segments(path: &str) -> Vec<String> {
+fn segments(path: &str) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
     path.split('?')
         .next()
         .unwrap_or_default()
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(aterm_codec::pct::decode)
-        .collect()
+        .map(decoded_segment)
 }
 
 /// How a `Content-Type` labels a body.
@@ -101,25 +109,27 @@ pub(crate) enum Media {
     Other,
 }
 
-/// A `Content-Type`'s essence: before any `;`, trimmed, ASCII lowercase; empty for none.
-fn essence(content_type: Option<&str>) -> String {
+/// A `Content-Type`'s essence: before any `;`, trimmed; empty for none.
+fn essence(content_type: Option<&str>) -> &str {
     content_type
         .and_then(|media| media.split(';').next())
-        .map(|media| media.trim().to_ascii_lowercase())
+        .map(str::trim)
         .unwrap_or_default()
 }
 
 impl Media {
     /// Classify `content_type` by its media essence.
     pub(crate) fn of(content_type: Option<&str>) -> Media {
-        Media::of_essence(&essence(content_type))
+        Media::of_essence(essence(content_type))
     }
 
     /// The label of an [`essence`].
     fn of_essence(essence: &str) -> Media {
-        if essence == "application/json" {
+        if essence.eq_ignore_ascii_case("application/json") {
             Media::Json
-        } else if essence.ends_with("+json") {
+        } else if essence.len() > 5
+            && essence.as_bytes()[essence.len() - 5..].eq_ignore_ascii_case(b"+json")
+        {
             Media::PlusJson
         } else {
             Media::Other
@@ -134,22 +144,18 @@ impl Media {
 /// parse is still the file (design §8.2: raw media types print bytes). Elsewhere GitHub uses
 /// these types on JSON objects (an issue's `raw+json`), which stay "JSON when it parses".
 fn is_file_bytes(essence: &str, path: &str) -> bool {
-    let rendering = matches!(
-        essence,
-        "application/vnd.github.raw"
-            | "application/vnd.github.raw+json"
-            | "application/vnd.github.html"
-            | "application/vnd.github.html+json"
-    );
-    let segs = segments(path);
-    let file = matches!(
-        segs.iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice(),
-        ["repos", _, _, "contents", ..] | ["repos", _, _, "readme", ..]
-    );
-    rendering && file
+    let rendering = essence.eq_ignore_ascii_case("application/vnd.github.raw")
+        || essence.eq_ignore_ascii_case("application/vnd.github.raw+json")
+        || essence.eq_ignore_ascii_case("application/vnd.github.html")
+        || essence.eq_ignore_ascii_case("application/vnd.github.html+json");
+    if !rendering {
+        return false;
+    }
+    let mut segs = segments(path);
+    segs.next().as_deref() == Some("repos")
+        && segs.next().is_some()
+        && segs.next().is_some()
+        && matches!(segs.next().as_deref(), Some("contents" | "readme"))
 }
 
 /// One answer as `api` prints it: its JSON, its bytes, or under `include` its status, headers
@@ -157,11 +163,17 @@ fn is_file_bytes(essence: &str, path: &str) -> bool {
 ///
 /// # Errors
 ///
-/// CouldNotRun `Sub::Protocol` for an `application/json` body that is not JSON.
-fn outcome_of(answered: Answered, include: bool, path: &str) -> Result<RawOutcome> {
+/// CouldNotRun `Sub::Protocol` for an `application/json` body that is not JSON when
+/// `strict_json` is true.
+fn outcome_of(
+    answered: Answered,
+    include: bool,
+    path: &str,
+    strict_json: bool,
+) -> Result<RawOutcome> {
     let essence = essence(answered.header("content-type"));
-    let media = Media::of_essence(&essence);
-    let file_bytes = is_file_bytes(&essence, path);
+    let media = Media::of_essence(essence);
+    let file_bytes = is_file_bytes(essence, path);
     let parsed = || match media {
         Media::Other => None,
         _ if file_bytes => None,
@@ -173,15 +185,15 @@ fn outcome_of(answered: Answered, include: bool, path: &str) -> Result<RawOutcom
             .unwrap_or_else(|| Value::String(String::from_utf8_lossy(&answered.body).into_owned()));
         RawAnswer::Included {
             status: answered.status,
-            headers: answered.headers.clone(),
+            headers: answered.headers,
             body,
         }
-    } else if media == Media::Json && !answered.body.is_empty() {
+    } else if strict_json && media == Media::Json && !answered.body.is_empty() {
         RawAnswer::Json(answered.json()?)
     } else {
         match parsed() {
             Some(value) => RawAnswer::Json(value),
-            None => RawAnswer::Bytes(answered.body.clone()),
+            None => RawAnswer::Bytes(answered.body),
         }
     };
     Ok(RawOutcome {
@@ -209,15 +221,8 @@ fn path_rules(path: &str) -> Result<()> {
 /// body that is not JSON is its bytes. GitHub answered a 2xx, so the write was done, and
 /// nothing read after it may report it as not sent.
 fn written_of(answered: Answered, include: bool, path: &str) -> RawOutcome {
-    let body = answered.body.clone();
-    let as_ = answered.as_.clone();
-    let requests = answered.requests;
-    outcome_of(answered, include, path).unwrap_or(RawOutcome {
-        answer: RawAnswer::Bytes(body),
-        as_,
-        requests,
-        pages: 1,
-    })
+    outcome_of(answered, include, path, false)
+        .expect("outcome_of with strict_json=false is infallible")
 }
 
 /// The journal key of an `api` write of `method` to `path` (plan §7 body 7): `api {METHOD}
@@ -226,29 +231,32 @@ fn written_of(answered: Answered, include: bool, path: &str) -> RawOutcome {
 /// again (`path::segment`); a `/repos/{owner}/{repo}/…` path's owner and repository are
 /// lowercased, as GitHub reads them; the query's pairs are sorted.
 pub(crate) fn journal_key(method: Method, path: &str) -> String {
-    let mut segs = segments(path);
+    let mut segs: Vec<std::borrow::Cow<'_, str>> = segments(path).collect();
     if segs.first().is_some_and(|first| first == "repos") {
         for seg in segs.iter_mut().skip(1).take(2) {
-            seg.make_ascii_lowercase();
+            if seg.bytes().any(|b| b.is_ascii_uppercase()) {
+                seg.to_mut().make_ascii_lowercase();
+            }
         }
     }
-    let mut canonical = String::new();
-    for seg in &segs {
-        canonical.push('/');
-        canonical.push_str(&crate::path::segment(seg));
-    }
-    if canonical.is_empty() {
-        canonical.push('/');
+    let mut out = format!("api {} ", method.as_str());
+    if segs.is_empty() {
+        out.push('/');
+    } else {
+        for seg in &segs {
+            out.push('/');
+            out.push_str(&crate::path::segment(seg));
+        }
     }
     if let Some((_, query)) = path.split_once('?') {
         let mut pairs: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty()).collect();
         pairs.sort_unstable();
-        if !pairs.is_empty() {
-            canonical.push('?');
-            canonical.push_str(&pairs.join("&"));
+        for (i, pair) in pairs.iter().enumerate() {
+            out.push(if i == 0 { '?' } else { '&' });
+            out.push_str(pair);
         }
     }
-    format!("api {} {canonical}", method.as_str())
+    out
 }
 
 /// What a 2xx answer to an `api` POST created: its numeric `id` (0 for an object GitHub gives
@@ -315,23 +323,25 @@ impl<'a> Raw<'a> {
             return self.all(req, no_probe);
         }
         let answered = self.gh.call(&Self::call(req, no_probe))?;
-        let outcome = outcome_of(answered, req.include, &req.path)?;
+        let outcome = outcome_of(answered, req.include, &req.path, true)?;
         Ok((outcome, End::Complete))
     }
 
     /// `get` with `all`.
     fn all(&self, req: &RawGet, no_probe: bool) -> Result<(RawOutcome, End)> {
-        let segs = segments(&req.path);
-        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let mut segs = segments(&req.path);
+        let first = segs.next();
+        let second = segs.next();
+        let third = segs.next();
         let mut lookups = 0;
-        let scope = match segs.as_slice() {
-            ["repos", owner, repo, ..] => match Slug::new(owner, repo) {
+        let scope = match (first.as_deref(), second.as_deref(), third.as_deref()) {
+            (Some("repos"), Some(owner), Some(repo)) => match Slug::new(owner, repo) {
                 Ok(slug) => LinkScope::Repo(slug),
                 Err(_) => LinkScope::Exact,
             },
-            ["orgs" | "users", owner, ..] => {
+            (Some("orgs" | "users"), Some(owner), _) => {
                 let mut route = req.route.clone();
-                route.target = RouteTarget::Owner((*owner).to_string());
+                route.target = RouteTarget::Owner(owner.to_string());
                 let path = format!("/users/{}", crate::path::segment(owner));
                 let answered = self.gh.call(&Call::get(path, route).probe_404(!no_probe))?;
                 lookups = answered.requests;
@@ -475,10 +485,12 @@ impl Raw<'_> {
     /// `/repos/{owner}/{repo}/…` path is `RouteTarget::Repo`, and every other path is
     /// Unscoped, which no permit covers, so the pipeline refuses it before anything is sent.
     fn write_call(req: &RawSend) -> Result<(Call, Option<Slug>)> {
-        let segs = segments(&req.path);
-        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-        let (target, slug) = match segs.as_slice() {
-            ["repos", owner, repo, ..] => match Slug::new(owner, repo) {
+        let mut segs = segments(&req.path);
+        let first = segs.next();
+        let second = segs.next();
+        let third = segs.next();
+        let (target, slug) = match (first.as_deref(), second.as_deref(), third.as_deref()) {
+            (Some("repos"), Some(owner), Some(repo)) => match Slug::new(owner, repo) {
                 Ok(slug) => (RouteTarget::Repo(slug.clone()), Some(slug)),
                 Err(_) => (RouteTarget::Unscoped, None),
             },

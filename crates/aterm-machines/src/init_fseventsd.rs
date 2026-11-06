@@ -167,7 +167,10 @@ impl Fseventsd {
     /// The restart sent within [`RECENT`], as [`Self::stamp`] records it.
     fn recent(&self, sys: &dyn System) -> Option<Sent> {
         let sent = Sent::parse(&sys.read_file(self.stamp.as_deref()?).ok()?)?;
-        (sys.now().saturating_sub(sent.at_s) < RECENT.as_secs()).then_some(sent)
+        sys.now()
+            .checked_sub(sent.at_s)
+            .is_some_and(|age| age < RECENT.as_secs())
+            .then_some(sent)
     }
 
     /// Whether the process `sent` names still runs: the same pid, started at the same second.
@@ -933,6 +936,44 @@ mod tests {
         assert_eq!(Sent::parse(sent.line().as_bytes()), Some(sent));
         for junk in ["", "537 1", "537 1 2 3", "x 1 2"] {
             assert_eq!(Sent::parse(junk.as_bytes()), None, "{junk:?}");
+        }
+    }
+
+    /// A record stamped after now (a clock set back, or a forged record) is no recent restart,
+    /// so it does not hold the next one off for ever. NEGATIVE CONTROL: a record stamped a
+    /// second ago still does.
+    #[test]
+    fn a_future_timestamp_in_the_stamp_record_does_not_suppress_a_restart() {
+        let sys = mac();
+        sys.file(
+            STAMPED,
+            Sent {
+                pid: 537,
+                start_s: STARTED + 537,
+                at_s: NOW - 1,
+            }
+            .line()
+            .as_bytes(),
+        );
+        let row = run(&item(true), &sys, vec![running(537, 141 * GIB)], Mode::Plan);
+        assert_ne!(row.outcome, Outcome::Planned, "{row:?}");
+        for future_at in [NOW + 1, u64::MAX] {
+            sys.file(
+                STAMPED,
+                Sent {
+                    pid: 537,
+                    start_s: STARTED + 537,
+                    at_s: future_at,
+                }
+                .line()
+                .as_bytes(),
+            );
+            let row = run(&item(true), &sys, vec![running(537, 141 * GIB)], Mode::Plan);
+            assert_eq!(
+                row.outcome,
+                Outcome::Planned,
+                "future_at={future_at}: {row:?}"
+            );
         }
     }
 }

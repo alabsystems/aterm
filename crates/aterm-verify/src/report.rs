@@ -351,6 +351,10 @@ pub struct CheckResult {
     pub findings: Vec<Finding>,
     /// The command that reruns just this check.
     pub rerun: String,
+    /// It could not run only because the run's first proven red stopped it: each of its NOT RUN
+    /// rows carries the halt's words ([`crate::sched::Halt`]). The verdict counts it apart from
+    /// what the machine kept from running.
+    pub stopped: bool,
 }
 
 /// The word a check's line opens with.
@@ -364,7 +368,9 @@ pub const fn word(o: Outcome) -> &'static str {
     }
 }
 
-/// Folds a check's stage reports into its [`CheckResult`] (worst outcome wins).
+/// Folds a check's stage reports into its [`CheckResult`] (worst outcome wins). `halt` is the
+/// words the run's first proven red stopped the rest with, once it did: a check whose every NOT
+/// RUN row says them was [`CheckResult::stopped`].
 #[must_use]
 pub fn judge(
     check: Check,
@@ -372,6 +378,7 @@ pub fn judge(
     seconds: f64,
     scope: &str,
     rerun: String,
+    halt: Option<&str>,
 ) -> CheckResult {
     let rows: Vec<(Outcome, &str)> = reports.iter().flat_map(|r| r.outcomes()).collect();
     let worst = [
@@ -430,6 +437,8 @@ pub fn judge(
             (detail, reasons)
         }
     };
+    let stopped = worst == Outcome::Fail(Severity::CouldNotRun)
+        && halt.is_some_and(|words| labels.iter().all(|l| l.contains(words)));
     CheckResult {
         check,
         outcome: worst,
@@ -437,6 +446,7 @@ pub fn judge(
         detail,
         findings,
         rerun,
+        stopped,
     }
 }
 
@@ -498,7 +508,9 @@ pub fn render(r: &CheckResult, width: usize) -> String {
     s
 }
 
-/// Formats the summary verdict line and returns the exit code.
+/// Formats the summary verdict line and returns the exit code. Beside a failure, the checks its
+/// halt stopped ([`CheckResult::stopped`]) are counted as not run at the first red, apart from
+/// what could not run.
 #[must_use]
 pub fn verdict(results: &[CheckResult], release: bool, seconds: f64) -> (String, i32) {
     let named = |o: Outcome| -> Vec<&str> {
@@ -509,7 +521,17 @@ pub fn verdict(results: &[CheckResult], release: bool, seconds: f64) -> (String,
             .collect()
     };
     let failed = named(Outcome::Fail(Severity::GateFailed));
-    let unrun = named(Outcome::Fail(Severity::CouldNotRun));
+    let unrun_of = |stopped: bool| -> Vec<&str> {
+        results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Fail(Severity::CouldNotRun))
+            // Only a failure stops the rest: beside none, a stopped check is one that could not run.
+            .filter(|r| (r.stopped && !failed.is_empty()) == stopped)
+            .map(|r| r.check.name())
+            .collect()
+    };
+    let unrun = unrun_of(false);
+    let stopped = unrun_of(true);
     let skipped = named(Outcome::Skip);
     let ok = named(Outcome::Ok).len();
     let mut tail = vec![format!("{ok} ok")];
@@ -525,6 +547,14 @@ pub fn verdict(results: &[CheckResult], release: bool, seconds: f64) -> (String,
         let mut head = format!("{} failed", failed.join(", "));
         if !unrun.is_empty() {
             let _ = write!(head, "; {} could not run", unrun.join(", "));
+        }
+        if !stopped.is_empty() {
+            let _ = write!(
+                head,
+                "; {} not run (stopped at the first red: {})",
+                stopped.len(),
+                stopped.join(", ")
+            );
         }
         return (
             format!("verify: FAIL — {head}; {tail}"),
@@ -1109,6 +1139,7 @@ mod tests {
             detail: String::new(),
             findings: Vec::new(),
             rerun: format!("targo --unverified verify {}", check.name()),
+            stopped: false,
         }
     }
 
@@ -1116,22 +1147,22 @@ mod tests {
     fn the_worst_row_decides_and_a_failed_test_is_its_own_finding() {
         let mut lint = Report::new("tippy");
         lint.pass("tippy -p a");
-        let r = judge(Check::Lint, &[&lint], 2.0, "-p a", "rerun".into());
+        let r = judge(Check::Lint, &[&lint], 2.0, "-p a", "rerun".into(), None);
         assert_eq!(r.outcome, Outcome::Ok);
 
         let mut skipped = Report::new("doc");
         skipped.skip("targo test --doc (no library)");
-        let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into());
+        let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into(), None);
         assert_eq!(r.outcome, Outcome::Skip);
         skipped.skip("another (no tool)");
-        let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into());
+        let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into(), None);
         assert_eq!(r.findings.len(), 2, "each reason listed under it");
 
         let mut test = Report::new("test");
         test.pass("compile");
         test.fail("a row");
         test.cannot_run("no disk");
-        let r = judge(Check::Test, &[&test], 0.0, "", "rerun".into());
+        let r = judge(Check::Test, &[&test], 0.0, "", "rerun".into(), None);
         assert_eq!(r.outcome, Outcome::Fail(Severity::GateFailed));
         let ids: Vec<&str> = r.findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
@@ -1169,6 +1200,55 @@ mod tests {
         assert_eq!(duration(f64::INFINITY), "0.0s");
         assert!(duration(1e30).ends_with("15s"));
         assert_eq!(duration(185.0), "3m05s");
+    }
+
+    #[test]
+    fn a_check_the_first_red_stopped_is_counted_apart_from_what_could_not_run() {
+        let words = "stopped: the release failed at fmt";
+        let mut halted = Report::new("tippy");
+        halted.cannot_run(format!("tippy — {words}"));
+        let mut machine = Report::new("doc");
+        machine.cannot_run("targo test --doc — no disk");
+        let lint = judge(
+            Check::Lint,
+            &[&halted],
+            0.0,
+            "",
+            "rerun".into(),
+            Some(words),
+        );
+        let doc = judge(
+            Check::Doc,
+            &[&machine],
+            0.0,
+            "",
+            "rerun".into(),
+            Some(words),
+        );
+        assert!(lint.stopped, "every NOT RUN row says the halt's words");
+        assert!(
+            !doc.stopped,
+            "the machine kept it from running, not the halt"
+        );
+        let fmt = result(Check::Fmt, Outcome::Fail(Severity::GateFailed));
+        let (line, code) = verdict(&[fmt, lint.clone(), doc], true, 1.0);
+        assert_eq!(code, crate::exit::FAILED);
+        assert_eq!(
+            line,
+            "verify: FAIL — fmt failed; doc could not run; \
+             1 not run (stopped at the first red: lint); 0 ok in 1.0s"
+        );
+        let (line, code) = verdict(&[lint], true, 1.0);
+        assert_eq!(
+            (line.as_str(), code),
+            (
+                "verify: COULD NOT RUN — lint could not run; 0 ok in 1.0s",
+                crate::exit::COULD_NOT_RUN
+            ),
+            "beside no failure nothing was stopped at a red"
+        );
+        let bare = judge(Check::Lint, &[&halted], 0.0, "", "rerun".into(), None);
+        assert!(!bare.stopped, "a run with no halt stopped nothing");
     }
 
     #[test]

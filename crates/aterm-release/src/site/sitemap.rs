@@ -88,7 +88,9 @@ pub fn update(text: &str, ensure: &str, today: &str, touch: &[&str]) -> Result<U
     for b in &found {
         let loc = &text[b.loc.0..b.loc.1];
         out.push_str(&text[last..b.lastmod.0]);
-        let touched = touch.iter().any(|p| format!("{ORIGIN}{p}") == loc);
+        let touched = loc
+            .strip_prefix(ORIGIN)
+            .is_some_and(|rest| touch.contains(&rest));
         out.push_str(if touched {
             today
         } else {

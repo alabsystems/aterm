@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicPtr, Ordering, fence};
 
 use aterm_win32::Win32::Foundation::{E_NOINTERFACE, E_OUTOFMEMORY, E_POINTER, S_OK};
 use aterm_win32::Win32::System::Com::CoCreateFreeThreadedMarshaler;
@@ -53,7 +53,7 @@ pub(super) unsafe trait Object: Send + Sync + Sized + 'static {
 
 /// An object's reference count and its aggregated free-threaded marshaler.
 pub(super) struct Count {
-    refs: AtomicU32,
+    refs: crate::uia_abi::RefCount,
     marshaler: AtomicPtr<c_void>,
 }
 
@@ -61,7 +61,7 @@ impl Count {
     /// One reference: the creator's.
     pub(super) const fn one() -> Self {
         Self {
-            refs: AtomicU32::new(1),
+            refs: crate::uia_abi::RefCount::one(),
             marshaler: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -155,7 +155,7 @@ unsafe extern "system" fn query<O: Object, const OFFSET: usize>(
         unsafe { out.write(ptr::null_mut()) };
         return E_NOINTERFACE;
     };
-    object.count().refs.fetch_add(1, Ordering::Relaxed);
+    object.count().refs.retain();
     // SAFETY: as above; the reference just taken is the caller's.
     unsafe { out.write(found.cast_mut()) };
     S_OK
@@ -204,23 +204,15 @@ unsafe fn marshal<O: Object>(object: &O, out: *mut *mut c_void) -> HRESULT {
 unsafe extern "system" fn add_ref<O: Object, const OFFSET: usize>(this: *mut c_void) -> u32 {
     // SAFETY: COM calls this slot through the field at `OFFSET` of a live `O`.
     let object = unsafe { object::<O, OFFSET>(this) };
-    object
-        .count()
-        .refs
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
+    object.count().refs.retain()
 }
 
 unsafe extern "system" fn release<O: Object, const OFFSET: usize>(this: *mut c_void) -> u32 {
     // SAFETY: COM calls this slot through the field at `OFFSET` of a live `O`,
     // with a reference of its own to give back.
     let object = unsafe { object::<O, OFFSET>(this) };
-    let left = object
-        .count()
-        .refs
-        .fetch_sub(1, Ordering::Release)
-        .wrapping_sub(1);
-    if left == 0 {
+    let (left, should_drop) = object.count().refs.release();
+    if should_drop {
         fence(Ordering::Acquire);
         // SAFETY: that was the last reference to the box `into_raw` made.
         drop(unsafe { Box::from_raw(ptr::from_ref(object).cast_mut()) });

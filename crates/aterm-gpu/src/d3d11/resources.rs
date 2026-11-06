@@ -339,8 +339,9 @@ impl D3dDevice {
             return Ok(());
         }
         let bpp = tex.format.bytes;
+        let min_row = w.checked_mul(bpp);
         if !bytes_per_row.is_multiple_of(bpp)
-            || bytes_per_row < w * bpp
+            || min_row.is_none_or(|min| bytes_per_row < min)
             || x.checked_add(w).is_none_or(|end| end > tex.width)
             || y.checked_add(h).is_none_or(|end| end > tex.height)
         {
@@ -350,7 +351,15 @@ impl D3dDevice {
                 tex.width, tex.height
             ));
         }
-        let need = bytes_per_row as usize * (h as usize - 1) + (w * bpp) as usize;
+        let min_row = min_row.expect("checked above") as usize;
+        let Some(need) = (bytes_per_row as usize)
+            .checked_mul(h as usize - 1)
+            .and_then(|rows| rows.checked_add(min_row))
+        else {
+            return Err(format!(
+                "d3d11: upload of {h} rows at stride {bytes_per_row} overflows usize"
+            ));
+        };
         if bytes.len() < need {
             return Err(format!(
                 "d3d11: upload of {h} rows needs {need} bytes, got {}",
@@ -387,10 +396,11 @@ impl D3dDevice {
     pub(crate) fn buffer(&self, role: D3dBufferRole, size: usize) -> Result<D3dBuffer, String> {
         let size = size.max(1);
         let width = match role {
-            D3dBufferRole::Instance => size,
-            D3dBufferRole::Uniform => size.next_multiple_of(16),
-        };
-        let width = u32::try_from(width).map_err(|_| format!("d3d11: a {size}-byte buffer"))?;
+            D3dBufferRole::Instance => Some(size),
+            D3dBufferRole::Uniform => size.checked_next_multiple_of(16),
+        }
+        .and_then(|w| u32::try_from(w).ok())
+        .ok_or_else(|| format!("d3d11: a {size}-byte buffer"))?;
         let desc = d3d::D3D11_BUFFER_DESC {
             ByteWidth: width,
             Usage: d3d::D3D11_USAGE_DYNAMIC,
@@ -548,9 +558,10 @@ impl D3dDevice {
             ));
         }
         let bpp = tex.format.bytes as usize;
+        let min_row = (width as usize).checked_mul(bpp);
         if width > tex.width
             || height > tex.height
-            || padded < width as usize * bpp
+            || min_row.is_none_or(|min| padded < min)
             || !padded.is_multiple_of(bpp)
         {
             return Err(format!(
@@ -558,7 +569,10 @@ impl D3dDevice {
                 tex.width, tex.height
             ));
         }
-        let mut out = vec![0u8; padded * height as usize];
+        let total = padded.checked_mul(height as usize).ok_or_else(|| {
+            format!("d3d11: readback of {width}x{height} at stride {padded} overflows usize")
+        })?;
+        let mut out = vec![0u8; total];
         if width == 0 || height == 0 {
             return Ok(out);
         }

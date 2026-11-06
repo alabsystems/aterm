@@ -198,15 +198,16 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
         let cooldown = std::sync::Mutex::new(None);
         let rediscovery = std::sync::Mutex::new(Rediscovery::default());
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &|_, _| panic!("disabled upkeep fetched a source"),
             spawn_renewal: &|_| panic!("disabled upkeep started a login"),
             sync_cooldown: &cooldown,
             rediscovery: &rediscovery,
             renew_guard: &guard,
             find_browser: &|_| false,
-            vault_sync: |_| super::super::sign_in_ladder::Vault::NotMember,
+            vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_| panic!("disabled upkeep started a vault worker"),
-            default_check: |_| panic!("disabled upkeep checked a login"),
+            default_check: |_, _scope| panic!("disabled upkeep checked a login"),
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_| {}),
             run_attempt: None,

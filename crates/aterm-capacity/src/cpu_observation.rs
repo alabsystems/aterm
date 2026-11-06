@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use aterm_json::{Map, Value};
+
 /// A held slot's diagnostic record, which is not proof of process identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuHolder {
@@ -43,6 +45,49 @@ pub enum CpuObservation {
 }
 
 impl CpuObservation {
+    /// Machine-readable observation shared by local capacity and authenticated control.
+    ///
+    /// Only a ready pool reports counts; absent or unreadable state never claims
+    /// free capacity. Holder identities remain explicitly reported diagnostics.
+    #[must_use]
+    pub fn json(&self) -> Value {
+        let mut out = Map::new();
+        let state = match self {
+            CpuObservation::Unsupported => "unsupported",
+            CpuObservation::Absent => "absent",
+            CpuObservation::Initializing => "initializing",
+            CpuObservation::Unreadable(error) => {
+                out.insert("error".to_owned(), Value::from(error.as_str()));
+                "unreadable"
+            }
+            CpuObservation::Ready { total, holders } => {
+                out.insert("total".to_owned(), Value::from(*total as u64));
+                out.insert("held".to_owned(), Value::from(holders.len() as u64));
+                out.insert(
+                    "available".to_owned(),
+                    Value::from((total - holders.len()) as u64),
+                );
+                let holders = holders
+                    .iter()
+                    .map(|holder| {
+                        let mut row = Map::new();
+                        row.insert("slot".to_owned(), Value::from(holder.slot));
+                        row.insert("reported_pid".to_owned(), Value::from(holder.reported_pid));
+                        row.insert(
+                            "reported_birth".to_owned(),
+                            Value::from(holder.reported_birth),
+                        );
+                        Value::Object(row)
+                    })
+                    .collect();
+                out.insert("holders".to_owned(), Value::Array(holders));
+                "ready"
+            }
+        };
+        out.insert("state".to_owned(), Value::from(state));
+        Value::Object(out)
+    }
+
     /// Read an existing pool without creating, repairing or claiming any file.
     ///
     /// `dir` is the account capacity directory, usually [`crate::ledger::user_dir`].
@@ -87,6 +132,43 @@ impl CpuObservation {
             let _ = dir;
             Self::Unsupported
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_observations_never_advertise_free_slots() {
+        for observation in [
+            CpuObservation::Unsupported,
+            CpuObservation::Absent,
+            CpuObservation::Initializing,
+            CpuObservation::Unreadable("permission denied".into()),
+        ] {
+            let json = observation.json();
+            for field in ["total", "held", "available", "holders"] {
+                assert!(json.get(field).is_none(), "{json}");
+            }
+        }
+    }
+
+    #[test]
+    fn held_lock_without_owner_record_still_consumes_capacity() {
+        let json = CpuObservation::Ready {
+            total: 2,
+            holders: vec![CpuHolder {
+                slot: 1,
+                reported_pid: None,
+                reported_birth: None,
+            }],
+        }
+        .json();
+        assert_eq!(json["held"], Value::from(1u64));
+        assert_eq!(json["available"], Value::from(1u64));
+        assert_eq!(json["holders"][0]["reported_pid"], Value::Null);
+        assert_eq!(json["holders"][0]["reported_birth"], Value::Null);
     }
 }
 

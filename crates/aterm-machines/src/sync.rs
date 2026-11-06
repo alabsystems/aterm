@@ -1733,15 +1733,26 @@ fn base_layer<'a>(ports: &'a dyn Ports, owed: &Owed<'_>, mode: Mode) -> BaseRun<
 /// class the pass never applies waits on a person, not on a pass.
 fn left_for_next(rows: &[ItemReport]) -> Vec<String> {
     rows.iter()
-        .filter(|row| row.class.is_some_and(|class| APPLIES.contains(&class)))
-        .filter(|row| {
-            !matches!(
-                row.outcome,
-                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
-            )
-        })
+        .filter(|row| unfinished(row))
         .map(|row| row.id.clone())
         .collect()
+}
+
+/// Only work this pass admits can remain owed to another pass. Person-only base classes
+/// stay planned without asking an unattended runner to apply them.
+fn unfinished(row: &ItemReport) -> bool {
+    row.class.is_some_and(|class| APPLIES.contains(&class))
+        && !matches!(
+            row.outcome,
+            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+        )
+}
+
+fn rows_complete(rows: &[ItemReport]) -> bool {
+    !rows.is_empty()
+        && !rows
+            .iter()
+            .any(|row| row.outcome.is_failure() || unfinished(row))
 }
 
 /// [`Record::builds`] once `build` ran a pass after `record`: each build once, where it last
@@ -1808,6 +1819,14 @@ pub struct Pass {
     pub rows: Vec<ItemReport>,
     /// Why the record could not be written, where it could not.
     pub unrecorded: Option<String>,
+}
+
+impl Pass {
+    /// Whether admitted work has settled and no record write failed.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.unrecorded.is_none() && rows_complete(&self.rows)
+    }
 }
 
 /// Run one pass for `trigger`: `mode` [`Mode::Apply`] under [`try_lock`] (a held lock stops it
@@ -1915,16 +1934,16 @@ fn run_pass(
             unrecorded: None,
         });
     }
-    let failed = rows.iter().any(|row| row.outcome.is_failure());
+    let complete = rows_complete(&rows);
     let record = Record {
         build: build.clone(),
         spec: SPEC,
         builds: builds_after(record.as_ref(), &build),
         attempted_ms: now,
-        converged_ms: if failed {
-            record.and_then(|record| record.converged_ms)
-        } else {
+        converged_ms: if complete {
             Some(now)
+        } else {
+            record.and_then(|record| record.converged_ms)
         },
         routes,
         rows: rows

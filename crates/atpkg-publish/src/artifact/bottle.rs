@@ -25,6 +25,8 @@ use crate::triple::{
 
 mod git_macos;
 mod git_text;
+mod source;
+pub mod upstream;
 
 /// `pack-bottle`'s usage synopsis.
 pub const SYNOPSIS: &str = "pack-bottle <program> --archive <path> --version <ver> --build <N> \
@@ -42,13 +44,22 @@ if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
 fi\n\
 exec \"$__atpkg_root/libexec/git-core/git\" \"$@\"\n";
 
+/// Install inputs held to the archive packer's relocation and payload gates.
+#[derive(Clone, Debug)]
+pub enum BottleInput {
+    /// An upstream install archive, extracted with the request's strip count.
+    Archive(PathBuf),
+    /// A producer-owned install tree, copied and held to the same relocation and payload gates.
+    InstallTree(PathBuf),
+}
+
 /// What a `pack-bottle` run is asked.
 #[derive(Clone, Debug)]
 pub struct BottleRequest {
     /// The program (`gh` or `git`).
     pub program: String,
-    /// Upstream bottle `.tar.gz` / `.tar` / `.zip` archive.
-    pub archive: PathBuf,
+    /// Upstream archive or producer-built install tree.
+    pub input: BottleInput,
     /// Upstream semantic version string (`2.x.y`).
     pub version: String,
     /// Monotonic channel build number (`>= 1`).
@@ -107,11 +118,12 @@ pub fn bottle_row(program: &str, triple: Triple) -> Result<(&'static ProgramDef,
              with `pack-bundle`, ALab packages with `pack-package`"
         )));
     };
-    if !b.darwin.contains(&triple) {
+    if !b.darwin.contains(&triple) && !b.linux.contains(&triple) {
         return Err(Error::usage(format!(
             "{program} is not packed as a bottle on {triple} (targets: {})",
             b.darwin
                 .iter()
+                .chain(b.linux)
                 .map(|t| t.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -410,6 +422,72 @@ fn collect_donor_libs(donor_roots: &[PathBuf]) -> Result<BTreeMap<String, PathBu
     Ok(libs)
 }
 
+fn preserve_donor_licenses(stage: &Path, donors: &[PathBuf]) -> Result<()> {
+    for (index, root) in donors.iter().enumerate() {
+        for relative in relocate::walk_files(root).map_err(Error::refused)? {
+            let name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !["copying", "copyright", "license", "licence", "notice"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                continue;
+            }
+            let destination = stage
+                .join("share/licenses/upstream")
+                .join(index.to_string())
+                .join(&relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| Error::io("create donor license directory", &error))?;
+            }
+            crate::identity::copy_regular_file(&root.join(&relative), &destination)
+                .map_err(|error| Error::io("preserve upstream donor license", &error))?;
+        }
+    }
+    Ok(())
+}
+
+fn preserve_gnu_git_trust(stage: &Path, donors: &[PathBuf]) -> Result<()> {
+    let mut bundle = None;
+    for root in donors {
+        for relative in relocate::walk_files(root).map_err(Error::refused)? {
+            if !relative.ends_with("share/ca-certificates/cacert.pem") {
+                continue;
+            }
+            let bytes = crate::identity::read_regular_bytes(&root.join(relative), 4 * 1024 * 1024)
+                .map_err(|error| Error::io("read declared certificate bundle", &error))?;
+            if !bytes
+                .windows(b"-----BEGIN CERTIFICATE-----".len())
+                .any(|part| part == b"-----BEGIN CERTIFICATE-----")
+            {
+                return Err(Error::refused(
+                    "declared ca-certificates bundle contains no PEM certificates",
+                ));
+            }
+            if bundle.as_ref().is_some_and(|previous| previous != &bytes) {
+                return Err(Error::refused(
+                    "declared donors contain different ca-certificates bundles",
+                ));
+            }
+            bundle = Some(bytes);
+        }
+    }
+    let bundle = bundle.ok_or_else(|| {
+        Error::refused("GNU Git needs the declared ca-certificates bottle for portable HTTPS trust")
+    })?;
+    std::fs::create_dir_all(stage.join("share/ca-certificates"))
+        .and_then(|()| std::fs::create_dir_all(stage.join("etc")))
+        .map_err(|error| Error::io("create GNU Git trust directories", &error))?;
+    std::fs::write(stage.join("share/ca-certificates/cacert.pem"), bundle)
+        .and_then(|()| std::fs::write(stage.join("etc/gitconfig"),
+            b"[http]\n\tsslCAInfo = %(prefix)/share/ca-certificates/cacert.pem\n[include]\n\tpath = /etc/gitconfig\n"))
+        .map_err(|error| Error::io("write GNU Git default trust configuration", &error))
+}
+
 fn relink_group(primary: &Path, aliases: &[PathBuf]) -> Result<()> {
     let primary_key = std::fs::symlink_metadata(primary)
         .ok()
@@ -436,6 +514,7 @@ fn relink_group(primary: &Path, aliases: &[PathBuf]) -> Result<()> {
 pub fn rewrite_bottle_objects(
     stage: &Path,
     donor_roots: &[PathBuf],
+    triple: Triple,
     backend: &dyn Backend,
 ) -> Result<Vec<String>> {
     let donor_libs = collect_donor_libs(donor_roots)?;
@@ -488,6 +567,25 @@ pub fn rewrite_bottle_objects(
         let group = aliases.get(&obj).map_or(&[][..], Vec::as_slice);
         let mut changed = false;
 
+        if let Some(loader) = system_loader(triple)
+            && let Some(interpreter) = backend.interpreter(&obj).map_err(Error::refused)?
+        {
+            if interpreter == "@@HOMEBREW_PREFIX@@/lib/ld.so" {
+                #[cfg(unix)]
+                crate::identity::set_regular_mode(&obj, 0o755)
+                    .map_err(|error| Error::io("make GNU interpreter rewrite writable", &error))?;
+                backend
+                    .set_interpreter(&obj, loader)
+                    .map_err(Error::refused)?;
+                changed = true;
+            } else if interpreter != loader {
+                return Err(Error::refused(format!(
+                    "{}: GNU bottle interpreter `{interpreter}` is not the target system loader `{loader}`",
+                    obj.display()
+                )));
+            }
+        }
+
         #[cfg(unix)]
         {
             if refs
@@ -512,7 +610,9 @@ pub fn rewrite_bottle_objects(
 
         let mut needed_lib_dirs: Vec<PathBuf> = Vec::new();
         for dep in &refs.needed {
-            if !dep.starts_with("@@HOMEBREW_") {
+            if !dep.starts_with("@@HOMEBREW_")
+                && !(system_loader(triple).is_some() && donor_libs.contains_key(basename_of(dep)))
+            {
                 continue;
             }
             let base = basename_of(dep).to_string();
@@ -612,6 +712,14 @@ pub fn rewrite_bottle_objects(
         }
     }
     Ok(vendored.into_iter().collect())
+}
+
+fn system_loader(triple: Triple) -> Option<&'static str> {
+    match triple {
+        X86_64_UNKNOWN_LINUX_GNU => Some("/lib64/ld-linux-x86-64.so.2"),
+        AARCH64_UNKNOWN_LINUX_GNU => Some("/lib/ld-linux-aarch64.so.1"),
+        _ => None,
+    }
 }
 
 /// Install the self-relocating `bin/git` wrapper when `program == "git"` and `libexec/git-core` is
@@ -728,6 +836,15 @@ fn check_stage_tree(
                     .map_err(|why| Error::refused(format!("{}: {why}", rel.display())))?;
             }
             if backend.is_native_object(&path) {
+                if let Some(loader) = system_loader(triple)
+                    && let Some(actual) = backend.interpreter(&path).map_err(Error::refused)?
+                    && actual != loader
+                {
+                    return Err(Error::refused(format!(
+                        "{}: GNU Git interpreter is `{actual}`, expected `{loader}`",
+                        rel.display()
+                    )));
+                }
                 let refs = backend.read_refs(&path).map_err(Error::refused)?;
                 let has_hb = refs
                     .id
@@ -772,10 +889,21 @@ pub fn pack_bottle_with(
             "--unsigned and --upload together make no sense — nothing unsigned may publish",
         ));
     }
-    if !request.archive.is_file() {
+    let (input, directory) = match &request.input {
+        BottleInput::Archive(path) => (path, false),
+        BottleInput::InstallTree(path) => (path, true),
+    };
+    if !std::fs::symlink_metadata(input).is_ok_and(|metadata| {
+        if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }
+    }) {
         return Err(Error::refused(format!(
-            "the bottle archive {} is not a regular file",
-            ctx.shown(&request.archive)
+            "the package input {} is not a regular {}",
+            ctx.shown(input),
+            if directory { "install tree" } else { "archive" }
         )));
     }
     let base = request
@@ -801,18 +929,22 @@ pub fn pack_bottle_with(
     let stage = scratch.path().join("stage");
     std::fs::create_dir_all(&stage)
         .map_err(|e| Error::io(format!("mkdir {}", stage.display()), &e))?;
-    extract_tree(
-        &request.archive,
-        &stage,
-        archive_container(&request.archive)?,
-        MAX_BOTTLE_EXTRACT_BYTES,
-        ExtractOptions {
-            strip_components: request.strip_components,
-            symlinks: SymlinkPolicy::InRoot,
-            allow_global_pax: true,
-        },
-    )
-    .map_err(|e| Error::refused(format!("extract {}: {e}", ctx.shown(&request.archive))))?;
+    if directory {
+        bundle::copy_tree(input, &stage)?;
+    } else {
+        extract_tree(
+            input,
+            &stage,
+            archive_container(input)?,
+            MAX_BOTTLE_EXTRACT_BYTES,
+            ExtractOptions {
+                strip_components: request.strip_components,
+                symlinks: SymlinkPolicy::InRoot,
+                allow_global_pax: true,
+            },
+        )
+        .map_err(|e| Error::refused(format!("extract {}: {e}", ctx.shown(input))))?;
+    }
 
     let mut all_donors = Vec::new();
     for (idx, dep_archive) in request.dep_bottles.iter().enumerate() {
@@ -850,13 +982,17 @@ pub fn pack_bottle_with(
     }
 
     materialize_symlinks(&stage)?;
+    preserve_donor_licenses(&stage, &all_donors)?;
+    if program == "git" && system_loader(request.triple).is_some() {
+        preserve_gnu_git_trust(&stage, &all_donors)?;
+    }
     rewrite_bottle_text(&stage)?;
     if program == "git" {
         drop_keychain_helper(&stage)?;
         git_text::rewrite(&stage, &version)?;
     }
     let _wrapped = install_git_wrapper(program, &stage)?;
-    let mut all_vendored = rewrite_bottle_objects(&stage, &all_donors, backend)?;
+    let mut all_vendored = rewrite_bottle_objects(&stage, &all_donors, request.triple, backend)?;
     let report =
         relocate::relocate_with(&stage, backend, None, &all_donors).map_err(Error::refused)?;
     report.require_self_contained().map_err(Error::refused)?;
@@ -898,7 +1034,11 @@ pub fn pack_bottle_with(
     };
     let row = BottleRow {
         triple: request.triple,
-        kind: Kind::Binary,
+        kind: if system_loader(request.triple).is_some() {
+            Kind::ElfBinary
+        } else {
+            Kind::Binary
+        },
         asset: asset_name,
         sha256: packed.sha256.clone(),
         tree_root: packed.tree_root.clone(),
@@ -913,7 +1053,7 @@ pub fn pack_bottle_with(
     let signature =
         pack::write_bottle_manifest(ctx, &doc, &header, &row, &manifest, signer.as_ref())?;
 
-    // Client self-check: parse (and signature-verify when signed) and stage through verify_and_stage.
+    // Publication self-check: authenticate and inspect a scratch tree without marking it live.
     let manifest_bytes =
         crate::identity::read_regular_bytes(&manifest, crate::identity::MAX_META_BYTES)
             .map_err(|e| Error::io(ctx.shown(&manifest), &e))?;
@@ -940,7 +1080,7 @@ pub fn pack_bottle_with(
         .join("store")
         .join(program)
         .join(request.build.to_string());
-    atpkg::verify_and_stage(
+    atpkg::verify_for_publication(
         artifact,
         &asset,
         &check_dir,
@@ -948,7 +1088,7 @@ pub fn pack_bottle_with(
     )
     .map_err(|e| {
         Error::refused(format!(
-            "the client's verify_and_stage refuses {program}@{} for {}: {e}",
+            "publication verification refuses {program}@{} for {}: {e}",
             request.build, request.triple
         ))
     })?;
@@ -1084,7 +1224,7 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
 
     Ok(BottleRequest {
         program,
-        archive,
+        input: BottleInput::Archive(archive),
         version,
         build,
         triple,
@@ -1142,6 +1282,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         refs: Mutex<BTreeMap<PathBuf, ObjectRefs>>,
+        interpreters: Mutex<BTreeMap<PathBuf, String>>,
     }
 
     impl FakeBackend {
@@ -1191,6 +1332,26 @@ mod tests {
         fn read_refs(&self, path: &Path) -> std::result::Result<ObjectRefs, String> {
             let map = self.refs.lock().expect("lock");
             Ok(Self::lookup(&map, path))
+        }
+
+        fn interpreter(&self, path: &Path) -> std::result::Result<Option<String>, String> {
+            let map = self.interpreters.lock().expect("lock");
+            Ok(map
+                .get(path)
+                .or_else(|| {
+                    map.iter().find_map(|(key, value)| {
+                        (key.file_name() == path.file_name()).then_some(value)
+                    })
+                })
+                .cloned())
+        }
+
+        fn set_interpreter(&self, path: &Path, loader: &str) -> std::result::Result<(), String> {
+            self.interpreters
+                .lock()
+                .expect("lock")
+                .insert(path.to_path_buf(), loader.into());
+            Ok(())
         }
 
         fn set_id_portable(&self, path: &Path, basename: &str) -> std::result::Result<(), String> {
@@ -1319,12 +1480,170 @@ mod tests {
     }
 
     #[test]
-    fn bottle_row_admits_gh_and_git_on_darwin_and_refuses_others() {
+    fn bottle_row_admits_git_on_darwin_and_gnu_linux_and_refuses_other_shapes() {
         assert!(bottle_row("gh", AARCH64_APPLE_DARWIN).is_ok());
         assert!(bottle_row("git", X86_64_APPLE_DARWIN).is_ok());
-        assert!(bottle_row("git", X86_64_UNKNOWN_LINUX_GNU).is_err());
+        assert!(bottle_row("git", X86_64_UNKNOWN_LINUX_GNU).is_ok());
+        assert!(bottle_row("git", AARCH64_UNKNOWN_LINUX_GNU).is_ok());
+        assert!(bottle_row("gh", X86_64_UNKNOWN_LINUX_GNU).is_err());
+        assert!(bottle_row("git", Triple::named("x86_64-pc-windows-msvc")).is_err());
         assert!(bottle_row("aterm", AARCH64_APPLE_DARWIN).is_err());
         assert!(bottle_row("no-such-program", AARCH64_APPLE_DARWIN).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gnu_git_archives_merge_stage_elf_payloads_and_refuse_mislabeled_objects() {
+        use std::sync::Arc;
+
+        use crate::host::fake::FakeHost;
+        use crate::testkit::Keys;
+
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let keys = Keys::mint("m3", &[]);
+        let host = Arc::new(FakeHost::new());
+        let ctx = keys.ctx(tmp.path(), host.clone());
+        keys.publish_quad(
+            &host,
+            &ctx.index_slug(),
+            41,
+            &keys.index_toml(41, &[("ay", "ay")], &[("ay", 9)]),
+        );
+        let mut previous = None;
+        for (triple, machine) in [
+            (X86_64_UNKNOWN_LINUX_GNU, 62_u16),
+            (AARCH64_UNKNOWN_LINUX_GNU, 183),
+        ] {
+            let mut elf = vec![0; 64];
+            elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            elf[6] = 1;
+            elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+            elf[18..20].copy_from_slice(&machine.to_le_bytes());
+            elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+            elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+            elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+            let archive = tmp.path().join(format!("git-{triple}.tar"));
+            build_tar(
+                &archive,
+                &[
+                    TarEntry::Dir("git/2.56.0/bin/"),
+                    TarEntry::Dir("git/2.56.0/libexec/git-core/"),
+                    TarEntry::File("git/2.56.0/libexec/git-core/git", &elf, 0o755),
+                ],
+            );
+            let donor = tmp.path().join(format!("pcre2-{triple}.tar"));
+            build_tar(
+                &donor,
+                &[
+                    TarEntry::Dir("pcre2/10.44/lib/"),
+                    TarEntry::File("pcre2/10.44/lib/libpcre2-8.so.0", &elf, 0o755),
+                    TarEntry::File("pcre2/10.44/COPYING", b"PCRE2 license\n", 0o644),
+                    TarEntry::File(
+                        "ca-certificates/2026/share/ca-certificates/cacert.pem",
+                        b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+                        0o644,
+                    ),
+                ],
+            );
+            let mut request = BottleRequest {
+                program: "git".into(),
+                input: BottleInput::Archive(archive),
+                version: "2.56.0".into(),
+                build: 1,
+                triple,
+                strip_components: 2,
+                dep_bottles: vec![donor],
+                donor_roots: Vec::new(),
+                merge_from: previous.clone(),
+                key: None,
+                out: tmp.path().join("out"),
+                signing: Signing::MachineKey,
+                upload: false,
+            };
+            let backend = FakeBackend::default();
+            backend.set(
+                Path::new("git"),
+                ObjectRefs {
+                    needed: vec!["libpcre2-8.so.0".into()],
+                    ..ObjectRefs::default()
+                },
+            );
+            backend
+                .interpreters
+                .lock()
+                .expect("lock")
+                .insert(PathBuf::from("git"), "@@HOMEBREW_PREFIX@@/lib/ld.so".into());
+            let result = pack_bottle_with(&ctx, &request, &backend, &RawFrames::WHOLE)
+                .expect("GNU Git install archive packs");
+            assert!(
+                backend
+                    .interpreters
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .any(|(path, loader)| path.ends_with("libexec/git-core/git")
+                        && Some(loader.as_str()) == system_loader(triple))
+            );
+            assert!(result.signature.as_ref().is_some_and(|p| p.is_file()));
+            let parsed: atpkg::PkgManifest = aterm_toml::from_str(
+                &std::fs::read_to_string(&result.manifest).expect("read manifest"),
+            )
+            .expect("client parses manifest");
+            let row = parsed
+                .artifacts
+                .iter()
+                .find(|row| row.target == triple.as_str())
+                .expect("GNU row retained");
+            assert_eq!(
+                row.kind, "elf-binary",
+                "old clients must refuse the selected GNU target before staging"
+            );
+            let stage = tmp.path().join(format!("store with spaces/{triple}"));
+            atpkg::verify_for_publication(
+                row,
+                &result.asset,
+                &stage,
+                &atpkg::install::StageHooks::NONE,
+            )
+            .expect("client verifies and stages GNU Git");
+            assert!(
+                !stage.with_file_name(format!("{triple}.ready")).exists(),
+                "publication inspection must not advertise a foreign package as installed"
+            );
+            assert_eq!(
+                std::fs::read(stage.join("libexec/git-core/git")).expect("ELF payload"),
+                elf
+            );
+            assert!(stage.join("lib/atpkg-vendored/libpcre2-8.so.0").is_file());
+            assert_eq!(
+                std::fs::read(stage.join("share/licenses/upstream/0/pcre2/10.44/COPYING"))
+                    .expect("donor license"),
+                b"PCRE2 license\n"
+            );
+            assert!(
+                std::fs::read_to_string(stage.join("bin/git"))
+                    .expect("wrapper")
+                    .contains("GIT_EXEC_PATH=")
+            );
+            let preserved = tmp.path().join(format!("git-{triple}.pkg.toml"));
+            std::fs::copy(&result.manifest, &preserved).expect("preserve manifest for merge");
+            previous = Some(preserved);
+            request.merge_from = None;
+            request.triple = if triple == X86_64_UNKNOWN_LINUX_GNU {
+                AARCH64_UNKNOWN_LINUX_GNU
+            } else {
+                AARCH64_APPLE_DARWIN
+            };
+            let error =
+                pack_bottle_with(&ctx, &request, &FakeBackend::default(), &RawFrames::WHOLE)
+                    .expect_err("wrong CPU or object format cannot masquerade as another target");
+            assert!(error.to_string().contains("MISMATCH"), "{error}");
+        }
+        let parsed: atpkg::PkgManifest = aterm_toml::from_str(
+            &std::fs::read_to_string(previous.expect("merged manifest")).expect("read final"),
+        )
+        .expect("parse merged");
+        assert_eq!(parsed.artifacts.len(), 2);
     }
 
     #[cfg(unix)]
@@ -1440,7 +1759,7 @@ mod tests {
         let out_dir = tmp.path().join("out");
         let missing_dep_req = BottleRequest {
             program: "git".to_string(),
-            archive: git_tar.clone(),
+            input: BottleInput::Archive(git_tar.clone()),
             version: "2.51.0".to_string(),
             build: 1,
             triple: AARCH64_APPLE_DARWIN,
@@ -1482,7 +1801,7 @@ mod tests {
         std::fs::copy(&arm_out.manifest, &merged_copy).expect("copy base manifest");
         let x64_req = BottleRequest {
             program: "git".to_string(),
-            archive: git_x64_tar,
+            input: BottleInput::Archive(git_x64_tar),
             version: "2.51.0".to_string(),
             build: 1,
             triple: X86_64_APPLE_DARWIN,
@@ -1510,13 +1829,13 @@ mod tests {
             .iter()
             .find(|a| a.target == "aarch64-apple-darwin")
             .expect("arm64 row");
-        atpkg::verify_and_stage(
+        atpkg::verify_for_publication(
             arm_row,
             &arm_out.asset,
             &staged,
             &atpkg::install::StageHooks::NONE,
         )
-        .expect("verify_and_stage");
+        .expect("publication verification");
         let wrapper = std::fs::read_to_string(staged.join("bin/git")).expect("read wrapper");
         assert!(wrapper.starts_with("#!/bin/sh\n"));
         assert!(wrapper.contains("GIT_EXEC_PATH="));
@@ -1609,7 +1928,7 @@ mod tests {
 
         let req = BottleRequest {
             program: "git".to_string(),
-            archive: git_tar,
+            input: BottleInput::Archive(git_tar),
             version: "2.51.0".to_string(),
             build: 1,
             triple: AARCH64_APPLE_DARWIN,

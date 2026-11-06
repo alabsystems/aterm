@@ -27,6 +27,7 @@ use std::time::Duration;
 use aterm_secrets::SecretBytes;
 use aterm_secrets::client::{self, Paths};
 use aterm_secrets::commons::bootstrap::Device;
+use aterm_secrets::discover;
 use aterm_secrets::members::join::{self, Dial, Heard, Stream};
 use aterm_secrets::members::joiner::Joining;
 use aterm_secrets::phrase::Phrase;
@@ -47,7 +48,7 @@ const USAGE: &str = "aterm members: Macs joining ALab and the members that let t
                         press of the row on the Machines view signs this Mac's share
   join [<phrase>] [--member <name>] [--at <host:port>]... [--no-wait]
                         join ALab automatically; an explicit phrase selects a manual join
-  status                whether this Mac is a member, waiting, or neither";
+  status                whether this Mac is a member, waiting, dropped, or neither";
 
 /// How long the joiner browses for members.
 const BROWSE_WITHIN: Duration = Duration::from_secs(3);
@@ -408,8 +409,9 @@ impl JoinArgs {
     }
 }
 
-/// The joining Mac: its paths, Commons device, node key, name and model, and where it is for its
-/// join's words ([`join_place`], read once when the run starts).
+/// The joining Mac: its paths, Commons device, node key, name and model, where it is for its
+/// join's words ([`join_place`], read once when the run starts), and the members service its
+/// browse looks for.
 struct Me {
     paths: Paths,
     device: Device,
@@ -417,6 +419,9 @@ struct Me {
     name: String,
     model: String,
     place: join::JoinPlace,
+    /// The DNS-SD service a browse for members looks for ([`discover::member_service`]): ALab's
+    /// ([`discover::MEMBER_SERVICE`]), or a lab's where `ATERM_LAB_MEMBER_SERVICE` names one.
+    members: String,
 }
 
 impl Me {
@@ -455,6 +460,10 @@ impl Me {
             name,
             model: model(),
             place: join_place(state),
+            members: discover::member_service(
+                std::env::var_os(discover::LAB_MEMBER_SERVICE_ENV).as_deref(),
+            )
+            .unwrap_or_else(|_| discover::MEMBER_SERVICE.to_owned()),
         })
     }
 
@@ -623,7 +632,7 @@ fn run_join(args: &JoinArgs) -> ExitCode {
         }
     };
     let reach = Reach {
-        browse: &|| aterm_secrets::discover::browse_members(BROWSE_WITHIN),
+        browse: &|| crate::lan_members::members(BROWSE_WITHIN),
         dial: &dial,
         prove: &|me, ats, until| proved_back(me, ats, Some(until)),
         join_vault: &join_alab_vault,
@@ -648,7 +657,7 @@ fn join_as(
 ) -> u8 {
     match join_tried(me, args, reach, out, err) {
         Tried::Ended(code) => code,
-        Tried::NoMember | Tried::Unsent => 1,
+        Tried::NoMember | Tried::Unsent | Tried::Dropped => 1,
     }
 }
 
@@ -664,6 +673,39 @@ enum Tried {
     /// shows a phrase for this Mac, several do, or the one that does could not be reached for
     /// the run): one given is not spent. Exit code 1.
     Unsent,
+    /// Before any member was looked for: a rotation dropped this Mac from the vault whose members
+    /// it would ask ([`dropped_here`]), which refuse its key, so it asked none and stays dropped,
+    /// with `aterm secrets status`'s words on stderr. Exit code 1.
+    Dropped,
+}
+
+/// `aterm secrets status`'s words for `me` where `membership` reads it out of its vault, a
+/// rotation dropped it ([`client::dropped_words`]), and the members this join asks serve that
+/// vault ([`browse_serves`]): every member that read the rotation refuses its key, so no join
+/// asks one with it and no phrase is spent on it (one-mesh E2, f299). Members a person names
+/// with `--at` (`at`) serve a vault nothing here knows, and the members of another vault than
+/// the one that dropped it never refused its key (a phrase moves it there afresh): both are
+/// asked as before.
+fn dropped_here(
+    me: &Me,
+    membership: &aterm_secrets::Result<client::Membership>,
+    at: &[String],
+) -> Option<String> {
+    let Ok(client::Membership::Revoked { seq }) = membership else {
+        return None;
+    };
+    let config = client::config(&me.paths).ok().flatten()?;
+    if !at.is_empty() || !browse_serves(&me.members, &config) {
+        return None;
+    }
+    client::dropped_words(&me.paths, *seq)
+}
+
+/// Whether the members a browse of `service` finds serve `config`'s vault: ALab's service finds
+/// ALab's members, which advertise it only from ALab's vault, and a lab's service the lab's,
+/// whose vault a lab Mac follows by its URL.
+fn browse_serves(service: &str, config: &client::Config) -> bool {
+    (service == discover::MEMBER_SERVICE) == client::alab_vault(config)
 }
 
 /// [`join_as`], saying whether it reached no member ([`Tried::NoMember`]).
@@ -688,6 +730,10 @@ fn join_tried(
     if matches!(membership, Ok(client::Membership::Pending)) && client::holds_allowed(&me.paths) {
         let _ = writeln!(out, "{}", allowed_words(&(reach.follow)(&me.paths.home)));
         return Tried::Ended(0);
+    }
+    if let Some(words) = dropped_here(me, &membership, &args.at) {
+        let _ = writeln!(err, "aterm members join: {words}");
+        return Tried::Dropped;
     }
     // A lab identity (one a test, a debug build, a lab lane or a VM made) never asks the live
     // ALab, whose members a browse of `_alab._tcp` finds: with no `--at` it refuses before it
@@ -1047,21 +1093,61 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
     }
     // A lab identity's subscriber asks no live ALab member ([`join_tried`]).
     client::refuse_lab_member_browse(&me.paths).map_err(|error| error.to_string())?;
-    let ats = aterm_secrets::discover::browse_members(BROWSE_WITHIN)
-        .map_err(|error| error.to_string())?;
-    ask_after_proof(proved_back(&me, &ats, None), || {
-        let dial: &Dial<'_> = &dial;
-        let (heard, _) = join::ask_all(dial, &me.joining()?, &ats);
-        if heard.is_empty() {
-            return Err("no ALab member answers on this network".to_owned());
-        }
-        Ok(heard.len())
-    })
+    let direct = crate::lan_members::probe(Duration::from_millis(500))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hint| hint.address.to_string())
+        .collect();
+    ask_discovered(
+        direct,
+        |ats| proved_back(&me, ats, Some(std::time::Instant::now() + PROVE_WITHIN)),
+        || discover::browse_members(BROWSE_WITHIN).map_err(|error| error.to_string()),
+        |ats| {
+            let dial: &Dial<'_> = &dial;
+            let (heard, _) = join::ask_all(dial, &me.joining()?, ats);
+            if heard.is_empty() {
+                return Err("no ALab member answers on this network".to_owned());
+            }
+            Ok(heard.len())
+        },
+    )
 }
 
-/// The fleet path's share of a proof that must dial no member past `until` ([`proved_back`]):
-/// half the time left, so the home-LAN path that follows keeps the rest.
-fn fleet_share(until: std::time::Instant) -> std::time::Instant {
+/// Only authenticated proof ends discovery. An untrusted first batch that
+/// proves nothing continues to the other members; a possibly signed admission
+/// sends nothing more until its ordinary retry can observe the records.
+fn ask_discovered(
+    mut direct: Vec<String>,
+    mut prove: impl FnMut(&[String]) -> Proved,
+    more: impl FnOnce() -> Result<Vec<String>, String>,
+    ask: impl FnOnce(&[String]) -> Result<usize, String>,
+) -> Result<usize, String> {
+    if !direct.is_empty() {
+        match prove(&direct) {
+            Proved::In | Proved::SignedMaybe => return Ok(1),
+            Proved::No => {}
+        }
+    }
+    let additional = match more() {
+        Ok(more) => more
+            .into_iter()
+            .filter(|at| !direct.contains(at))
+            .collect::<Vec<_>>(),
+        Err(_) if !direct.is_empty() => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let outcome = if additional.is_empty() {
+        Proved::No
+    } else {
+        prove(&additional)
+    };
+    direct.extend(additional);
+    ask_after_proof(outcome, || ask(&direct))
+}
+
+/// The fresh-address path's share of a bounded proof: half the time left, so
+/// recovery over a previously held fleet keeps the rest.
+fn first_proof_share(until: std::time::Instant) -> std::time::Instant {
     let now = std::time::Instant::now();
     now + until.saturating_duration_since(now) / 2
 }
@@ -1102,13 +1188,13 @@ fn ask_after_proof(
 
 /// Before any person is asked, prove this Mac to the members with nobody's Allow
 /// (`aterm_secrets::client::readmit`): a Mac that is ALab's already but whose vault key changed
-/// gets back in by itself. Over the fleet first, where this Mac holds the fleet code and a book
-/// ([`crate::vault_join::prove_over_fleet`]: the channel proves the fleet's key too, so a node key
-/// no seat binds gets a seat), then on each member's own port at `ats` (its node key alone, which
-/// moves the seat the log binds to it). One path after the other, and none after a try that may
+/// gets back in by itself. Freshly heard member addresses go first (its node key
+/// alone, which moves the seat the log binds to it), before cached fleet peers
+/// ([`crate::vault_join::prove_over_fleet`]: the channel proves the fleet's key too,
+/// so a node key no seat binds gets a seat). One path after the other, and none after a try that may
 /// have signed ([`Proved::SignedMaybe`]). No member is dialed on either path once `until` has
-/// passed ([`crate::vault_join::dial_until`]; `None`: none is too late), and the fleet path dials
-/// none past half the time left, so dead fleet peers never take the home-LAN proof's turn. One
+/// passed ([`crate::vault_join::dial_until`]; `None`: none is too late). The first path
+/// dials none past half the time left, preserving the recovery path's turn. One
 /// proof of this Mac runs at a time across processes ([`join::ProofLock`]): while another holds
 /// it (`aterm members join` beside the subscriber's round) this one waits until `until`, then
 /// sends nothing, as after a member that may have signed. [`Proved::No`] where no member let it
@@ -1133,6 +1219,17 @@ fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Pr
     let Ok(joining) = me.joining() else {
         return Proved::No;
     };
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        node.sign_record(aterm_secrets::members::desk::PROVE_RECORD, message)
+    };
+    let direct =
+        crate::vault_join::dial_until(until.map(first_proof_share), DIAL_WITHIN, &dial_within);
+    match proof_outcome(join::prove_first(
+        &me.paths, &direct, &joining, &sign_node, ats,
+    )) {
+        Proved::No => {}
+        done => return done,
+    }
     if let Ok(code) = read_join_code(&state)
         && let Ok(secret) = aterm_net::fleet::FleetSecret::new(&code.secret)
     {
@@ -1150,21 +1247,14 @@ fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Pr
                 &joining,
                 (&secret, &node),
                 &peers,
-                until.map(fleet_share),
+                until,
             )) {
                 Proved::No => {}
                 done => return done,
             }
         }
     }
-    let sign_node = |message: &[u8]| -> [u8; 64] {
-        node.sign_record(aterm_secrets::members::desk::PROVE_RECORD, message)
-    };
-    let dial = crate::vault_join::dial_until(until, DIAL_WITHIN, &dial_within);
-    let dial: &Dial<'_> = &dial;
-    proof_outcome(join::prove_first(
-        &me.paths, dial, &joining, &sign_node, ats,
-    ))
+    Proved::No
 }
 
 /// What a try with the phrase came to ([`join_with_phrase`]), each with what the join said, for
@@ -1176,6 +1266,10 @@ pub enum PhraseTry {
     /// It reached a member and let nobody in, it is not three of the list's words, or this Mac
     /// cannot join: a phrase is good for one try, so the member's person presses Allow again.
     Refused(String),
+    /// A rotation dropped this Mac from the vault whose members it would ask: none was asked with
+    /// its key, which they refuse, so no phrase lets it in; it comes back as a new Mac. `aterm
+    /// secrets status`'s words ([`client::dropped_words`]), which name its vault folder.
+    Dropped(String),
     /// The phrase never went to a member: no ALab Mac answered on this network (one asleep, on
     /// another network, or macOS's Local Network question still unanswered), none could be
     /// looked for, none that answered shows a phrase for this Mac (the one that showed it is
@@ -1198,7 +1292,7 @@ pub fn join_with_phrase(phrase: &SecretBytes) -> PhraseTry {
         Err(why) => return PhraseTry::NotReached(why),
     };
     let reach = Reach {
-        browse: &|| aterm_secrets::discover::browse_members(BROWSE_WITHIN),
+        browse: &|| crate::lan_members::members(BROWSE_WITHIN),
         dial: &dial,
         prove: &|me, ats, until| proved_back(me, ats, Some(until)),
         join_vault: &join_alab_vault,
@@ -1209,8 +1303,14 @@ pub fn join_with_phrase(phrase: &SecretBytes) -> PhraseTry {
 
 /// [`join_with_phrase`] as `me`, through `reach`: `join` with the phrase given, its lines on
 /// stdout when it went (a Mac already in, or let in already, says so), else its lines on stderr.
-/// A phrase that is not three of the list's words is refused before any member is looked for.
+/// A phrase that is not three of the list's words is refused before any member is looked for,
+/// and a Mac a rotation dropped reads [`PhraseTry::Dropped`] before its phrase is read.
 fn phrase_join_as(me: &Me, phrase: &SecretBytes, reach: &Reach<'_>) -> PhraseTry {
+    // Before the phrase is read: no words let a dropped Mac in, so none read as a spent phrase.
+    let membership = client::status(&me.paths).map(|status| status.membership);
+    if let Some(words) = dropped_here(me, &membership, &[]) {
+        return PhraseTry::Dropped(words);
+    }
     let Some(text) = phrase.as_str() else {
         return PhraseTry::Refused("the phrase is not text".to_owned());
     };
@@ -1233,11 +1333,12 @@ fn phrase_join_as(me: &Me, phrase: &SecretBytes, reach: &Reach<'_>) -> PhraseTry
         Tried::Ended(0) => PhraseTry::Joined(lines(&out)),
         Tried::Ended(_) => PhraseTry::Refused(lines(&err).join("; ")),
         Tried::NoMember | Tried::Unsent => PhraseTry::NotReached(lines(&err).join("; ")),
+        Tried::Dropped => PhraseTry::Dropped(lines(&err).join("; ")),
     }
 }
 
 /// `status`: a member; allowed, with `~/.secrets` written, until the vault records it; asking;
-/// or not in ALab.
+/// dropped (it says how it comes back); or not in ALab.
 fn status() -> ExitCode {
     let Ok(paths) = Paths::live() else {
         eprintln!("aterm members: no home directory");
@@ -1278,7 +1379,14 @@ pub enum Standing {
     },
     /// Asking to be let in from this place ([`join::let_in`] says what lets it in there).
     Asking(join::JoinPlace),
-    /// Neither a member nor asking.
+    /// Its vault let it go with no act against it that it can read: a rotation left it out, and
+    /// every member that read that rotation refuses its key, its proof and a person's Allow
+    /// alike, so it comes back only as a new Mac, its vault folder set aside (one-mesh E2). The
+    /// words are [`client::dropped_words`]'s, as `aterm secrets status` says them.
+    Dropped(String),
+    /// Neither a member nor asking, and not dropped: never in, taken out by an act it can read,
+    /// or let go where its log does not say a rotation left it out on purpose (no trusted log, a
+    /// heal or sync it waits on, or a key no newest epoch knew).
     NotIn,
     /// The vault's local state could not be read: why.
     Unknown(String),
@@ -1308,6 +1416,9 @@ impl Standing {
                 }
             }
             Ok(client::Membership::Pending) => Self::Asking(place()),
+            Ok(client::Membership::Revoked { seq }) => {
+                client::dropped_words(paths, seq).map_or(Self::NotIn, Self::Dropped)
+            }
             Ok(_) => Self::NotIn,
             Err(error) => Self::Unknown(error.to_string()),
         }
@@ -1331,6 +1442,7 @@ impl Standing {
             Self::Seatless => client::Seat::SEATLESS.to_owned(),
             Self::Allowed { fix, .. } => allowed_line(fix.as_deref()),
             Self::Asking(place) => format!("asking: {}", join::let_in(*place)),
+            Self::Dropped(words) => words.clone(),
             Self::NotIn => "not in ALab: run `aterm members join` here".to_owned(),
             Self::Unknown(error) => format!("unknown: {error}"),
         }
@@ -1377,6 +1489,7 @@ mod tests {
             name: name.to_owned(),
             model: "Mac15,3".to_owned(),
             place: join::JoinPlace::Home,
+            members: discover::MEMBER_SERVICE.to_owned(),
         }
     }
 
@@ -1539,6 +1652,184 @@ mod tests {
         assert!(!absent.contains("finishes by itself"), "{absent}");
         let runs = status_said(&j.paths, &|_| Follows::Runs, &|| join::JoinPlace::Home);
         assert!(runs.contains("finishes by itself"), "{runs}");
+    }
+
+    /// Write `membership` into the vault state of the Mac at `paths`, as its sync stores it.
+    fn store_membership(paths: &Paths, membership: &str) {
+        let at = paths.dir.join("state.toml");
+        let mut state: aterm_toml::Table =
+            aterm_toml::from_str(&std::fs::read_to_string(&at).expect("state")).expect("toml");
+        state.insert(
+            "membership".into(),
+            aterm_toml::Value::String(membership.into()),
+        );
+        aterm_secrets::fsx::write_atomic(
+            &at,
+            aterm_toml::to_string(&state).expect("toml").as_bytes(),
+            0o600,
+        )
+        .expect("state written");
+    }
+
+    /// A Mac a rotation dropped with no `Remove` (one-mesh E2) is told so, in `aterm secrets
+    /// status`'s words, with the way back (a new Mac), and not to run `aterm members join` here,
+    /// which every member that read the rotation refuses for its key.
+    /// `client::test_read_dropped` stands in for the judgment, which aterm-secrets'
+    /// `a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped` holds to a real
+    /// rotation.
+    ///
+    /// CONTROL: the same Mac, revoked and not dropped, reads `NotIn` and its old line.
+    #[test]
+    fn a_dropped_mac_says_how_it_comes_back_where_a_revoked_one_reads_not_in() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let m1 = member(root.path(), "m1");
+        let j = me(root.path(), "j");
+        let _ = let_in(&m1, &j, &|_| Follows::Runs);
+        store_membership(&j.paths, "revoked");
+        let Ok(client::Membership::Revoked { seq }) =
+            client::status(&j.paths).map(|status| status.membership)
+        else {
+            panic!("j reads itself out");
+        };
+        let read = || Standing::read(&j.paths, &|_| Follows::Runs, &|| join::JoinPlace::Home);
+        assert!(!client::dropped(&j.paths), "no rotation dropped j");
+        assert_eq!(read(), Standing::NotIn, "the control");
+        assert!(read().line().contains("aterm members join"));
+
+        let (standing, words) =
+            client::test_read_dropped(|| (read(), client::out_words(&j.paths, seq)));
+        assert_eq!(standing, Standing::Dropped(words.clone()));
+        let line = standing.line();
+        assert_eq!(line, words, "the words `aterm secrets status` says");
+        assert!(line.starts_with("dropped"), "{line}");
+        assert!(!line.contains("aterm members join"), "{line}");
+    }
+
+    /// A Mac a rotation dropped (one-mesh E2, f299) asks no member of that vault with its key:
+    /// where its browse finds the members of the vault that dropped it (here a lab's members
+    /// service, the lab's vault being this world's), `aterm members join` and the window's phrase
+    /// join say `aterm secrets status`'s words before a member is looked for, dialed or proved to,
+    /// or ALab's vault joined, a phrase that is not one included, and the Mac stays revoked.
+    /// `client::test_read_dropped` stands in for the judgment, which aterm-secrets'
+    /// `a_dropped_macs_join_sends_no_key_and_keeps_its_way_back` holds to a real rotation.
+    ///
+    /// CONTROLS, still dropped: a browse of ALab's service finds ALab's members, which never
+    /// refused this key (a phrase moves the Mac to ALab afresh), and members a person names with
+    /// `--at` serve a vault nothing here knows, so both joins look for a member as before. Not
+    /// dropped, a phrase that is not one reads `Refused`.
+    /// NEGATIVE CONTROL: without `join_tried`'s dropped check the lab join looks for a member
+    /// (the count), and without `phrase_join_as`'s a phrase that is not one reads `Refused`
+    /// ("Press Allow again" on the page).
+    #[test]
+    fn a_dropped_mac_asks_no_member_of_its_vault_and_no_phrase_reads_spent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let m1 = member(root.path(), "m1");
+        let mut j = me(root.path(), "j");
+        let _ = let_in(&m1, &j, &|_| Follows::Runs);
+        store_membership(&j.paths, "revoked");
+        let Ok(client::Membership::Revoked { seq }) =
+            client::status(&j.paths).map(|status| status.membership)
+        else {
+            panic!("j reads itself out");
+        };
+        let config = client::config(&j.paths).expect("config").expect("a vault");
+        assert!(
+            !client::alab_vault(&config),
+            "this world's vault is a lab's"
+        );
+        let lab = "_alab-lab-e2._tcp";
+        assert!(aterm_secrets::discover::lab_service(lab));
+        assert!(browse_serves(lab, &config));
+        assert!(!browse_serves(discover::MEMBER_SERVICE, &config));
+        j.members = lab.to_owned();
+
+        let reached = AtomicUsize::new(0);
+        let dial = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+            reached.fetch_add(1, Ordering::SeqCst);
+            Err(aterm_secrets::Error::new("no member here"))
+        };
+        let reach = Reach {
+            browse: &|| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            dial: &dial,
+            prove: &|_, _, _| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                Proved::No
+            },
+            join_vault: &|paths| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                no_vault(paths)
+            },
+            follow: &|_| Follows::Runs,
+        };
+        let phrase = SecretBytes::from(Phrase::generate().expect("a phrase").words().join(" "));
+        let not_one = SecretBytes::from("not a phrase".to_owned());
+        let joined = |me: &Me, args: &JoinArgs| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let tried = join_tried(me, args, &reach, &mut out, &mut err);
+            (tried, String::from_utf8_lossy(&err).into_owned())
+        };
+        let named = JoinArgs {
+            at: vec!["127.0.0.1:1".to_owned()],
+            ..JoinArgs::default()
+        };
+        let alab = Me {
+            members: discover::MEMBER_SERVICE.to_owned(),
+            ..me(root.path(), "j")
+        };
+
+        let (words, tried, tried_as, phrased, unread, at_alab, at_named) =
+            client::test_read_dropped(|| {
+                let words = client::out_words(&j.paths, seq);
+                let tried = joined(&j, &JoinArgs::default());
+                let tried_as = join_as(
+                    &j,
+                    &JoinArgs::default(),
+                    &reach,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                let phrased = phrase_join_as(&j, &phrase, &reach);
+                let unread = phrase_join_as(&j, &not_one, &reach);
+                let before = reached.load(Ordering::SeqCst);
+                let at_alab = (
+                    joined(&alab, &JoinArgs::default()).0,
+                    reached.load(Ordering::SeqCst) > before,
+                );
+                let before = reached.load(Ordering::SeqCst);
+                let at_named = (
+                    joined(&j, &named).0,
+                    reached.load(Ordering::SeqCst) > before,
+                );
+                (words, tried, tried_as, phrased, unread, at_alab, at_named)
+            });
+        assert!(words.starts_with("dropped"), "{words}");
+        assert_eq!(
+            tried,
+            (Tried::Dropped, format!("aterm members join: {words}\n"))
+        );
+        assert_eq!(tried_as, 1);
+        assert_eq!(phrased, PhraseTry::Dropped(words.clone()));
+        assert_eq!(unread, PhraseTry::Dropped(words));
+        assert!(
+            at_alab.0 != Tried::Dropped && at_alab.1,
+            "ALab's members never refused this key: {at_alab:?}"
+        );
+        assert!(
+            at_named.0 != Tried::Dropped && at_named.1,
+            "members named with --at are asked: {at_named:?}"
+        );
+        assert!(matches!(
+            client::status(&j.paths).map(|status| status.membership),
+            Ok(client::Membership::Revoked { .. })
+        ));
+
+        // CONTROL: not dropped, the same Mac reads a phrase that is not one as refused.
+        let refused = phrase_join_as(&j, &not_one, &reach);
+        assert!(matches!(refused, PhraseTry::Refused(_)), "{refused:?}");
     }
 
     /// System State's phrase field joins as `aterm members join <phrase>` does, with no
@@ -2579,5 +2870,61 @@ mod tests {
             Ok(3)
         );
         assert_eq!(asked.get(), 1, "a plain ask after a proof nobody took");
+    }
+
+    #[test]
+    fn direct_admission_skips_bonjour_only_after_proof_and_continues_unproved_hints() {
+        for outcome in [Proved::In, Proved::SignedMaybe] {
+            let mut outcome = Some(outcome);
+            assert_eq!(
+                ask_discovered(
+                    vec!["192.0.2.1:7100".into()],
+                    |_| outcome.take().unwrap(),
+                    || panic!("a direct proof needs no browse"),
+                    |_| panic!("an admission that may have signed sends no ask")
+                ),
+                Ok(1)
+            );
+        }
+        let attempts = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            ask_discovered(
+                vec!["192.0.2.1:7100".into()],
+                |ats| {
+                    attempts.borrow_mut().push(ats.to_vec());
+                    if ats == ["member.local:7100"] {
+                        Proved::In
+                    } else {
+                        Proved::No
+                    }
+                },
+                || Ok(vec!["192.0.2.1:7100".into(), "member.local:7100".into()]),
+                |_| panic!("the continued discovery proved a member")
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            *attempts.borrow(),
+            [
+                vec!["192.0.2.1:7100".to_owned()],
+                vec!["member.local:7100".to_owned()]
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_direct_proofs_keep_all_reachable_members_for_the_plain_request() {
+        assert_eq!(
+            ask_discovered(
+                vec!["192.0.2.1:7100".into()],
+                |_| Proved::No,
+                || Ok(vec!["member.local:7100".into()]),
+                |ats| {
+                    assert_eq!(ats, ["192.0.2.1:7100", "member.local:7100"]);
+                    Ok(2)
+                }
+            ),
+            Ok(2)
+        );
     }
 }

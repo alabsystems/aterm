@@ -3961,7 +3961,7 @@ fn below_the_floor_a_live_worktree_gives_up_what_no_build_wrote_for_an_hour() {
     assert!(
         went.iter().any(|(_, why)| matches!(
             why,
-            Unused::Stale { incremental: 1, units: 0, after }
+            Unused::Stale { incremental: 1, units: 0, superseded: 0, after }
                 if *after == RECLAIM_STALE_UNDER_PRESSURE
         )),
         "{went:?}"
@@ -4449,6 +4449,7 @@ fn a_live_build_directory_loses_only_what_no_build_reads_again() {
     let why = Unused::Stale {
         incremental: 1,
         units: 1,
+        superseded: 0,
         after: RECLAIM_STALE,
     };
     let dry = |held: bool| {
@@ -4530,4 +4531,114 @@ fn a_live_build_directory_loses_only_what_no_build_reads_again() {
     assert!(doomed.iter().all(|p| !p.exists()) && !stage.exists());
     kept();
     assert!(plan(&root, home, SystemTime::now(), ReclaimAfter::CALM, None).is_empty());
+}
+
+/// THE DAILY BOUND TAKES WHAT THE LAST PASSING RELEASE RUN SUPERSEDED, under every custody
+/// recheck ([`stale::USED`]): a release clone's build directory holds the test unit of the
+/// candidate before (unwritten five days, which that run, begun four days ago, did not use), the
+/// test unit it used (unwritten as long: cargo found it fresh) and a test unit built an hour ago,
+/// all of a package the run built tests of. While a build
+/// holds the profile's cargo lock the pass takes nothing; once it is let go, the pass takes the
+/// superseded unit's folder whole, saying so, and keeps the other two; the listing (`aterm pkg
+/// machine cache`) named it first. NEGATIVE CONTROL: the same directory with no record of the
+/// run loses nothing.
+#[cfg(unix)]
+#[test]
+fn the_daily_bound_takes_what_the_last_passing_release_run_superseded() {
+    let f = Fixture::new("build-cache-superseded");
+    let root = cache_root(&f.home);
+    let clone = f.dir("home/aterm-cut");
+    std::fs::write(clone.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = build_dir(&root, &clone);
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(&profile).unwrap();
+    let lock = profile.join(".cargo-build-lock");
+    std::fs::write(&lock, b"").unwrap();
+    let unit = |hash: &str, ago: Duration| {
+        let dir = profile.join("build/aterm-grid").join(hash);
+        std::fs::create_dir_all(dir.join("fingerprint")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("fingerprint/test-lib-aterm_grid"), b"h").unwrap();
+        std::fs::write(
+            dir.join("fingerprint/test-lib-aterm_grid.json"),
+            b"{\"rustc\":2,\"features\":\"[]\"}",
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("out/aterm_grid-{hash}")), b"exe").unwrap();
+        age_tree(&dir, ago);
+        dir
+    };
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let superseded = unit("1111111111111111", 5 * DAY);
+    let used = unit("2222222222222222", 5 * DAY);
+    let fresh = unit("3333333333333333", Duration::from_secs(60 * 60));
+    let began = SystemTime::now() - 4 * DAY - Duration::from_secs(60 * 60);
+    let mut record = stale::Used {
+        began_ms: u64::try_from(
+            began
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap(),
+        members: std::collections::BTreeSet::from(["aterm-grid".to_owned()]),
+        ..stale::Used::default()
+    };
+    record.add(&leaf, &used.join("out/aterm_grid-2222222222222222"));
+    record.keep(&leaf).unwrap();
+    age_by(&leaf.join(stale::USED), 4 * DAY);
+    let pass = || {
+        reclaim_watched(
+            &root,
+            Some(f.home.as_path()),
+            SystemTime::now(),
+            ReclaimAfter::CALM,
+            None,
+            &mut |_, _| true,
+        )
+    };
+    let took = |went: &[(PathBuf, Unused)]| {
+        went.iter().any(|(_, why)| {
+            matches!(
+                why,
+                Unused::Stale {
+                    superseded: 1,
+                    units: 0,
+                    ..
+                }
+            )
+        })
+    };
+
+    let listed = plan(
+        &root,
+        Some(&f.home),
+        SystemTime::now(),
+        ReclaimAfter::CALM,
+        None,
+    );
+    let row = listed.iter().find(|p| p.path == leaf).expect("listed");
+    assert!(
+        matches!(row.why, Unused::Stale { superseded: 1, .. }),
+        "{:?}",
+        row.why
+    );
+    assert_eq!(row.paths, vec![superseded.clone()]);
+
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).unwrap()).unwrap();
+    let went = pass();
+    assert!(!took(&went), "{went:?}");
+    assert!(superseded.is_dir());
+    drop(held);
+
+    let went = pass();
+    assert!(took(&went), "{went:?}");
+    assert!(!superseded.exists());
+    assert!(used.is_dir() && fresh.is_dir());
+
+    std::fs::remove_file(leaf.join(stale::USED)).unwrap();
+    let again = unit("1111111111111111", 5 * DAY);
+    let went = pass();
+    assert!(!took(&went), "{went:?}");
+    assert!(again.is_dir() && used.is_dir() && fresh.is_dir());
 }

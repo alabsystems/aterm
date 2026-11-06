@@ -211,7 +211,8 @@ fn recover_locked(
     let expected = client::config(paths)
         .map_err(|e| e.to_string())?
         .ok_or("native intake authority is unavailable")?;
-    if plan["context"].as_str() != Some(context(&expected).as_str()) {
+    let expected_context = context(&expected);
+    if plan["context"].as_str() != Some(expected_context.as_str()) {
         return Err("native intake configured authority changed".into());
     }
     allowed()?;
@@ -243,7 +244,7 @@ fn recover_locked(
                 None
             };
         let admin = current_admin.or(opened.as_ref()).unwrap();
-        if context(&admin.config) != context(&expected) {
+        if context(&admin.config) != expected_context {
             return Err("native intake authority changed before publication".into());
         }
         let previous = admin
@@ -411,6 +412,23 @@ pub(super) fn set_after_pending(
     )
 }
 
+/// A raw key piped in for `native-key set`: at most [`MAX`] bytes, one trailing LF or CR LF
+/// dropped. A longer input is refused whole, never cut to the part that fits.
+pub(super) fn read_piped_key(reader: impl Read) -> Result<Secret, String> {
+    // Room for the key, its CR LF, and one byte past them that shows the input runs longer.
+    let room = MAX + 3;
+    let mut bytes = Vec::with_capacity(room);
+    let read = reader.take(room as u64).read_to_end(&mut bytes);
+    let bytes = Secret::from_vec(bytes);
+    read.map_err(|_| "native key input could not be read")?;
+    let raw = bytes.expose().strip_suffix(b"\n").unwrap_or(bytes.expose());
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    if raw.len() > MAX {
+        return Err("native key exceeds its size bound".into());
+    }
+    Ok(Secret::new(raw))
+}
+
 pub(super) fn command(paths: &Paths, args: &[OsString]) -> Result<Value, String> {
     if args.first().is_some_and(|a| a == "attach") && args.len() == 1 {
         return recover(paths,None).map(|done|json!({"kind":"native-key-intake","state":if done{"attached"}else{"pending-or-absent"},"authority":"no-new-grant"}));
@@ -419,17 +437,6 @@ pub(super) fn command(paths: &Paths, args: &[OsString]) -> Result<Value, String>
         return Err("usage: accounts native-key set --key <proposal> (raw key on stdin), or native-key attach".into());
     }
     let key = args[2].to_str().ok_or("native proposal key is not UTF-8")?;
-    let mut bytes = Vec::with_capacity(MAX + 2);
-    let read = std::io::stdin()
-        .lock()
-        .take((MAX + 2) as u64)
-        .read_to_end(&mut bytes);
-    let bytes = Secret::from_vec(bytes);
-    read.map_err(|_| "native key input could not be read")?;
-    let raw = bytes.expose().strip_suffix(b"\n").unwrap_or(bytes.expose());
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-    if raw.len() > MAX {
-        return Err("native key exceeds its size bound".into());
-    }
-    set(paths, key, raw)
+    let raw = read_piped_key(std::io::stdin().lock())?;
+    set(paths, key, raw.expose())
 }

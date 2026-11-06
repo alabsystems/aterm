@@ -83,10 +83,12 @@ pub(super) fn resolve(
     hash.update(record.to_le_bytes());
     hash.update(column.to_le_bytes());
     let key = aterm_codec::hex::encode_lower(&hash.finalize());
-    let origin = json!({"selector":selector,"table":aterm_codec::hex::encode_lower(&table),"operation":aterm_codec::hex::encode_lower(&candidate.operation)});
+    let table_hex = aterm_codec::hex::encode_lower(&table);
+    let op_hex = aterm_codec::hex::encode_lower(&candidate.operation);
+    let origin = json!({"selector":selector,"table":table_hex,"operation":op_hex});
     let value = json!({"provider":provider.name(),"method":"api-key","email":row["email"],"source":{
-        "import":{"kind":"source-ref","value":format!("{}:{selector}",aterm_codec::hex::encode_lower(&table))},
-        "import-operation":{"kind":"source-ref","value":aterm_codec::hex::encode_lower(&candidate.operation)}
+        "import":{"kind":"source-ref","value":format!("{table_hex}:{selector}")},
+        "import-operation":{"kind":"source-ref","value":op_hex}
     }});
     aterm_db::accounts::validate(&value).map_err(|e| e.to_string())?;
     Ok(Some(Imported { key, value, origin }))

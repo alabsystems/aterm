@@ -3314,10 +3314,11 @@ fn takes_over(
 }
 
 /// Hold a newer version an admin published at the vault's store file itself (an admin whose
-/// vault is that path), checked at each read of the vault, each slice of a held long-poll and
-/// each PUT. Without it the server serves what it read at launch, and the next publish built
-/// on that overwrites the path's version, a revoke included. A version there is held only as a
-/// PUT of it would be ([`takes_over`]); any other file changes nothing.
+/// vault is that path), checked at each read of the vault or of its join queue, each slice of a
+/// held long-poll, each PUT and each join request. Without it the server serves what it read at
+/// launch and judges join requests by that version's seq, and the next publish built on that
+/// overwrites the path's version, a revoke included. A version there is held only as a PUT of it
+/// would be ([`takes_over`]); any other file changes nothing.
 fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
     let Some(slot) = state.vaults.get_mut(name) else {
         return;
@@ -4398,6 +4399,10 @@ fn decide_join(
     now: u64,
 ) -> Result<Decided, Reply> {
     let mut state = shared.lock_server_state();
+    // A version an admin published at the store file counts as a PUT of it does
+    // ([`take_from_store`]): a request is asked at its seq, and one asked at an older seq gives
+    // way.
+    take_from_store(shared, &mut state, name);
     let Some(seq) = state.vaults.get(name).map(|slot| slot.held.seq) else {
         return Err(Reply::text(404, format!("no vault named {name} here")));
     };
@@ -4512,15 +4517,17 @@ fn make_room(
 
 /// `GET /v1/<name>/join[?after=<n>]`: the queued requests, one line each, with the queue's
 /// [`Slot::joins`] as the `ETag`. With `after=<n>` while the queue is still at `n`, held until
-/// a request is queued or changed or the vault takes a new version (`200`, the lines), or the
-/// hold runs out (`204`): an admin Mac's approver hears a new request at once, with one
-/// request per hold while none comes.
+/// a request is queued or changed or the vault takes a new version, a PUT's or one an admin
+/// published at the store file ([`take_from_store`]) (`200`, the lines), or the hold runs out
+/// (`204`): an admin Mac's approver hears a new request at once, with one request per hold
+/// while none comes.
 fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str>) -> Reply {
     let after = match after_query(query) {
         Ok(after) => after,
         Err(reply) => return reply,
     };
     let mut state = shared.lock_server_state();
+    take_from_store(shared, &mut state, name);
     let now = (shared.tuning.now)();
     let State { vaults, joins, .. } = &mut *state;
     let Some(slot) = vaults.get_mut(name) else {
@@ -4539,6 +4546,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
     if let Some(after) = after.filter(|after| *after == slot.joins) {
         let (wake, seq) = (Arc::clone(&slot.wake), slot.held.seq);
         state = park_until_news(shared, stream, state, &wake, |state| {
+            take_from_store(shared, state, name);
             state
                 .vaults
                 .get(name)
@@ -8296,6 +8304,88 @@ mod tests {
             .map(|line| parse_join_line(line).expect("parses").host)
             .collect();
         assert_eq!(hosts, ["m3", "m4", "m5", "m6"]);
+        running.stop();
+    }
+
+    /// A version an admin publishes at the store file makes room in the join queue as a PUT of
+    /// it does: a request is judged at its seq, so one asked at the older seq gives way. Control:
+    /// before the store file moves, a fifth request from one address finds no room.
+    #[test]
+    fn a_join_is_judged_at_the_seq_published_at_the_store_file() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let ask = |n: u8| transport::post_join(&url(&running), &join_line(n, &format!("m{n}")));
+        for n in 1..=4 {
+            ask(n).expect("queued");
+        }
+        assert!(ask(5).expect_err("a fifth").0.contains("429"));
+
+        let at_path = Source::Path(root.path().join("alab.vault"));
+        transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
+        ask(5).expect("m1, asked at seq 1, gave way");
+        let hosts: Vec<String> = transport::list_joins(&url(&running))
+            .expect("listed")
+            .iter()
+            .map(|line| parse_join_line(line).expect("parses").host)
+            .collect();
+        assert_eq!(hosts, ["m2", "m3", "m4", "m5"]);
+        running.stop();
+    }
+
+    /// A version an admin publishes at the store file ends a listing held on the join queue, as
+    /// a PUT's does, naming the queue's version unchanged.
+    #[test]
+    fn a_version_published_at_the_store_file_ends_a_held_join_listing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let tuning = Tuning {
+            liveness_every: Duration::from_millis(10),
+            ..Tuning::default()
+        };
+        let running = run_tuned(&options(root.path(), HANG_DETECTOR), tuning);
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let listed = transport::wait_joins(&url(&running), None, HANG_DETECTOR).expect("listed");
+        let transport::Joins::Listed(lines, Some(version)) = listed else {
+            panic!("the queue names its version: {listed:?}");
+        };
+        let at = url(&running);
+        let waiter =
+            std::thread::spawn(move || transport::wait_joins(&at, Some(version), HANG_DETECTOR));
+        until_waiting(&running, 1);
+        let at_path = Source::Path(root.path().join("alab.vault"));
+        transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
+        assert_eq!(
+            waiter.join().expect("waiter").expect("woken"),
+            transport::Joins::Listed(lines, Some(version)),
+            "the store file's new version ends the held listing"
+        );
+        running.stop();
+    }
+
+    /// A listing asked after the store file moved, with nothing new since, is held to its end:
+    /// the version it would have woken on came before it. Control: the same after a PUT.
+    #[test]
+    fn a_join_listing_asked_after_the_store_file_moved_is_held_as_after_a_put() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let Ok(transport::Joins::Listed(_, Some(version))) =
+            transport::wait_joins(&url(&running), None, HANG_DETECTOR)
+        else {
+            panic!("listed with its version");
+        };
+        let at_path = Source::Path(root.path().join("alab.vault"));
+        transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
+        assert_eq!(
+            transport::wait_joins(&url(&running), Some(version), HANG_DETECTOR).expect("held"),
+            transport::Joins::Unchanged
+        );
+        put(&running, &envelope(&OLD, 3)).expect("a PUT");
+        assert_eq!(
+            transport::wait_joins(&url(&running), Some(version), HANG_DETECTOR).expect("held"),
+            transport::Joins::Unchanged,
+            "the control: the same after a PUT"
+        );
         running.stop();
     }
 

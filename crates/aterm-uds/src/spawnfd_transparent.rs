@@ -235,7 +235,11 @@ impl TransparentCommand {
                 ..Placement::default()
             },
         )?;
-        Ok(LaneChild { pid, status: None })
+        Ok(LaneChild {
+            pid,
+            status: None,
+            custody: super::WaitCustody::default(),
+        })
     }
 
     /// Run the child to its end ([`Self::spawn`], then wait).

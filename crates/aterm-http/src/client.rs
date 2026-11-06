@@ -684,15 +684,14 @@ fn connect_tunnel(
     basic_auth: Option<&str>,
 ) -> Result<(), Error> {
     let authority = target.authority();
-    let mut request = format!(
+    let fields = format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
     );
-    if let Some(credential) = basic_auth {
-        request.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
-    }
-    request.push_str("\r\n");
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
+    let mut request = credentialed_head(&fields, basic_auth, &[]);
+    let wrote = stream.write_all(&request).and_then(|()| stream.flush());
+    scrub(&mut request);
+    drop(request);
+    wrote?;
     let head = read_head(stream)?;
     if !(200..300).contains(&head.code) {
         return Err(Error::Protocol(format!(
@@ -703,7 +702,7 @@ fn connect_tunnel(
     Ok(())
 }
 
-/// Render the request head.
+/// Render the request head: [`render_head`] with no secret header.
 #[cfg(test)]
 fn render_request(
     method: Method,
@@ -712,9 +711,15 @@ fn render_request(
     headers: &[(String, String)],
     content_length: Option<u64>,
 ) -> String {
-    let mut head = render_fields(method, target, via, headers, content_length);
-    head.push_str("\r\n");
-    head
+    String::from_utf8(render_head(
+        method,
+        target,
+        via,
+        headers,
+        &[],
+        content_length,
+    ))
+    .expect("a head of text fields and a text credential is UTF-8")
 }
 
 fn render_head(
@@ -726,7 +731,30 @@ fn render_head(
     content_length: Option<u64>,
 ) -> Vec<u8> {
     let fields = render_fields(method, target, via, headers, content_length);
+    let credential = absolute_via(target, via).and_then(ProxyTarget::basic_auth);
+    credentialed_head(&fields, credential, secrets)
+}
+
+/// The proxy a plain-http request names in absolute form: an https request tunnels instead, and
+/// its credential rides only the CONNECT.
+fn absolute_via<'a>(target: &Uri, via: Option<&'a ProxyTarget>) -> Option<&'a ProxyTarget> {
+    via.filter(|_| target.scheme() == Scheme::Http)
+}
+
+/// `fields`, then the proxy credential and each secret header, then the empty line that ends the
+/// head, in one buffer allocated at its final size, so no reallocation leaves a copy of a secret
+/// byte behind; the caller scrubs it once it is written. `fields` holds no secret byte, so this
+/// buffer is the one copy of each that rendering makes.
+fn credentialed_head(
+    fields: &str,
+    credential: Option<&str>,
+    secrets: &[(String, Secret)],
+) -> Vec<u8> {
+    const PROXY_AUTHORIZATION: &[u8] = b"Proxy-Authorization: Basic ";
     let size = fields.len()
+        + credential.map_or(0, |credential| {
+            PROXY_AUTHORIZATION.len() + credential.len() + 2
+        })
         + secrets
             .iter()
             .map(|(name, value)| name.len() + 2 + value.len() + 2)
@@ -734,6 +762,11 @@ fn render_head(
         + 2;
     let mut head = Vec::with_capacity(size);
     head.extend_from_slice(fields.as_bytes());
+    if let Some(credential) = credential {
+        head.extend_from_slice(PROXY_AUTHORIZATION);
+        head.extend_from_slice(credential.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
     for (name, value) in secrets {
         head.extend_from_slice(name.as_bytes());
         head.extend_from_slice(b": ");
@@ -758,8 +791,7 @@ fn render_fields(
     content_length: Option<u64>,
 ) -> String {
     let method = method.as_str();
-    let absolute_via = via.filter(|_| target.scheme() == Scheme::Http);
-    let request_target = if absolute_via.is_some() {
+    let request_target = if absolute_via(target, via).is_some() {
         format!(
             "{}://{}{}",
             target.scheme().as_str(),
@@ -771,9 +803,6 @@ fn render_fields(
     };
     let mut head = format!("{method} {request_target} HTTP/1.1\r\n");
     head.push_str(&format!("Host: {}\r\n", target.host_header()));
-    if let Some(credential) = absolute_via.and_then(ProxyTarget::basic_auth) {
-        head.push_str(&format!("Proxy-Authorization: Basic {credential}\r\n"));
-    }
     head.push_str("Connection: close\r\n");
     if let Some(length) = content_length {
         head.push_str(&format!("Content-Length: {length}\r\n"));
@@ -1330,10 +1359,9 @@ fn read_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<String, Er
         let mut byte = [0u8; 1];
         let n = read_head_byte(reader, &mut byte)?;
         if n == 0 {
-            if raw.is_empty() {
-                return Err(Error::Protocol("connection closed mid-header".to_owned()));
-            }
-            break;
+            // A line its '\n' never ended is no line: a head cut after its last "\r" would
+            // otherwise read that "\r" as the empty line that ends the header block.
+            return Err(Error::Protocol("connection closed mid-header".to_owned()));
         }
         *consumed += 1;
         if *consumed > MAX_HEADER_BYTES {
@@ -1758,6 +1786,46 @@ mod tests {
         );
     }
 
+    /// Every secret byte of a head (a proxy credential, a secret header) is written into the one
+    /// buffer the send path scrubs, and that buffer is allocated at its final size: a size short
+    /// by one byte would grow it and leave a copy of what it held in the freed allocation. std's
+    /// `Vec::with_capacity` of bytes allocates exactly what it is asked for, and a buffer that a
+    /// short line outgrows is at least doubled, so here `capacity == len` holds only for an exact
+    /// size. The CONNECT a tunnel writes is built the same way.
+    #[test]
+    fn a_head_carrying_a_secret_is_one_buffer_at_its_final_size() {
+        let via = proxy("http://alice:s3cret@proxy.test:3128");
+        let secrets = [("X-Api-Key".to_owned(), Secret::new(b"k3y"))];
+        let head = render_head(
+            Method::Post,
+            &uri("http://api.test/v1/x"),
+            Some(&via),
+            &headers(&[("Content-Type", "application/json")]),
+            &secrets,
+            Some(2),
+        );
+        assert_eq!(head.capacity(), head.len());
+        let text = String::from_utf8(head).unwrap();
+        assert_eq!(
+            text.matches("\r\nProxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.ends_with("\r\nX-Api-Key: k3y\r\n\r\n"), "{text}");
+        let tunnel = credentialed_head(
+            "CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n",
+            via.basic_auth(),
+            &[],
+        );
+        assert_eq!(tunnel.capacity(), tunnel.len());
+        assert_eq!(
+            tunnel,
+            b"CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n\
+Proxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n\r\n"
+        );
+    }
+
     #[test]
     fn https_keeps_origin_form_even_through_a_proxy() {
         let head = render_request(
@@ -2081,11 +2149,24 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         );
         for raw in [
             &b"HTTP/1.1 200 OK\r\n"[..],
+            b"HTTP/1.1 200 OK\r\n\r",
+            b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r",
             b"HTTP/1.1 100 Continue\r\n\r\n",
             b"\r\n",
         ] {
             assert!(
                 matches!(parse(raw, 1024), Err(Error::Protocol(_))),
+                "{raw:?}"
+            );
+        }
+        // Control: the same heads with their last '\n' are whole, and parse.
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\n",
+        ] {
+            assert_eq!(
+                parse(raw, 1024).map(|r| r.status()).ok(),
+                Some(200),
                 "{raw:?}"
             );
         }
@@ -2193,6 +2274,7 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                 &b"HTTP/1.1 200 OK\r\nX-A:"[..],
             ),
             (&b"HTTP/1.1 200 OK\r\n"[..], &b"HTTP/1.1 200 OK\r\n"[..]),
+            (&b"HTTP/1.1 200 OK\r\n\r"[..], &b"HTTP/1.1 200 OK\r\n\r"[..]),
         ] {
             let over_tls = read_final_head(&mut BufReader::new(UncleanClose(unclean)));
             let over_tcp = read_final_head(&mut BufReader::new(plain));

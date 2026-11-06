@@ -79,6 +79,145 @@ pub(super) fn candidate_file(state: &Path) -> PathBuf {
 }
 
 #[test]
+fn recovered_google_grants_keep_the_scope_even_without_cookies() {
+    for cookies in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (state, home, _) = setup(root.path());
+        let exe = std::env::current_exe().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let seeded = run_with(
+            &exe,
+            &state,
+            &home,
+            "one",
+            staging(&root.path().join("seed"), 19),
+            deadline,
+            |program, state, home, account, staging, deadline| {
+                let mut grant = fresh(program, state, home, account, staging, deadline)?;
+                if !cookies {
+                    grant.native.session = None;
+                }
+                Ok(grant)
+            },
+        )
+        .unwrap();
+        drop(seeded);
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let recovered = run_with_journal(
+            &exe,
+            &state,
+            &home,
+            "one",
+            staging(&root.path().join("recovered"), 19),
+            deadline,
+            |_, _, _| Ok(()),
+            |_, _, _, _, _, _| panic!("a retained candidate must not start a provider"),
+            ("pending-native-google", lifetime.enter()),
+        )
+        .unwrap();
+        assert_eq!(recovered.native.session.is_some(), cookies);
+        let pause = lifetime.pause().unwrap().try_wait().unwrap_err();
+        assert!(recovered.check_binding().is_err());
+        assert!(
+            crate::harness::browser_window::ProfileLock::claim(&root.path().join("recovered"))
+                .is_err()
+        );
+        drop(recovered);
+        let drained = pause.try_wait().unwrap();
+        let claim =
+            crate::harness::browser_window::ProfileLock::claim(&root.path().join("recovered"))
+                .unwrap();
+        assert!(drained.resume().is_ok());
+        drop(claim);
+    }
+}
+
+#[test]
+fn closing_work_during_cached_google_verification_preserves_the_checkpoint() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (state, home, _) = setup(root.path());
+    let exe = std::env::current_exe().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    drop(
+        run_with(
+            &exe,
+            &state,
+            &home,
+            "one",
+            staging(&root.path().join("seed"), 20),
+            deadline,
+            fresh,
+        )
+        .unwrap(),
+    );
+    let checkpoint = candidate_file(&state);
+    let before = std::fs::read(&checkpoint).unwrap();
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let work = lifetime.enter();
+    let pause = std::cell::RefCell::new(None);
+    let target = root.path().join("refused");
+    let result = run_with_journal(
+        &exe,
+        &state,
+        &home,
+        "one",
+        staging(&target, 20),
+        deadline,
+        |_, _, _| {
+            *pause.borrow_mut() = lifetime.pause();
+            Ok(())
+        },
+        |_, _, _, _, _, _| panic!("closed recovery must not start a provider"),
+        ("pending-native-google", work),
+    );
+    assert!(result.is_err());
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(checkpoint).unwrap(), before);
+    assert!(pause.into_inner().unwrap().try_wait().is_ok());
+}
+
+#[test]
+fn closing_after_native_completion_records_recovery_without_publishing_or_replay() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (state, home, _) = setup(root.path());
+    let exe = std::env::current_exe().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let work = lifetime.enter();
+    let pause = std::cell::RefCell::new(None);
+    let result = run_with_journal(
+        &exe,
+        &state,
+        &home,
+        "one",
+        staging(&root.path().join("completed"), 21),
+        deadline,
+        |_, _, _| panic!("fresh completion has no cached canonical-status request"),
+        |program, state, home, account, staging, deadline| {
+            let grant = fresh(program, state, home, account, staging, deadline)?;
+            *pause.borrow_mut() = lifetime.pause();
+            Ok(grant)
+        },
+        ("pending-native-google", work),
+    );
+    assert!(result.is_err());
+    assert!(candidate_file(&state).is_file());
+    assert!(pause.into_inner().unwrap().try_wait().is_ok());
+    let recovered = run_with(
+        &exe,
+        &state,
+        &home,
+        "one",
+        staging(&root.path().join("recovered"), 21),
+        deadline,
+        |_, _, _, _, _, _| panic!("recorded completion must not replay the provider"),
+    )
+    .unwrap();
+    assert!(recovered.check_binding().is_ok());
+    drop(recovered);
+}
+
+#[test]
 fn pending_crash_stand_in() {
     let Some(root) = std::env::var_os("ATERM_TEST_PENDING_CRASH_ROOT").map(PathBuf::from) else {
         return;

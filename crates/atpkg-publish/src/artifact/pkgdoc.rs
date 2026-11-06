@@ -7,7 +7,7 @@ use atpkg::manifest::Provenance;
 
 use crate::api::{Build, Lineage};
 use crate::error::{Error, Result};
-use crate::triple::{AARCH64_APPLE_DARWIN, Triple};
+use crate::triple::{AARCH64_APPLE_DARWIN, Os, Triple};
 
 /// Package manifest schema version produced by this writer.
 pub const SCHEMA: i64 = 1;
@@ -17,6 +17,8 @@ pub const SCHEMA: i64 = 1;
 pub enum Kind {
     /// Plain program `bin/` directory shimmed by `exposes`.
     Binary,
+    /// GNU binary whose actual ELF runtime requirements must be admitted by the client.
+    ElfBinary,
     /// Self-contained sysroot bundle relocated at pack time.
     SysrootBundle,
 }
@@ -27,6 +29,7 @@ impl Kind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Binary => "binary",
+            Self::ElfBinary => "elf-binary",
             Self::SysrootBundle => "sysroot-bundle",
         }
     }
@@ -274,6 +277,9 @@ fn render_row(row: &Row) -> Result<String> {
 }
 
 fn render_bottle_row(row: &BottleRow) -> Result<String> {
+    if row.kind == Kind::ElfBinary && row.triple.os() != Os::Linux {
+        return Err(Error::refused("elf-binary rows require a GNU/Linux target"));
+    }
     plain("the asset name", &row.asset)?;
     for (what, hex) in [("sha256", &row.sha256), ("tree_root", &row.tree_root)] {
         if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {

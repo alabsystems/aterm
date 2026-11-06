@@ -918,12 +918,12 @@ impl GpuRenderer {
             ]
         });
         let scissor = if let Some([x0, y0, x1, y1]) = bbox {
-            let d = ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
+            let d = aterm_render::bloom::reach_px(self.bloom_radius);
             Some([
                 x0.saturating_sub(d),
                 y0.saturating_sub(d),
-                (x1 + d).min(fw),
-                (y1 + d).min(fh),
+                x1.saturating_add(d).min(fw),
+                y1.saturating_add(d).min(fh),
             ])
         } else {
             clip.map(|_| [0, 0, fw, fh])

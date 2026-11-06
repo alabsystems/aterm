@@ -69,6 +69,7 @@ mod unix {
             changed: None,
             watch_every: Duration::from_secs(60),
             observe: None,
+            stores: None,
         }
     }
 

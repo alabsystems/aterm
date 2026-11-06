@@ -502,6 +502,9 @@ struct Mock {
     task: Option<(u64, String)>,
     task_requests: Vec<String>,
     task_reopens_at: Option<usize>,
+    /// From the first `task` read once the screen at this index was served, a `done` record reads
+    /// `failed why=expired`: another writer's end, marked over the harness's landing.
+    task_fails_at: Option<usize>,
     task_busy: usize,
     task_mark_replies: VecDeque<CtlReply>,
     task_lost: usize,
@@ -1306,6 +1309,7 @@ impl Mock {
             task: None,
             task_requests: Vec::new(),
             task_reopens_at: None,
+            task_fails_at: None,
             task_busy: 0,
             task_mark_replies: VecDeque::new(),
             task_lost: 0,
@@ -1328,6 +1332,20 @@ impl Mock {
             self.task = Some((
                 rev,
                 "state=working from=ctl since_ms=0 result_bytes=0 why=turn".to_string(),
+            ));
+        }
+        if let Some(at) = self.task_fails_at
+            && self.served >= at
+            && self
+                .task
+                .as_ref()
+                .is_some_and(|(_, f)| f.starts_with("state=done "))
+        {
+            self.task_fails_at = None;
+            let rev = self.task.as_ref().map_or(0, |(rev, _)| rev + 1);
+            self.task = Some((
+                rev,
+                "state=failed from=ctl since_ms=0 result_bytes=0 why=expired".to_string(),
             ));
         }
         let line = |task: &Option<(u64, String)>| match task {

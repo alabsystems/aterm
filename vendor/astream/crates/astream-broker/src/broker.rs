@@ -3945,6 +3945,36 @@ impl Broker {
         opts: OpenOptions,
         prepare: impl FnOnce() -> io::Result<Prepared>,
     ) -> io::Result<Broker> {
+        Self::open_opts_on(opts, |opts| BrokerLog::open_opts(log_path, opts, prepare))
+    }
+
+    /// [`open_opts`](Self::open_opts) on a SIMULATED DEVICE ([`SimDevice`](crate::SimDevice))
+    /// in place of a file, with nothing to prepare ([`BrokerLog::open_sim`]): the whole
+    /// broker — its writer, its flushes, its clean close — over a device a test can take
+    /// every power-loss image of once the broker is stopped. Retention's rewrite refuses
+    /// on it, and `opts.health_every` is refused here: the health sidecar is a file.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`open_opts`](Self::open_opts) and [`BrokerLog::open_sim`] refuse, and
+    /// `InvalidInput` for `opts.health_every`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn open_sim(device: &crate::SimDevice, opts: OpenOptions) -> io::Result<Broker> {
+        if opts.health_every.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a simulated log keeps no health sidecar",
+            ));
+        }
+        Self::open_opts_on(opts, |opts| BrokerLog::open_sim(device, opts))
+    }
+
+    /// [`open_opts`](Self::open_opts) with the log opened by `open`: what is refused before
+    /// the log is opened, the open, and what the broker sets up after it.
+    fn open_opts_on(
+        opts: OpenOptions,
+        open: impl FnOnce(OpenOptions) -> io::Result<BrokerLog>,
+    ) -> io::Result<Broker> {
         #[cfg(feature = "cap")]
         let guard = opts.guard.clone();
         #[cfg(not(feature = "cap"))]
@@ -3969,7 +3999,7 @@ impl Broker {
         let health_every = opts.health_every;
         let selective_tail_wake = opts.selective_tail_wake;
         let sticky_batch_refusal = opts.sticky_batch_refusal;
-        let log = BrokerLog::open_opts(log_path, opts, prepare)?;
+        let log = open(opts)?;
         let broker = Self::start(log, None, guard, sticky_batch_refusal);
         if selective_tail_wake {
             broker.set_selective_tail_wake(true);
@@ -13278,6 +13308,7 @@ mod tests {
         // `/t/last` takes the last slot; `/t/behind` is refused at the bound for it;
         // then the fsync fails and the batch rolls back.
         b.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -14760,6 +14791,7 @@ mod tests {
                 // Every full flush fails; Relaxed's batch issues none and Ordered's issues
                 // a barrier, so only the held head's flush meets the fault.
                 b.inject_faults(InjectedFaults {
+                    write: false,
                     sync: true,
                     truncate: false,
                 });
@@ -14977,6 +15009,7 @@ mod tests {
         let mut c = crate::Client::connect(&sock).unwrap();
         c.publish(1, 1, "/o/a", b"before").unwrap();
         b.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: true,
         });
@@ -15055,6 +15088,7 @@ mod tests {
         let mut c = crate::Client::connect(&sock).unwrap();
         c.publish(1, 1, "/o/a", b"page cache").unwrap();
         b.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -15128,6 +15162,7 @@ mod tests {
         c.publish(1, 1, "/o/a", b"before").unwrap();
         let rx = parked_waiter(&b);
         b.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: true,
         });
@@ -15182,6 +15217,7 @@ mod tests {
         assert_eq!(read(&log).unwrap().health.poisoned, None, "healthy");
 
         b.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: true,
         });

@@ -66,8 +66,7 @@ pub(super) fn client(
         ) {
             return Err(Error::new("pending device refused membership witness"));
         }
-        let records = aterm_secrets::membership_log::decode_records(&wire[4..]).map_err(failure)?;
-        let wires: Vec<Vec<u8>> = records.into_iter().map(|r| r.bytes().to_vec()).collect();
+        let wires: Vec<Vec<u8>> = witness_log.records().map(|r| r.bytes().to_vec()).collect();
         let acks = client::retain_records_for_commons(
             paths,
             endpoint.trust.network,

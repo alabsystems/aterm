@@ -272,6 +272,10 @@ impl Inert {
         self.applies.lock().unwrap().clone()
     }
 
+    pub(crate) fn clone_is(&self, owed: crate::init::OwedClone) {
+        *self.owed.lock().unwrap() = owed;
+    }
+
     /// The trigger of each time a runner lowered its scheduling.
     pub(crate) fn backgrounds(&self) -> Vec<Trigger> {
         self.backgrounds.lock().unwrap().clone()
@@ -788,15 +792,68 @@ fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     *ports.owed.lock().unwrap() = crate::init::OwedClone::Waiting("no token yet".into());
     let waiting = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&waiting.rows, CLONE).outcome, Outcome::Deferred);
+    assert!(!waiting.complete());
+    assert_eq!(read_record(scratch.path()).unwrap().converged_ms, None);
     *ports.owed.lock().unwrap() = crate::init::OwedClone::Due("the token landed".into());
     let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
     assert_eq!(row(&planned.rows, CLONE).outcome, Outcome::Planned);
     assert_eq!(clones(&ports), 0);
     let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&applied.rows, CLONE).outcome, Outcome::Changed);
+    assert!(applied.complete());
     let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&again.rows, CLONE).outcome, Outcome::Ok);
     assert_eq!(clones(&ports), 1, "once");
+}
+
+/// Missing Git and an older Git's missing capability both leave an admitted clone unfinished.
+/// Local readiness alone admits its next pass, without a changed vault or a renewed setup run.
+/// Explicit off and Stop controls settle without cloning or scheduling unfinished work.
+#[test]
+fn repository_readiness_waits_resume_and_explicit_holds_are_settled() {
+    use crate::init::OwedClone;
+    for waiting in [
+        OwedClone::Waiting("Git is still installing".into()),
+        OwedClone::Person("the installed Git lacks the required capability".into()),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        ports.clone_is(waiting);
+        let pending = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert!(!pending.complete(), "{pending:?}");
+        assert!(!ports.applies().contains(&"clone"));
+        assert_eq!(read_record(scratch.path()).unwrap().converged_ms, None);
+        ports.clone_is(OwedClone::Due("managed Git is now ready".into()));
+        let ready = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert!(ready.complete(), "{ready:?}");
+        assert!(ports.applies().contains(&"clone"));
+        let record = read_record(scratch.path()).unwrap();
+        assert_eq!(record.converged_ms, Some(record.attempted_ms));
+    }
+    for (swarm, hold, owed) in [
+        (true, None, OwedClone::Off("repositories are off".into())),
+        (
+            true,
+            None,
+            OwedClone::Held("repositories left as is".into()),
+        ),
+        (
+            true,
+            Some("a Stop holds setup"),
+            OwedClone::Waiting("Git is installing".into()),
+        ),
+        (false, None, OwedClone::Waiting("Git is installing".into())),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.swarm.lock().unwrap() = Ok(swarm);
+        *ports.held.lock().unwrap() = hold.map(str::to_owned);
+        ports.clone_is(owed);
+        let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert!(pass.complete(), "{pass:?}");
+        assert_eq!(row(&pass.rows, CLONE).outcome, Outcome::NotApplicable);
+        assert!(!ports.applies().contains(&"clone"));
+    }
 }
 
 /// Fleet registration, the node listener and account setup finish before cloning starts:
@@ -3183,14 +3240,7 @@ pub(crate) mod owed_clone {
         ));
         let waiting = row(&first.rows, CLONE);
         assert_eq!(waiting.outcome, Outcome::Deferred, "{waiting:?}");
-        assert!(
-            waiting
-                .why
-                .as_deref()
-                .is_some_and(|why| why.contains("Command Line Tools")
-                    && why.contains("`aterm init --only base.clt`")),
-            "{waiting:?}"
-        );
+        assert!(!first.complete());
         let asked = || {
             sys.calls()
                 .iter()

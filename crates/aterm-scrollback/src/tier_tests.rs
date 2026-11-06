@@ -250,7 +250,7 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
     forged.extend_from_slice(&huge_size.to_le_bytes());
     forged.extend_from_slice(&[0u8; 10]); // garbage compressed data
 
-    let block = WarmBlock {
+    let mut block = WarmBlock {
         compressed: forged,
         line_count: 1,
         decompress_failures: Cell::new(0),
@@ -264,11 +264,11 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
         "error should mention size limit: {err_msg}"
     );
     let cold_err = block
-        .to_cold_compressed()
-        .expect_err("to_cold_compressed should reject oversized LZ4 prefix");
+        .take_cold_compressed()
+        .expect_err("take_cold_compressed should reject oversized LZ4 prefix");
     assert!(
         cold_err.to_string().contains("exceeds"),
-        "to_cold_compressed should name the size limit: {cold_err}"
+        "take_cold_compressed should name the size limit: {cold_err}"
     );
 }
 

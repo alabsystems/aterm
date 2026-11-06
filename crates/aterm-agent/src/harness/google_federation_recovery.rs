@@ -46,7 +46,6 @@ impl aterm_http::Guard for RefreshGuard {
 }
 
 pub(in crate::harness) struct Journal {
-    scope: FederationScope,
     key: login_drive::RecoveryKey,
     storage: super::super::pending_native_store::Store,
     candidate: Option<Candidate>,
@@ -55,6 +54,7 @@ pub(in crate::harness) struct Journal {
     rejection_observed: bool,
     fallback_cookies: Option<(SecretBytes, Option<[u8; 32]>)>,
     _native_claim: std::sync::Arc<super::super::browser_window::ProfileLock>,
+    scope: FederationScope,
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -197,7 +197,7 @@ impl Journal {
         if self.rejection_observed {
             return self.checkpoint_rejected(request);
         }
-        self.check_context(request)?;
+        self.check_receipt_context(request)?;
         if let Ok((config, credential)) = kimi_pending_files(request.staging, self.scope.region)
             && self.files != Some((digest(config.as_slice()), digest(credential.as_slice())))
         {
@@ -206,7 +206,7 @@ impl Journal {
         Ok(())
     }
     fn checkpoint_rejected(&mut self, request: &login_drive::Request<'_>) -> Result<(), String> {
-        self.check_context(request)?;
+        self.check_receipt_context(request)?;
         // Once the provider rejected this attempt, even a failed storage write
         // must not turn a later generic error into a cached usable seed.
         self.rejection_observed = true;
@@ -253,7 +253,7 @@ impl Journal {
             })?;
         let scope = self.scope.clone();
         let result = self.renew_recorded(request, &scope, now, deadline);
-        self.check_context(request)
+        self.check_receipt_context(request)
             .map_err(ObservationError::Unavailable)?;
         if matches!(
             &result,
@@ -265,11 +265,20 @@ impl Journal {
             self.checkpoint_current(request, home)
                 .map_err(ObservationError::Unavailable)?;
         }
+        self.scope
+            .work_current()
+            .map_err(ObservationError::Unavailable)?;
         result.map_err(kimi_observation_error)
     }
-    pub(in crate::harness) fn open(
+    #[cfg(test)]
+    fn open(request: &login_drive::Request<'_>, home: &Path) -> Result<Option<Self>, String> {
+        Self::open_scoped(request, home, None)
+    }
+
+    pub(in crate::harness) fn open_scoped(
         request: &login_drive::Request<'_>,
         home: &Path,
+        work: Option<super::super::account_work::Scope>,
     ) -> Result<Option<Self>, String> {
         let Some(key) = request.recovery else {
             return Ok(None);
@@ -296,6 +305,7 @@ impl Journal {
                 .binding_revision(provider, &request.row.label)
                 .ok_or(UNAVAILABLE)?,
             region: request.row.vendor.region.ok_or(UNAVAILABLE)?,
+            work,
         };
         scope.check_request(request)?;
         let mut account = aterm_digest::Sha256::new();
@@ -353,6 +363,20 @@ impl Journal {
         self.storage.unchanged().map_err(str::to_owned)
     }
 
+    fn check_receipt_context(&self, request: &login_drive::Request<'_>) -> Result<(), String> {
+        self.scope.check_receipt_request(request)?;
+        self.storage.unchanged().map_err(str::to_owned)
+    }
+
+    pub(in crate::harness) fn retain_work(
+        &mut self,
+        work: Option<super::super::account_work::Scope>,
+    ) {
+        if self.scope.work.is_none() {
+            self.scope.work = work;
+        }
+    }
+
     pub(in crate::harness) fn check(
         &self,
         request: &login_drive::Request<'_>,
@@ -361,11 +385,17 @@ impl Journal {
     }
 
     pub(in crate::harness) fn check_attempt(&self, attempt: &NativeAttempt) -> Result<(), String> {
+        self.scope.work_current()?;
+        self.check_receipt_attempt(attempt)?;
+        self.scope.work_current()
+    }
+
+    fn check_receipt_attempt(&self, attempt: &NativeAttempt) -> Result<(), String> {
         if attempt != &self.scope.attempt {
             return Err("Kimi recovery attempt changed".into());
         }
         self.scope.check_attempt()?;
-        self.scope.current()?;
+        self.scope.binding_current()?;
         self.storage.unchanged().map_err(str::to_owned)?;
         let (config, credential) = kimi_pending_files(&attempt.staging, self.scope.region)?;
         if self.files != Some((digest(config.as_slice()), digest(credential.as_slice()))) {
@@ -386,7 +416,7 @@ impl Journal {
         home: &Path,
     ) -> Result<(), String> {
         if let Some(pending) = pending {
-            pending.scope.check_request(request)?;
+            pending.scope.check_receipt_request(request)?;
             if scope_digest(&pending.scope)? != scope_digest(&self.scope)? {
                 return Err("Kimi pending Google scope differs from its native completion".into());
             }
@@ -395,9 +425,11 @@ impl Journal {
             return self.checkpoint_rejected(request);
         }
         if self.resumed {
-            return self.check(request);
+            return self.check_receipt_attempt(&NativeAttempt::capture(request));
         }
-        self.scope.check_request(request)?;
+        // This records a completed effect, not permission for another provider call or
+        // publication. Preserve exact pending evidence even if its work scope just closed.
+        self.scope.check_receipt_request(request)?;
         let (config, credential) = kimi_pending_files(request.staging, self.scope.region)?;
         let (cookies, previous) = pending
             .and_then(|p| p.session.as_ref())
@@ -455,7 +487,7 @@ impl Journal {
         let bytes = SecretBytes::from(bytes);
         self.storage.save(bytes.as_slice()).map_err(str::to_owned)?;
         self.files = Some((digest(config.as_slice()), digest(credential.as_slice())));
-        self.check(request)
+        self.check_receipt_attempt(&NativeAttempt::capture(request))
     }
 
     /// Observe the exact retained root staging without invoking a consumed
@@ -618,18 +650,27 @@ impl Journal {
         native
             .check_native(request.staging, self.scope.region, &self.scope.expected)
             .map_err(ObservationError::Unavailable)?;
-        self.check_context(request)
+        self.check_receipt_context(request)
             .map_err(ObservationError::Unavailable)?;
+        if let Err(why) = self.scope.work_current() {
+            // A provider may have completed its exact native rotation before cancellation
+            // was observed. Preserve only that encrypted receipt, then refuse further use.
+            self.fallback_cookies = Some((candidate.cookies, candidate.previous));
+            self.checkpoint_current(request, home)
+                .map_err(ObservationError::Unavailable)?;
+            return Err(ObservationError::Unavailable(why));
+        }
         let session = if candidate.cookies.is_empty() {
             None
         } else {
             Some(
-                PendingSession::recover(
+                PendingSession::recover_scoped(
                     &self.scope.identity,
                     &self.scope.attempt.state,
                     home,
                     candidate.cookies,
                     candidate.previous,
+                    self.scope.work.clone(),
                 )
                 .map_err(|_| {
                     ObservationError::Unavailable(
@@ -777,17 +818,19 @@ impl Journal {
             None
         } else {
             Some(
-                PendingSession::recover(
+                PendingSession::recover_scoped(
                     &self.scope.identity,
                     &self.scope.attempt.state,
                     home,
                     candidate.cookies,
                     candidate.previous,
+                    self.scope.work.clone(),
                 )
                 .map_err(|_| "Kimi pending Google session is unavailable")?,
             )
         };
         self.resumed = true;
+        self.scope.current()?;
         Ok(Some(PendingFederation {
             scope: self.scope.clone(),
             session,
@@ -796,19 +839,22 @@ impl Journal {
     }
 
     pub(in crate::harness) fn pending(&mut self, home: &Path) -> Result<PendingFederation, String> {
+        self.scope.current()?;
         let session = match self.fallback_cookies.take() {
             Some((cookies, previous)) if !cookies.is_empty() => Some(
-                PendingSession::recover(
+                PendingSession::recover_scoped(
                     &self.scope.identity,
                     &self.scope.attempt.state,
                     home,
                     cookies,
                     previous,
+                    self.scope.work.clone(),
                 )
                 .map_err(|_| "Kimi pending Google session is unavailable")?,
             ),
             _ => None,
         };
+        self.scope.current()?;
         Ok(PendingFederation {
             scope: self.scope.clone(),
             session,

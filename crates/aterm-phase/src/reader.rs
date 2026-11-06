@@ -420,6 +420,12 @@ pub trait ScreenReader: Sync {
     fn housekeeping(&self, _rows: &[String]) -> bool {
         false
     }
+    /// The program's own notice that it stopped the last turn, where only a person clears what it
+    /// names (Muse Code's fault rows, [`muse::stopped_turn`]): no reply and no wall, so no rule
+    /// types at it.
+    fn stopped_turn(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
     /// Whether the screen shows only the initial launch card with no turn yet.
     fn fresh(&self, _rows: &[String]) -> bool {
         false
@@ -966,6 +972,9 @@ impl ScreenReader for MuseReader {
     }
     fn interrupted(&self, rows: &[String]) -> bool {
         muse::interrupted(rows)
+    }
+    fn stopped_turn(&self, rows: &[String]) -> Option<String> {
+        muse::stopped_turn(rows)
     }
     /// A backgrounded shell or a monitor running in the panel under the
     /// composer, the turn over it ended ([`muse::background_wait`]).

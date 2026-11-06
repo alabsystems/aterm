@@ -112,7 +112,63 @@ impl FabricSession for crate::SessionCtx {
     fn fleet_mail_ready(&self) -> bool {
         !aterm_update::is_uncommitted_handoff_candidate()
     }
+
+    /// [`peer_mail_in`] this Mac's state directory; with none, by direct fleet mail.
+    #[cfg(unix)]
+    fn peer_mail(&self, node: &str) -> fleet_mail::PeerMail {
+        aterm_types::dirs::state_dir().map_or(fleet_mail::PeerMail::Fleet, |state| {
+            peer_mail_in(&state, node)
+        })
+    }
+
+    /// One drive of `node` as `aterm ctl --host <node>` dials it, bounded by its deadline, which
+    /// writes `request` and reads the one line that answers it.
+    #[cfg(unix)]
+    fn fleet_drive(&self, node: &str, request: &str) -> Result<String, String> {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let link = aterm_agent::drive_fleet(node, FLEET_MAIL_WITHIN).map_err(|r| r.why)?;
+        let label = link.label;
+        let mut stream = link.stream;
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .and_then(|()| stream.flush())
+            .map_err(|e| format!("{label}: {e}"))?;
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .take(FLEET_MAIL_ANSWER_MAX)
+            .read_line(&mut line)
+            .map_err(|e| format!("{label}: {e}"))?;
+        if line.is_empty() {
+            return Err(format!("{label} hung up before it answered"));
+        }
+        Ok(line)
+    }
 }
+
+/// How mail reaches `node` from the Mac whose state directory is `state` (§11 C6): by the mesh
+/// route once that Mac heard `node`'s presence row (the node service's seen ledger,
+/// `<state>/mesh/seen`, which outlives a restart), by direct fleet mail before. Its own node is
+/// on the mesh.
+#[cfg(unix)]
+fn peer_mail_in(state: &std::path::Path, node: &str) -> fleet_mail::PeerMail {
+    let own = aterm_net::fleet_member::read_node_id(state).ok().flatten();
+    if own.as_deref() == Some(node)
+        || aterm_mesh::presence::read_seen(&state.join(aterm_mesh::logs::MESH_DIR))
+            .contains_key(node)
+    {
+        fleet_mail::PeerMail::Mesh
+    } else {
+        fleet_mail::PeerMail::Fleet
+    }
+}
+
+/// A direct fleet mail drive's deadline, under the peer's 30 s cut as `aterm ctl --host`'s is.
+#[cfg(unix)]
+const FLEET_MAIL_WITHIN: std::time::Duration = std::time::Duration::from_secs(28);
+
+/// The longest answer to a direct fleet mail post a drive reads.
+#[cfg(unix)]
+const FLEET_MAIL_ANSWER_MAX: u64 = 4096;
 
 impl Registry for crate::session_store::SessionStore {
     fn sessions(&self) -> Vec<Arc<dyn FabricSession>> {
@@ -215,3 +271,54 @@ pub(crate) fn assert_parked_on_the_fence(
 #[cfg(test)]
 #[path = "fabric_handoff_carry_tests.rs"]
 mod handoff_carry;
+
+#[cfg(all(test, unix))]
+mod peer_mail_tests {
+    use super::{fleet_mail::PeerMail, peer_mail_in};
+
+    /// A Mac reaches a peer by the mesh once its presence row was heard, and its own node always;
+    /// any other by direct fleet mail.
+    #[test]
+    fn a_peer_is_on_the_mesh_once_its_presence_row_was_heard() {
+        use aterm_uds::private_file::{ensure_private_dir, write_private};
+        let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
+        let state = scratch.path().join("state");
+        let mesh = state.join(aterm_mesh::logs::MESH_DIR);
+        ensure_private_dir(&state).expect("a private state dir");
+        ensure_private_dir(&mesh).expect("a private mesh dir");
+        let heard = format!("n-{}", "a".repeat(16));
+        let unheard = format!("n-{}", "b".repeat(16));
+        // Control: before any row was heard, the peer is reached by direct fleet mail.
+        assert_eq!(peer_mail_in(&state, &heard), PeerMail::Fleet);
+        write_private(
+            &mesh,
+            aterm_mesh::presence::SEEN_FILE,
+            format!("{heard} 1000\n").as_bytes(),
+        )
+        .expect("the seen ledger");
+        assert_eq!(peer_mail_in(&state, &heard), PeerMail::Mesh);
+        assert_eq!(peer_mail_in(&state, &unheard), PeerMail::Fleet);
+        // Its node as `read_node_id` reads it with MESH on (the key) and off (the legacy id).
+        write_private(
+            &state,
+            aterm_net::fleet_member::NODE_KEY_FILE,
+            format!("{}\n", "1".repeat(64)).as_bytes(),
+        )
+        .expect("a node key");
+        write_private(
+            &state,
+            aterm_net::fleet_member::NODE_FILE,
+            format!("{}\n", "2".repeat(32)).as_bytes(),
+        )
+        .expect("a node id");
+        let own = aterm_net::fleet_member::read_node_id(&state)
+            .expect("the node key reads")
+            .expect("a node id");
+        assert_ne!(own, heard);
+        assert_eq!(
+            peer_mail_in(&state, &own),
+            PeerMail::Mesh,
+            "this Mac itself"
+        );
+    }
+}

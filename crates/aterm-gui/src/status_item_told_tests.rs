@@ -578,9 +578,9 @@ fn an_adopted_told_ask_is_not_told_again() {
     assert!(successor(carry(false)).1.notice.is_some(), "untold: owed");
 }
 
-/// THE OWNER'S TURN IS HIS LAST PLAIN ENTER IN THE TAB (§14.18): `App::status_session_row` reads
+/// THE OWNER'S TURN IS THEIR LAST PLAIN ENTER IN THE TAB (§14.18): `App::status_session_row` reads
 /// it from the tab's person stamp (`HumanInputStamp::last_plain_enter`), so typing keeps the turn
-/// and only a plain Enter starts a new one, which lets a need he was told of be told again.
+/// and only a plain Enter starts a new one, which lets a need they were told of be told again.
 #[test]
 fn the_rows_owner_turn_is_the_last_plain_enter() {
     use crate::human_input::Gesture;

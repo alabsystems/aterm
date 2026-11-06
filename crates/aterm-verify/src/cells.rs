@@ -438,6 +438,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         ..aterm_uds::host::Lookup::host(row)
     });
     for cell in &cells {
+        // A cell that failed ends a run whose halt is armed before the next cell starts.
+        crate::red_now(ctx, crate::checks::Check::Cells, r);
         let label = format!("cell {} ({})", cell.name, cell.triple);
         let started = Instant::now();
         let outcome = if cell.triple == host {
@@ -2835,6 +2837,7 @@ mod tests {
                 output: out.clone(),
                 code: Some(0),
                 spawn_error: None,
+                usage: None,
             };
             let mut red = Red::default();
             read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, tests, &mut red)
@@ -2848,6 +2851,7 @@ mod tests {
             output: out.clone(),
             code: Some(0),
             spawn_error: None,
+            usage: None,
         };
         let mut red = Red::default();
         read_cargo_run(&run, "x86_64-pc-windows-msvc", &graph, false, &mut red)
@@ -2869,6 +2873,7 @@ mod tests {
             output: out.clone(),
             code: Some(0),
             spawn_error: None,
+            usage: None,
         };
         let read = |triple: &str, pulled: bool, tests: bool| {
             let mut red = Red {
@@ -2901,6 +2906,7 @@ mod tests {
             output: clippy_only,
             code: Some(0),
             spawn_error: None,
+            usage: None,
         };
         let mut red = Red::default();
         read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, false, &mut red)
@@ -2918,6 +2924,7 @@ mod tests {
             output: artifact.to_string(),
             code,
             spawn_error: None,
+            usage: None,
         };
         for tests in [false, true] {
             let mut red = Red::default();
@@ -2963,6 +2970,7 @@ mod tests {
                     output: diagnostic.to_string(),
                     code: Some(101),
                     spawn_error: None,
+                    usage: None,
                 };
                 let mut red = Red::default();
                 read_cargo_run(&run, "x86_64-pc-windows-msvc", &graph, tests, &mut red)
@@ -2980,6 +2988,7 @@ mod tests {
                     output,
                     code: None,
                     spawn_error,
+                    usage: None,
                 };
                 let mut red = Red::default();
                 assert!(matches!(
@@ -3025,6 +3034,7 @@ mod tests {
                 ok,
                 code: Some(if ok { 0 } else { 101 }),
                 spawn_error: None,
+                usage: None,
                 output: format!("{}{artifact}\n{tail}\n", diagnostic(path)),
             };
             let mut red = Red::default();

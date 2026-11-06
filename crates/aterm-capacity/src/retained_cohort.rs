@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One retained CPU unit bound to original private cohort custody.
+//! Retained CPU units bound to original private cohort custody.
 //!
 //! This owns the claim and its one-use launch state, rather than interpreting a
 //! root outcome or saved closure reference as permission to settle CPU backing.
 //! It does not constrain arbitrary threads or descendants that escape the native
-//! cohort's group. A reusable GNU credit must not be published against this unit:
+//! cohort's group. Reusable GNU credits must not be published against these units:
 //! its transport epoch and outstanding borrows require separate lifetime custody.
 
 use crate::Claim;
@@ -51,6 +51,40 @@ impl fmt::Display for BindError {
 }
 
 impl std::error::Error for BindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// A refused bundle binding, retaining every actual settlement capability.
+#[derive(Debug)]
+pub struct BundleBindError {
+    error: io::Error,
+    inputs: Box<(Claim, Vec<RetainedLease>)>,
+}
+
+impl BundleBindError {
+    /// Why the bundle could not be bound to the original claim.
+    #[must_use]
+    pub const fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    /// Recover the original claim and all original CPU capabilities.
+    #[must_use]
+    pub fn into_parts(self) -> (io::Error, Claim, Vec<RetainedLease>) {
+        let (claim, cpu) = *self.inputs;
+        (self.error, claim, cpu)
+    }
+}
+
+impl fmt::Display for BundleBindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "retained cohort bundle binding refused: {}", self.error)
+    }
+}
+
+impl std::error::Error for BundleBindError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
@@ -115,10 +149,10 @@ enum Phase {
     SettlementUncertain,
 }
 
-/// Original cohort custody and the sole API capability for one retained CPU unit.
+/// Original cohort custody and the sole API capabilities for its retained CPU units.
 ///
 /// Binding does not construct a pool or select a machine budget. The caller must
-/// supply an already durable retained capability for this one controlled unit.
+/// supply already durable retained capabilities for this controlled workload.
 /// The claim and CPU descriptor remain private, so this wrapper cannot relaunch
 /// a finished claim or release backing on the root's exit alone. Drop retains
 /// CPU debt even when dropping an unused claim retires its ledger description.
@@ -126,7 +160,8 @@ enum Phase {
 pub struct RetainedCohort {
     binding: Binding,
     claim: Claim,
-    cpu: Option<RetainedLease>,
+    cpu: Vec<RetainedLease>,
+    cpu_units: usize,
     phase: Phase,
 }
 
@@ -149,7 +184,8 @@ impl RetainedCohort {
             Ok(binding) => Ok(Self {
                 binding,
                 claim,
-                cpu: Some(cpu),
+                cpu: vec![cpu],
+                cpu_units: 1,
                 phase: Phase::Ready,
             }),
             Err(error) => Err(BindError {
@@ -157,6 +193,52 @@ impl RetainedCohort {
                 inputs: Box::new((claim, cpu)),
             }),
         }
+    }
+
+    /// Bind a nonempty, already-admitted CPU bundle to one original cohort.
+    ///
+    /// This does not acquire CPU units or select their pool. An external-debt
+    /// allocator may supply its actual retained capabilities here; their
+    /// declared width remains unavailable until this cohort conclusively drains.
+    /// Every failure returns all supplied capabilities without settling any.
+    ///
+    /// # Errors
+    /// Empty or oversized bundle, stale/foreign leadership, or a claim whose
+    /// unused original launch custody cannot be established.
+    pub fn new_bundle(
+        fence: &Fence,
+        claim: Claim,
+        cpu: Vec<RetainedLease>,
+    ) -> Result<Self, BundleBindError> {
+        let checked = (|| {
+            if cpu.is_empty() || cpu.len() > crate::build_cpu::MAX_SLOTS as usize {
+                return Err(refused(
+                    "retained cohort needs a bounded nonempty CPU bundle",
+                ));
+            }
+            let binding = fence.capture_binding(&claim)?;
+            claim.check_retained_description()?;
+            Ok(binding)
+        })();
+        match checked {
+            Ok(binding) => Ok(Self {
+                binding,
+                claim,
+                cpu_units: cpu.len(),
+                cpu,
+                phase: Phase::Ready,
+            }),
+            Err(error) => Err(BundleBindError {
+                error,
+                inputs: Box::new((claim, cpu)),
+            }),
+        }
+    }
+
+    /// Original bundle width, not a count of free or reusable CPU credits.
+    #[must_use]
+    pub const fn cpu_units(&self) -> usize {
+        self.cpu_units
     }
 
     /// Launch this wrapper's single actual child through durable ARM and BIND.
@@ -273,8 +355,10 @@ impl RetainedCohort {
     /// Actual leadership differs or is stale, a no-child receipt has not been
     /// cancelled, launch custody is unknown, group drain is not conclusive, or
     /// journal/CPU settlement fails. Journal errors retain the original CPU
-    /// capability. Once the CPU Free write starts an I/O error has an uncertain
+    /// capabilities. Once any CPU Free write starts an I/O error has an uncertain
     /// outcome; its consumed capability cannot be retried or reported settled.
+    /// Remaining capabilities stay retained. No unit's settlement starts before
+    /// the same original cohort's durable closure has been established.
     pub fn try_finish(&mut self, fence: &Fence) -> io::Result<()> {
         self.binding.check(fence)?;
         match self.phase {
@@ -293,12 +377,13 @@ impl RetainedCohort {
         // finish. This privately owned original claim performs retry_event and
         // exact durable closure validation itself before CPU settlement begins.
         self.claim.finish_cohort()?;
-        let cpu = self
-            .cpu
-            .take()
-            .ok_or_else(|| refused("retained CPU settlement capability is missing"))?;
+        if self.cpu.is_empty() {
+            return Err(refused("retained CPU settlement capability is missing"));
+        }
         self.phase = Phase::SettlementUncertain;
-        cpu.settle()?;
+        while let Some(cpu) = self.cpu.pop() {
+            cpu.settle()?;
+        }
         self.phase = Phase::Settled;
         Ok(())
     }

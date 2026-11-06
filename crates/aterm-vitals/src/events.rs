@@ -221,14 +221,16 @@ impl Detector {
             }
             if let Some(r) = m.rates {
                 let bps = r.swap_bps();
-                let active = bps >= SWAP_ACTIVE_BPS;
-                if self.swapping.is_some_and(|was| was != active) {
-                    push(EventKind::Swap {
-                        started: active,
-                        bps: bps as u64,
-                    });
+                if bps.is_finite() {
+                    let active = bps >= SWAP_ACTIVE_BPS;
+                    if self.swapping.is_some_and(|was| was != active) {
+                        push(EventKind::Swap {
+                            started: active,
+                            bps: bps as u64,
+                        });
+                    }
+                    self.swapping = Some(active);
                 }
-                self.swapping = Some(active);
             }
         }
         if let Some(t) = s.thermal {
@@ -341,6 +343,9 @@ impl Detector {
             self.load.retain(|k, _| live.contains(k));
         }
         for (scope, level, top) in scopes {
+            if !level.is_finite() {
+                continue;
+            }
             let Some(w) = self.load.get_mut(&scope) else {
                 self.load.insert(
                     scope,
@@ -572,6 +577,7 @@ mod tests {
             }
         );
         assert!(d.detect(&at(3, 4e6)).is_empty());
+        assert!(d.detect(&at(3, f64::NAN)).is_empty());
         let e = d.detect(&at(4, 0.0));
         assert_eq!(
             e[0].kind,
@@ -654,6 +660,26 @@ mod tests {
         for t in 15..40 {
             assert!(d.detect(&at(t, 3.1)).is_empty());
         }
+        for t in 41..56 {
+            assert!(
+                d.detect(&at(t, f32::NAN)).is_empty(),
+                "a NaN level is no move (t={t})"
+            );
+        }
+        assert!(d.detect(&at(56, f32::INFINITY)).is_empty());
+        for t in 57..67 {
+            assert!(d.detect(&at(t, 0.5)).is_empty(), "t={t}");
+        }
+        assert_eq!(
+            d.detect(&at(67, 0.5))[0].kind,
+            EventKind::Load {
+                scope: LoadScope::Global,
+                from_mc: 3100,
+                to_mc: 500,
+                top: Some("trustc".into()),
+            },
+            "control: the reference the NaN levels skipped still moves on a real step"
+        );
     }
 
     #[test]

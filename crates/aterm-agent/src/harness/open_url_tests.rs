@@ -4121,6 +4121,36 @@ fn a_pin_admits_only_its_own_vendors_pages() {
     assert!(flow.is_callback("http://127.0.0.1:7777/cb?code=c&state=s"));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_hosted_claude_callback_is_exact_and_its_code_is_taken_once() {
+    let flow = MailboxFlow::new(
+        "https://claude.com/cai/oauth/authorize?client_id=claude&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=expected",
+    )
+    .unwrap();
+    assert!(flow.hosted());
+    assert!(flow.admits_provider_url(
+        "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=expected"
+    ));
+    let callback = "https://platform.claude.com/oauth/code/callback?code=secret&state=expected";
+    assert!(flow.is_callback(callback));
+    assert!(flow.admits_provider_url(callback));
+    for wrong in [
+        "https://platform.claude.com/oauth/code/callback?code=secret&state=other",
+        "https://platform.claude.com/oauth/code/callback?state=expected",
+        "https://platform.claude.com/oauth/code/callback?code=secret&state=expected&error=denied",
+        "https://example.invalid/oauth/code/callback?code=secret&state=expected",
+    ] {
+        assert!(!flow.is_callback(wrong), "{wrong}");
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome.code");
+    write_oauth_code(path.clone(), "secret").unwrap();
+    assert_eq!(take_oauth_code(path.clone()), Ok(Some("secret".into())));
+    assert!(!path.exists());
+    assert_eq!(take_oauth_code(path), Ok(None));
+}
+
 #[test]
 fn an_account_run_names_its_cli_and_label_before_its_home_does() {
     use std::ffi::OsString;
@@ -5834,7 +5864,7 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
 }
 #[cfg(unix)]
 #[test]
-fn opener_outcome_phases_preserve_diagnostics_but_only_failed_is_terminal() {
+fn opener_outcome_phases_preserve_diagnostics_and_only_explicit_ends_are_terminal() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let path = tmp.path().join("outcome");
     for word in [
@@ -5847,9 +5877,12 @@ fn opener_outcome_phases_preserve_diagnostics_but_only_failed_is_terminal() {
         let met = Met::new(word, Some("claude.ai"));
         write_outcome_phase(&path, &met, OutcomePhase::Continuing);
         assert_eq!(read_outcome(&path), Some(met.clone()));
-        assert_eq!(read_failed_outcome(&path), None);
+        assert_eq!(read_terminal_outcome(&path), None);
         write_outcome(&path, &met);
-        assert_eq!(read_failed_outcome(&path), Some(met));
+        assert_eq!(
+            read_terminal_outcome(&path),
+            Some(TerminalOutcome::Failed(met))
+        );
     }
     for bad in [
         "bot-check claude.ai\n".to_owned(),
@@ -5866,7 +5899,7 @@ fn opener_outcome_phases_preserve_diagnostics_but_only_failed_is_terminal() {
     ] {
         std::fs::write(&path, bad).unwrap();
         assert_eq!(read_outcome(&path), None);
-        assert_eq!(read_failed_outcome(&path), None);
+        assert_eq!(read_terminal_outcome(&path), None);
     }
 }
 
@@ -5879,11 +5912,64 @@ fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success()
     for code in [0, 1] {
         let result = profile_fallback_outcome(Some(&path), Some(&met), || {
             assert_eq!(read_outcome(&path), Some(met.clone()));
-            assert_eq!(read_failed_outcome(&path), None);
+            assert_eq!(read_terminal_outcome(&path), None);
             (code, Some("profile opener diagnostic".to_owned()))
         });
         assert_eq!(result, (code, Some("profile opener diagnostic".to_owned())));
         assert_eq!(read_outcome(&path), Some(met.clone()));
-        assert_eq!(read_failed_outcome(&path), (code != 0).then(|| met.clone()));
+        assert_eq!(
+            read_terminal_outcome(&path),
+            (code != 0).then(|| TerminalOutcome::Failed(met.clone()))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_issuer_is_typed_deferred_without_callback_or_profile_fallback() {
+    for state in ["bot_check", "block_page"] {
+        let _central = super::super::challenge_relay::set_central_result_for_tests(Err(
+            super::super::challenge_relay::RequestError::Unavailable,
+        ));
+        let (result, delivered, _, met) = drive_bot_check(
+            move |_| aterm_json::json!({"state":state,"url":"https://claude.ai/login"}),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert!(delivered.is_empty());
+        let met = met.unwrap();
+        assert!(met.is_service_unavailable());
+        assert!(!met.stopped());
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcome");
+        write_outcome(&path, &met);
+        assert_eq!(read_outcome(&path), Some(met.clone()));
+        assert_eq!(
+            read_terminal_outcome(&path),
+            Some(TerminalOutcome::Deferred(met.clone()))
+        );
+        let result = profile_fallback_outcome(Some(&path), Some(&met), || {
+            panic!("unavailable issuer cannot start a profile fallback")
+        });
+        assert_eq!(result.0, 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_opener_records_require_the_exact_service_cause_and_closed_grammar() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    for record in [
+        "opener-outcome=1\nphase=deferred\nmet=bot-check claude.ai\n",
+        "opener-outcome=1\nphase=failed\nmet=service-unavailable\n",
+        "opener-outcome=1\nphase=continuing\nmet=service-unavailable\n",
+        "opener-outcome=1\nphase=deferred\nmet=service-unavailable claude.ai\n",
+        "opener-outcome=1\nphase=deferred\nmet=service-unavailable\nextra=true\n",
+    ] {
+        std::fs::write(&path, record).unwrap();
+        assert_eq!(read_outcome(&path), None);
+        assert_eq!(read_terminal_outcome(&path), None);
     }
 }

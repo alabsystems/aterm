@@ -28,6 +28,14 @@ const LIPO_X86_64: &str = "x86_64";
 /// The compile-time marker every release build carries.
 pub const RELEASE_BUILD_MARKER: &str = "ATERM_RELEASE_BUILD";
 
+/// Platform policy, independent of the shared core pool and per-slice memory admission.
+pub enum Sequencing {
+    /// macOS slices borrow from one Release jobserver.
+    Parallel,
+    /// Linux's native build remains explicitly serial.
+    OneAtATime,
+}
+
 /// Everything [`run`] needs, resolved by the caller.
 pub struct BuildPlan {
     /// The checkout whose repository holds [`BuildPlan::commit`] — release orchestration runs here.
@@ -42,8 +50,8 @@ pub struct BuildPlan {
     pub short_version: String,
     /// Exact lowercase SHA-256 fingerprint that every independently-built and final shipped architecture slice must embed for its compiled updater key.
     pub expected_update_pin_sha256: Option<String>,
-    /// Build the slices one after the other, not at once.
-    pub one_slice_at_a_time: bool,
+    /// Platform sequencing policy for architecture builds.
+    pub sequencing: Sequencing,
     /// The shipped channel's published index run the build compiles in as [`atpkg::net::INDEX_HINT_ENV`].
     pub index_hint: Option<String>,
 }
@@ -84,16 +92,21 @@ pub struct SliceBuild {
 }
 
 /// What one compile call's Cargo messages said (`--message-format=json-render-diagnostics`,
-/// `docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1).
+/// `docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1), read as a verify run reads its
+/// calls' ([`aterm_verify::compile_account::Artifacts::book`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Units {
     /// `compiler-artifact` messages Cargo found `fresh`.
     pub fresh: u64,
-    /// `compiler-artifact` messages it built.
+    /// `compiler-artifact` messages it built (`fresh: false`).
     pub compiled: u64,
-    /// The bytes of the files the built (not fresh) units reported, each file once, by
-    /// `fs::metadata`: what this call wrote, short of the compiler's intermediates. A reported
-    /// file that is gone counts nothing.
+    /// `compiler-artifact` messages that said neither (no boolean `fresh`, or fields repeated),
+    /// counted as neither.
+    pub unknown: u64,
+    /// The bytes of the regular files the units not reported fresh named, each path and file
+    /// once ([`aterm_verify::compile_account::output_bytes`]): what this call wrote, short of the
+    /// compiler's intermediates. A reported file that is gone, a directory and a symlink count
+    /// nothing.
     pub output_bytes: u64,
 }
 
@@ -647,6 +660,24 @@ fn build_slices(
 ) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
     // The x86_64 compat slice is the STOCK EXCEPTION (see the note at the file's head).
     require_rustup_target(X86_64)?;
+    let claim = aterm_capacity::admit(
+        aterm_capacity::Need::new("release slice core pool")
+            .rank(aterm_capacity::Rank::Release)
+            .cores(aterm_capacity::cores()),
+        aterm_capacity::Admit::Wait,
+    )
+    .map_err(|e| e.to_string())?;
+    let pool_dir = aterm_tempfile::Builder::new()
+        .prefix("release-pool-")
+        .tempdir_in(&take.temporary_dir)
+        .map_err(|e| format!("release pool directory: {e}"))?;
+    let pool = aterm_capacity::Jobserver::new(&pool_dir.path().join("jobs"), claim.cores())
+        .map_err(|e| format!("release jobserver: {e}"))?;
+    println!(
+        "==> release pool: S={} waiting_s={:.3}",
+        pool.slots(),
+        claim.waited().as_secs_f64()
+    );
     let slices: [(&'static str, Option<&'static str>, &str); 2] = [
         (ARM64, None, "Trust toolchain (+t): native build"),
         (
@@ -664,7 +695,29 @@ fn build_slices(
             plan.build_number,
             log.display()
         );
-        let built = build_one(plan, take, "aterm", target, Some(&log));
+        let built = (|| {
+            let memory = aterm_capacity::admit(
+                aterm_capacity::Need::new(format!("release slice {triple}"))
+                    .rank(aterm_capacity::Rank::Release)
+                    .mem_gib(if target.is_none() { 37 } else { 20 }),
+                aterm_capacity::Admit::Wait,
+            )
+            .map_err(|e| e.to_string())?;
+            println!(
+                "==> [{triple}] memory waiting_s={:.3}",
+                memory.waited().as_secs_f64()
+            );
+            let run = SliceRun {
+                verb: "build",
+                pkg: "aterm",
+                target,
+                target_dir: take.slice_target(target),
+                build_number: plan.build_number,
+                index_hint: plan.index_hint.as_deref(),
+                static_crt: false,
+            };
+            run_slice_profile(take, &run, Some(&log), None, Some(&pool))
+        })();
         let secs = t.elapsed().as_secs();
         match built {
             Ok(usage) => {
@@ -687,27 +740,24 @@ fn build_slices(
             Err(error) => Err(format!("[{triple}] {error}\n{}", log_tail(&log, 40))),
         }
     };
-    let results: Vec<Result<SliceBuild, String>> = if plan.one_slice_at_a_time {
-        println!(
-            "==> the slices build one after the other: the memory their last builds \
-             peaked at would not fit beside each other"
-        );
-        slices.into_iter().map(one).collect()
-    } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = slices
-                .into_iter()
-                .map(|slice| scope.spawn(move || one(slice)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err("a slice build's thread panicked".to_string()))
-                })
-                .collect()
-        })
-    };
+    let results: Vec<Result<SliceBuild, String>> =
+        if matches!(plan.sequencing, Sequencing::OneAtATime) {
+            slices.into_iter().map(one).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = slices
+                    .into_iter()
+                    .map(|slice| scope.spawn(move || one(slice)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("a slice build's thread panicked".to_string()))
+                    })
+                    .collect()
+            })
+        };
     let mut builds = Vec::new();
     let mut failed = Vec::new();
     for result in results {
@@ -998,6 +1048,7 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
             release_profile_debug().1.into(),
         ),
         (RELEASE_BUILD_MARKER, "1".into()),
+        (aterm_capacity::RELEASE_RUN_ENV, "1".into()),
     ];
     if let Some(hint) = e.index_hint {
         env.push((atpkg::net::INDEX_HINT_ENV, hint.into()));
@@ -1061,6 +1112,7 @@ pub(crate) fn pilot_build(
             },
             Some(&log),
             Some((arm, claim.cores())),
+            None,
         )
     });
     let usage = usage?;
@@ -1291,7 +1343,7 @@ struct SliceRun<'a> {
 }
 
 fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<BuildUsage, String> {
-    run_slice_profile(take, run, log, None)
+    run_slice_profile(take, run, log, None, None)
 }
 
 fn run_slice_profile(
@@ -1299,6 +1351,7 @@ fn run_slice_profile(
     run: &SliceRun<'_>,
     log: Option<&Path>,
     arm: Option<(crate::profile_pilot::Arm, u32)>,
+    pool: Option<&aterm_capacity::Jobserver>,
 ) -> Result<BuildUsage, String> {
     let &SliceRun {
         verb, pkg, target, ..
@@ -1360,6 +1413,22 @@ fn run_slice_profile(
         cmd.envs(arm.environment())
             .env("CARGO_BUILD_JOBS", cores.to_string());
     }
+    // Cargo's implicit job is charged before it starts, just like its rustc workers.
+    let _implicit = match pool {
+        Some(pool) => {
+            let waiting = Instant::now();
+            let token = pool
+                .attach_cargo(&mut cmd, &|| crate::interrupt::caught().is_some())
+                .map_err(|e| format!("release implicit job: {e}"))?;
+            println!(
+                "==> [{}] jobserver waiting_s={:.3}",
+                target.unwrap_or(ARM64),
+                waiting.elapsed().as_secs_f64()
+            );
+            Some(token)
+        }
+        None => None,
+    };
     let lane = if run.static_crt {
         "upstream stable (+r) static"
     } else if target.is_some() {
@@ -1428,40 +1497,32 @@ fn run_slice_profile(
 /// The longest Cargo message line [`units_of`] reads; a longer one is skipped.
 const MESSAGE_LINE_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Count the units Cargo's `messages` report ([`Units`]), each line read once and bounded.
+/// Count the units Cargo's `messages` report ([`Units`]), each line read once and bounded, by
+/// the reading a verify run gives its own calls ([`aterm_verify::compile_account`]).
 /// # Errors
 /// The read's.
 fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
-    let mut units = Units::default();
-    let mut built = std::collections::BTreeSet::new();
+    let mut read = aterm_verify::compile_account::Artifacts::default();
     let mut line = Vec::new();
     let mut overflow = false;
     let mut chunk = [0; 64 * 1024];
-    let mut book = |line: &[u8], units: &mut Units| {
-        let Ok(text) = std::str::from_utf8(line) else {
-            return;
-        };
-        for artifact in aterm_verify::shape::artifacts(text) {
-            if artifact.fresh {
-                units.fresh += 1;
-            } else {
-                units.compiled += 1;
-                built.extend(artifact.filenames);
-            }
+    let book = |line: &[u8], read: &mut aterm_verify::compile_account::Artifacts| {
+        if let Ok(text) = std::str::from_utf8(line) {
+            read.book(text);
         }
     };
     loop {
         let n = messages.read(&mut chunk)?;
         if n == 0 {
             if !overflow {
-                book(&line, &mut units);
+                book(&line, &mut read);
             }
             break;
         }
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 if !overflow {
-                    book(&line, &mut units);
+                    book(&line, &mut read);
                 }
                 line.clear();
                 overflow = false;
@@ -1472,17 +1533,12 @@ fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
             }
         }
     }
-    // A file reported twice, or under two names (an uplifted hard link), is written once.
-    let mut seen = std::collections::BTreeSet::new();
-    for file in built {
-        if let Ok(meta) = std::fs::metadata(&file) {
-            use std::os::unix::fs::MetadataExt as _;
-            if seen.insert((meta.dev(), meta.ino())) {
-                units.output_bytes = units.output_bytes.saturating_add(meta.len());
-            }
-        }
-    }
-    Ok(units)
+    Ok(Units {
+        fresh: read.units.fresh,
+        compiled: read.units.compiled,
+        unknown: read.units.unknown,
+        output_bytes: aterm_verify::compile_account::output_bytes(&read.written),
+    })
 }
 
 /// One compile call's line (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1): `-` where
@@ -1491,7 +1547,14 @@ fn units_of(mut messages: impl Read) -> std::io::Result<Units> {
 fn compile_line(call: &str, usage: BuildUsage, wall: std::time::Duration) -> String {
     let units = usage.units.map_or_else(
         || "- fresh / - compiled".to_owned(),
-        |u| format!("{} fresh / {} compiled", u.fresh, u.compiled),
+        |u| {
+            let unknown = if u.unknown > 0 {
+                format!(" / {} unknown", u.unknown)
+            } else {
+                String::new()
+            };
+            format!("{} fresh / {} compiled{unknown}", u.fresh, u.compiled)
+        },
     );
     let cpu = usage.cpu_ns.map_or_else(
         || "-".to_owned(),
@@ -1531,7 +1594,7 @@ fn build_cpu_event(
             "package": package, "target": target, "verb": verb,
             "log": log.map(|path| path.to_string_lossy().into_owned()),
             "units": usage.units.map(|u| aterm_json::json!({
-                "fresh": u.fresh, "compiled": u.compiled,
+                "fresh": u.fresh, "compiled": u.compiled, "unknown": u.unknown,
             })),
             "output_bytes": usage.units.map(|u| u.output_bytes),
             "outcome": if status.success() { "ok" } else { "FAIL" },
@@ -1546,8 +1609,8 @@ fn build_cpu_event(
 }
 
 /// Wait for `child` and retain its CPU and peak resident memory, including the
-/// children it waited for (`wait4`'s rusage). The peak decides whether the next
-/// build's slices may run at once; CPU is separate from the wall clock.
+/// children it waited for (`wait4`'s rusage). These are accounting observations;
+/// each slice admits its memory separately. CPU is separate from the wall clock.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
@@ -2610,6 +2673,7 @@ mod tests {
                 units: Some(super::Units {
                     fresh: 3,
                     compiled: 2,
+                    unknown: 1,
                     output_bytes: 4096,
                 }),
             },
@@ -2621,6 +2685,7 @@ mod tests {
         assert_eq!(value["call"].as_str(), Some("build aterm native"));
         assert_eq!(value["units"]["fresh"].as_u64(), Some(3));
         assert_eq!(value["units"]["compiled"].as_u64(), Some(2));
+        assert_eq!(value["units"]["unknown"].as_u64(), Some(1));
         assert_eq!(value["output_bytes"].as_u64(), Some(4096));
         assert_eq!(value["outcome"].as_str(), Some("FAIL"));
         assert_eq!(value["execution_s"].as_f64(), Some(3.0));
@@ -2653,9 +2718,12 @@ mod tests {
         );
     }
 
-    /// Cargo's messages count each unit once by `fresh`, and the bytes are the built units'
-    /// files, each file once however many names it has; a fresh unit's files, a file that is
-    /// gone and a line that is not a `compiler-artifact` count nothing.
+    /// Cargo's messages count each unit once by `fresh`, a unit with no `fresh` as neither
+    /// fresh nor built (verify's reading, `aterm_verify::compile_account`), and the bytes are
+    /// the files of the units not reported fresh, each file once however many names it has; a
+    /// fresh unit's files, a file that is gone, a symlink and a line that is not a
+    /// `compiler-artifact` count nothing. NEGATIVE CONTROL: the symlink names a 5000-byte file,
+    /// and a unit with no `fresh` read as built would count 6 built.
     #[test]
     fn the_units_count_fresh_and_built_and_size_only_what_was_built() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -2678,12 +2746,22 @@ mod tests {
             .to_string()
         };
         let gone = dir.path().join("gone.rlib");
+        let link = dir.path().join("liblink.rlib");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        let unsaid = dir.path().join("libunsaid.rlib");
+        std::fs::write(&unsaid, vec![0_u8; 7]).unwrap();
         let messages = [
             artifact(&[&lib, &meta], false),
             artifact(&[&uplifted], false),
             artifact(&[&alias, &gone], false),
             artifact(&[&fresh], true),
             artifact(&[&lib], false),
+            artifact(&[&link], false),
+            aterm_json::json!({
+                "reason": "compiler-artifact",
+                "filenames": [unsaid.to_string_lossy().into_owned()],
+            })
+            .to_string(),
             r#"{"reason":"build-script-executed","filenames":["x"]}"#.to_owned(),
             "   Compiling aterm v0.1.0".to_owned(),
         ]
@@ -2693,8 +2771,9 @@ mod tests {
             units,
             super::Units {
                 fresh: 1,
-                compiled: 4,
-                output_bytes: 1230,
+                compiled: 5,
+                unknown: 1,
+                output_bytes: 1237,
             }
         );
     }
@@ -3281,6 +3360,7 @@ mod tests {
             assert_eq!(get("CARGO_PROFILE_RELEASE_DEBUG").as_deref(), Some(debug));
             assert_eq!(get("CARGO_PROFILE_RELEASE_STRIP").as_deref(), Some(strip));
             assert_eq!(get(RELEASE_BUILD_MARKER).as_deref(), Some("1"));
+            assert_eq!(get(aterm_capacity::RELEASE_RUN_ENV).as_deref(), Some("1"));
             assert_eq!(get(atpkg::net::INDEX_HINT_ENV).as_deref(), index_hint);
             assert_eq!(
                 get("RUSTUP_TOOLCHAIN").as_deref(),

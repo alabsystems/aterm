@@ -39,7 +39,12 @@ fn an_adopted_agent_call_counts_new_same_group_compiler_work() {
     assert_eq!(early_row.members, 3);
     assert_eq!(early_row.class, Class::Running, "birth is recent progress");
     assert!(!early_row.no_progress, "the new child is already working");
-    // Numeric CPU is shown for BusySilent, after the existing recent-progress window.
+    assert!(
+        early_row.cpu_mc.is_some_and(|cpu| cpu >= 1000),
+        "running jobs expose measured CPU before becoming silent: {}",
+        early_row.wire()
+    );
+    // The CPU reading remains available after the recent-progress window.
     let after = run_to(
         &mut w,
         aterm_vitals::jobs::RUNNING_WINDOW_MS + TICK_MS,
@@ -224,7 +229,7 @@ fn example_a_password_prompt_in_a_background_tab_waits_for_you() {
     let v = run_to(&mut w, 252_000, |_, _| {});
     assert_eq!(
         wire(&v, "b51"),
-        "job id=b51 kind=shell consumer=person-fg exe=ssh class=waiting wait=tty-password quiet_ms=252000 phi=0 verdict=waiting-you"
+        "job id=b51 kind=shell consumer=person-fg exe=ssh class=waiting wait=tty-password cpu_mc=0 quiet_ms=252000 phi=0 verdict=waiting-you"
     );
     assert_eq!(v.demand, Demand::Idle);
 }
@@ -249,7 +254,7 @@ fn example_b_an_agent_call_hung_on_a_silent_tcp_peer_is_stuck() {
     });
     assert_eq!(
         wire(&v, "a4711"),
-        "job id=a4711 kind=agent-call consumer=agent-bg promoted=timeout:120000 task=bm3k2x9q1 pgid=4711 exe=curl class=waiting wait=tcp remote=192.0.2.10:8080 state=ESTABLISHED queued=0 quiet_ms=1142000 phi=8.27 mu_ms=60000 mu_from=prior verdict=stuck"
+        "job id=a4711 kind=agent-call consumer=agent-bg promoted=timeout:120000 task=bm3k2x9q1 pgid=4711 exe=curl class=waiting wait=tcp remote=192.0.2.10:8080 state=ESTABLISHED queued=0 cpu_mc=0 quiet_ms=1142000 phi=8.27 mu_ms=60000 mu_from=prior verdict=stuck"
     );
     let row = v.row("a4711").expect("the call");
     assert_eq!(row.verdict.mark(), Some('⊘'));
@@ -274,7 +279,7 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
     let v = run_to(&mut w, 420_000, churn);
     assert_eq!(
         wire(&v, "b77"),
-        "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed quiet_ms=420000 phi=15.2 mu_ms=12000 mu_from=class verdict=quiet"
+        "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed cpu_mc=0 quiet_ms=420000 phi=15.2 mu_ms=12000 mu_from=class verdict=quiet"
     );
     assert_eq!(v.row("b61").map(|r| r.class), Some(Class::Running));
     w.advance(TICK_MS);
@@ -294,7 +299,7 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
     let v = w.observe();
     assert_eq!(
         wire(&v, "b77"),
-        "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed named=lock holder=5120:cargo:tab2:running quiet_ms=424000 phi=0 verdict=fine"
+        "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed named=lock holder=5120:cargo:tab2:running cpu_mc=0 quiet_ms=424000 phi=0 verdict=fine"
     );
 }
 
@@ -447,7 +452,7 @@ fn example_d_tail_f_in_an_agent_foreground_call_never_returns() {
     let v = run_to(&mut w, 41_000, |_, _| {});
     assert_eq!(
         wire(&v, "a8102"),
-        "job id=a8102 kind=agent-call consumer=agent-fg task=c81d0f2ma pgid=8102 exe=tail class=waiting wait=follow fd=3 quiet_ms=41000 phi=0 verdict=never-returns"
+        "job id=a8102 kind=agent-call consumer=agent-fg task=c81d0f2ma pgid=8102 exe=tail class=waiting wait=follow fd=3 cpu_mc=0 quiet_ms=41000 phi=0 verdict=never-returns"
     );
 }
 
@@ -489,7 +494,7 @@ fn example_f_a_held_stop_under_an_agent_call_is_stuck_and_a_parked_one_is_parked
     let v = run_to(&mut w, 1_130_000, |_, _| {});
     assert_eq!(
         wire(&v, "a6301"),
-        "job id=a6301 kind=agent-call consumer=agent-bg task=a71pq0zz3 pgid=6301 exe=zsh class=stopped stop=held stopped_pid=6302:node quiet_ms=1130000 phi=8.18 verdict=stuck"
+        "job id=a6301 kind=agent-call consumer=agent-bg task=a71pq0zz3 pgid=6301 exe=zsh class=stopped stop=held stopped_pid=6302:node cpu_mc=0 quiet_ms=1130000 phi=8.18 verdict=stuck"
     );
 
     let mut w = World::new();
@@ -532,7 +537,7 @@ fn example_g_a_zombie_pile_under_a_logging_server_is_running_with_its_zombies_co
     });
     assert_eq!(
         wire(&v, "j6120"),
-        "job id=j6120 kind=shell-bg consumer=person-bg exe=node class=running zombies=37 zombie_parent=6120 zombies_per_min=0.9 verdict=fine"
+        "job id=j6120 kind=shell-bg consumer=person-bg exe=node class=running cpu_mc=10 zombies=37 zombie_parent=6120 zombies_per_min=0.9 verdict=fine"
     );
     let lines = v.findings.wire_lines();
     assert!(
@@ -9206,7 +9211,7 @@ fn a_build_front_waiting_for_its_claim_reads_as_its_build_waiting_for_memory() {
     let (mut w, v) = front(Some("targo"));
     assert_eq!(
         wire(&v, "b7"),
-        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine"
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory cpu_mc=0 quiet_ms=1680000 phi=0 verdict=fine"
     );
     let p = w.p(1000);
     p.name = "targo".to_owned();
@@ -9273,12 +9278,12 @@ fn a_fronts_wait_for_memory_counts_as_the_claims_ahead_of_it_progress() {
     assert_eq!(v.row("b61").map(|r| r.class), Some(Class::Running));
     assert_eq!(
         wire(&v, "b7"),
-        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine"
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory cpu_mc=0 quiet_ms=1680000 phi=0 verdict=fine"
     );
     let (_, v) = front_behind(9999, false);
     assert_eq!(
         wire(&v, "b7"),
-        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine",
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory cpu_mc=0 quiet_ms=1680000 phi=0 verdict=fine",
         "a claim no tab's job holds"
     );
     let (_, v) = front_behind(5120, true);

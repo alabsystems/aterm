@@ -192,20 +192,17 @@ impl Activations {
     pub fn local_preparations(&self) -> Result<Vec<(Digest, Digest)>> {
         self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
-            let accounts: BTreeSet<_> = history
-                .records
-                .values()
-                .map(|record| record.request().account)
-                .collect();
-            Ok(accounts
-                .into_iter()
-                .filter_map(|account| {
-                    let State::Ready(decision) = history.status(account) else {
+            let statuses = history.statuses();
+            Ok(statuses
+                .iter()
+                .filter_map(|(&account, state)| {
+                    let &State::Ready(decision) = state else {
                         return None;
                     };
-                    intents::current(&history, &history.records[&decision]).ok()?;
+                    let record = &history.records[&decision];
+                    intents::current_with_statuses(&history, &statuses, record).ok()?;
                     session
-                        .permit_account(&history.records[&decision])
+                        .permit_account(record)
                         .ok()
                         .map(|()| (account, decision))
                 })

@@ -51,8 +51,8 @@ struct ColdPage {
 
 impl ColdPage {
     /// Create a cold page from a warm block.
-    fn from_warm_block(block: &WarmBlock) -> Result<Self, super::ScrollbackError> {
-        let (compressed, line_count) = block.to_cold_compressed()?;
+    fn from_warm_block(block: &mut WarmBlock) -> Result<Self, super::ScrollbackError> {
+        let (compressed, line_count) = block.take_cold_compressed()?;
 
         Ok(Self {
             compressed,
@@ -137,17 +137,18 @@ impl ColdTier {
         self.pages.len()
     }
 
-    /// Push a validated warm block, re-encoding only a trimmed logical suffix.
-    pub(crate) fn push_block(&mut self, block: &WarmBlock) -> usize {
+    /// Drain a validated warm block into this tier, re-encoding only a trimmed logical suffix.
+    /// A failed validation leaves the block available for retry or quarantine.
+    pub(crate) fn push_block(&mut self, block: &mut WarmBlock) -> usize {
         self.push(block, false)
     }
 
     /// Push `block` as the blank stand-in for a quarantined warm block's lines, whose loss is already counted.
-    pub(crate) fn push_lost_block(&mut self, block: &WarmBlock) -> usize {
+    pub(crate) fn push_lost_block(&mut self, block: &mut WarmBlock) -> usize {
         self.push(block, true)
     }
 
-    fn push(&mut self, block: &WarmBlock, lost: bool) -> usize {
+    fn push(&mut self, block: &mut WarmBlock, lost: bool) -> usize {
         match ColdPage::from_warm_block(block) {
             Ok(mut page) => {
                 page.lost = lost;

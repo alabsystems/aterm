@@ -174,6 +174,17 @@ contract! {
         else if outcome == 3 { 2 } else if custody == 1 { 1 } else { 0 }
     }
 }
+contract! {
+    /// Whether a log takes a seat's Mac out, the one removal predicate (P4's binding 4,
+    /// `aterm_secrets::membership_log::Log::seat_removed`): an effective `Remove` of its `actor`,
+    /// its `recipient` bound to a Mac now out, its `writer` key a removed Mac's, or a `kin` seat
+    /// (one sharing its actor or recipient) holding a node key a removed Mac bound. Any one takes
+    /// it out: the actor alone takes out a superseded seat whose recipient and node key are now
+    /// another seat's.
+    pub fn seat_out(actor: bool, recipient: bool, writer: bool, kin: bool) -> bool
+    clauses [ensures result == seat_out_spec(actor, recipient, writer, kin) by seat_out_is_exact]
+    { actor || (recipient || (writer || kin)) }
+}
 
 pub mod peer_check {
     //! The handshake kernels' codes, named. A driver passes a kernel `code as u8` and reads its
@@ -425,7 +436,7 @@ verify_island! {
 #[cfg(test)]
 mod peer_check_sheets {
     use super::peer_check::{self, Custody, Listing, Read, RosterGate, Stage, View};
-    use super::{peer_check_next, peer_check_roster, peer_check_start, peer_check_view};
+    use super::{peer_check_next, peer_check_roster, peer_check_start, peer_check_view, seat_out};
 
     const ISLAND: &str = include_str!("peer_check_island.rs");
 
@@ -492,12 +503,39 @@ mod peer_check_sheets {
         sheet
     }
 
+    /// The removal predicate's sheet: the actor, recipient, writer and kin verdicts, each false
+    /// then true, as the island's `sheetSeatOut` folds them.
+    fn seat_sheet(out: impl Fn(bool, bool, bool, bool) -> bool) -> String {
+        let mut sheet = String::new();
+        for a in [false, true] {
+            for r in [false, true] {
+                for w in [false, true] {
+                    for k in [false, true] {
+                        sheet.push(digit(u8::from(out(a, r, w, k))));
+                    }
+                }
+            }
+        }
+        sheet
+    }
+
     #[test]
     fn the_kernels_answer_the_islands_sheets() {
         assert_eq!(start_sheet(peer_check_start), proved("sheetStart"));
         assert_eq!(next_sheet(peer_check_next), proved("sheetNext"));
         assert_eq!(roster_sheet(peer_check_roster), proved("sheetRoster"));
         assert_eq!(view_sheet(peer_check_view), proved("sheetView"));
+        assert_eq!(seat_sheet(seat_out), proved("sheetSeatOut"));
+    }
+
+    /// NEGATIVE CONTROL: a removal predicate that lost its actor disjunct (the island's
+    /// `seatOutNoActor`) answers another sheet, and keeps the seat whose actor alone is out.
+    #[test]
+    fn the_removal_predicate_without_its_actor_answers_another_sheet() {
+        let no_actor = |_: bool, r: bool, w: bool, k: bool| seat_out(false, r, w, k);
+        assert_ne!(seat_sheet(no_actor), proved("sheetSeatOut"));
+        assert!(seat_out(true, false, false, false));
+        assert!(!no_actor(true, false, false, false));
     }
 
     /// Every code outside the meaningful domain refuses, each coordinate across its whole range

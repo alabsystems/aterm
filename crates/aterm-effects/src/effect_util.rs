@@ -209,7 +209,8 @@ pub(crate) fn push_soft_disc(
     }
 }
 
-/// [`push_fx_quad`] with a horizontal `(colour, alpha)` ramp from `left` to `right`.
+/// [`push_fx_quad`] with a horizontal `(colour, alpha)` ramp from `left` to `right`. A geometry
+/// with no cell height has no row bands to split into and lays nothing.
 #[allow(
     clippy::too_many_arguments,
     reason = "the rect + both ramp ends IS the call, as in `push_fx_quad`"
@@ -228,6 +229,9 @@ pub(crate) fn push_fx_ramp(
     if w <= 0 || h <= 0 || (left == (0, 0) && right == (0, 0)) {
         return;
     }
+    let Some(ch) = i32::try_from(geom.ch).ok().filter(|&ch| ch > 0) else {
+        return;
+    };
     debug_assert_eq!(
         left.1 == 0,
         right.1 == 0,
@@ -283,7 +287,6 @@ pub(crate) fn push_fx_ramp(
         };
         (end0, end1)
     };
-    let ch = geom.ch as i32;
     let oy = i32::from(geom.origin_y);
     let x0_u = x0 as u16;
     let w_u = (x1 - x0) as u16;
@@ -1006,6 +1009,35 @@ mod tests {
             win_h: 96,
             head: 0,
         }
+    }
+
+    /// A geometry with no cell height lays no effects-box quad, even where its head leaves the box
+    /// rows tall, rather than dividing by the height; the same quad at a 16 px cell lays one band.
+    #[test]
+    fn a_zero_cell_height_lays_no_effects_quad() {
+        let headed = Geom {
+            origin_y: 10,
+            head: 10,
+            ..geom()
+        };
+        let mut quads = Vec::new();
+        push_fx_quad(
+            &mut quads,
+            Geom { ch: 0, ..headed },
+            0,
+            0,
+            8,
+            16,
+            0x00FF_FFFF,
+            0,
+        );
+        assert!(quads.is_empty(), "{quads:?}");
+        push_fx_quad(&mut quads, headed, 0, 0, 8, 16, 0x00FF_FFFF, 0);
+        assert_eq!(
+            quads.len(),
+            2,
+            "control: the head band and row 0's: {quads:?}"
+        );
     }
 
     /// Only additive zero light is skipped: a source-over quad that rounds to black still darkens.

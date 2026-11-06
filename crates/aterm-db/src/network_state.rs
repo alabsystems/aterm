@@ -939,7 +939,10 @@ impl Observer {
         }
         self.state.visibility = visibility;
         self.state.unverified_endpoints = unverified;
-        self.state.detail = detail.into();
+        if self.state.detail != detail {
+            self.state.detail.clear();
+            self.state.detail.push_str(detail);
+        }
         for peer in &mut self.state.peers {
             let next = if !available || at_ms == 0 {
                 Reachability::Unknown
@@ -1044,9 +1047,22 @@ fn sample(peer: &mut PeerObservation, at_ms: u64, state: Reachability) {
 /// read's wall clock; an unavailable clock or future stamp leaves the age unknown.
 pub fn value(observation: &NetworkObservation) -> Value {
     let now = aterm_time::unix_millis();
+    let visibility = match observation.visibility {
+        Visibility::Checking => "Checking",
+        Visibility::Active => "Active",
+        Visibility::Offline => "Offline",
+        Visibility::Disabled => "Disabled",
+        Visibility::Waiting => "Waiting",
+        Visibility::Unavailable => "Unavailable",
+    };
+    let history = match observation.history {
+        HistoryState::Ready => "Ready",
+        HistoryState::Restoring => "Restoring",
+        HistoryState::Unavailable => "Unavailable",
+    };
     json!({"revision":observation.revision,"observed_at_ms":observation.observed_at_ms,
         "via_local_process":observation.via_local_process,
-        "visibility":format!("{:?}",observation.visibility),"history":format!("{:?}",observation.history),"detail":observation.detail,
+        "visibility":visibility,"history":history,"detail":observation.detail,
         "observer":observation.observer.as_ref().map(identity_value),"unverified_endpoints":observation.unverified_endpoints,
         "retention_limited":observation.retention_limited,"instances":Value::Null,
         "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),

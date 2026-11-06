@@ -27,8 +27,10 @@ clean {
     -- spec_row_revokes: a row taken out that no row restores revokes its recipient.
     def spec_row_revokes (takenOut holderAfter : Bool) : Bool := takenOut && !holderAfter
     -- spec_gate_row: an epoch keeps the row's recipient out when the row does not
-    -- revoke or every Remove that took it lies in the epoch's past.
-    def spec_gate_row (revokes everyTakerBefore : Bool) : Bool := !revokes || everyTakerBefore
+    -- revoke; or every Remove that took it lies in the epoch's past; or no row that
+    -- is not out binds its recipient and some Remove that took it lies there.
+    def spec_gate_row (revokes everyTakerBefore recipientLive someTakerBefore : Bool) : Bool :=
+      !revokes || (everyTakerBefore || (!recipientLive && someTakerBefore))
     -- spec_current: a row that is not out binds the recipient, and nothing revokes it.
     def spec_current (boundLive revoked : Bool) : Bool := boundLive && !revoked
     -- spec_wraps_removed: a newest epoch holds a Wrap to a revoked recipient.
@@ -248,6 +250,10 @@ clean {
     def takersBefore (t : Table) (i x : Nat) : Bool :=
       allN t.rms (fun j => spec_precedes (takes t j i) (t.before (t.mid j) x))
 
+    -- some Remove that took row i lies in record x's past
+    def someTakerBefore (t : Table) (i x : Nat) : Bool :=
+      anyN t.rms (fun j => takes t j i && t.before (t.mid j) x)
+
     def restores (t : Table) (i m : Nat) : Bool :=
       spec_restores (decide (t.rrcp m = t.rrcp i)) (isOut t m) (takersBefore t i (t.rid m))
 
@@ -265,10 +271,13 @@ clean {
     -- Log::current_recipients
     def current (t : Table) (r : Nat) : Bool := spec_current (boundLive t r) (revoked t r)
 
-    -- The writer's gate and the re-key due (one rule): every Remove that took out a
-    -- row whose recipient stays revoked lies in the epoch's causal past.
+    -- The writer's gate and the re-key due (one rule): for each row whose recipient
+    -- stays revoked, every Remove that took it lies in the epoch's causal past, or
+    -- one does and no row that is not out binds the recipient (then no Mac holding
+    -- the epoch can read the recipient as current: section 5).
     def gate (t : Table) (e : Nat) : Bool :=
-      allN t.rows (fun i => spec_gate_row (revokes t i) (takersBefore t i e))
+      allN t.rows (fun i => spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i))
+        (someTakerBefore t i e))
 
     -- ===========================================================================
     -- 2. The decision is exact (all sizes)
@@ -632,12 +641,45 @@ clean {
     -- 5. The gate, and the core of confidentiality (all sizes)
     -- ===========================================================================
 
+    theorem gate_row_of (t : Table) (e i : Nat) (hg : gate t e = true) (hi : i < t.rows) :
+        spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i)) (someTakerBefore t i e) = true :=
+      allN_elim _ t.rows hg i hi
+
+    -- While a row of the recipient is live, an open gate has every Remove that
+    -- took a revoking row in the epoch's past.
+    theorem gate_every (t : Table) (e i : Nat) (hg : gate t e = true) (hi : i < t.rows)
+        (hrv : revokes t i = true) (hl : boundLive t (t.rrcp i) = true) : takersBefore t i e = true := by
+      have hrow := gate_row_of t e i hg hi
+      rw [hrv, hl] at hrow
+      cases htb : takersBefore t i e with
+      | true => rfl
+      | false =>
+        rw [htb] at hrow
+        exact Bool.noConfusion hrow
+
     theorem gate_sound (t : Table) (e i j : Nat) (hg : gate t e = true) (hi : i < t.rows)
-        (hrv : revokes t i = true) (hj : j < t.rms) (htk : takes t j i = true) :
-        t.before (t.mid j) e = true := by
-      have hrow : spec_gate_row (revokes t i) (takersBefore t i e) = true := allN_elim _ t.rows hg i hi
+        (hrv : revokes t i = true) (hl : boundLive t (t.rrcp i) = true) (hj : j < t.rms)
+        (htk : takes t j i = true) : t.before (t.mid j) e = true :=
+      takers_before_elim t i e j (gate_every t e i hg hi hrv hl) hj htk
+
+    -- Always, an open gate has some Remove that took a revoking row in the
+    -- epoch's past, so every Mac that holds the epoch holds that Remove.
+    theorem gate_some (t : Table) (e i : Nat) (hg : gate t e = true) (hi : i < t.rows)
+        (hrv : revokes t i = true) :
+        ∃ j, j < t.rms ∧ takes t j i = true ∧ t.before (t.mid j) e = true := by
+      have hrow := gate_row_of t e i hg hi
       rw [hrv] at hrow
-      exact takers_before_elim t i e j hrow hj htk
+      cases htb : takersBefore t i e with
+      | true =>
+        exact Exists.elim (anyN_elim _ t.rms (revokes_parts t i hrv).1) (fun j hj =>
+          ⟨j, hj.1, hj.2, takers_before_elim t i e j htb hj.1 hj.2⟩)
+      | false =>
+        rw [htb] at hrow
+        have hs : (!(boundLive t (t.rrcp i)) && someTakerBefore t i e) = true := hrow
+        have hs2 : someTakerBefore t i e = true := (Eq.mp (Bool.and_eq_true _ _) hs).2
+        exact Exists.elim (anyN_elim _ t.rms hs2) (fun j hj =>
+          have hb := Eq.mp (Bool.and_eq_true _ _) hj.2
+          ⟨j, hj.1, hb.1, hb.2⟩)
 
     -- Progress, one step: an epoch minted by a Mac holding every Remove (its past is
     -- the minter's whole view) opens the gate, so the re-key clears the due there.
@@ -651,21 +693,21 @@ clean {
         show (!(takes t j i) || t.before (t.mid j) e) = true
         rw [h j hj]
         exact Bool.or_true _
-      show (!(revokes t i) || takersBefore t i e) = true
+      show (!(revokes t i) || (takersBefore t i e || (!(boundLive t (t.rrcp i)) && someTakerBefore t i e))) = true
       rw [hall]
       exact Bool.or_true _
 
-    -- The gate is exactly its premises: an epoch whose causal past holds every
-    -- Remove that took out a row which revokes its recipient has its gate open.
-    -- With gate_sound, this is why Log::head_due may read the gate as the union of
-    -- those Removes (Membership::revoking_removes) all lying in the epoch's past.
+    -- An epoch whose causal past holds every Remove that took out a row which
+    -- revokes its recipient has its gate open: the re-key that postdates them
+    -- clears the due. Log::head_due reads the gate row by row, from each revoking
+    -- row's Removes and whether its recipient is live (Membership::revoking_rows).
     theorem gate_of_takers (t : Table) (e : Nat)
         (h : ∀ i j, i < t.rows → revokes t i = true → j < t.rms → takes t j i = true →
           t.before (t.mid j) e = true) :
         gate t e = true := by
       apply allN_intro
       intro i hi
-      show (!(revokes t i) || takersBefore t i e) = true
+      show (!(revokes t i) || (takersBefore t i e || (!(boundLive t (t.rrcp i)) && someTakerBefore t i e))) = true
       cases hr : revokes t i
       · rfl
       · have hall : takersBefore t i e = true := by
@@ -703,15 +745,14 @@ clean {
              ∧ t2.mquorum j2 = t1.mquorum j)
         (hcur : current t2 (t2.rrcp i2) = true) :
         ∃ m, m < t2.rows ∧ restores t2 i2 m = true := by
-      have hrvb := revokes_parts t1 i1 hrv
-      exact Exists.elim (anyN_elim _ t1.rms hrvb.1) (fun j hjt =>
-        have hbe : t1.before (t1.mid j) e = true := gate_sound t1 e i1 j hg hi1 hrv hjt.1 hjt.2
+      exact Exists.elim (gate_some t1 e i1 hg hi1 hrv) (fun j hjt =>
+        have hbe : t1.before (t1.mid j) e = true := hjt.2.2
         Exists.elim (hholds j hjt.1 hbe) (fun j2 hj2 => by
           have htk2 : takes t2 j2 i2 = true := by
             show (t2.mlive j2 && (decide (t2.mactor j2 = t2.ractor i2)
                   && (t2.mquorum j2 || !(t2.before (t2.mid j2) (t2.rid i2))))) = true
             rw [hj2.2.2.2.1, hj2.2.2.2.2, hj2.2.1, hj2.2.2.1, hra, hrid, hbefore]
-            exact hjt.2
+            exact hjt.2.1
           have hout2 : isOut t2 i2 = true := anyN_intro _ t2.rms j2 hj2.1 htk2
           have hnrev : revoked t2 (t2.rrcp i2) = false := current_not_revoked t2 _ hcur
           cases hex : restored t2 i2 with
@@ -728,6 +769,60 @@ clean {
             have hyes := revoked_complete t2 i2 hi2 hout2 hall
             rw [hnrev] at hyes
             exact Bool.noConfusion hyes))
+
+    -- A row of a recipient that no live row binds is out.
+    theorem out_of_not_live (t : Table) (r m : Nat) (hl : boundLive t r = false) (hm : m < t.rows)
+        (hr : t.rrcp m = r) : isOut t m = true := by
+      cases ho : isOut t m with
+      | true => rfl
+      | false =>
+        have hlive : boundLive t r = true := anyN_intro _ t.rows m hm (by
+          show (decide (t.rrcp m = r) && !(isOut t m)) = true
+          rw [ho, dtrue hr])
+        rw [hl] at hlive
+        exact Bool.noConfusion hlive
+
+    -- What the gate's second clause keeps. When no row of t1 that is not out binds
+    -- the recipient, the restorer a wrapper's view needs (honest_wrap_needs_restorer)
+    -- is no row t1 holds: such a row is out in t1 and, restored by no live row,
+    -- revokes the recipient there too, so the gate has a Remove that took it in e's
+    -- past; the wrapper holds that Remove, so the row is out there as well. Only an
+    -- Admit of the key that t1 has not seen lets a wrapper read it as current.
+    theorem restorer_is_unseen (t1 t2 : Table) (e i1 i2 m1 m2 : Nat)
+        (hbefore : t2.before = t1.before)
+        (hm1 : m1 < t1.rows) (hma : t2.ractor m2 = t1.ractor m1) (hmr : t2.rrcp m2 = t1.rrcp m1)
+        (hmi : t2.rid m2 = t1.rid m1) (hrr : t2.rrcp i2 = t1.rrcp i1)
+        (hg : gate t1 e = true) (hl : boundLive t1 (t1.rrcp i1) = false)
+        (hholds : ∀ j, j < t1.rms → t1.before (t1.mid j) e = true →
+           ∃ j2, j2 < t2.rms ∧ t2.mactor j2 = t1.mactor j ∧ t2.mid j2 = t1.mid j ∧ t2.mlive j2 = t1.mlive j
+             ∧ t2.mquorum j2 = t1.mquorum j)
+        (hres : restores t2 i2 m2 = true) : False := by
+      have hp := restores_parts t2 i2 m2 hres
+      have hsame : t1.rrcp m1 = t1.rrcp i1 := Eq.trans (Eq.symm hmr) (Eq.trans hp.1 hrr)
+      have hout1 : isOut t1 m1 = true := out_of_not_live t1 (t1.rrcp i1) m1 hl hm1 hsame
+      have hrest : restored t1 m1 = false := anyN_false _ _ (fun m hmr => by
+        show spec_restores (decide (t1.rrcp m = t1.rrcp m1)) (isOut t1 m) (takersBefore t1 m1 (t1.rid m)) = false
+        cases hd : decide (t1.rrcp m = t1.rrcp m1) with
+        | false => rfl
+        | true =>
+          have hom : isOut t1 m = true :=
+            out_of_not_live t1 (t1.rrcp i1) m hl hmr (Eq.trans (of_decide_eq_true hd) hsame)
+          rw [hom]
+          rfl)
+      have hrv1 : revokes t1 m1 = true := by
+        show spec_row_revokes (isOut t1 m1) (restored t1 m1) = true
+        rw [hout1, hrest]
+        rfl
+      exact Exists.elim (gate_some t1 e m1 hg hm1 hrv1) (fun j hjt =>
+        Exists.elim (hholds j hjt.1 hjt.2.2) (fun j2 hj2 => by
+          have htk2 : takes t2 j2 m2 = true := by
+            show (t2.mlive j2 && (decide (t2.mactor j2 = t2.ractor m2)
+                  && (t2.mquorum j2 || !(t2.before (t2.mid j2) (t2.rid m2))))) = true
+            rw [hj2.2.2.2.1, hj2.2.2.2.2, hj2.2.1, hj2.2.2.1, hma, hmi, hbefore]
+            exact hjt.2.1
+          have hout2 : isOut t2 m2 = true := anyN_intro _ t2.rms j2 hj2.1 htk2
+          rw [hp.2.1] at hout2
+          exact Bool.noConfusion hout2))
 
     -- ===========================================================================
     -- 6. Law 1 (determinism): the evaluation depends only on the record set and
@@ -802,24 +897,41 @@ clean {
         (fun i hi hv => Exists.elim (h.1 i hi) (fun k hk => ⟨k, hk.1, Eq.trans (hp i k hk.2) hv⟩))
         (fun k hk hv => Exists.elim (h.2.1 k hk) (fun i hi => ⟨i, hi.1, Eq.trans (hp i k hi.2).symm hv⟩))).symm
 
-    theorem current_match (t u : Table) (h : SameRecords t u) (r : Nat) : current u r = current t r := by
+    theorem boundLive_match (t u : Table) (h : SameRecords t u) (r : Nat) : boundLive u r = boundLive t r := by
       have hp : ∀ i k, RowMatch t u i k →
           (decide (u.rrcp k = r) && !(isOut u k)) = (decide (t.rrcp i = r) && !(isOut t i)) :=
         fun i k hik => by rw [hik.2.1, isOut_match t u h i k hik]
-      have hb : boundLive u r = boundLive t r :=
-        (anyN_match (fun i => decide (t.rrcp i = r) && !(isOut t i))
-          (fun k => decide (u.rrcp k = r) && !(isOut u k)) t.rows u.rows
-          (fun i hi hv => Exists.elim (h.1 i hi) (fun k hk => ⟨k, hk.1, Eq.trans (hp i k hk.2) hv⟩))
-          (fun k hk hv => Exists.elim (h.2.1 k hk) (fun i hi => ⟨i, hi.1, Eq.trans (hp i k hi.2).symm hv⟩))).symm
+      exact (anyN_match (fun i => decide (t.rrcp i = r) && !(isOut t i))
+        (fun k => decide (u.rrcp k = r) && !(isOut u k)) t.rows u.rows
+        (fun i hi hv => Exists.elim (h.1 i hi) (fun k hk => ⟨k, hk.1, Eq.trans (hp i k hk.2) hv⟩))
+        (fun k hk hv => Exists.elim (h.2.1 k hk) (fun i hi => ⟨i, hi.1, Eq.trans (hp i k hi.2).symm hv⟩))).symm
+
+    theorem current_match (t u : Table) (h : SameRecords t u) (r : Nat) : current u r = current t r := by
       show spec_current (boundLive u r) (revoked u r) = spec_current (boundLive t r) (revoked t r)
-      rw [hb, revoked_match t u h r]
+      rw [boundLive_match t u h r, revoked_match t u h r]
+
+    theorem someTakerBefore_match (t u : Table) (h : SameRecords t u) (i k x : Nat) (hr : RowMatch t u i k) :
+        someTakerBefore u k x = someTakerBefore t i x := by
+      have hp : ∀ j l, RmMatch t u j l →
+          (takes u l k && u.before (u.mid l) x) = (takes t j i && t.before (t.mid j) x) :=
+        fun j l hm => by
+          rw [takes_match t u j l i k hm hr h.2.2.2.2, hm.2.2.2, h.2.2.2.2]
+      exact (anyN_match (fun j => takes t j i && t.before (t.mid j) x)
+        (fun l => takes u l k && u.before (u.mid l) x) t.rms u.rms
+        (fun j hj hv => Exists.elim (h.2.2.1 j hj) (fun l hl => ⟨l, hl.1, Eq.trans (hp j l hl.2) hv⟩))
+        (fun l hl hv => Exists.elim (h.2.2.2.1 l hl) (fun j hj => ⟨j, hj.1, Eq.trans (hp j l hj.2).symm hv⟩))).symm
 
     theorem gate_match (t u : Table) (h : SameRecords t u) (e : Nat) : gate u e = gate t e := by
       have hp : ∀ i k, RowMatch t u i k →
-          spec_gate_row (revokes u k) (takersBefore u k e) = spec_gate_row (revokes t i) (takersBefore t i e) :=
-        fun i k hik => by rw [revokes_match t u h i k hik, takersBefore_match t u h i k e hik]
-      exact (allN_match (fun i => spec_gate_row (revokes t i) (takersBefore t i e))
-        (fun k => spec_gate_row (revokes u k) (takersBefore u k e)) t.rows u.rows
+          spec_gate_row (revokes u k) (takersBefore u k e) (boundLive u (u.rrcp k)) (someTakerBefore u k e)
+            = spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i)) (someTakerBefore t i e) :=
+        fun i k hik => by
+          rw [revokes_match t u h i k hik, takersBefore_match t u h i k e hik, hik.2.1,
+            boundLive_match t u h (t.rrcp i), someTakerBefore_match t u h i k e hik]
+      exact (allN_match
+        (fun i => spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i)) (someTakerBefore t i e))
+        (fun k => spec_gate_row (revokes u k) (takersBefore u k e) (boundLive u (u.rrcp k)) (someTakerBefore u k e))
+        t.rows u.rows
         (fun i hi hv => Exists.elim (h.1 i hi) (fun k hk => ⟨k, hk.1, Eq.trans (hp i k hk.2) hv⟩))
         (fun k hk hv => Exists.elim (h.2.1 k hk) (fun i hi => ⟨i, hi.1, Eq.trans (hp i k hi.2).symm hv⟩))).symm
 
@@ -868,24 +980,36 @@ clean {
         show (decide (t.rrcp i = r) && revokes (relabel t pi b') i) = (decide (t.rrcp i = r) && revokes t i)
         rw [relabel_revokes t pi b' hpi i])
 
+    theorem relabel_boundLive (t : Table) (pi : Nat → Nat) (b' : Nat → Nat → Bool)
+        (hpi : ∀ x y, b' (pi x) (pi y) = t.before x y) (r : Nat) :
+        boundLive (relabel t pi b') r = boundLive t r :=
+      anyN_congr _ _ t.rows (fun i _ => by
+        show (decide (t.rrcp i = r) && !(isOut (relabel t pi b') i)) = (decide (t.rrcp i = r) && !(isOut t i))
+        rw [relabel_isOut t pi b' hpi i])
+
     theorem relabel_current (t : Table) (pi : Nat → Nat) (b' : Nat → Nat → Bool)
         (hpi : ∀ x y, b' (pi x) (pi y) = t.before x y) (r : Nat) :
         current (relabel t pi b') r = current t r := by
-      have hb : boundLive (relabel t pi b') r = boundLive t r :=
-        anyN_congr _ _ t.rows (fun i _ => by
-          show (decide (t.rrcp i = r) && !(isOut (relabel t pi b') i)) = (decide (t.rrcp i = r) && !(isOut t i))
-          rw [relabel_isOut t pi b' hpi i])
       show spec_current (boundLive (relabel t pi b') r) (revoked (relabel t pi b') r)
          = spec_current (boundLive t r) (revoked t r)
-      rw [hb, relabel_revoked t pi b' hpi r]
+      rw [relabel_boundLive t pi b' hpi r, relabel_revoked t pi b' hpi r]
+
+    theorem relabel_someTakerBefore (t : Table) (pi : Nat → Nat) (b' : Nat → Nat → Bool)
+        (hpi : ∀ x y, b' (pi x) (pi y) = t.before x y) (i x : Nat) :
+        someTakerBefore (relabel t pi b') i (pi x) = someTakerBefore t i x :=
+      anyN_congr _ _ t.rms (fun j _ => by
+        show (takes (relabel t pi b') j i && b' (pi (t.mid j)) (pi x)) = (takes t j i && t.before (t.mid j) x)
+        rw [relabel_takes t pi b' hpi j i, hpi])
 
     theorem relabel_gate (t : Table) (pi : Nat → Nat) (b' : Nat → Nat → Bool)
         (hpi : ∀ x y, b' (pi x) (pi y) = t.before x y) (e : Nat) :
         gate (relabel t pi b') (pi e) = gate t e :=
       allN_congr _ _ t.rows (fun i _ => by
         show spec_gate_row (revokes (relabel t pi b') i) (takersBefore (relabel t pi b') i (pi e))
-           = spec_gate_row (revokes t i) (takersBefore t i e)
-        rw [relabel_revokes t pi b' hpi i, relabel_takersBefore t pi b' hpi i e])
+              (boundLive (relabel t pi b') (t.rrcp i)) (someTakerBefore (relabel t pi b') i (pi e))
+           = spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i)) (someTakerBefore t i e)
+        rw [relabel_revokes t pi b' hpi i, relabel_takersBefore t pi b' hpi i e, relabel_boundLive t pi b' hpi,
+          relabel_someTakerBefore t pi b' hpi i e])
 
     -- Law 1, whole: two Macs that hold the same records, listed and numbered in
     -- any order, answer the same.
@@ -1039,7 +1163,7 @@ clean {
       precedes : Bool → Bool → Bool
       restores : Bool → Bool → Bool → Bool
       rowRevokes : Bool → Bool → Bool
-      gateRow : Bool → Bool → Bool
+      gateRow : Bool → Bool → Bool → Bool → Bool
       current : Bool → Bool → Bool
       wrapsRemoved : Bool → Bool → Bool
       headDue : Bool → Bool → Bool
@@ -1049,7 +1173,7 @@ clean {
         ∧ (∀ a b, K.precedes a b = spec_precedes a b)
         ∧ (∀ a b c, K.restores a b c = spec_restores a b c)
         ∧ (∀ a b, K.rowRevokes a b = spec_row_revokes a b)
-        ∧ (∀ a b, K.gateRow a b = spec_gate_row a b)
+        ∧ (∀ a b c d, K.gateRow a b c d = spec_gate_row a b c d)
         ∧ (∀ a b, K.current a b = spec_current a b)
         ∧ (∀ a b, K.wrapsRemoved a b = spec_wraps_removed a b)
         ∧ (∀ a b, K.headDue a b = spec_head_due a b)
@@ -1068,8 +1192,11 @@ clean {
     def boundLiveW (K : Kernels) (t : Table) (r : Nat) : Bool :=
       anyN t.rows (fun m => decide (t.rrcp m = r) && !(isOutW K t m))
     def currentW (K : Kernels) (t : Table) (r : Nat) : Bool := K.current (boundLiveW K t r) (revokedW K t r)
+    def someTakerBeforeW (K : Kernels) (t : Table) (i x : Nat) : Bool :=
+      anyN t.rms (fun j => takesW K t j i && t.before (t.mid j) x)
     def gateW (K : Kernels) (t : Table) (e : Nat) : Bool :=
-      allN t.rows (fun i => K.gateRow (revokesW K t i) (takersBeforeW K t i e))
+      allN t.rows (fun i => K.gateRow (revokesW K t i) (takersBeforeW K t i e) (boundLiveW K t (t.rrcp i))
+        (someTakerBeforeW K t i e))
     def headDueW (K : Kernels) (t : Table) (e : Nat) (wrapsRevoked : Bool) : Bool :=
       K.headDue (gateW K t e) wrapsRevoked
 
@@ -1107,11 +1234,18 @@ clean {
       show K.current (boundLiveW K t r) (revokedW K t r) = spec_current (boundLive t r) (revoked t r)
       rw [boundLiveW_eq K hK t r, revokedW_eq K hK t r]
       exact hK.2.2.2.2.2.1 _ _
+    theorem someTakerBeforeW_eq (K : Kernels) (hK : Exact K) (t : Table) (i x : Nat) :
+        someTakerBeforeW K t i x = someTakerBefore t i x :=
+      anyN_congr _ _ t.rms (fun j _ => by
+        show (takesW K t j i && t.before (t.mid j) x) = (takes t j i && t.before (t.mid j) x)
+        rw [takesW_eq K hK t j i])
     theorem gateW_eq (K : Kernels) (hK : Exact K) (t : Table) (e : Nat) : gateW K t e = gate t e :=
       allN_congr _ _ t.rows (fun i _ => by
-        show K.gateRow (revokesW K t i) (takersBeforeW K t i e) = spec_gate_row (revokes t i) (takersBefore t i e)
-        rw [revokesW_eq K hK t i, takersBeforeW_eq K hK t i e]
-        exact hK.2.2.2.2.1 _ _)
+        show K.gateRow (revokesW K t i) (takersBeforeW K t i e) (boundLiveW K t (t.rrcp i)) (someTakerBeforeW K t i e)
+          = spec_gate_row (revokes t i) (takersBefore t i e) (boundLive t (t.rrcp i)) (someTakerBefore t i e)
+        rw [revokesW_eq K hK t i, takersBeforeW_eq K hK t i e, boundLiveW_eq K hK t (t.rrcp i),
+          someTakerBeforeW_eq K hK t i e]
+        exact hK.2.2.2.2.1 _ _ _ _)
     theorem headDueW_eq (K : Kernels) (hK : Exact K) (t : Table) (e : Nat) (w : Bool) :
         headDueW K t e w = spec_head_due (gate t e) w := by
       show K.headDue (gateW K t e) w = spec_head_due (gate t e) w
@@ -1170,26 +1304,37 @@ clean {
           rw [hs] at hs'
           exact Bool.noConfusion hs')
 
-    -- The writer's rule of the World that asks K, in every state of every run: a
-    -- head the kernels call not due has every Remove that took a row which still
-    -- revokes its recipient in its causal past, so nothing sealed under it reaches
-    -- that recipient (section 5).
+    -- The writer's rule of the World that asks K, one state: a head the kernels
+    -- call not due has, for each row that still revokes its recipient, a Remove
+    -- that took it in its causal past, and every such Remove while a row of the
+    -- recipient is live, so nothing sealed under it reaches that recipient
+    -- (section 5).
+    def WriterRule (K : Kernels) (t : Table) : Prop :=
+      ∀ e w i, headDueW K t e w = false → i < t.rows → revokesW K t i = true →
+        (∃ j, j < t.rms ∧ takesW K t j i = true ∧ t.before (t.mid j) e = true)
+          ∧ (boundLiveW K t (t.rrcp i) = true →
+              ∀ j, j < t.rms → takesW K t j i = true → t.before (t.mid j) e = true)
+
+    theorem writer_rule_holds (K : Kernels) (hK : Exact K) (t : Table) : WriterRule K t :=
+      fun e w i hd hi hrv =>
+        have hg : gate t e = true := head_not_due_opens_gate t e w (Eq.trans (Eq.symm (headDueW_eq K hK t e w)) hd)
+        have hr : revokes t i = true := Eq.trans (Eq.symm (revokesW_eq K hK t i)) hrv
+        ⟨Exists.elim (gate_some t e i hg hi hr) (fun j hj =>
+           ⟨j, hj.1, Eq.trans (takesW_eq K hK t j i) hj.2.1, hj.2.2⟩),
+         fun hl j hj htk => gate_sound t e i j hg hi hr (Eq.trans (Eq.symm (boundLiveW_eq K hK t (t.rrcp i))) hl) hj
+           (Eq.trans (Eq.symm (takesW_eq K hK t j i)) htk)⟩
+
+    -- The writer's rule of the World that asks K, in every state of every run.
     theorem writer_rule_of_exact (K : Kernels) (hK : Exact K) (t0 : Table) :
-        Satisfies (SpecW K t0) (Always (Lift (fun t => ∀ e w i j, headDueW K t e w = false →
-          i < t.rows → revokesW K t i = true → j < t.rms → takesW K t j i = true →
-          t.before (t.mid j) e = true))) :=
+        Satisfies (SpecW K t0) (Always (Lift (WriterRule K))) :=
       invariantSatisfies (SpecW K t0) _
-        (fun s _ e w i j hd hi hrv hj htk => gate_sound s e i j
-          (head_not_due_opens_gate s e w (Eq.trans (Eq.symm (headDueW_eq K hK s e w)) hd)) hi
-          (Eq.trans (Eq.symm (revokesW_eq K hK s i)) hrv) hj (Eq.trans (Eq.symm (takesW_eq K hK s j i)) htk))
-        (fun _ t _ _ e w i j hd hi hrv hj htk => gate_sound t e i j
-          (head_not_due_opens_gate t e w (Eq.trans (Eq.symm (headDueW_eq K hK t e w)) hd)) hi
-          (Eq.trans (Eq.symm (revokesW_eq K hK t i)) hrv) hj (Eq.trans (Eq.symm (takesW_eq K hK t j i)) htk))
+        (fun s _ => writer_rule_holds K hK s)
+        (fun _ t _ _ => writer_rule_holds K hK t)
 
     -- The spec kernels are exact, so every law above holds of the spec World too.
     theorem spec_exact : Exact (Kernels.mk spec_takes spec_precedes spec_restores spec_row_revokes
         spec_gate_row spec_current spec_wraps_removed spec_head_due) :=
-      ⟨fun _ _ _ _ => rfl, fun _ _ => rfl, fun _ _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl,
+      ⟨fun _ _ _ _ => rfl, fun _ _ => rfl, fun _ _ _ => rfl, fun _ _ => rfl, fun _ _ _ _ => rfl,
        fun _ _ => rfl, fun _ _ => rfl, fun _ _ => rfl⟩
 
     -- ===========================================================================
@@ -1310,6 +1455,20 @@ clean {
     theorem held_wrap_gate_opens : wrapGate moved (fun r => decide (r = 1)) = true := rfl
     theorem causal_gate_stays_shut : gate moved 0 = false := rfl
 
+    -- PF1's first gate asked for every Remove that took the row. A recipient no
+    -- live row binds, removed twice concurrently (F21's split: m22 and m40 each
+    -- remove m42): an epoch (record 3) with one Remove (record 1) in its past and
+    -- the other (record 2) concurrent keeps the recipient out, since every Mac
+    -- holding the epoch holds record 1 and no row it holds can restore the
+    -- recipient (restorer_is_unseen); the first gate called it due.
+    def twice : Table :=
+      { rows := 1, ractor := fun _ => 0, rrcp := fun _ => 0, rid := fun _ => 0,
+        rms := 2, mactor := fun _ => 0, mid := fun j => if j = 0 then 1 else 2, mlive := fun _ => true,
+        mquorum := fun _ => false, before := fun a b => decide (a < b) && !(decide (a = 2) && decide (b = 3)) }
+    def everyTakerGate (t : Table) (e : Nat) : Bool := allN t.rows (fun i => !(revokes t i) || takersBefore t i e)
+    theorem every_taker_gate_shuts : everyTakerGate twice 3 = false := rfl
+    theorem gate_opens_on_one_taker : gate twice 3 = true := rfl
+
     -- Law 2's negative control: an automatic Admit without the guard (it binds a
     -- recipient its view revokes, with the Remove in its past) restores it.
     theorem unguarded_auto_admit_restores :
@@ -1368,13 +1527,13 @@ clean {
 
     theorem sheet_is : sheet =
       [0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0x3434797934347979,
-       0xe161e369e161e369, 0xe161e36934346969, 0xf171f379f171f379, 0x3434797934347979,
+       0xf161f379f161f379, 0xe161e37934347979, 0xf171f379f171f379, 0x3434797934347979,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0xe1e1e3e3e1e1e3e3, 0xe161e36934346969, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0x3434797934347979,
        0xf1e1f3e3f1e1f3e3, 0x34e179e334347979, 0xf171f379f171f379, 0x3434797934347979,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
-       0x34a13ca634a13ca6, 0x34a13ca634343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
+       0x34a13cb634a13cb6, 0x34a13ca634343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xe161e369e161e369, 0xe161e36934346969,
        0xe161e369e161e369, 0xe161e36934346969, 0xe161e369e161e369, 0xe161e36934346969,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
@@ -1384,13 +1543,13 @@ clean {
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
        0x34a13ca634a13ca6, 0x34a13ca634343c3c, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0x3434797934347979,
-       0xe161e369e161e369, 0xe161e369e161e369, 0xf171f379f171f379, 0x3434797934347979,
+       0xf161f379f161f379, 0xe161e379e161e379, 0xf171f379f171f379, 0x3434797934347979,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0xe1e1e3e3e1e1e3e3, 0xe161e369e161e369, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0x3434797934347979,
        0xf1e1f3e3f1e1f3e3, 0x34e179e334e179e3, 0xf171f379f171f379, 0x3434797934347979,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
-       0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
+       0x34a13cb634a13cb6, 0x34a13ca634a13ca6, 0x34b13cb634b13cb6, 0x34343c3c34343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xe161e369e161e369, 0xe161e36934346969,
        0xe161e369e161e369, 0xe161e369e161e369, 0xe161e369e161e369, 0xe161e36934346969,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
@@ -1400,13 +1559,13 @@ clean {
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
        0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34a13ca634343c3c,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0xf134f379f134f379,
-       0xe161e369e161e369, 0xe161e369e134e369, 0xf171f379f171f379, 0xf134f379f134f379,
+       0xf161f379f161f379, 0xf161f379f134f379, 0xf171f379f171f379, 0xf134f379f134f379,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0xe1e1e3e3e1e1e3e3, 0xe1e1e3e334e169e3, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0xf134f379f134f379,
        0xf1e1f3e3f1e1f3e3, 0xf1e1f3e3f134f379, 0xf171f379f171f379, 0xf134f379f134f379,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
-       0x34a13ca634a13ca6, 0x34a13ca634b13cb6, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
+       0x34a13cb634a13cb6, 0x34a13cb634b13cb6, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xe161e369e161e369, 0xe161e369e134e369,
        0xe161e369e161e369, 0xe161e369e134e369, 0xe161e369e161e369, 0xe161e369e134e369,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6,
@@ -1416,13 +1575,13 @@ clean {
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6,
        0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0xf134f379f134f379,
-       0xe161e369e161e369, 0xe161e369e161e369, 0xf171f379f171f379, 0xf134f379f134f379,
+       0xf161f379f161f379, 0xf161f379f161f379, 0xf171f379f171f379, 0xf134f379f134f379,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0xe1e1e3e3e1e1e3e3, 0xe1e1e3e3e1e1e3e3, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xf171f379f171f379, 0xf134f379f134f379,
        0xf1e1f3e3f1e1f3e3, 0xf1e1f3e3f1e1f3e3, 0xf171f379f171f379, 0xf134f379f134f379,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
-       0x34a13ca634a13ca6, 0x34a13ca634a13ca6, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
+       0x34a13cb634a13cb6, 0x34a13cb634a13cb6, 0x34b13cb634b13cb6, 0x34b13cb634b13cb6,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0xe161e369e161e369, 0xe161e369e134e369,
        0xe161e369e161e369, 0xe161e369e161e369, 0xe161e369e161e369, 0xe161e369e134e369,
        0x34343c3c34343c3c, 0x34343c3c34343c3c, 0x34a13ca634a13ca6, 0x34a13ca634a13ca6,

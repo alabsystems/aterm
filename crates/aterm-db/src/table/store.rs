@@ -29,12 +29,17 @@ use std::{
 mod append_tests;
 pub mod custody;
 mod directory;
+mod held;
+#[cfg(test)]
+mod hook_tests;
 #[cfg(test)]
 mod recovery_tests;
 mod replay;
 mod replicas;
 mod witness;
 use witness::Witness;
+
+pub use held::{Held, held_lengths, read_held};
 
 #[cfg(test)]
 type ReplayObserver = Option<Box<dyn FnOnce()>>;
@@ -196,6 +201,86 @@ pub struct Receipt {
     pub id: Digest,
     pub received_ms: u64,
     pub offset: u64,
+}
+
+/// Where a record that enters a table store came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// A local write, or a record an older peer delivered by an old path (a repair round,
+    /// recovery, custody import): the egress publishes it.
+    Local,
+    /// A record the mesh delivered (its relay or `Inventory`): never published again.
+    Mesh,
+}
+
+/// Which journal subject a record took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendKind {
+    Operation,
+    Conflict,
+}
+
+/// One durable append to a table store, handed to the process's sink after the journal append
+/// and the witness publish succeeded (the end of the store's one append path, or a writing open
+/// that adopts the unwitnessed append a cut-off writer left). Fired exactly once per new record;
+/// never for a duplicate, which an ingest answers with its stored receipt.
+#[derive(Debug)]
+pub struct Appended<'a> {
+    /// The table's identifier ([`Scope::digest`]).
+    pub table: Digest,
+    /// Whether the store is a recovery replica (its own claim and data directories).
+    pub recovery: bool,
+    pub kind: AppendKind,
+    /// The record's offset ([`Receipt::offset`]).
+    pub offset: u64,
+    /// The witnessed record count after the append (`offset + 1`).
+    pub length: u64,
+    pub via: Via,
+    /// The operation or conflict wire, without the journal's receipt time.
+    pub wire: &'a [u8],
+}
+
+type AppendSink = Box<dyn Fn(&Appended<'_>) + Send + Sync>;
+static APPEND_SINK: std::sync::OnceLock<AppendSink> = std::sync::OnceLock::new();
+
+/// Install the process's append sink; false where one is installed already. The sink runs under
+/// the control journal lock and the table flock: it must not block (no I/O round trip).
+pub fn set_append_sink(sink: impl Fn(&Appended<'_>) + Send + Sync + 'static) -> bool {
+    APPEND_SINK.set(Box::new(sink)).is_ok()
+}
+
+#[cfg(any(test, debug_assertions))]
+type ThreadSink = std::rc::Rc<dyn Fn(&Appended<'_>)>;
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static THREAD_SINK: std::cell::RefCell<Option<ThreadSink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `sink` taking this thread's appends in place of the process's sink, so tests
+/// in one binary do not share one. The previous override comes back when `run` returns.
+#[cfg(any(test, debug_assertions))]
+pub fn with_append_sink<T>(sink: impl Fn(&Appended<'_>) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ThreadSink>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            THREAD_SINK.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _restore =
+        Restore(THREAD_SINK.with(|slot| slot.borrow_mut().replace(std::rc::Rc::new(sink))));
+    run()
+}
+
+fn appended(record: &Appended<'_>) {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(sink) = THREAD_SINK.with(|slot| slot.borrow().clone()) {
+        sink(record);
+        return;
+    }
+    if let Some(sink) = APPEND_SINK.get() {
+        sink(record);
+    }
 }
 struct Stored {
     wire: Vec<u8>,
@@ -693,6 +778,15 @@ impl Store {
         // The complete acknowledged prefix is verified before any opaque
         // record is considered for quarantine. The tail has no such authority.
         store.witness = replay.witness;
+        // The one unwitnessed append a cut-off writer can leave (replay allows no more). A
+        // writing open adopts it below and publishes its witness: that makes it a new record
+        // here, which the append sink hears of as of any append. Where it came from is lost
+        // with the writer, so it is `Local`: one publish too many is harmless, a missed one
+        // is not.
+        let adopted = (store.witness.count > acknowledged.count)
+            .then(|| replay.entries.last())
+            .flatten()
+            .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()));
         #[cfg(test)]
         if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
             observe();
@@ -748,6 +842,21 @@ impl Store {
             }
             if pending || store.witness != acknowledged {
                 store.publish_witness(store.witness)?;
+                if let Some((offset, conflict, wire)) = &adopted {
+                    appended(&Appended {
+                        table: scope.digest(),
+                        recovery: store.is_recovery(),
+                        kind: if *conflict {
+                            AppendKind::Conflict
+                        } else {
+                            AppendKind::Operation
+                        },
+                        offset: *offset,
+                        length: store.witness.count,
+                        via: Via::Local,
+                        wire,
+                    });
+                }
             }
             // Complete a possible earlier rename whose directory barrier failed.
             aterm_durable::durable_dir(&store.claim_dir)?;
@@ -890,6 +999,11 @@ impl Store {
         )
     )]
     pub fn ingest(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
+        self.ingest_via(session, wire, Via::Local)
+    }
+
+    /// [`Self::ingest`] of a record that arrived by `via`, which the append sink reports.
+    pub fn ingest_via(&mut self, session: &Session<'_>, wire: &[u8], via: Via) -> Result<Receipt> {
         session.mutation_guard()?;
         self.check(session)?;
         let record = session.authenticate(self.scope, wire)?;
@@ -909,7 +1023,7 @@ impl Store {
         proposed
             .insert(record.header().clone())
             .map_err(|_| Error::new("table index refused header or capacity"))?;
-        let receipt = self.append(SUBJECT, wire, id)?;
+        let receipt = self.append(SUBJECT, wire, id, via)?;
         self.operation_bytes += wire.len();
         self.index = proposed;
         self.records.insert(
@@ -924,8 +1038,9 @@ impl Store {
         self.poisoned = false;
         Ok(receipt)
     }
-    // Publish the independently retained witness before returning any receipt.
-    fn append(&mut self, subject: &str, wire: &[u8], id: Digest) -> Result<Receipt> {
+    // Publish the independently retained witness before returning any receipt, then hand the
+    // record to the append sink.
+    fn append(&mut self, subject: &str, wire: &[u8], id: Digest, via: Via) -> Result<Receipt> {
         let log = self
             .log
             .as_mut()
@@ -942,6 +1057,19 @@ impl Store {
             return Err(Error::new("table log and custody witness diverged"));
         }
         self.publish_witness(witness)?;
+        appended(&Appended {
+            table: self.scope.digest(),
+            recovery: self.is_recovery(),
+            kind: if subject == CONFLICT_SUBJECT {
+                AppendKind::Conflict
+            } else {
+                AppendKind::Operation
+            },
+            offset,
+            length: self.witness.count,
+            via,
+            wire,
+        });
         Ok(Receipt {
             id,
             received_ms,
@@ -969,6 +1097,17 @@ impl Store {
         )
     )]
     pub fn ingest_conflict(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
+        self.ingest_conflict_via(session, wire, Via::Local)
+    }
+
+    /// [`Self::ingest_conflict`] of a certificate that arrived by `via`, which the append sink
+    /// reports.
+    pub fn ingest_conflict_via(
+        &mut self,
+        session: &Session<'_>,
+        wire: &[u8],
+        via: Via,
+    ) -> Result<Receipt> {
         session.mutation_guard()?;
         self.check(session)?;
         let conflict = Conflict::authenticate(session, self.scope, wire)?;
@@ -986,7 +1125,7 @@ impl Store {
                 .insert(source.header.clone())
                 .map_err(|_| Error::new("invalid discarded-source header"))?;
         }
-        let receipt = self.append(CONFLICT_SUBJECT, wire, conflict.id())?;
+        let receipt = self.append(CONFLICT_SUBJECT, wire, conflict.id(), via)?;
         self.conflicts
             .insert(key, StoredConflict { conflict, receipt });
         self.index = index;
@@ -2069,7 +2208,10 @@ impl Store {
     }
     pub fn receipt(&self, session: &Session<'_>, id: &Digest) -> Result<Option<Receipt>> {
         self.check(session)?;
-        Ok(self.records.get(id).map(|stored| stored.receipt))
+        Ok(self.receipt_unchecked(id))
+    }
+    pub(crate) fn receipt_unchecked(&self, id: &Digest) -> Option<Receipt> {
+        self.records.get(id).map(|stored| stored.receipt)
     }
 }
 

@@ -17,7 +17,24 @@ use std::time::Duration;
 const BUDGET: Duration = Duration::from_secs(1800);
 
 fn local(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
-    checkout::git(sys, user, path).args(["-c", "core.fsmonitor=false"])
+    checkout::git(sys, user, path)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .arg("--no-lazy-fetch")
+        .args(["-c", "core.fsmonitor=false"])
+}
+
+fn require_local_reads(sys: &dyn System, user: &User, repo: &Repo) -> Result<(), String> {
+    if repo.required_submodules.is_empty() {
+        return Ok(());
+    }
+    // The environment variable can be silently ignored by older Git. Its equivalent
+    // global option must be recognized before any object read or submodule operation.
+    let ran = sys.run_complete_stdout(&local(sys, user, None).arg("--version"))
+        .map_err(|_| "cannot check Git's --no-lazy-fetch capability; required dependencies stay untouched")?;
+    if !ran.success() {
+        return Err("Git must support --no-lazy-fetch to inspect required dependencies safely; required dependencies stay untouched".into());
+    }
+    Ok(())
 }
 
 /// Admit canonical, bounded relative paths, with no overlaps even on a case-insensitive
@@ -430,17 +447,25 @@ fn state(
     Ok(State::Lagging)
 }
 
+/// Why a required dependency cannot yet be measured as ready.
+#[derive(Debug)]
+pub(super) enum Unready {
+    Git(String),
+    Preserved(String),
+}
+
 /// Whether every explicitly required gitlink is already populated at its recorded commit.
-/// An error names preserved work or invalid metadata, never a successful exemption.
+/// A tool wait is distinct from preserved work or invalid metadata; neither is an exemption.
 pub(super) fn ready(
     sys: &dyn System,
     user: &User,
     parent: &Path,
     repo: &Repo,
-) -> Result<bool, String> {
+) -> Result<bool, Unready> {
+    require_local_reads(sys, user, repo).map_err(Unready::Git)?;
     let mut ready = true;
     for path in &repo.required_submodules {
-        let named = |why: String| format!("{path}: {why}");
+        let named = |why: String| Unready::Preserved(format!("{path}: {why}"));
         let dependency = resolve(sys, user, parent, repo, path).map_err(named)?;
         ready &= state(sys, user, parent, &dependency).map_err(named)? == State::Ready;
     }
@@ -535,6 +560,11 @@ pub(super) fn repair(
     repo: &Repo,
     authorized: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<(), String> {
+    if repo.required_submodules.is_empty() {
+        return Ok(());
+    }
+    authorized()?;
+    require_local_reads(sys, user, repo)?;
     for path in &repo.required_submodules {
         authorized()?;
         let dependency = resolve(sys, user, parent, repo, path)?;
@@ -571,27 +601,41 @@ pub(super) fn repair(
             State::Ready => continue,
             State::Lagging => {
                 current()?;
-                read(
-                    sys,
-                    network(sys, user, Some(&parent.join(path)), &dependency)?
-                        .budget(BUDGET)
-                        .args([
-                            "fetch",
-                            "--no-recurse-submodules",
-                            "--no-tags",
-                            "--",
-                            &dependency.url(),
-                            &dependency.pin,
-                        ]),
-                    "cannot fetch the required dependency's recorded commit",
-                )?;
+                let inner = parent.join(path);
+                // Inspect availability only in a complete object store: a partial clone's
+                // read could otherwise fetch implicitly, outside the admitted route.
+                complete_storage(sys, user, &inner)?;
+                let available = sys
+                    .run_complete_stdout(&local(sys, user, Some(&inner)).args([
+                        "cat-file",
+                        "-e",
+                        &format!("{}^{{commit}}", dependency.pin),
+                    ]))
+                    .map_err(|_| "cannot inspect the required dependency's local commit")?;
+                current()?;
+                if !available.success() {
+                    read(
+                        sys,
+                        network(sys, user, Some(&inner), &dependency)?
+                            .budget(BUDGET)
+                            .args([
+                                "fetch",
+                                "--no-recurse-submodules",
+                                "--no-tags",
+                                "--",
+                                &dependency.url(),
+                                &dependency.pin,
+                            ]),
+                        "cannot fetch the required dependency's recorded commit",
+                    )?;
+                }
                 current()?;
                 match state(sys, user, parent, &dependency)? {
                     State::Ready => continue,
                     State::Lagging => {}
                     State::Missing => {
                         return Err(
-                            "required dependency disappeared after its fetch; left untouched"
+                            "required dependency disappeared before alignment; left untouched"
                                 .into(),
                         );
                     }

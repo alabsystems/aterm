@@ -4,6 +4,32 @@
 //! `spawnfd`'s tests.
 
 use super::*;
+
+#[test]
+fn lost_wait_custody_is_sticky_without_numeric_child_operations() {
+    let mut custody = WaitCustody::default();
+    custody.observe_error(
+        &std::io::Error::from(std::io::ErrorKind::Interrupted),
+        false,
+    );
+    assert!(custody.require().is_ok());
+    custody.observe_error(&std::io::Error::from_raw_os_error(libc::ECHILD), false);
+    assert_eq!(
+        custody.require().unwrap_err().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    custody.observe_error(&std::io::Error::from(std::io::ErrorKind::Interrupted), true);
+    assert!(
+        custody.require().is_err(),
+        "later observations cannot recreate custody"
+    );
+    let mut reaped = WaitCustody::default();
+    reaped.observe_error(&std::io::Error::from_raw_os_error(libc::ECHILD), true);
+    assert!(
+        reaped.require().is_ok(),
+        "a cached positive reap is not forfeited"
+    );
+}
 use crate::host::could_not_run;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

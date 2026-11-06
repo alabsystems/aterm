@@ -598,9 +598,11 @@ label_enum! {
         KittyTenure => "kitty_tenure",
         MessageBand => "message_band",
         SessionStatus => "session_status",
+        AccountProgress => "account_progress",
         ConsentCard => "consent_card",
         Presence => "presence",
         HandoffPark => "handoff_park",
+        AccountDrain => "account_drain",
         MessageBandMotion => "message_band_motion",
         SessionWaits => "session_waits",
         AosEchoHold => "aos_echo_hold",
@@ -1046,7 +1048,11 @@ fn slow_episode_step(
     deadline_owner: DeadlineOwner,
     at_ns: u64,
 ) -> SlowEpisodeStep {
-    if latency_ns <= SLOW_PRESENT_LOG_THRESHOLD_NS || deadline_owner == DeadlineOwner::SessionStatus
+    if latency_ns <= SLOW_PRESENT_LOG_THRESHOLD_NS
+        || matches!(
+            deadline_owner,
+            DeadlineOwner::SessionStatus | DeadlineOwner::AccountProgress
+        )
     {
         return SlowEpisodeStep::Ignored;
     }
@@ -5316,6 +5322,11 @@ mod lateness_attribution_tests {
             slow_episode_step(&mut ep, slow, DeadlineOwner::SessionStatus, 1),
             SlowEpisodeStep::Ignored,
             "a delay owned by the session-status observer is not logged"
+        );
+        assert_eq!(
+            slow_episode_step(&mut ep, slow, DeadlineOwner::AccountProgress, 1),
+            SlowEpisodeStep::Ignored,
+            "nor is one owned by the account progress poll, which that observer's owner held"
         );
         assert_eq!(
             slow_episode_step(&mut ep, slow, owner, 1),

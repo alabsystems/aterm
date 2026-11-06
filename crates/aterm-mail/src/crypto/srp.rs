@@ -44,12 +44,13 @@ pub fn authenticate(
 }
 
 fn expand(slices: &[&[u8]]) -> Zeroizing<[u8; 256]> {
+    let mut base = ring::digest::Context::new(&ring::digest::SHA512);
+    for slice in slices {
+        base.update(slice);
+    }
     let mut result = Zeroizing::new([0u8; 256]);
     for (id, chunk) in result.as_chunks_mut::<64>().0.iter_mut().enumerate() {
-        let mut hash = ring::digest::Context::new(&ring::digest::SHA512);
-        for slice in slices {
-            hash.update(slice);
-        }
+        let mut hash = base.clone();
         hash.update(&[id as u8]);
         chunk.copy_from_slice(hash.finish().as_ref());
     }

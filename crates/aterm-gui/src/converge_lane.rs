@@ -64,7 +64,7 @@ pub(crate) fn spawn_lane() -> bool {
 }
 
 /// The lane's rounds: a window pass at once ([`aterm_secrets::converge::WINDOW`]), then, each
-/// time `wait` waited out [`crate::secrets_join::MEND_EVERY`] or was woken by a move, another;
+/// time `wait` waited out the recheck or bounded retry, or was woken by a move, another;
 /// `log` gets a pass's [`ended_line`] once per change of how passes end, and the source of each
 /// move that started one ([`moved_line`]). It returns once `wait` says to stop (`None`), which
 /// the live lane's never does.
@@ -74,16 +74,26 @@ fn lane(
     log: &mut dyn FnMut(&str),
     wait: &mut dyn FnMut(std::time::Duration) -> Option<crate::network_moved::Woke>,
 ) {
+    let clock = std::time::Instant::now();
+    let mut retry = aterm_secrets::converge::RunnerRetry::default();
     let mut said = None;
     loop {
+        retry.started();
         let ended = pass(aterm_secrets::converge::WINDOW);
+        let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        retry.reaped(ended.last(), now_ms);
         if said.as_ref() != Some(&ended) {
             if let Some(line) = ended_line(&ended) {
                 log(&line);
             }
             said = Some(ended);
         }
-        match wait(crate::secrets_join::MEND_EVERY) {
+        let every = retry
+            .remaining(now_ms)
+            .map_or(crate::secrets_join::MEND_EVERY, |pause| {
+                pause.min(crate::secrets_join::MEND_EVERY)
+            });
+        match wait(every) {
             None => return,
             Some(crate::network_moved::Woke::Timer) => {}
             Some(woke) => log(&moved_line(woke)),
@@ -134,12 +144,29 @@ fn after_secrets(start: &mut dyn FnMut(&str) -> std::io::Result<()>) {
 /// How one pass of the lane ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ended {
-    /// It ran (its own aterm.log line says what it did), or another pass held the lock.
+    /// It ran and settled (its own aterm.log line says what it did).
     Ran,
+    /// Another pass held the lock; this lane still owes its pass.
+    Held,
+    /// It ran without failure but admitted work is waiting; retry quietly.
+    Unfinished,
     /// It exited with this status (a failed row, a refusal): the runner's log line says why.
     Failed(Option<i32>),
     /// It could not be started or waited for: why.
     Unstarted(String),
+}
+
+#[cfg(unix)]
+impl Ended {
+    fn last(&self) -> aterm_secrets::converge::Last {
+        use aterm_secrets::converge::Last;
+        match self {
+            Self::Ran => Last::Ended,
+            Self::Held => Last::Held,
+            Self::Unfinished => Last::Unfinished,
+            Self::Failed(_) | Self::Unstarted(_) => Last::Failed,
+        }
+    }
 }
 
 /// Run one pass for `trigger` from `exe` and wait for it.
@@ -150,8 +177,12 @@ fn pass(exe: &std::path::Path, trigger: &str) -> Ended {
         Err(error) => return Ended::Unstarted(error.to_string()),
     };
     match child.wait() {
-        Ok(status) if status.success() || status.code() == Some(aterm_secrets::converge::HELD) => {
-            Ended::Ran
+        Ok(status) if status.success() => Ended::Ran,
+        Ok(status) if status.code() == Some(i32::from(aterm_secrets::converge::HELD)) => {
+            Ended::Held
+        }
+        Ok(status) if status.code() == Some(i32::from(aterm_secrets::converge::UNFINISHED)) => {
+            Ended::Unfinished
         }
         Ok(status) => Ended::Failed(status.code()),
         Err(error) => Ended::Unstarted(error.to_string()),
@@ -161,7 +192,7 @@ fn pass(exe: &std::path::Path, trigger: &str) -> Ended {
 /// The aterm.log line for a lane pass that ended as `ended`; none for one that ran.
 fn ended_line(ended: &Ended) -> Option<String> {
     match ended {
-        Ended::Ran => None,
+        Ended::Ran | Ended::Held | Ended::Unfinished => None,
         Ended::Failed(code) => Some(format!(
             "converge: the window's pass ended {} (its own aterm.log line says which row \
              failed, or why the pass was refused)",
@@ -199,13 +230,13 @@ mod tests {
         );
     }
 
-    /// The lane runs a window pass at once, then one each time it waited out `MEND_EVERY`, and
+    /// The lane runs at once, then after the recheck or a bounded retry, and
     /// logs how passes end once per change: a pass failing the same way again says nothing more.
     /// NEGATIVE CONTROL: a lane that waits before its first pass, or that logs every failed
     /// pass, fails here.
     #[cfg(unix)]
     #[test]
-    fn the_lane_runs_a_window_pass_at_once_and_one_every_mend_interval() {
+    fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
         let events = std::cell::RefCell::new(Vec::new());
         let mut ends = [
             Ended::Ran,
@@ -215,6 +246,7 @@ mod tests {
         ]
         .into_iter();
         let mut logged = Vec::new();
+        let mut waits = Vec::new();
         lane(
             &mut |trigger| {
                 events.borrow_mut().push(format!("pass {trigger}"));
@@ -222,7 +254,7 @@ mod tests {
             },
             &mut |line| logged.push(line.to_owned()),
             &mut |every| {
-                assert_eq!(every, crate::secrets_join::MEND_EVERY);
+                waits.push(every);
                 let mut events = events.borrow_mut();
                 events.push("wait".to_owned());
                 (events.iter().filter(|event| *event == "wait").count() < 4)
@@ -244,6 +276,57 @@ mod tests {
         );
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert!(logged[0].contains("exit 1"), "{logged:?}");
+        assert_eq!(
+            waits,
+            [
+                crate::secrets_join::MEND_EVERY,
+                std::time::Duration::from_millis(aterm_secrets::converge::FIRST_RETRY_MS),
+                std::time::Duration::from_millis(2 * aterm_secrets::converge::FIRST_RETRY_MS),
+                crate::secrets_join::MEND_EVERY,
+            ]
+        );
+    }
+
+    /// A Git readiness wait retries on unchanged inputs without a failure log. Once the
+    /// prerequisite arrives and the pass settles, only the ordinary recheck remains.
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_work_retries_quietly_until_its_prerequisite_is_ready() {
+        let first = std::time::Duration::from_millis(aterm_secrets::converge::FIRST_RETRY_MS);
+        for (ends, expected) in [
+            (
+                vec![
+                    Ended::Unfinished,
+                    Ended::Held,
+                    Ended::Unfinished,
+                    Ended::Ran,
+                ],
+                vec![first, first, 2 * first, crate::secrets_join::MEND_EVERY],
+            ),
+            (
+                vec![Ended::Held, Ended::Ran],
+                vec![first, crate::secrets_join::MEND_EVERY],
+            ),
+        ] {
+            let total = ends.len();
+            let passes = std::cell::Cell::new(0);
+            let mut ends = ends.into_iter();
+            let mut waits = Vec::new();
+            let mut logged = Vec::new();
+            lane(
+                &mut |_| {
+                    passes.set(passes.get() + 1);
+                    ends.next().unwrap()
+                },
+                &mut |line| logged.push(line.to_owned()),
+                &mut |every| {
+                    waits.push(every);
+                    (passes.get() < total).then_some(crate::network_moved::Woke::Timer)
+                },
+            );
+            assert_eq!(waits, expected);
+            assert!(logged.is_empty(), "{logged:?}");
+        }
     }
 
     /// A route change this window's route source hears ends the lane's wait at once: a second
@@ -314,6 +397,8 @@ mod tests {
     #[test]
     fn only_a_pass_that_did_not_run_right_is_logged_by_the_lane() {
         assert_eq!(ended_line(&Ended::Ran), None);
+        assert_eq!(ended_line(&Ended::Held), None);
+        assert_eq!(ended_line(&Ended::Unfinished), None);
         assert!(ended_line(&Ended::Failed(Some(1))).is_some_and(|line| line.contains("exit 1")));
         assert!(
             ended_line(&Ended::Unstarted("no such file".to_owned()))

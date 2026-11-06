@@ -234,14 +234,16 @@ impl Values {
     /// # Errors
     /// There are not one or two distinct valid entries, or their combined value exceeds 64KiB.
     pub fn encode(&self) -> crate::Result<SecretBytes> {
-        let mut out = Zeroizing::new(Vec::new());
         if self.0.is_empty() || self.0.len() > 2 {
             return Err(Error::new(
                 "credential handoff: one or two entries required",
             ));
         }
-        out.push(self.0.len() as u8);
         let mut total = 0usize;
+        // The count byte, then each entry's two length fields, its name and its value: the
+        // whole encoding, allocated once, so no value is copied to grow the buffer and left
+        // behind unzeroed in the one it outgrew.
+        let mut exact = 1usize;
         let mut seen = std::collections::BTreeSet::new();
         for (name, value) in &self.0 {
             total = total.saturating_add(value.as_slice().len());
@@ -255,12 +257,23 @@ impl Values {
                     "credential handoff: invalid entry or value size",
                 ));
             }
+            exact += 2 + name.len() + 4 + value.as_slice().len();
+        }
+        let mut out = Zeroizing::new(Vec::with_capacity(exact));
+        let room = out.capacity();
+        out.push(self.0.len() as u8);
+        for (name, value) in &self.0 {
             out.extend_from_slice(&(name.len() as u16).to_be_bytes());
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(&(value.as_slice().len() as u32).to_be_bytes());
             out.extend_from_slice(value.as_slice());
         }
-        Ok(SecretBytes::from(out.to_vec()))
+        debug_assert_eq!(
+            (out.len(), out.capacity()),
+            (exact, room),
+            "the encoding filled the buffer it was given without growing it"
+        );
+        Ok(SecretBytes::new(std::mem::take(&mut *out)))
     }
 
     /// Read the exact bounded encoding; trailing bytes and duplicate names are refused.
@@ -507,5 +520,23 @@ mod tests {
         let mut trailing = values.encode().unwrap().as_slice().to_vec();
         trailing.push(0);
         assert!(Values::decode(&trailing).is_err());
+    }
+
+    /// Two entries encode into the one buffer sized for them (`encode` asserts it never grew, so
+    /// no first value is copied out of an outgrown buffer), and decode back as given, byte for
+    /// byte.
+    #[test]
+    fn two_values_encode_in_one_buffer_and_decode_as_given() {
+        let values = Values(vec![
+            ("first_token".into(), SecretBytes::from(vec![0xa5; 300])),
+            ("second".into(), SecretBytes::from(b"s".as_slice())),
+        ]);
+        let encoded = values.encode().unwrap();
+        assert_eq!(encoded.len(), 1 + (2 + 11 + 4 + 300) + (2 + 6 + 4 + 1));
+        let decoded = Values::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.0.len(), 2);
+        for ((name, value), (want_name, want)) in decoded.0.iter().zip(&values.0) {
+            assert_eq!((name, value.as_slice()), (want_name, want.as_slice()));
+        }
     }
 }

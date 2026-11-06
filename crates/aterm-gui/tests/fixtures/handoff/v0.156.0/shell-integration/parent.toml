@@ -1,0 +1,66 @@
+# What the v0.156.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.156.0"
+producer_commit = "b9253c4c6405"
+outgoing_build = 1793926057
+park_carry_ceiling = "full"
+manifest = "seamless-52444-00000000000000000000000001000005.toml"
+nonce = "00000000000000000000000001000005"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "0ad07af5137e22f07d7958f115cfcc9a32055dd6906743cce6e88557a2b4e98d"
+layout_digest = "db2766a4a0e9980e8660ebd0c42596a149ca7b900a2866bd0fd252eea28f0061"
+proof_target_build = 1794012457
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000], [1, 6, 40001]]
+proof_count = 2
+proof_digest = "e0ae4ecd2a3b7627da55fd852c4da4632413e8a4111b5c674bf900553e21bfe2"
+ready_wire = "4153523100000002e0ae4ecd2a3b7627da55fd852c4da4632413e8a4111b5c674bf900553e21bfe2"
+commit_wire = "4153433100000002e0ae4ecd2a3b7627da55fd852c4da4632413e8a4111b5c674bf900553e21bfe2"
+files = ["seamless-52444-00000000000000000000000001000005.layout.toml", "seamless-52444-00000000000000000000000001000005.s0.ctl", "seamless-52444-00000000000000000000000001000005.s0.grid", "seamless-52444-00000000000000000000000001000005.s1.altgrid", "seamless-52444-00000000000000000000000001000005.s1.ctl", "seamless-52444-00000000000000000000000001000005.s1.grid", "seamless-52444-00000000000000000000000001000005.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 25
+alt_grid = false
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "9494949494949494949494949494949494949494949494949494949494949494"
+history_take = 0
+history_lost = 0
+fg_holder = 40000
+absolute_row_counter = 55
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 2
+shell_marks = 27
+shell_completed_seq = 27
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 30
+cols = 99
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "4949494949494949494949494949494949494949494949494949494949494949"
+history_take = 0
+history_lost = 0
+fg_holder = 41001
+absolute_row_counter = 30
+alt_absolute_row_counter = 70
+color = false
+shell_phase = 2
+shell_marks = 34
+shell_completed_seq = 34
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

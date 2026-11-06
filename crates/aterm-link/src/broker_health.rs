@@ -378,6 +378,7 @@ impl Seam {
             "aterm link broker: {FAULT_SEAM}: arming sync (one shot): every full flush fails"
         );
         broker.inject_faults(astream_broker::InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -631,6 +632,7 @@ mod tests {
         );
 
         broker.inject_faults(astream_broker::InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });

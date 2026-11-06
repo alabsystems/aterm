@@ -13,6 +13,9 @@ pub enum Unavailable {
     UnsignedSource,
     NotAdmitted,
     Revoked,
+    /// The vault let this installation go with no act against it that it can read
+    /// (`client::dropped`): a rotation left it out, and it comes back only as a new Mac.
+    Dropped,
     IncompleteApply,
     SourceChanged,
     UntrustedPin,
@@ -47,6 +50,7 @@ impl Unavailable {
             Self::UnsignedSource => "vault-unsigned",
             Self::NotAdmitted => "vault-not-admitted",
             Self::Revoked => "vault-revoked",
+            Self::Dropped => "vault-dropped",
             Self::IncompleteApply => "vault-apply-incomplete",
             Self::SourceChanged => "vault-source-changed",
             Self::UntrustedPin => "vault-pin-untrusted",
@@ -66,6 +70,11 @@ impl Unavailable {
             Self::UnsignedSource => "the configured secrets source has no trusted signing pin",
             Self::NotAdmitted => "this installation has not been admitted to its secrets vault",
             Self::Revoked => "this installation's secrets vault membership is revoked",
+            Self::Dropped => {
+                "this installation was dropped from its secrets vault (a rotation left it out with \
+                 no Remove); set the vault folder aside (aterm secrets status names it) to come \
+                 back as a new Mac"
+            }
             Self::IncompleteApply => {
                 "the local vault apply is incomplete; sync the configured vault"
             }

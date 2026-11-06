@@ -1352,6 +1352,7 @@ fn steps(
     };
 
     let mut planned: BTreeMap<&str, String> = BTreeMap::new();
+    let mut existing: BTreeMap<&str, Option<String>> = BTreeMap::new();
     for page in pages::PAGES {
         let text = read_text(&public.join(page)).ok_or_else(|| {
             refusal(
@@ -1361,14 +1362,13 @@ fn steps(
         })?;
         let rewritten = pages::rewrite(page, &text, &facts, levels.as_ref())
             .map_err(|e| refusal(Refusal::Page, e.to_string()))?;
-        planned.insert(
-            match page {
-                "index.html" => "public/index.html",
-                "aterm.html" => "public/aterm.html",
-                _ => "public/terminal.html",
-            },
-            rewritten,
-        );
+        let rel = match page {
+            "index.html" => "public/index.html",
+            "aterm.html" => "public/aterm.html",
+            _ => "public/terminal.html",
+        };
+        existing.insert(rel, Some(text));
+        planned.insert(rel, rewritten);
     }
     let (mut sections, source) = match read_text(&clone.join("CHANGELOG.md")) {
         Some(log) => (notes::from_changelog(&log), "CHANGELOG.md"),
@@ -1487,10 +1487,14 @@ fn steps(
         true
     };
 
-    let differs = |rel: &str, new: &str| {
-        crate::durable::read_regular_bytes(&site_dir.join(rel), MAX_SITE_FILE_BYTES)
-            .map_or(true, |old| old != new.as_bytes())
-    };
+    for rel in [
+        "public/releases.html",
+        "public/assets/releases.css",
+        "public/install.sh",
+    ] {
+        existing.insert(rel, read_text(&site_dir.join(rel)));
+    }
+    let differs = |rel: &str, new: &str| existing.get(rel).and_then(Option::as_deref) != Some(new);
     let mut changed: Vec<&str> = Vec::new();
     let mut touch: Vec<&str> = Vec::new();
     for (rel, path) in [
@@ -1523,9 +1527,10 @@ fn steps(
     if map.added {
         say(out, "sitemap: added /releases");
     }
-    if differs("public/sitemap.xml", &map.text) {
+    if current_map != map.text {
         changed.push("public/sitemap.xml");
     }
+    existing.insert("public/sitemap.xml", Some(current_map));
     planned.insert("public/sitemap.xml", map.text);
 
     if dry {
@@ -1541,10 +1546,10 @@ fn steps(
             );
             for rel in &changed {
                 let new = &planned[rel];
-                match read_text(&site_dir.join(rel)) {
+                match existing.get(rel).and_then(Option::as_deref) {
                     None => say(out, &format!("  {rel}: new file ({} bytes)", new.len())),
                     Some(old) => {
-                        for line in diff::unified(rel, &old, new).iter().take(40) {
+                        for line in diff::unified(rel, old, new).iter().take(40) {
                             let _ = writeln!(out, "  {line}");
                         }
                     }
@@ -1614,7 +1619,8 @@ fn steps(
                     .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
             }
             let mut f = opts.open(&path)?;
-            if !f.metadata()?.is_file() {
+            let meta = f.metadata()?;
+            if !meta.is_file() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "target is not a regular file",
@@ -1623,7 +1629,9 @@ fn steps(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                if meta.permissions().mode() & 0o7777 != 0o644 {
+                    f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                }
             }
             f.set_len(0)?;
             f.write_all(planned[rel].as_bytes())
@@ -1645,7 +1653,7 @@ fn steps(
     }
     let pair_on_disk = std::fs::read_dir(&term).is_ok_and(|d| {
         d.flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with("aterm_wasm."))
+            .any(|e| e.file_name().as_encoded_bytes().starts_with(b"aterm_wasm."))
     });
     if pair_on_disk
         || git

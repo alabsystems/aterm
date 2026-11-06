@@ -69,33 +69,30 @@ const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
     ("AppKit", Bound::Sub),
 ];
 
-/// Is `rel` an engine crate's shipped default build, a file whose path names tests aside
-/// ([`test_path`])? Test support a crate mounts under `cfg(any(test, debug_assertions))` for its
-/// suites (aterm-effects' `test_pool.rs`, their thread pool) is in a debug build, so
-/// [`TestCode::holds`] reads it as shipped; this rule leaves it out by its name, and so also
-/// leaves out a shipped file whose name opens with `test`.
+/// aterm-effects' replay pool for its unit tests and its integration suite, which its root mounts
+/// under `cfg(any(test, debug_assertions))`: a debug build holds it, so [`TestCode::holds`] reads
+/// it as shipped, and engine-platform leaves it out by this one name.
+const ENGINE_SUITE_POOL: &str = "crates/aterm-effects/src/test_pool.rs";
+
+/// Is `rel` an engine crate's file that engine-platform judges: not a build script, an example,
+/// aterm-effects' `file_feed.rs` or [`ENGINE_SUITE_POOL`]? The rule leaves test code out as
+/// every guard does ([`TestCode::holds`]), so a shipped file whose name opens with `test` is
+/// judged.
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
     }
-    if test_path(rel) || rel.ends_with("/build.rs") || rel.contains("/examples/") {
+    if rel.ends_with("/build.rs") || rel.contains("/examples/") {
         return false;
     }
-    rel != "crates/aterm-effects/src/file_feed.rs"
+    rel != "crates/aterm-effects/src/file_feed.rs" && rel != ENGINE_SUITE_POOL
 }
 
-/// Does a directory or file of `rel` name test code?
-pub(super) fn test_path(rel: &str) -> bool {
-    rel.split('/').any(|part| {
-        part.trim_end_matches(".rs")
-            .split('_')
-            .any(|word| word.starts_with("test"))
-    })
-}
-
-/// Top-level out-of-line modules declared under a test-only `cfg` (`#[cfg(test)] mod rig;`),
-/// every file such a module loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it), and
-/// their directories.
+/// Every file a test-only `cfg` loads: an out-of-line `mod` or a literal `include!` inside an
+/// item whose `cfg` proves it test-only, at any depth (`#[cfg(test)] mod rig;`,
+/// `#[cfg(test)] mod tests { include!("tests_hooks.rs"); }`, `mod imp { #[cfg(test)] mod deep;
+/// }`); every file such a file loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it);
+/// and, for each, the directory of its stem (`rig/` beside `rig.rs`, or `rig/mod.rs`'s own).
 fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let push = |out: &mut Vec<String>, file: String| {
@@ -108,10 +105,10 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
         out.push(file);
     };
     for parent in corpus.under(prefixes) {
-        if !parent.mentions(&["mod"]) {
+        if !parent.mentions(&["mod", "include"]) {
             continue;
         }
-        for load in parent.loads().iter().filter(|l| l.gated && l.top) {
+        for load in parent.loads().iter().filter(|l| l.gated) {
             if let Some(file) = load.files.iter().find(|f| corpus.get(f).is_some()) {
                 push(&mut out, file.clone());
             }
@@ -138,7 +135,10 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
 }
 
 /// Which files of the corpus are test code, and which ship whatever their names or their parents
-/// say: the one answer every guard that skips test code reads ([`Corpus::test_code`]).
+/// say. Every guard that leaves a file out because it is test code asks [`TestCode::holds`]
+/// ([`Corpus::test_code`]); beside it, engine-platform leaves out one piece of test support by
+/// its name ([`ENGINE_SUITE_POOL`]). A guard that asks another question walks its own way:
+/// seam-caller follows what a release build compiles.
 pub(super) struct TestCode {
     /// The files and directories [`declared_test_modules`] names.
     declared: Vec<String>,
@@ -158,10 +158,10 @@ impl TestCode {
         Self { declared, shipped }
     }
 
-    /// Is `rel` test code by its parent's say (the file a test-only `mod` loads, or one in that
-    /// module's own directory: [`declared_test_modules`]) or by its path ([`named_for_tests`]),
-    /// that nothing ships? A file that a shipped `mod` or `include!` of a shipped file also loads
-    /// ships, and is read.
+    /// Is `rel` test code by its parent's say (a file a test-only `mod` or `include!` loads, at
+    /// any depth, or one in such a file's stem directory: [`declared_test_modules`]) or by its
+    /// path ([`named_for_tests`]), that nothing ships? A file that a shipped `mod` or `include!`
+    /// of a shipped file also loads ships, and is read.
     pub(super) fn holds(&self, rel: &str) -> bool {
         (in_declared(&self.declared, rel) || named_for_tests(rel)) && !self.shipped.contains(rel)
     }
@@ -2344,7 +2344,7 @@ mod tests {
             &ENGINE_PLATFORM,
             &[
                 ("crates/aterm-grid/src/lib.rs", src),
-                ("crates/aterm-grid/src/grid/test_support.rs", src),
+                ("crates/aterm-grid/src/grid/tests.rs", src),
                 ("crates/aterm-scrollback/src/storage.rs", src),
                 ("crates/aterm-effects/src/file_feed.rs", src),
                 ("crates/aterm-gui/src/lib.rs", src),
@@ -2455,21 +2455,6 @@ mod tests {
             ],
             "{found:?}"
         );
-    }
-
-    #[test]
-    fn a_test_path_is_named_by_a_word_not_a_substring() {
-        for rel in [
-            "crates/aterm-grid/src/page_tests/mod.rs",
-            "crates/aterm-grid/src/style_test_helpers.rs",
-            "crates/aterm-core/test_support/generated/sixel.rs",
-            "crates/aterm-messages/src/strain/tests.rs",
-            "crates/aterm-grid/tests/it.rs",
-        ] {
-            assert!(test_path(rel), "{rel}");
-        }
-        assert!(!test_path("crates/aterm-core/src/latest.rs"));
-        assert!(!test_path("crates/aterm-core/src/attestation.rs"));
     }
 
     #[test]
@@ -2665,20 +2650,36 @@ mod tests {
         assert!(found(tests, &[own]).is_empty());
     }
 
+    /// The files of [`test_code_layout`] that ship.
+    const SHIPPED_IN_LAYOUT: [&str; 5] = [
+        "host.rs",
+        "test_binary.rs",
+        "shipped_tests.rs",
+        "both.rs",
+        "cross.rs",
+    ];
+
     /// A crate whose `src` folder is `krate`/`src` (its root `lib.rs`, or `mod.rs` deeper) with
     /// `body` in every file but the loaders: a plain shipped module, a shipped one whose name
-    /// opens with `test`, a `_tests.rs` an ungated `#[path]` mounts, a module the root declares
-    /// test-only (which a test target mounts too), a `_tests.rs` only a test target mounts, one
-    /// only an example mounts, a `tests.rs` nothing loads, a test target and its `mod common;`,
-    /// and a test support file only a bench and a test-only mount load.
+    /// opens with `test`, a `_tests.rs` an ungated `#[path]` mounts, a file both a test-only
+    /// inline module and a shipped one `include!`, and a module the root declares test-only that
+    /// another crate's shipped `#[path]` mounts; then a module the root declares test-only (which
+    /// a test target mounts too), a file only a test-only inline module `include!`s, a test-only
+    /// `mod` inside a shipped inline module, a `_tests.rs` only a test target mounts, one only an
+    /// example mounts, a `tests.rs` nothing loads, a test target and its `mod common;`, and a
+    /// test support file only a bench and a test-only mount load.
     fn test_code_layout(krate: &str, src: &str, body: &str) -> Vec<(String, String)> {
         let root = if src == "src" { "lib.rs" } else { "mod.rs" };
         let up = "../".repeat(src.split('/').count());
         let loads = format!(
             "pub mod host;\npub mod test_binary;\n#[path = \"shipped_tests.rs\"]\nmod shipped;\n\
              #[cfg(test)]\nmod rig;\n#[cfg(test)]\n#[path = \"{up}tests/support/files.rs\"]\n\
-             mod files;\n"
+             mod files;\n#[cfg(test)]\nmod cross;\n#[cfg(test)]\nmod checks {{\n    \
+             include!(\"spliced.rs\");\n    include!(\"both.rs\");\n}}\nmod again {{\n    \
+             include!(\"both.rs\");\n}}\nmod imp {{\n    #[cfg(test)]\n    mod deep;\n}}\n"
         );
+        let name = krate.strip_prefix("crates/").unwrap_or(krate);
+        let mounter = format!("#[path = \"../../{name}/{src}/cross.rs\"]\nmod cross;\n");
         let suite = format!(
             "#[path = \"../{src}/shared_tests.rs\"]\nmod shared;\n\
              #[path = \"../{src}/rig.rs\"]\nmod rig;\nmod common;\n{body}"
@@ -2694,16 +2695,16 @@ mod tests {
                 format!("{krate}/examples/demo.rs"),
                 format!("#[path = \"../{src}/demo_tests.rs\"]\nmod demo;\n"),
             ),
+            ("crates/zz-mount/src/lib.rs".to_string(), mounter),
         ];
-        for file in [
-            "host.rs",
-            "test_binary.rs",
-            "shipped_tests.rs",
+        for file in SHIPPED_IN_LAYOUT.into_iter().chain([
             "rig.rs",
+            "spliced.rs",
+            "imp/deep.rs",
             "shared_tests.rs",
             "demo_tests.rs",
             "old/tests.rs",
-        ] {
+        ]) {
             files.push((format!("{krate}/{src}/{file}"), body.to_string()));
         }
         for file in ["tests/common/mod.rs", "tests/support/files.rs"] {
@@ -2712,12 +2713,12 @@ mod tests {
         files
     }
 
-    /// Every guard that skips test code asks [`TestCode::holds`], so each reads the same files of
-    /// [`test_code_layout`]: the plain shipped module, `test_binary.rs` and the mounted
-    /// `shipped_tests.rs`, and nothing else, though a test target, an example and a bench load
-    /// test code and the name of `rig.rs` says nothing of tests. Each row is a guard, a crate in
-    /// its scope with the `src` folder its scope reads, a line it fails, and the files the guard
-    /// needs beside them to read anything.
+    /// Each of these guards skips test code by [`TestCode::holds`] alone, so each reads the same
+    /// files of [`test_code_layout`], the ones that ship ([`SHIPPED_IN_LAYOUT`]), and nothing
+    /// else, though a test target, an example and a bench load test code, a test-only inline
+    /// module splices a file in, and the names of `rig.rs` and `imp/deep.rs` say nothing of
+    /// tests. Each row is a guard, a crate in its scope with the `src` folder its scope reads, a
+    /// line it fails, and the files the guard needs beside them to read anything.
     #[test]
     fn every_guard_skips_the_same_test_code() {
         let enums = [
@@ -2872,6 +2873,41 @@ mod tests {
                 "fn f(w: SinkWriter) {}\n",
                 &[],
             ),
+            (
+                &ENGINE_PLATFORM,
+                "crates/aterm-core",
+                "src",
+                "use std::fs::File;\n",
+                &[],
+            ),
+            (
+                &super::super::mint::LAUNCHER_MINT,
+                "crates/aterm-pty",
+                "src",
+                "fn f() {\n    let a = Authority::root_authority();\n}\n",
+                &[],
+            ),
+            (
+                &super::super::github::GITHUB_AUTH_DOOR,
+                "crates/agh",
+                "src",
+                "const H: &str = \"Authorization\";\n",
+                &[],
+            ),
+            (
+                &super::super::github::GH_SPAWN,
+                "crates/aterm-pty",
+                "src",
+                "fn f() {\n    let c = Command::new(\"gh\");\n}\n",
+                &[],
+            ),
+            (
+                &super::super::github::AGH_FX,
+                "crates/agh",
+                "src",
+                "fn f() {\n    let t = Instant::now();\n}\n",
+                &[],
+            ),
         ];
         let mut wrong = Vec::new();
         for (rule, krate, src, body, beside) in rows {
@@ -2890,11 +2926,10 @@ mod tests {
                 .map(|f| f.path)
                 .filter(|p| p.starts_with(&format!("{krate}/")))
                 .collect();
-            let want: std::collections::BTreeSet<String> =
-                ["host.rs", "test_binary.rs", "shipped_tests.rs"]
-                    .iter()
-                    .map(|f| format!("{krate}/{src}/{f}"))
-                    .collect();
+            let want: std::collections::BTreeSet<String> = SHIPPED_IN_LAYOUT
+                .iter()
+                .map(|f| format!("{krate}/{src}/{f}"))
+                .collect();
             if read != want {
                 wrong.push(format!("{} over {krate}: read {read:?}", rule.id));
             }
@@ -2902,10 +2937,9 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// engine-platform leaves out a file whose path names tests ([`engine_shipped`]) and reads
-    /// the rest as every guard does: a module its parent declares test-only stays test code
-    /// though a test target, a bench or an example mounts it too, and is read once a shipped
-    /// line mounts it.
+    /// engine-platform reads test code as every guard does: a module its parent declares
+    /// test-only stays test code though a test target, a bench or an example mounts it too, and
+    /// is read once a shipped line mounts it.
     #[test]
     fn an_engine_module_a_test_target_also_mounts_stays_test_code() {
         let body = "use std::fs::File;\n";

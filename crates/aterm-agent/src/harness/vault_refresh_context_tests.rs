@@ -8,6 +8,25 @@ fn key(value: i64) -> VaultContext {
     [u8::try_from(value).unwrap(); 32]
 }
 
+#[test]
+fn cancelled_refresh_retires_only_its_own_running_context_without_backoff() {
+    let at = Instant::now();
+    let mut ladder = Ladder::default();
+    assert_eq!(ladder.vault_turn(Some(key(1)), at), VaultTurn::Due);
+    ladder.vault_cancelled(key(2));
+    assert_eq!(ladder.vault_turn(Some(key(1)), at), VaultTurn::Running);
+    ladder.vault_cancelled(key(1));
+    assert_eq!(ladder.vault_turn(Some(key(2)), at), VaultTurn::Due);
+    ladder.vault_cancelled(key(1));
+    assert_eq!(ladder.vault_turn(Some(key(2)), at), VaultTurn::Running);
+    ladder.vault_done(Vault::Unchanged(2));
+    ladder.vault_cancelled(key(2));
+    assert_eq!(
+        ladder.vault_turn(Some(key(2)), at),
+        VaultTurn::Seen(Vault::Unchanged(2))
+    );
+}
+
 /// Project actual cache operations; `needed` records an observed invalidation obligation.
 pub(crate) fn transition(state: &State, action: &str) -> State {
     let mut next = state.clone();

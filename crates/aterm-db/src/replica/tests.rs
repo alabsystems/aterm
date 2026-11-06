@@ -1777,6 +1777,44 @@ struct LostReceipt {
     stream: std::os::unix::net::UnixStream,
     receipt: Option<Digest>,
     failed: bool,
+    writes: Vec<usize>,
+    window: ReceiptWindow,
+}
+
+#[derive(Clone, Default)]
+struct ReceiptWindow {
+    bytes: Digest,
+    len: usize,
+}
+
+impl ReceiptWindow {
+    fn contains(&mut self, bytes: &[u8], id: &Digest) -> bool {
+        for byte in bytes {
+            self.bytes[self.len] = *byte;
+            self.len += 1;
+            if self.len == self.bytes.len() {
+                let hit = &self.bytes == id;
+                self.bytes.copy_within(1.., 0);
+                self.len -= 1;
+                if hit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl LostReceipt {
+    fn new(stream: std::os::unix::net::UnixStream, receipt: Option<Digest>) -> Self {
+        Self {
+            stream,
+            receipt,
+            failed: false,
+            writes: Vec::new(),
+            window: ReceiptWindow::default(),
+        }
+    }
 }
 impl Read for LostReceipt {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -1785,19 +1823,100 @@ impl Read for LostReceipt {
 }
 impl Write for LostReceipt {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        // A receipt is one write: the record's id, then its verdict.
-        if self
-            .receipt
-            .as_ref()
-            .is_some_and(|id| bytes.starts_with(id))
+        self.writes.push(bytes.len());
+        // Reject the call that would complete the selected digest. Prior calls may
+        // already have forwarded a partial receipt; never buffer or synthesize output.
+        if self.failed
+            || self
+                .receipt
+                .as_ref()
+                .is_some_and(|id| self.window.clone().contains(bytes, id))
         {
             self.failed = true;
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost receipt"));
         }
-        self.stream.write(bytes)
+        let written = self.stream.write(bytes)?;
+        if let Some(id) = &self.receipt {
+            // A short underlying write advances recognition only over delivered bytes.
+            self.window.contains(&bytes[..written], id);
+        }
+        Ok(written)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+#[test]
+fn receipt_loss_follows_the_selected_digest_across_write_partitions() {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixStream;
+
+    let id = [42; 32];
+    let mut unrelated = b"other wire data".to_vec();
+    unrelated.extend_from_slice(&id[..31]);
+    unrelated.push(9);
+    let mut partitions = (0..=id.len())
+        .map(|cut| {
+            vec![
+                unrelated.clone(),
+                id[..cut].to_vec(),
+                id[cut..].to_vec(),
+                vec![1],
+            ]
+        })
+        .collect::<Vec<_>>();
+    partitions.push(
+        std::iter::once(unrelated.clone())
+            .chain(id.iter().map(|byte| vec![*byte]))
+            .collect(),
+    );
+    let mut whole = id.to_vec();
+    whole.push(1);
+    partitions.push(vec![unrelated.clone(), whole]);
+    for chunks in partitions {
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut target = LostReceipt::new(stream, Some(id));
+        let mut forwarded = Vec::new();
+        for chunk in chunks {
+            match target.write_all(&chunk) {
+                Ok(()) => forwarded.extend_from_slice(&chunk),
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+                    break;
+                }
+            }
+        }
+        assert!(target.failed);
+        drop(target);
+        let mut observed = Vec::new();
+        peer.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, forwarded, "no buffering or fabricated writes");
+    }
+    let mut other = id;
+    other[0] ^= 1;
+    let mut other_receipt = other.to_vec();
+    other_receipt.push(1);
+    for chunks in [
+        vec![unrelated],
+        vec![other_receipt],
+        vec![id[..17].to_vec(), vec![9], id[..31].to_vec()],
+    ] {
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut target = LostReceipt::new(stream, Some(id));
+        let expected = chunks.concat();
+        for chunk in chunks {
+            target.write_all(&chunk).unwrap();
+        }
+        assert!(!target.failed);
+        drop(target);
+        let mut observed = Vec::new();
+        peer.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, expected);
     }
 }
 
@@ -1825,25 +1944,25 @@ fn interrupted_application_reports_durable_ingestion_without_a_receipt() {
         let (client, server) = repairs.split_at_mut(1);
         thread::scope(|threads| {
             let worker = threads.spawn(move || {
-                let mut stream = LostReceipt {
-                    stream: right,
-                    receipt: lose_receipt.then_some(id),
-                    failed: false,
-                };
+                let mut stream = LostReceipt::new(right, lose_receipt.then_some(id));
                 let result =
                     receiver.exchange(&mut stream, sender.actor, Side::Responder, &mut server[0]);
-                (result, stream.failed)
+                (result, stream.failed, stream.writes)
             });
             let result =
                 sender.exchange(&mut left, receiver.actor, Side::Initiator, &mut client[0]);
             drop(left);
-            let (received, failed) = worker.join().unwrap();
-            ([result, received], failed)
+            let (received, failed, writes) = worker.join().unwrap();
+            ([result, received], failed, writes)
         })
     };
     let mut repairs = [Repair::default(), Repair::default()];
-    let (failed, receipt_lost) = exchange(true, &mut repairs);
-    assert!(receipt_lost);
+    let (failed, receipt_lost, writes) = exchange(true, &mut repairs);
+    assert!(
+        receipt_lost,
+        "receipt was not intercepted: results={failed:?}; retained={}; writes={writes:?}",
+        pair.count(1)
+    );
     assert!(failed.iter().all(Result::is_err));
     assert_eq!(pair.count(1), 1);
     let received = repairs[1]
@@ -1854,7 +1973,7 @@ fn interrupted_application_reports_durable_ingestion_without_a_receipt() {
     assert_eq!(received.sent, 0);
     assert_eq!(repairs[0].interrupted.unwrap().sent, 0);
 
-    let (retried, receipt_lost) = exchange(false, &mut repairs);
+    let (retried, receipt_lost, _) = exchange(false, &mut repairs);
     assert!(!receipt_lost);
     assert!(retried.iter().all(Result::is_ok), "{retried:?}");
     assert!(repairs.iter().all(|repair| repair.interrupted.is_none()));
@@ -2755,4 +2874,32 @@ fn completed_rounds_trade_signed_versions_and_a_0_145_peer_reads_as_saying_nothi
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     p.round(&bare_a, &bare_b, &mut ra, &mut rb);
     assert_eq!((ra.said(), rb.said()), (Said::Unknown, Said::Unknown));
+}
+
+/// What a repair round with a peer on the old path brings is a local append (`Via::Local`), which
+/// the mesh's egress publishes on `tables.log` (one-mesh §11 B7b); the mesh's own ingest tags its
+/// appends `Via::Mesh` (`mesh_tests`), which the egress never publishes again.
+#[test]
+fn a_repair_round_appends_what_it_brings_as_local() {
+    use crate::table::store::{Via, with_append_sink};
+    let p = Pair::new(false, 1);
+    let bootstrap = p.lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    Store::open(&session, &p.paths[1], p.scope)
+        .unwrap()
+        .commit_catalog(&session, b"an old peer's operation")
+        .unwrap();
+    drop(session);
+    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    // The initiator's side runs on this thread: what Mac 0 receives is recorded here.
+    with_append_sink(
+        move |record| sink.borrow_mut().push((record.table, record.via)),
+        || p.round(&a, &b, &mut ra, &mut rb),
+    );
+    let seen = seen.take();
+    assert_eq!(p.count(0), 2, "the round brought the old peer's operation");
+    assert_eq!(seen, [(p.scope.digest(), Via::Local)]);
 }

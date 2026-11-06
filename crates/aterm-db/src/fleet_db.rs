@@ -153,20 +153,41 @@ pub fn resolve_table(raw: &str) -> Result<(&'static str, &'static str)> {
 }
 
 fn digits_only(raw: &str) -> String {
-    let d: String = raw.chars().filter(char::is_ascii_digit).collect();
+    let mut d: String = raw.chars().filter(char::is_ascii_digit).collect();
     if d.len() == 11 && d.starts_with('1') {
-        d[1..].to_owned()
-    } else {
-        d
+        d.remove(0);
     }
+    d
 }
 
 /// Normalize a US 10-digit phone number to `XXX-XXX-XXXX`, leaving non-10-digit strings trimmed.
 pub fn normalize_phone_key(raw: &str) -> String {
     let trimmed = raw.trim();
-    let d = digits_only(trimmed);
-    if d.len() == 10 {
-        format!("{}-{}-{}", &d[0..3], &d[3..6], &d[6..10])
+    let mut digits = [0u8; 12];
+    let mut len = 0;
+    for b in trimmed.bytes().filter(u8::is_ascii_digit) {
+        if len == digits.len() {
+            return trimmed.to_owned();
+        }
+        digits[len] = b;
+        len += 1;
+    }
+    let ten = if len == 10 {
+        Some(&digits[..10])
+    } else if len == 11 && digits[0] == b'1' {
+        Some(&digits[1..11])
+    } else {
+        None
+    };
+    if let Some(d) = ten {
+        let mut out = String::with_capacity(12);
+        for (i, &b) in d.iter().enumerate() {
+            if i == 3 || i == 6 {
+                out.push('-');
+            }
+            out.push(char::from(b));
+        }
+        out
     } else {
         trimmed.to_owned()
     }
@@ -431,7 +452,7 @@ pub fn normalize_row(logical_table: &str, natural_key: &str, mut value: Value) -
                 obj.insert("password".into(), Value::Null);
             }
             let skey = storage_key("emails", &email)?;
-            validate_email_record(&skey, &Value::Object(obj.clone()))?;
+            validate_email_record(&skey, &value)?;
         }
         "phones" => {
             let raw_phone = obj
@@ -500,12 +521,9 @@ fn password_weight(row: &Value) -> u8 {
 
 /// Whether a row's password cell says a password exists: it holds one, or a has-password word.
 fn claims_a_password(row: &Value) -> bool {
-    match row.get("password").and_then(Value::as_str) {
-        Some(cell) if password_weight(row) == 1 => {
-            crate::typed::secret::flag_says(&crate::typed::secret::Secret::new(cell.to_owned()))
-                == Some(true)
-        }
-        _ => password_weight(row) == 2,
+    match row.get("password").and_then(Value::as_str).map(str::trim) {
+        None | Some("") => false,
+        Some(cell) => crate::typed::secret::flag_says_str(cell).unwrap_or(true),
     }
 }
 
@@ -560,11 +578,15 @@ fn project_cell(logical_table: &str, cell: &Cell) -> Option<Value> {
         shown
     };
     let mut row = read(&winner.value);
+    if cell.candidates.len() == 1 && !any_protected {
+        return Some(row);
+    }
     // A stored password outlives a concurrent empty cell or has-password word, as a row outlives a
     // concurrent delete: the digest order must not decide whether a partial edit keeps it, or hide
     // it from `tables` and the import. Both values stay in `_conflicts` until a later write settles
     // them, so the import reports the cell rather than taking either.
     if logical_table == "emails"
+        && cell.candidates.len() > 1
         && let Some(held) = cell
             .candidates
             .iter()
@@ -576,6 +598,7 @@ fn project_cell(logical_table: &str, cell: &Cell) -> Option<Value> {
     {
         obj.insert("password".into(), held["password"].clone());
     }
+    let row_compared = as_compared(logical_table, &row);
     let mut conflicts: Vec<Value> = Vec::new();
     for candidate in &cell.candidates {
         let mut shown = read(&candidate.value);
@@ -591,9 +614,7 @@ fn project_cell(logical_table: &str, cell: &Cell) -> Option<Value> {
                 obj.insert("password".into(), Value::from(HAS_PASSWORD));
             }
         }
-        if as_compared(logical_table, &shown) != as_compared(logical_table, &row)
-            && !conflicts.contains(&shown)
-        {
+        if as_compared(logical_table, &shown) != row_compared && !conflicts.contains(&shown) {
             conflicts.push(shown);
         }
     }
@@ -1230,10 +1251,13 @@ pub fn tables_summary(db: &Database) -> Result<Value> {
 
 /// Export all 4 tables to a single canonical JSON document.
 pub fn dump_all(db: &Database, show_passwords: bool) -> Result<Value> {
-    let view = db.view();
+    dump_view(&db.view(), show_passwords)
+}
+
+fn dump_view(view: &View, show_passwords: bool) -> Result<Value> {
     let mut out = Map::new();
     for &t in TABLES {
-        let rows = scan_table(&view, t)?;
+        let rows = scan_table(view, t)?;
         let list: Vec<Value> = rows
             .into_values()
             .map(|r| redact_row(t, r, show_passwords))
@@ -1487,8 +1511,10 @@ fn rekey_with(dir: &Path, secret: &[u8]) -> Result<Value> {
 /// it holds is known to fit a new dataset. A key used twice would name the same folder twice.
 fn set_aside(dir: &Path, place: u64) -> Result<PathBuf> {
     let old = while_busy(|| Database::open_for_rekey(dir))?;
-    let mut changes = plan_rows(&View::default(), &dump_all(&old, true)?, Existing::Keep)?.changes;
-    changes.extend(deletions(&old.view()));
+    let view = old.view();
+    let mut changes =
+        plan_rows(&View::default(), &dump_view(&view, true)?, Existing::Keep)?.changes;
+    changes.extend(deletions(&view));
     one_writer_holds(changes)?;
     let name = dir
         .file_name()
@@ -1521,7 +1547,11 @@ fn finish_rekey(dir: &Path, kept: &Path, secret: &[u8]) -> Result<Value> {
     let (doc, deleted, left) = while_busy(|| Database::open_for_rekey(kept))
         .and_then(|old| {
             let view = old.view();
-            Ok((dump_all(&old, true)?, deletions(&view), left_behind(&view)?))
+            Ok((
+                dump_view(&view, true)?,
+                deletions(&view),
+                left_behind(&view)?,
+            ))
         })
         .map_err(rerun)?;
     let moved = while_busy(|| {
@@ -1554,7 +1584,7 @@ fn finish_rekey(dir: &Path, kept: &Path, secret: &[u8]) -> Result<Value> {
 /// Whether a password cell holds a has-password word, as an export that leaves passwords out does,
 /// by the words the import reads ([`crate::typed::secret::flag_says`]). A flag is not a password.
 fn is_password_flag(cell: &str) -> bool {
-    crate::typed::secret::flag_says(&crate::typed::secret::Secret::new(cell.to_owned())).is_some()
+    crate::typed::secret::flag_says_str(cell).is_some()
 }
 
 /// Read non-flag email passwords from an optional workbook (`alab-emails.xlsx` or
@@ -1687,22 +1717,13 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         let arch = row.get(2).map_or("", |s| s.trim());
         let os = row.get(3).map_or("", |s| s.trim());
         let chip = row.get(4).map_or("", |s| s.trim());
-        let ram = row
-            .get(5)
-            .map_or("", |s| s.trim())
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse::<u64>()
-            .ok();
-        let disk = row
-            .get(6)
-            .map_or("", |s| s.trim())
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse::<u64>()
-            .ok();
+        let parse_leading_u64 = |col: usize| {
+            let s = row.get(col).map_or("", |s| s.trim());
+            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            s[..end].parse::<u64>().ok()
+        };
+        let ram = parse_leading_u64(5);
+        let disk = parse_leading_u64(6);
         let aliases_raw = row.get(7).map_or("", |s| s.trim());
         let aliases: Vec<String> = aliases_raw
             .split([',', ';'])

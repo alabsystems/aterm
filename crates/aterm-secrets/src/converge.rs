@@ -22,7 +22,10 @@ use std::net::IpAddr;
 use std::path::Path;
 
 /// The exit status a runner ends with while another pass holds the pass's lock: it did not run.
-pub const HELD: i32 = 75;
+pub const HELD: u8 = 75;
+
+/// The runner ran without failure but admitted work still waits on a precondition or readback.
+pub const UNFINISHED: u8 = 76;
 
 /// The vault subscriber's `--trigger` word (`aterm_machines::sync::Trigger::Subscriber`).
 pub const SUBSCRIBER: &str = "subscriber";
@@ -37,9 +40,9 @@ pub const SETUP: &str = "setup";
 /// pass's own recheck (`aterm_machines::sync::RECHECK`).
 pub const RECHECK_MS: u64 = 30 * 60 * 1000;
 
-/// Retry a failed runner on unchanged inputs after five seconds, backing off to five minutes.
+/// Retry an unfinished or failed runner after five seconds, backing off to five minutes.
 pub const FIRST_RETRY_MS: u64 = 5 * 1000;
-/// The maximum failed-runner retry delay on unchanged inputs.
+/// The maximum runner retry delay on unchanged inputs.
 pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 
 /// The runner for `trigger` (`subscriber`, `window` or `setup`): `exe init --converge --trigger
@@ -88,6 +91,8 @@ pub enum Last {
     Running,
     /// It ended successfully.
     Ended,
+    /// It ran without failure, with admitted work still unfinished ([`UNFINISHED`]).
+    Unfinished,
     /// It exited unsuccessfully, or ended by a signal.
     Failed,
     /// It ended without running, another pass holding the lock ([`HELD`]).
@@ -103,7 +108,8 @@ impl Last {
         };
         let last = match child.try_wait() {
             Ok(None) | Err(_) => Self::Running,
-            Ok(Some(status)) if status.code() == Some(HELD) => Self::Held,
+            Ok(Some(status)) if status.code() == Some(i32::from(HELD)) => Self::Held,
+            Ok(Some(status)) if status.code() == Some(i32::from(UNFINISHED)) => Self::Unfinished,
             Ok(Some(status)) if status.success() => Self::Ended,
             Ok(Some(_)) => Self::Failed,
         };
@@ -114,17 +120,18 @@ impl Last {
     }
 }
 
-/// Failed runner pacing shared by the subscriber and the mesh node's vault pass.
+/// Unfinished and failed runner pacing shared by the subscriber, mesh node and window lane.
 #[derive(Debug, Default)]
-pub(crate) struct RunnerRetry {
+pub struct RunnerRetry {
     at: Option<u64>,
     delay: u64,
 }
 
 impl RunnerRetry {
-    pub(crate) fn reaped(&mut self, last: Last, now_ms: u64) {
+    /// Keep one terminal result, using elapsed milliseconds on the caller's monotonic clock.
+    pub fn reaped(&mut self, last: Last, now_ms: u64) {
         match last {
-            Last::Failed => {
+            Last::Failed | Last::Unfinished => {
                 let pause = self.delay.clamp(FIRST_RETRY_MS, LONGEST_RETRY_MS);
                 self.at = Some(now_ms.saturating_add(pause));
                 self.delay = pause.saturating_mul(2).min(LONGEST_RETRY_MS);
@@ -133,15 +140,27 @@ impl RunnerRetry {
                 self.at = None;
                 self.delay = 0;
             }
-            Last::None | Last::Running | Last::Held => {}
+            // A held lock owes a pass, without spending or resetting its unfinished backoff.
+            Last::Held => self.at = Some(now_ms.saturating_add(FIRST_RETRY_MS)),
+            Last::None | Last::Running => {}
         }
     }
 
-    pub(crate) fn due(&self, now_ms: u64) -> bool {
+    /// Whether the kept retry is due on that clock.
+    #[must_use]
+    pub fn due(&self, now_ms: u64) -> bool {
         self.at.is_some_and(|at| now_ms >= at)
     }
 
-    pub(crate) fn started(&mut self) {
+    /// How long until the kept retry, or none once it has started or completed.
+    #[must_use]
+    pub fn remaining(&self, now_ms: u64) -> Option<std::time::Duration> {
+        self.at
+            .map(|at| std::time::Duration::from_millis(at.saturating_sub(now_ms)))
+    }
+
+    /// A runner started; keep its backoff until a settled completion resets it.
+    pub fn started(&mut self) {
         self.at = None;
     }
 }
@@ -152,7 +171,7 @@ impl RunnerRetry {
 /// healthy pass once this Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back)
 /// since the last start. One runner at a time: a start that comes due while the last one runs,
 /// or after one that found the lock held, is owed to the next round, so a version applied during
-/// a pass is never left to the next recheck. A failed runner retries unchanged inputs on a
+/// a pass is never left to the next recheck. An unfinished or failed runner retries on a
 /// bounded backoff; every time here is elapsed milliseconds on the subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
@@ -342,17 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_runner_retries_unchanged_inputs_and_success_ends_the_retry() {
+    fn an_unfinished_runner_retries_unchanged_inputs_and_success_ends_the_retry() {
         let mut due = Due::default();
         assert!(due.at_start(0, HOME, Last::None));
         // The subscriber reaps before its source round, even if that round is unhealthy.
-        due.reaped(Last::Failed, 1_000);
+        due.reaped(Last::Unfinished, 1_000);
         for at in [1_000, 1_001, 5_999] {
             assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
         }
         assert!(
             due.after_pass(&unchanged(), 6_000, HOME, Last::None),
-            "a failed clone gets another pass without a new route, token or inventory"
+            "unfinished work gets another pass without a new route, token or inventory"
         );
         assert!(
             !due.after_pass(&unchanged(), 6_001, HOME, Last::Running),
@@ -480,7 +499,12 @@ mod tests {
             Last::None,
             "a signal is consumed once"
         );
-        for (code, expected) in [(0, Last::Ended), (1, Last::Failed), (HELD, Last::Held)] {
+        for (code, expected) in [
+            (0, Last::Ended),
+            (1, Last::Failed),
+            (HELD, Last::Held),
+            (UNFINISHED, Last::Unfinished),
+        ] {
             let exe = script(&format!("exit-{code}"), format!("exit {code}"));
             let mut runner = Some(start(&exe, "subscriber").expect("start a runner"));
             runner.as_mut().unwrap().wait().expect("reap it");

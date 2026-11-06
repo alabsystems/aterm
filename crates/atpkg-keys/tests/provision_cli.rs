@@ -560,6 +560,79 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
     assert!(!err.contains("unexpected argument"), "{err}");
 }
 
+/// `sign` takes every file `verify-signed` takes: a payload past the 1 MiB key-file cap signs and
+/// verifies, and one past the shared signed-file cap is refused by both verbs before anything is
+/// written. NEGATIVE CONTROL: the 1 MiB + 17 payload is one a `sign` reading at the key-file cap
+/// refuses.
+#[test]
+fn sign_and_verify_signed_take_the_same_files() {
+    use atpkg_keys::fsio::{READ_CAP, SIGNED_FILE_READ_CAP};
+
+    let tmp = scratch("sign-cap");
+    let dir = tmp.path().to_path_buf();
+    let seed = parse_master(PAPER).expect("synthetic phrase").seed();
+    let master_pub = seed.pubkey_b64().expect("master identity");
+    let (machine_key, machine_pub) = atpkg_keys::generate().expect("machine keypair");
+    let key = p(&dir, "m3.key");
+    std::fs::write(&key, &machine_key).unwrap();
+    let roster = add(empty(NOW), "m3", &machine_pub, NOW).expect("m3 joins");
+    let roster_bytes = roster.to_toml().expect("valid roster").into_bytes();
+    std::fs::write(p(&dir, "roster.toml"), &roster_bytes).unwrap();
+    std::fs::write(
+        p(&dir, "roster.toml.sig"),
+        seed.sign(&roster_bytes).expect("master signs"),
+    )
+    .unwrap();
+    let verify = |file: &str, sig: &str| {
+        run(
+            &dir,
+            None,
+            &[
+                "verify-signed",
+                &master_pub,
+                file,
+                sig,
+                &p(&dir, "roster.toml"),
+                &p(&dir, "roster.toml.sig"),
+            ],
+        )
+    };
+
+    let payload = p(&dir, "SHA256SUMS");
+    let len = usize::try_from(READ_CAP).expect("fits usize") + 17;
+    std::fs::write(&payload, vec![b'a'; len]).unwrap();
+    let signed = run(&dir, None, &["sign", &key, &payload]);
+    assert!(signed.status.success(), "{}", stderr_of(&signed));
+    let sig = p(&dir, "SHA256SUMS.sig");
+    let verified = verify(&payload, &sig);
+    assert!(verified.status.success(), "{}", stderr_of(&verified));
+    assert!(
+        stdout_of(&verified).contains("OK: signed by machine m3"),
+        "{}",
+        stdout_of(&verified)
+    );
+
+    let over = p(&dir, "OVER");
+    std::fs::File::create(&over)
+        .and_then(|f| f.set_len(SIGNED_FILE_READ_CAP + 1))
+        .expect("a file one byte past the cap");
+    let refused = run(&dir, None, &["sign", &key, &over]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr_of(&refused).contains("exceeds the 64 MiB read cap"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!Path::new(&p(&dir, "OVER.sig")).exists(), "no signature");
+    let refused = verify(&over, &sig);
+    assert!(!refused.status.success());
+    assert!(
+        stderr_of(&refused).contains("exceeds the 64 MiB read cap"),
+        "{}",
+        stderr_of(&refused)
+    );
+}
+
 #[test]
 fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
     let tmp = scratch("revoke-no-roster");

@@ -471,24 +471,22 @@ impl Gathered {
 }
 
 /// Read this machine's facts for `aterm doctor`, only the rows `only` names (the shell's
-/// always: [`reads`]), each probe on a thread of its own, the stale copies' look among them;
-/// it waits on no person. With `fix`, the Full Disk Access and Developer Tools hand-over is left
-/// due for after the report ([`Gathered::hand_over`]).
+/// always: [`reads`]), each probe on a thread of its own (in the caller where no thread starts),
+/// the stale copies' look among them; it waits on no person. With `fix`, the Full Disk Access and
+/// Developer Tools hand-over is left due for after the report ([`Gathered::hand_over`]).
 #[must_use]
 pub fn gather(fix: bool, only: &[String]) -> Gathered {
     let reads = |label: &str| reads(only, label);
     std::thread::scope(|scope| {
-        let copies = (cfg!(target_os = "macos") && reads("copies:"))
-            .then(|| scope.spawn(|| atpkg::copies::prune(true)));
+        let copies = (cfg!(target_os = "macos") && reads("copies:")).then(|| {
+            super::beside::start(scope, "aterm-doctor-copies", || atpkg::copies::prune(true))
+        });
         let read = super::doctor_facts_rows(fix, &reads);
         Gathered {
             lines: read.rows,
             rust_docs: read.rust_docs,
             copies: copies.map(|look| {
-                let look = look
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                Copies::new(atpkg::copies::prune, Some(look))
+                Copies::new(atpkg::copies::prune, Some(look.answer()))
                     .pruning_after(atpkg::copies::prune_after)
             }),
             hand_over: read.hand_over,
@@ -633,6 +631,9 @@ fn fix_at(text: &str) -> Option<usize> {
 #[must_use]
 pub fn shorten(text: &str, room: usize) -> String {
     let cut = |text: &str, room: usize| -> String {
+        if room == 0 {
+            return String::new();
+        }
         if text.chars().count() <= room {
             return text.to_owned();
         }
@@ -669,13 +670,22 @@ pub fn shorten(text: &str, room: usize) -> String {
         .next()
         .unwrap_or(head)
         .trim();
+    // What a fix that would fill the row leaves the clause: the fix is cut to this many
+    // characters short of `room` (and the joint's), never below 20. Every budget here counts
+    // characters, as `room` does, never UTF-8 bytes. A row with no room left for the clause is
+    // the fix alone, cut to the whole room rather than to what the clause would have left it.
+    const MIN_CLAUSE_CHARS: usize = 22;
     let joint = " \u{2014} ";
-    let fix = cut(fix, room.saturating_sub(joint.len() + 20).max(20));
-    let left = room.saturating_sub(fix.chars().count() + joint.chars().count());
+    let joint_chars = joint.chars().count();
+    let short_fix = cut(
+        fix,
+        room.saturating_sub(joint_chars + MIN_CLAUSE_CHARS).max(20),
+    );
+    let left = room.saturating_sub(short_fix.chars().count() + joint_chars);
     if clause.is_empty() || left < 10 {
-        return cut(&fix, room);
+        return cut(fix, room);
     }
-    format!("{}{joint}{fix}", cut(clause, left))
+    format!("{}{joint}{short_fix}", cut(clause, left))
 }
 
 /// The verdict line bare `aterm doctor` opens with: `healthy` alone, or how many rows need the
@@ -1441,8 +1451,9 @@ mod tests {
         );
     }
 
-    /// A row too long for one line keeps its first clause and its one fix. NEGATIVE CONTROL: a
-    /// line that fits is left whole, and one with no fix is cut.
+    /// A row too long for one line keeps its first clause and its one fix, in at most `room`
+    /// characters, none at all when there is no room. NEGATIVE CONTROL: a line that fits is left
+    /// whole, and one with no fix is cut.
     #[test]
     fn a_long_row_keeps_its_first_clause_and_its_fix() {
         let long = format!(
@@ -1457,6 +1468,42 @@ mod tests {
         );
         assert!(short.chars().count() <= 80, "{short}");
         assert_eq!(shorten("fits", 80), "fits");
+        assert_eq!(
+            shorten("anything", 0),
+            "",
+            "no room holds nothing, not even the `\u{2026}`"
+        );
+        assert_eq!(shorten("anything", 1), "\u{2026}");
+        let tight = shorten(&long, 50);
+        assert!(
+            tight.ends_with(" \u{2014} fix: open a new aterm tab"),
+            "{tight}"
+        );
+        assert_eq!(tight.chars().count(), 50, "{tight}");
+        assert_eq!(
+            shorten(
+                "no accessibility for Terminal, because of a long reason \u{2014} fix: switch on aterm!",
+                46
+            ),
+            "no accessibility for \u{2026} \u{2014} fix: switch on aterm!",
+            "a fix that would fill the row leaves the clause its 22 characters"
+        );
+        assert_eq!(
+            shorten(
+                "no accessibility for Terminal \u{2014} fix: switch on aterm row",
+                28
+            ),
+            "fix: switch on aterm row",
+            "a row with no room for the clause gives the fix the whole room, not its 20"
+        );
+        assert_eq!(
+            shorten(
+                "no accessibility for Terminal \u{2014} fix: switch on aterm row",
+                23
+            ),
+            "fix: switch on aterm r\u{2026}",
+            "a fix longer than the whole room is cut to it"
+        );
         let plain = "x".repeat(100);
         assert_eq!(shorten(&plain, 10).chars().count(), 10);
         let help = format!(

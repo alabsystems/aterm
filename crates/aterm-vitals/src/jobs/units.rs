@@ -2832,7 +2832,7 @@ impl Jobs {
                 named: named.filter(|_| matches!(class, Class::Waiting | Class::Polling)),
                 stop: out.stop,
                 input: (class == Class::UnreadInput).then_some(gate),
-                cpu_mc: cpu_mc.filter(|_| matches!(class, Class::UnreadInput | Class::BusySilent)),
+                cpu_mc,
                 zombies: ev.zombies,
                 standing: out.standing,
                 quiet_ms: out.quiet_ms,

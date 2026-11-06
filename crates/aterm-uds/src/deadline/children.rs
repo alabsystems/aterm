@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unix `poll(2)` multiplexing for [`super::ExitWait`] and [`super::outputs_until`].
+//! Unix `poll(2)` multiplexing for [`super::ExitWait`], [`super::outputs_until`] and
+//! [`super::outputs_until_unless`].
 
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -102,6 +103,9 @@ pub(super) fn exit_reported(fd: &OwnedFd, timeout: Duration) -> io::Result<bool>
 /// the child itself. The child is not yet reaped, so its pid, and with it the group id it leads,
 /// cannot have been reused.
 pub(super) fn kill_group(child: &mut Child) {
+    if !child.owns_unreaped() {
+        return;
+    }
     if let Ok(pid) = i32::try_from(child.id()) {
         let _ = crate::process::kill_group_until_empty(pid);
     }
@@ -268,6 +272,23 @@ pub(super) fn outputs_until(
         cmds.iter_mut().map(|cmd| Run::start(cmd)).collect(),
         deadline,
         reap,
+        None,
+    )
+}
+
+/// [`outputs_until`] that ends the children still running, as at `deadline`, once `stopped()`
+/// reads true, read at least every [`super::STOP_TICK`].
+pub(super) fn outputs_until_unless(
+    cmds: &mut [&mut Command],
+    deadline: Instant,
+    reap: Duration,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Vec<Result<Output, RunError>> {
+    run_until(
+        cmds.iter_mut().map(|cmd| Run::start(cmd)).collect(),
+        deadline,
+        reap,
+        Some(stopped),
     )
 }
 
@@ -277,7 +298,7 @@ pub(super) fn output_of_until(
     deadline: Instant,
     reap: Duration,
 ) -> Result<Output, RunError> {
-    run_until(vec![Run::of(Ok(child))], deadline, reap)
+    run_until(vec![Run::of(Ok(child))], deadline, reap, None)
         .pop()
         .unwrap_or(Err(RunError::TimedOut))
 }
@@ -286,6 +307,7 @@ fn run_until(
     mut runs: Vec<Run>,
     deadline: Instant,
     reap: Duration,
+    mut stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Vec<Result<Output, RunError>> {
     let mut tick = POLL_MIN;
     loop {
@@ -304,7 +326,7 @@ fn run_until(
         if runs.iter().all(Run::settled) {
             break;
         }
-        if now >= deadline {
+        if now >= deadline || stopped.as_mut().is_some_and(|stopped| stopped()) {
             let reap_by = super::saturating_after(Instant::now(), reap);
             for run in runs.iter_mut().filter(|run| run.running()) {
                 if let Ok(child) = run.child.as_mut() {
@@ -320,7 +342,11 @@ fn run_until(
             }
             break;
         }
-        let mut wake = deadline;
+        let mut wake = if stopped.is_some() {
+            deadline.min(super::saturating_after(now, super::STOP_TICK))
+        } else {
+            deadline
+        };
         let mut ticking = false;
         let mut fds = Vec::new();
         let mut owners = Vec::new();

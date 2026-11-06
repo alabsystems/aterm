@@ -1719,6 +1719,7 @@ mod everyone_key;
 mod reach;
 mod readers;
 mod record_budgets;
+mod seat_removed;
 pub(super) mod signed;
 pub(super) mod weigh;
 
@@ -2324,4 +2325,78 @@ fn membership_model_conforms_across_reachable_transitions_and_catches_mutants() 
     reverted.insert("u1", 1);
     assert!(!model.successors("Evaluate1", &healed).contains(&reverted));
     assert!(!model.check_invariant("HonestWriteOnACutEpochStands", &reverted));
+}
+
+/// P1's revocation answers by causality, never by the order records arrived in. X is admitted by
+/// A, and A then removes it. Concurrently B admits X2: another install (another writer key and
+/// incarnation) of X's age identity, so its seat binds X's recipient. X2's `Admit` does not have
+/// the `Remove` of X in its causal past, so it does not restore that recipient: it stays revoked
+/// in each of the six arrival orders, and every order evaluates one membership. The rule before
+/// PF1 kept the recipient when X2's entry had a higher index than X's seat, which only the
+/// arrival order decided.
+///
+/// NEGATIVE CONTROL: `ATERM_TEST_NEGATIVE_CONTROL=revocation-arrival-order` reads the arrival
+/// order as the causal order: the orders in which X2's `Admit` lands after the `Remove` restore
+/// the recipient, and the asserts fail.
+#[test]
+fn a_concurrent_admit_of_a_removed_macs_key_keeps_it_revoked_in_every_arrival_order() {
+    let lab = found(&[(A, "m1"), (B, "m2")]);
+    let twin = Entrant {
+        request: Request::create(
+            [2; 16],
+            [3; 32],
+            [X.0; 16],
+            [0x70; 16],
+            &X.identity(),
+            &[0x70; 32],
+        )
+        .unwrap(),
+        node_key: [0x70; 32],
+        name: "mac-x2".to_owned(),
+        label: "m4".to_owned(),
+    };
+    let twin_actor = twin.request.binding().actor();
+    assert_ne!(twin_actor, X.id());
+    let mut one = lab.clone();
+    let ax = one.keep(admit(&one, A, X, "m3"));
+    let rx = one.keep(remove(&one, A, X, ax.id()));
+    let mut two = lab.clone();
+    let bx2 = two.keep(sign(
+        &two,
+        B,
+        Body::Admit {
+            entrant: twin,
+            evidence: Evidence::Phrase,
+        },
+    ));
+    let records = [ax, rx, bx2];
+    let orders = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let recipient = X.identity().recipient();
+    let mut want: Option<Membership> = None;
+    for order in orders {
+        let mut log = lab.clone();
+        for i in order {
+            log.insert(records[i].clone()).unwrap();
+        }
+        let membership = log.membership();
+        assert!(
+            membership.contains(&twin_actor),
+            "order {order:?}: X2 is a member"
+        );
+        assert!(
+            membership.removed_recipients().contains(&recipient),
+            "order {order:?}: X2's concurrent Admit does not restore X's recipient"
+        );
+        match &want {
+            None => want = Some(membership),
+            Some(want) => assert_eq!(&membership, want, "order {order:?}"),
+        }
+    }
 }

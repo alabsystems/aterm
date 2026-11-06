@@ -138,7 +138,7 @@ impl D3dWindowSurface {
         }
         let swap_format =
             swap_format(format).ok_or_else(|| format!("d3d11: no {format:?} swap chain"))?;
-        let latency = latency.max(1);
+        let latency = latency.clamp(1, 15);
         let flags = dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT as u32;
         let desc = dxgi::DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
@@ -437,7 +437,13 @@ impl D3dWindowSurface {
     /// Resize the buffers to `width` x `height` (clamped to 1); a no-op at the
     /// current size.
     pub(crate) fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let max = self.dev.caps().max_texture_dim;
         let (width, height) = (width.max(1), height.max(1));
+        if width > max || height > max {
+            return Err(format!(
+                "d3d11: a {width}x{height} swap chain is outside 1..={max} per side"
+            ));
+        }
         if (width, height) == (self.width, self.height) {
             return Ok(());
         }

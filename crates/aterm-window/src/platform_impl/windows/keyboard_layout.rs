@@ -429,7 +429,8 @@ impl LayoutCache {
                     super::handle::from_usize(locale_id as usize),
                 );
                 if wide_len > 0 {
-                    let os_string = OsString::from_wide(&label_wide[0..wide_len as usize]);
+                    let n = crate::platform_impl::reported_len(wide_len as usize, label_wide.len());
+                    let os_string = OsString::from_wide(&label_wide[..n]);
                     if let Ok(label_str) = os_string.into_string() {
                         if let Some(ch) = label_str.chars().next() {
                             return ToUnicodeResult::Dead(Some(ch));
@@ -439,7 +440,8 @@ impl LayoutCache {
                 return ToUnicodeResult::Dead(None);
             }
             if wide_len > 0 {
-                let os_string = OsString::from_wide(&label_wide[0..wide_len as usize]);
+                let n = crate::platform_impl::reported_len(wide_len as usize, label_wide.len());
+                let os_string = OsString::from_wide(&label_wide[..n]);
                 if let Ok(label_str) = os_string.into_string() {
                     return ToUnicodeResult::Str(label_str);
                 }

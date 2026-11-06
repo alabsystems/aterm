@@ -735,6 +735,25 @@ mod tests {
             "event":"stage-started","stage_index":MAX_OPEN_STAGES,"stage":"extra"})));
     }
 
+    /// The build-inputs seal's counting lines (`build_inputs::current`, one per call, in every
+    /// mode it prints) are events of the run, never rejected lines, so a log that holds them
+    /// still reads as complete. CONTROL: an event of a name nothing prints is rejected.
+    /// NEGATIVE CONTROL: without `inputs` among the known events each is a rejected line.
+    #[test]
+    fn the_inputs_seal_lines_are_events_of_the_run() {
+        let rows = ["hashed", "rechecked", "adopted"].map(|mode| {
+            aterm_json::json!({"schema":1,"event":"inputs","mode":mode,"entries":10,"secs":0.5})
+        });
+        let lines = rows
+            .iter()
+            .map(|row| format!("release-event: {row}\n"))
+            .collect::<String>();
+        let events = read_events(lines.as_bytes()).unwrap();
+        assert_eq!((events.rejected_lines, events.count), (0, 3));
+        let unknown = "release-event: {\"schema\":1,\"event\":\"inputs-guessed\"}\n";
+        assert_eq!(read_events(unknown.as_bytes()).unwrap().rejected_lines, 1);
+    }
+
     #[test]
     fn malformed_activity_never_hides_a_reported_failure_or_prints_control_titles() {
         let rows = [

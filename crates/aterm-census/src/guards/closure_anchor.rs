@@ -3,7 +3,7 @@
 
 //! closure-anchor: an action's only anchor sits in code the source-spec closure links.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::{Finding, Rule, SourceFile, Tree};
 
@@ -56,20 +56,16 @@ struct Anchor<'a> {
 }
 
 fn closure_anchor(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let mut test_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut anchors = Vec::new();
     for file in tree.corpus.under(&["crates/"]) {
         if ATTRIBUTE_CRATES.iter().any(|c| file.rel.starts_with(c)) || !file.mentions(&ANCHORS) {
             continue;
         }
-        let Some((krate, inner)) = crate_of(&file.rel) else {
+        let Some((_, inner)) = crate_of(&file.rel) else {
             continue;
         };
         let unlinked = UNLINKED_TARGETS.iter().any(|t| inner.starts_with(t))
-            || test_only
-                .entry(krate.to_string())
-                .or_insert_with(|| tree.corpus.test_only(krate))
-                .contains(&file.rel);
+            || tree.corpus.test_code().holds(&file.rel);
         anchors.extend(anchors_in(file, unlinked));
     }
     let covered: BTreeSet<(&str, &str)> = anchors
@@ -315,5 +311,37 @@ mod tests {
         }
         let shipped = "#[cfg(test)]\nmod rig;\n#[path = \"rig.rs\"]\nmod again;\n";
         assert!(found(shipped, None).is_empty());
+    }
+
+    /// The library links what a shipped line loads, and test code is what every guard calls it
+    /// (`TestCode::holds`): a file named for tests that nothing ships, a file only a test-only
+    /// inline module splices in and a test-only `mod` inside a shipped inline module link
+    /// nothing, so an anchor there covers no action; a `_tests.rs` a shipped `#[path]` mounts
+    /// links.
+    #[test]
+    fn an_anchor_in_test_code_by_any_road_covers_nothing() {
+        let lib = "#[cfg(test)]\nmod rig;\n#[cfg(test)]\nmod checks {\n    \
+                   include!(\"spliced.rs\");\n}\nmod imp {\n    #[cfg(test)]\n    mod deep;\n}\n\
+                   #[path = \"shipped_tests.rs\"]\nmod shipped;\n";
+        let found = run(
+            &CLOSURE_ANCHOR,
+            &[
+                ("crates/x/src/lib.rs", lib),
+                ("crates/x/src/rig.rs", &waiver("M", "Rig")),
+                ("crates/x/src/old/tests.rs", &waiver("M", "Rig")),
+                ("crates/x/src/spliced.rs", &waiver("M", "Spliced")),
+                ("crates/x/src/imp/deep.rs", &waiver("M", "Deep")),
+                ("crates/x/src/shipped_tests.rs", &waiver("M", "Shipped")),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/x/src/imp/deep.rs:3",
+                "crates/x/src/old/tests.rs:3",
+                "crates/x/src/rig.rs:3",
+                "crates/x/src/spliced.rs:3",
+            ]
+        );
     }
 }

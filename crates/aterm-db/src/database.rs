@@ -127,49 +127,130 @@ impl Command {
     }
     /// Encode the closed versioned payload. All maps use the workspace's sorted map.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let value = match self {
-            Self::Merge { request } => {
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"merge"})
+        let request_hex = hex::encode_lower(&self.request());
+        let encoded = match self {
+            Self::Merge { .. } => {
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    kind: &'static str,
+                    request: &'a str,
+                    v: u8,
+                }
+                aterm_json::to_vec(&Encoded {
+                    kind: "merge",
+                    request: &request_hex,
+                    v: 1,
+                })
             }
-            Self::Write { request, changes } => {
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"write","changes":changes.iter().map(|c|json!({"collection":c.collection,"key":c.key,"value":c.value})).collect::<Vec<_>>()})
+            Self::Write { changes, .. } => {
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    changes: &'a [Change],
+                    kind: &'static str,
+                    request: &'a str,
+                    v: u8,
+                }
+                aterm_json::to_vec(&Encoded {
+                    changes,
+                    kind: "write",
+                    request: &request_hex,
+                    v: 1,
+                })
             }
             Self::Revert {
-                request,
-                operation,
-                changes,
+                operation, changes, ..
             } => {
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"revert","operation":hex::encode_lower(operation),"changes":changes.iter().map(|c|json!({"collection":c.collection,"key":c.key,"value":c.value})).collect::<Vec<_>>()})
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    changes: &'a [Change],
+                    kind: &'static str,
+                    operation: &'a str,
+                    request: &'a str,
+                    v: u8,
+                }
+                let op_hex = hex::encode_lower(operation);
+                aterm_json::to_vec(&Encoded {
+                    changes,
+                    kind: "revert",
+                    operation: &op_hex,
+                    request: &request_hex,
+                    v: 1,
+                })
             }
             Self::Budget {
-                request,
                 name,
                 total,
                 shares,
+                ..
             } => {
-                let shares: aterm_json::Map = shares
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    kind: &'static str,
+                    name: &'a str,
+                    request: &'a str,
+                    shares: BTreeMap<String, u64>,
+                    total: u64,
+                    v: u8,
+                }
+                let shares: BTreeMap<String, u64> = shares
                     .iter()
-                    .map(|(a, n)| (hex::encode_lower(a), Value::from(*n)))
+                    .map(|(a, n)| (hex::encode_lower(a), *n))
                     .collect();
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"budget","name":name,"total":total,"shares":shares})
+                aterm_json::to_vec(&Encoded {
+                    kind: "budget",
+                    name,
+                    request: &request_hex,
+                    shares,
+                    total: *total,
+                    v: 1,
+                })
             }
             Self::Spend {
-                request,
                 grant,
                 cumulative,
                 cost,
+                ..
             } => {
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"spend","grant":hex::encode_lower(grant),"cumulative":cumulative,"cost":cost})
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    cost: u64,
+                    cumulative: u64,
+                    grant: &'a str,
+                    kind: &'static str,
+                    request: &'a str,
+                    v: u8,
+                }
+                let grant_hex = hex::encode_lower(grant);
+                aterm_json::to_vec(&Encoded {
+                    cost: *cost,
+                    cumulative: *cumulative,
+                    grant: &grant_hex,
+                    kind: "spend",
+                    request: &request_hex,
+                    v: 1,
+                })
             }
-            Self::Revoke {
-                request,
-                actor,
-                through,
-            } => {
-                json!({"v":1,"request":hex::encode_lower(request),"kind":"revoke","actor":hex::encode_lower(actor),"through":through.as_ref().map(|d|hex::encode_lower(d))})
+            Self::Revoke { actor, through, .. } => {
+                #[derive(serde::Serialize)]
+                struct Encoded<'a> {
+                    actor: &'a str,
+                    kind: &'static str,
+                    request: &'a str,
+                    through: Option<&'a str>,
+                    v: u8,
+                }
+                let actor_hex = hex::encode_lower(actor);
+                let through_hex = through.as_ref().map(|d| hex::encode_lower(d));
+                aterm_json::to_vec(&Encoded {
+                    actor: &actor_hex,
+                    kind: "revoke",
+                    request: &request_hex,
+                    through: through_hex.as_deref(),
+                    v: 1,
+                })
             }
         };
-        aterm_json::to_vec(&value).map_err(|_| Error::new("database payload could not be encoded"))
+        encoded.map_err(|_| Error::new("database payload could not be encoded"))
     }
     /// Parse only the supported schema; unknown fields cannot silently change authority.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -481,6 +562,9 @@ impl History {
             .iter()
             .map(|(id, (_, reason))| (id, reason.as_str()))
     }
+    pub(crate) fn is_refused(&self, id: &Digest) -> bool {
+        self.refused.contains_key(id)
+    }
     /// Signed author/time/causal metadata without decrypted application contents.
     /// Display names resolve through the machine registry rather than becoming identity.
     pub fn provenance(&self, id: &Digest) -> Option<Value> {
@@ -552,13 +636,21 @@ impl History {
             .inventory()
             .filter(|prior| *prior != id && self.index.observes(id, prior))
         {
-            let opened = self
-                .records
-                .get(prior)
-                .map(|(o, _)| o)
-                .or_else(|| self.refused.get(prior).map(|(o, _)| o))
-                .ok_or_else(|| Error::new("causal record has no retained ciphertext"))?;
-            past.replay(opened.clone())?;
+            if let Some((opened, command)) = self.records.get(prior) {
+                past.index.insert(opened.header.clone()).map_err(|_| {
+                    Error::new("causal header refused or history capacity exhausted")
+                })?;
+                past.records
+                    .insert(*prior, (opened.clone(), command.clone()));
+            } else if let Some((opened, reason)) = self.refused.get(prior) {
+                past.index.insert(opened.header.clone()).map_err(|_| {
+                    Error::new("causal header refused or history capacity exhausted")
+                })?;
+                past.refused
+                    .insert(*prior, (opened.clone(), reason.clone()));
+            } else {
+                return Err(Error::new("causal record has no retained ciphertext"));
+            }
         }
         Ok(past.view())
     }

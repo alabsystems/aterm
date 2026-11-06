@@ -2112,6 +2112,9 @@ mod tests {
         let mut bar = vec![
             "aterm", "File", "Edit", "View", "Agents", "Window", "Help", "Version",
         ];
+        if cfg!(target_os = "macos") {
+            bar.push(crate::menu::MACHINE_SECTION);
+        }
         if PALETTE_APP_MENU_LAST {
             bar.rotate_left(1);
         }

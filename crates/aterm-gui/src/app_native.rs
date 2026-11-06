@@ -10159,7 +10159,6 @@ impl App {
     }
 
     /// Re-run native document/restore safety at asynchronous handoff completion.
-    #[cfg(unix)]
     pub(crate) fn revalidate_native_update_safety(
         &self,
     ) -> Result<NativeUpdateSafetyToken, Vec<String>> {

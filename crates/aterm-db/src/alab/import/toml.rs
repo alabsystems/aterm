@@ -344,21 +344,22 @@ pub fn mailbox_sheet(name: &str, bytes: &[u8]) -> Result<Sheet> {
         rows_read.push(stray);
     }
     // Every spelling any mailbox gives, the known ones first in their reading order.
-    let given: BTreeSet<&String> = rows_read
+    let given: BTreeSet<&str> = rows_read
         .iter()
         .flat_map(|read| read.cells.keys().chain(read.secrets.keys()))
+        .map(String::as_str)
         .collect();
     let mut headers: Vec<String> = FIELDS
         .iter()
         .map(|(spelled, _)| *spelled)
-        .filter(|spelled| given.iter().any(|g| g.as_str() == *spelled))
+        .filter(|spelled| given.contains(*spelled))
         .map(str::to_owned)
         .collect();
     headers.extend(
         given
             .iter()
             .filter(|g| field(g).is_none())
-            .map(|g| (*g).clone()),
+            .map(|g| (*g).to_owned()),
     );
     let mut rows = Vec::with_capacity(rows_read.len());
     let mut secrets = BTreeMap::new();
@@ -415,21 +416,21 @@ enum Pattern {
 }
 
 fn pattern(raw: &str) -> Option<Pattern> {
-    let lower = raw.trim().to_ascii_lowercase();
-    if lower == "*" {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
         return Some(Pattern::Any);
     }
-    if lower.chars().any(char::is_whitespace) || lower.matches('@').count() != 1 {
+    if trimmed.chars().any(char::is_whitespace) || trimmed.matches('@').count() != 1 {
         return None;
     }
-    let (local, domain) = lower.split_once('@')?;
+    let (local, domain) = trimmed.split_once('@')?;
     if domain.is_empty() || domain.contains('*') {
         return None;
     }
     match local {
-        "" | "*" => Some(Pattern::Domain(domain.to_owned())),
+        "" | "*" => Some(Pattern::Domain(domain.to_ascii_lowercase())),
         _ if local.contains('*') => None,
-        _ => keys::address(&lower).ok().map(Pattern::Exact),
+        _ => keys::address(trimmed).ok().map(Pattern::Exact),
     }
 }
 

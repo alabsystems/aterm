@@ -532,7 +532,11 @@ pub(crate) const NOTES_MAX: usize = 125_000;
 /// §11.2, step 1): `{name}.agh-` and the first 8 hex digits of the digest.
 #[must_use]
 pub fn clobber_temporary(name: &str, digest: &Sha256Digest) -> String {
-    format!("{name}.agh-{}", &digest.hex()[..8])
+    let mut out = String::with_capacity(name.len() + 13);
+    out.push_str(name);
+    out.push_str(".agh-");
+    aterm_codec::hex::push_lower(&mut out, &digest.as_bytes()[..4]);
+    out
 }
 
 /// Whether `asset` is the temporary name of some clobber of `name` ([`clobber_temporary`] of
@@ -1369,7 +1373,7 @@ impl<'a> Releases<'a> {
             return Ok(None);
         };
         let matching: Vec<&ReleaseObject> = tag_objects(seen)
-            .into_iter()
+            .iter()
             .filter(|release| matches(release, &intent))
             .collect();
         let [release] = matching.as_slice() else {
@@ -1459,7 +1463,7 @@ impl Releases<'_> {
                 ));
             }
             let matching: Vec<&ReleaseObject> = tag_objects(&objects)
-                .into_iter()
+                .iter()
                 .filter(|release| matches(release, &open))
                 .collect();
             return Ok(match matching.as_slice() {
@@ -1469,7 +1473,9 @@ impl Releases<'_> {
                     intent: open.id,
                     observe: true,
                 },
-                several => CreateStep::Refuse(self.ambiguous(tag, several)),
+                several => {
+                    CreateStep::Refuse(self.ambiguous(tag, several.iter().map(|r| r.id).collect()))
+                }
             });
         }
         // The created-intent rule: the tag's latest closed intent that made an object is read
@@ -1529,7 +1535,7 @@ impl Releases<'_> {
                 format!("published release {} holds tag {tag}", release.id),
             )),
             TagObjects::Many(several) => {
-                CreateStep::Refuse(self.ambiguous(tag, &several.iter().collect::<Vec<_>>()))
+                CreateStep::Refuse(self.ambiguous(tag, several.iter().map(|r| r.id).collect()))
             }
         })
     }
@@ -1616,7 +1622,7 @@ impl Releases<'_> {
     ) -> Result<Discovered> {
         let objects = self.guard_view(None).recent_objects_for_tag(&intent.key)?;
         let matching: Vec<&ReleaseObject> = tag_objects(&objects)
-            .into_iter()
+            .iter()
             .filter(|release| matches(release, intent))
             .collect();
         Ok(match matching.as_slice() {
@@ -2175,18 +2181,17 @@ impl<'a> Releases<'a> {
         self.conflict(Sub::GuardFailed { what: what.clone() }, what)
     }
 
-    /// Conflict `AmbiguousTag` over `several`.
-    fn ambiguous(&self, tag: &str, several: &[&ReleaseObject]) -> Error {
-        let ids: Vec<u64> = several.iter().map(|release| release.id).collect();
-        let listed: Vec<String> = ids.iter().map(u64::to_string).collect();
-        self.conflict(
-            Sub::AmbiguousTag { ids },
-            format!(
-                "{} releases hold tag {tag}: {}",
-                listed.len(),
-                listed.join(", ")
-            ),
-        )
+    /// Conflict `AmbiguousTag` over `ids`.
+    fn ambiguous(&self, tag: &str, ids: Vec<u64>) -> Error {
+        use std::fmt::Write as _;
+        let mut why = format!("{} releases hold tag {tag}: ", ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            if i > 0 {
+                why.push_str(", ");
+            }
+            let _ = write!(why, "{id}");
+        }
+        self.conflict(Sub::AmbiguousTag { ids }, why)
     }
 
     /// The publish guard's judgement of `release`, whose assets are `seen`, against `want`
@@ -2392,11 +2397,11 @@ fn created_release(answered: &Answered) -> Option<(u64, String)> {
 }
 
 /// The releases a `TagObjects` holds.
-fn tag_objects(objects: &TagObjects) -> Vec<&ReleaseObject> {
+fn tag_objects(objects: &TagObjects) -> &[ReleaseObject] {
     match objects {
-        TagObjects::None => Vec::new(),
-        TagObjects::One(release) => vec![release.as_ref()],
-        TagObjects::Many(several) => several.iter().collect(),
+        TagObjects::None => &[],
+        TagObjects::One(release) => std::slice::from_ref(release.as_ref()),
+        TagObjects::Many(several) => several.as_slice(),
     }
 }
 
@@ -2426,12 +2431,10 @@ fn made_object(view: &IntentView) -> Option<u64> {
 /// where the intent sent one (an intent with no target matches any, design §11.2).
 fn matches(release: &ReleaseObject, intent: &Intent) -> bool {
     release.tag_name == intent.key
-        && intent.body_digest.as_deref()
-            == Some(
-                Sha256Digest::of(release.body.as_deref().unwrap_or("").as_bytes())
-                    .to_string()
-                    .as_str(),
-            )
+        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
+            == Some(Sha256Digest::of(
+                release.body.as_deref().unwrap_or("").as_bytes(),
+            ))
         && intent
             .target_commitish
             .as_ref()
@@ -2442,8 +2445,8 @@ fn matches(release: &ReleaseObject, intent: &Intent) -> bool {
 /// its target where the intent has one.
 fn agrees(req: &DraftRequest, intent: &Intent) -> bool {
     req.tag_name == intent.key
-        && intent.body_digest.as_deref()
-            == Some(Sha256Digest::of(req.body.as_bytes()).to_string().as_str())
+        && intent.body_digest.as_deref().and_then(Sha256Digest::parse)
+            == Some(Sha256Digest::of(req.body.as_bytes()))
         && intent
             .target_commitish
             .as_ref()
@@ -2500,21 +2503,24 @@ pub fn asset_change(want: &AssetSet, seen: &AssetSet) -> AssetChange {
 
 /// What changed between the expected asset set and the one seen.
 fn set_change(id: u64, want: &AssetSet, seen: &AssetSet) -> String {
+    use std::fmt::Write as _;
     let change = asset_change(want, seen);
-    let mut parts = Vec::new();
+    let mut out = format!("draft {id}'s assets are not the expected set: ");
+    let mut first = true;
     for (label, names) in [
         ("added", &change.added),
         ("missing", &change.missing),
         ("changed", &change.changed),
     ] {
         if !names.is_empty() {
-            parts.push(format!("{label} {}", names.join(", ")));
+            if !first {
+                out.push_str("; ");
+            }
+            first = false;
+            let _ = write!(out, "{label} {}", names.join(", "));
         }
     }
-    format!(
-        "draft {id}'s assets are not the expected set: {}",
-        parts.join("; ")
-    )
+    out
 }
 
 /// `Begin`'s projection: 1 for `CreateStep::Begin { .. }` (`matches!`), else 0.

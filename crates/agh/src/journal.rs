@@ -989,15 +989,15 @@ impl Journal {
 impl IntentStore for Journal {
     fn begin(&self, draft: &IntentDraft) -> Result<IntentId> {
         let op = draft.op.slug();
-        if draft.slug.key() != self.repo() {
+        if draft.slug != self.slug {
             // Another repository's intent here would be missed by its own journal's
             // open-intent rule, so a rerun through that journal would post again.
+            let repo = self.repo();
             return Err(Error::usage(format!(
-                "a {op} draft for {} cannot begin in the journal of {}",
+                "a {op} draft for {} cannot begin in the journal of {repo}",
                 draft.slug.key(),
-                self.repo()
             ))
-            .with_repo(self.repo()));
+            .with_repo(repo));
         }
         for (field, value) in [
             ("key", Some(draft.key.as_str())),
@@ -1014,11 +1014,7 @@ impl IntentStore for Journal {
         let at_secs = self.fx.wall_secs()?;
         let mut minted = None;
         self.append_with(|records, step| {
-            let views = views(records);
-            let of_key: Vec<&IntentView> = views
-                .iter()
-                .filter(|v| v.intent.op == draft.op && v.intent.key == draft.key)
-                .collect();
+            let of_key = views_filtered(records, |i| i.op == draft.op && i.key == draft.key);
             if draft.op != WriteOp::RefCreate
                 && let Some(open) = of_key.iter().rev().find(|v| v.open)
             {
@@ -1339,11 +1335,18 @@ const fn settles_closed(settled: &Settled) -> bool {
 
 /// Every intent's view, in step order, from one pass over `records` (plan §8, body 7).
 pub(crate) fn views(records: &[(u64, JournalRecord)]) -> Vec<IntentView> {
+    views_filtered(records, |_| true)
+}
+
+fn views_filtered(
+    records: &[(u64, JournalRecord)],
+    keep: impl Fn(&Intent) -> bool,
+) -> Vec<IntentView> {
     let mut views: Vec<IntentView> = Vec::new();
     let mut index: HashMap<&IntentId, usize> = HashMap::new();
     for (_, record) in records {
         match record {
-            JournalRecord::Intent(intent) => {
+            JournalRecord::Intent(intent) if keep(intent) => {
                 index.insert(&intent.id, views.len());
                 views.push(IntentView {
                     intent: (**intent).clone(),
@@ -1353,6 +1356,7 @@ pub(crate) fn views(records: &[(u64, JournalRecord)]) -> Vec<IntentView> {
                     open: true,
                 });
             }
+            JournalRecord::Intent(_) => {}
             JournalRecord::Settled { intent, outcome } => {
                 // The first counts: `settle` refuses a second, and a spliced one must not
                 // close an intent left Unknown.
@@ -1486,7 +1490,7 @@ pub fn journals(dirs: &Dirs) -> Result<Vec<(Slug, PathBuf)>> {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".steps")) else {
                 continue;
             };
-            let Ok(slug) = Slug::parse(&format!("{owner_name}/{stem}")) else {
+            let Ok(slug) = Slug::new(owner_name, stem) else {
                 continue;
             };
             if file.file_type().is_ok_and(|t| t.is_file()) {

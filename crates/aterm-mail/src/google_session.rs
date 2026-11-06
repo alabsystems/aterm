@@ -81,7 +81,7 @@ fn decode(bytes: &[u8]) -> Result<Grant, String> {
     let mut rest = bytes
         .strip_prefix(b"aterm-google-mail-v1\0")
         .ok_or("Unknown Google mail credential format")?;
-    let mut field = |empty: bool| -> Result<Secret, String> {
+    let mut field = |empty: bool| -> Result<&str, String> {
         let length = u32::from_le_bytes(
             rest.get(..4)
                 .ok_or("Truncated Google mail credential")?
@@ -101,19 +101,20 @@ fn decode(bytes: &[u8]) -> Result<Grant, String> {
             return Err("Invalid Google mail credential".into());
         }
         rest = &rest[length..];
-        Ok(Secret::new(text.into()))
+        Ok(text)
     };
-    let account = email(field(false)?.expose())?;
-    let client_id = field(false)?.expose().to_owned();
-    let client_secret = field(true)?;
-    let refresh = field(false)?;
+    let account = email(field(false)?)?;
+    let client_id = field(false)?.to_owned();
+    let client_secret_raw = field(true)?;
+    let refresh = Secret::new(field(false)?.into());
     if !rest.is_empty() {
         return Err("Trailing Google mail credential data".into());
     }
     Ok(Grant {
         email: account,
         client_id,
-        client_secret: (!client_secret.expose().is_empty()).then_some(client_secret),
+        client_secret: (!client_secret_raw.is_empty())
+            .then(|| Secret::new(client_secret_raw.into())),
         refresh,
     })
 }

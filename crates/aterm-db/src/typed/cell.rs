@@ -512,6 +512,14 @@ impl Field {
         }
     }
 
+    /// For a set: whether `elem` is present.
+    pub fn has_member(&self, elem: &str) -> bool {
+        match self {
+            Self::Set(elements) => elements.get(elem).is_some_and(Self::present),
+            _ => false,
+        }
+    }
+
     /// For a set: its present elements.
     pub fn members(&self) -> BTreeSet<&str> {
         match self {

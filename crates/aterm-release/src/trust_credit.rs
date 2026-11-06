@@ -138,9 +138,19 @@ pub fn parse_epochs(text: &str) -> Result<Vec<Epoch>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let f: Vec<&str> = line.split('\t').collect();
-        let [id, old, mapped, floor, why] = f[..] else {
-            return Err(format!("{EPOCHS}:{n}: {} fields, not 5", f.len()));
+        let mut cols = line.split('\t');
+        let (Some(id), Some(old), Some(mapped), Some(floor), Some(why), None) = (
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+        ) else {
+            return Err(format!(
+                "{EPOCHS}:{n}: {} fields, not 5",
+                line.split('\t').count()
+            ));
         };
         let id: u32 = (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
             .then(|| id.parse().ok())

@@ -3101,7 +3101,7 @@ impl Volume {
         match self {
             Volume::Detect => match file {
                 Backing::Os(f) => on_boot_volume(f),
-                #[cfg(test)]
+                #[cfg(any(test, debug_assertions))]
                 Backing::Sim(_) => true,
             },
             Volume::Boot => true,
@@ -3614,13 +3614,20 @@ impl Mutation {
     }
 }
 
-/// A DOCUMENTED fault-injection seam: make the log's fsync and/or its rollback
-/// truncate fail, so the failed-fsync rollback and the failed-rollback POISON paths
-/// can be witnessed by the claim tests without a real disk fault. Integration tests
-/// link the library without `cfg(test)`, so this is always compiled; it is inert
-/// unless armed, and nothing in the broker arms it.
+/// A DOCUMENTED fault-injection seam: make the log's record writes, its fsync and/or
+/// its rollback truncate fail, so the failed-write and failed-fsync rollbacks and the
+/// failed-rollback POISON paths can be witnessed by the claim tests without a real disk
+/// fault. Integration tests link the library without `cfg(test)`, so this is always
+/// compiled; it is inert unless armed, and nothing in the broker arms it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InjectedFaults {
+    /// Every write of the log's records fails once it has landed the first half of its
+    /// bytes (rounded down), as a disk that fills in the middle of a write does: a
+    /// batch's, on every tier, and an un-batched append's. The written part is rolled
+    /// back and nothing is promoted — no record of the write acked, visible or deduped —
+    /// and the log goes on unpoisoned (a failed write flushed nothing, so says nothing
+    /// of earlier acks), unless `truncate` fails that rollback too.
+    pub write: bool,
     /// Every FULL `fsync` of the log fails: a Strict batch's (rolled back, nothing
     /// acked), and on the weaker tiers the full flush an escalated record, the horizon or
     /// `flush_durable` asks for (the run is recorded `Lossy` and the log poisoned until it is
@@ -3630,6 +3637,15 @@ pub struct InjectedFaults {
     pub sync: bool,
     /// Every rollback truncate fails (the log poisons itself).
     pub truncate: bool,
+}
+
+/// The injected write fault ([`InjectedFaults::write`]): the first half of `bytes`, then
+/// the failure.
+fn faulted_write(write_all: impl FnOnce(&[u8]) -> io::Result<()>, bytes: &[u8]) -> io::Error {
+    match write_all(&bytes[..bytes.len() / 2]) {
+        Ok(()) => io::Error::other("injected write fault"),
+        Err(e) => e,
+    }
 }
 
 /// Why staging a record into the current batch failed.
@@ -3844,13 +3860,21 @@ pub(crate) fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Where an open's bytes live: the real file at a path, or (tests) the crash
-/// simulation's device, which the same open runs against unchanged.
+/// Where an open's bytes live: the real file at a path, or (tests and debug builds:
+/// the crash simulation, [`SimDevice`](crate::SimDevice)) the simulated device, which the
+/// same open runs against unchanged.
 pub(crate) enum Storage<'a> {
     Os(&'a Path),
-    #[cfg(test)]
-    Sim(crate::crash_sim::Sim),
+    #[cfg(any(test, debug_assertions))]
+    Sim(crate::sim_device::Sim),
 }
+
+/// A release build opens the real file alone: this match names `Os` and nothing else, so
+/// it compiles only while that is the one variant (as `storage.rs`'s own check).
+#[cfg(not(any(test, debug_assertions)))]
+const _: fn(&Storage<'_>) = |s| match s {
+    Storage::Os(_) => {}
+};
 
 /// The served-tier code `<log>.id` carries for `tier`: what the NEXT open reads to decide
 /// whether this run could have lost an acked record to a power loss.
@@ -4092,8 +4116,13 @@ impl BatchWrite {
     /// the only part of a commit that waits on the device, and the part that runs
     /// without the log's lock. The injected fsync fault ([`InjectedFaults::sync`]) fails
     /// a full flush HERE, as a real one would, so a failed flush reaches the rollback
-    /// through the same halves a real one does.
+    /// through the same halves a real one does; the injected write fault
+    /// ([`InjectedFaults::write`]) fails the write here the same way.
     pub(crate) fn run(&mut self) -> io::Result<()> {
+        if self.faults.write {
+            let out = &self.out;
+            return Err(faulted_write(|b| out.write_all(b), &self.bytes));
+        }
         self.out.write_all(&self.bytes)?;
         let _ = issue_flush(
             &self.out,
@@ -4295,6 +4324,37 @@ impl BrokerLog {
             key,
             anti_rollback,
             prepare,
+        )?;
+        Ok(log)
+    }
+
+    /// [`open_opts`](Self::open_opts) on a SIMULATED DEVICE ([`SimDevice`](crate::SimDevice))
+    /// in place of a file, with nothing to prepare: the same open (recovery, the identity
+    /// rules, both sidecar phases) over a device a test can take every power-loss image
+    /// of. Anti-rollback is refused there, as retention's rewrite is (their sidecars are
+    /// files), and a key opens a log sealed at rest with no `<log>.seal` binding.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`open_opts`](Self::open_opts) refuses, and `Unsupported` for
+    /// anti-rollback or a bound at-rest log.
+    #[cfg(any(test, debug_assertions))]
+    pub fn open_sim(device: &crate::SimDevice, opts: OpenOptions) -> io::Result<BrokerLog> {
+        let key = opts.at_rest_key_opt();
+        let anti_rollback = opts.anti_rollback_mode();
+        if anti_rollback != AntiRollbackMode::Off {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anti-rollback keeps its watermark in a file: not on a simulated log",
+            ));
+        }
+        let (log, _) = Self::open_core(
+            Storage::Sim(device.sim().clone()),
+            &opts,
+            false,
+            key,
+            anti_rollback,
+            Self::prepare_nothing,
         )?;
         Ok(log)
     }
@@ -4729,7 +4789,7 @@ impl BrokerLog {
                     created,
                 )
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Storage::Sim(sim) => {
                 let created = sim.open_file();
                 (Backing::Sim(sim.clone()), Dir::Sim(sim), created)
@@ -10521,7 +10581,13 @@ impl BrokerLog {
         } else {
             self.flush_owed()
         };
-        if let Err(e) = self.file.write_all(frame_bytes) {
+        let wrote = if self.faults.write {
+            let file = &mut self.file;
+            Err(faulted_write(|b| file.write_all(b), frame_bytes))
+        } else {
+            self.file.write_all(frame_bytes)
+        };
+        if let Err(e) = wrote {
             if let Some(why) = self.rollback_to(committed) {
                 self.publish_poison(why, None);
             }
@@ -11615,6 +11681,7 @@ mod tests {
             .unwrap();
         let durable_len = log.bytes().len() as u64;
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -11623,6 +11690,7 @@ mod tests {
         let mut write = begun_write(&mut log);
         // The write window: armed now, for a later batch.
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: true,
         });
@@ -11661,6 +11729,7 @@ mod tests {
             .unwrap();
         let durable_len = log.bytes().len() as u64;
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -11717,6 +11786,7 @@ mod tests {
         log.publish(1, 1, "/a/s/x".into(), b"durable".to_vec())
             .unwrap();
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: true,
         });
@@ -14243,8 +14313,8 @@ mod ordered_tests {
     //! platform (its barrier exists everywhere); on a real file for what the platform
     //! decides (the tier served).
     use super::*;
-    use crate::crash_sim::Sim;
     use crate::proto::{ServedReason, Tier};
+    use crate::sim_device::Sim;
     use crate::test_scratch::Scratch;
     use crate::{Escalate, Escalation};
 
@@ -14515,6 +14585,7 @@ mod ordered_tests {
         let c = log.commit_batch().unwrap();
         assert_eq!(c.owe_full, Some(Offset(2)));
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -14580,6 +14651,7 @@ mod ordered_tests {
         stage(&mut log, 1, 1, "/o/a");
         log.commit_batch().unwrap();
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -14600,6 +14672,7 @@ mod ordered_tests {
         assert_eq!(log.durable_head(), Offset(0), "acked on a barrier");
         log.refuse_barrier = true;
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -14841,6 +14914,7 @@ mod ordered_tests {
         let double_fault = |log: &mut BrokerLog| {
             log.refuse_barrier = true;
             log.inject_faults(InjectedFaults {
+                write: false,
                 sync: true,
                 truncate: true,
             });

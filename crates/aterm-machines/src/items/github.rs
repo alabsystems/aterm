@@ -60,18 +60,18 @@ const XCODE_DEVELOPER: &str = "/Applications/Xcode.app/Contents/Developer";
 /// The distribution's git everywhere but macOS ([`installed_git`]).
 pub const SYSTEM_GIT: &str = "/usr/bin/git";
 
-/// The git installed for the runs here. On a Mac never `/usr/bin/git` (macOS's shim, which asks
-/// a person to install the Command Line Tools): the tools' own ([`CLT_GIT`]), else, on a Mac with
-/// Xcode and not the tools, the git of the developer directory `xcode-select -p` names (the one a
-/// person chose, else Xcode's), else a live `git` build in the account's `atpkg` store. Elsewhere
-/// the distribution's ([`SYSTEM_GIT`]). Read without a child process; `None` when none is there.
+/// The git installed for the runs here: a live build in the account's `atpkg` store first,
+/// which the default toolset updates independently of the operating system. Without one,
+/// the distribution's git ([`SYSTEM_GIT`]) or, on a Mac, the tools' own ([`CLT_GIT`]), then
+/// the selected Xcode's. Never macOS's `/usr/bin/git` shim, which asks a person to install
+/// the Command Line Tools. Read without a child process; `None` when none is there.
 #[must_use]
 pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
     installed_git_for(sys, None)
 }
 
 /// [`installed_git`] restricted to the system / Apple Developer paths without `atpkg`'s store
-/// (used first by [`installed_git`] and as the negative-control baseline in tests).
+/// (the fallback of [`installed_git`] and the negative-control baseline in tests).
 #[must_use]
 pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
     let file = |path: &Path| sys.stat(path).is_ok_and(|stat| !stat.dir);
@@ -90,26 +90,19 @@ pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
         .find(|git| file(git))
 }
 
-/// [`installed_git`] checking `user_home`'s `atpkg` store (when given) before falling back to
-/// [`System::identity`]'s home.
+/// [`installed_git`] for `user_home`'s store when given, otherwise this process's account.
+/// A named account never borrows another account's managed build; native Git is the fallback.
 #[must_use]
 pub fn installed_git_for(sys: &dyn System, user_home: Option<&Path>) -> Option<PathBuf> {
-    if let Some(git) = installed_git_without_atpkg(sys) {
-        return Some(git);
+    if let Some(home) = user_home {
+        return atpkg_installed_git(sys, home).or_else(|| installed_git_without_atpkg(sys));
     }
-    if !sys.macos() {
-        return None;
-    }
-    if let Some(home) = user_home
-        && let Some(git) = atpkg_installed_git(sys, home)
+    if let Some(home) = sys.account_home()
+        && let Some(git) = atpkg_installed_git(sys, &home)
     {
         return Some(git);
     }
-    let id_home = sys.account_home()?;
-    if user_home == Some(id_home.as_path()) {
-        return None;
-    }
-    atpkg_installed_git(sys, &id_home)
+    installed_git_without_atpkg(sys)
 }
 
 fn atpkg_prefix_for(sys: &dyn System, home: &Path) -> PathBuf {
@@ -170,6 +163,7 @@ fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<PathBuf> {
     if !exec_file(&store_git.join(&build).join("bin/git")) {
         return None;
     }
+    sys.admit_runtime(&store_git.join(&build)).ok()?;
     let shim = prefix.join("bin/git");
     exec_file(&shim).then_some(shim)
 }
@@ -178,7 +172,17 @@ fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<PathBuf> {
 /// elsewhere [`SYSTEM_GIT`]; each caller reads that first).
 #[must_use]
 pub fn git_program(sys: &dyn System) -> PathBuf {
-    installed_git(sys).unwrap_or_else(|| {
+    program_or_default(sys, installed_git(sys))
+}
+
+/// The git a command runs as `user`: only that account's managed build or native Git.
+#[must_use]
+pub fn git_program_for_user(sys: &dyn System, user: &User) -> PathBuf {
+    program_or_default(sys, installed_git_for(sys, Some(Path::new(&user.home))))
+}
+
+fn program_or_default(sys: &dyn System, installed: Option<PathBuf>) -> PathBuf {
+    installed.unwrap_or_else(|| {
         if sys.macos() {
             CLT_GIT.into()
         } else {
@@ -243,15 +247,25 @@ pub fn key_title(host: &str, user: &str) -> String {
     format!("aterm-machines:{host}:{user}")
 }
 
-/// Extracts the key type and base64 body of a valid OpenSSH public key line.
+/// Extracts the key type and base64 body of a valid OpenSSH public key line: a blob whose
+/// first field names the line's type and that carries at least one non-empty key field after it.
 #[must_use]
 pub fn key_material(line: &str) -> Option<(String, String)> {
     let mut words = line.split_whitespace();
     let kind = words.next()?;
     let body = words.next()?;
     let blob = aterm_codec::base64::decode(body).ok()?;
-    let len = u32::from_be_bytes(blob.get(..4)?.try_into().ok()?) as usize;
-    (blob.get(4..4 + len)? == kind.as_bytes()).then(|| (kind.to_owned(), body.to_owned()))
+    let (named, rest) = ssh_field(&blob)?;
+    let (key, _) = ssh_field(rest)?;
+    (named == kind.as_bytes() && !key.is_empty()).then(|| (kind.to_owned(), body.to_owned()))
+}
+
+/// One SSH wire string (RFC 4251 §5), a big-endian `u32` length and that many bytes, and the
+/// bytes after it; `None` when `bytes` holds less than its length says.
+fn ssh_field(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = usize::try_from(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?)).ok()?;
+    let end = len.checked_add(4)?;
+    Some((bytes.get(4..end)?, bytes.get(end..)?))
 }
 
 /// `path`'s text, read as `user`: `Absent` when it does not exist.
@@ -862,6 +876,29 @@ mod tests {
         assert!(key_material("").is_none());
     }
 
+    /// A blob that names its type and stops, carries an empty key, or claims more bytes than
+    /// it holds (`u32::MAX` included) is no key. NEGATIVE CONTROL: the same type with a
+    /// 32-byte key field parses.
+    #[test]
+    fn a_public_key_blob_with_no_whole_key_after_its_type_is_refused() {
+        let line =
+            |blob: &[u8]| format!("ssh-ed25519 {}", aterm_codec::base64::encode(blob).unwrap());
+        let mut whole = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20".to_vec();
+        whole.extend_from_slice(&[7; 32]);
+        for blob in [
+            &b"\x00\x00\x00\x0bssh-ed25519"[..],
+            b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x00",
+            b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20abc",
+            b"\x00\x00\x00\x0bssh-ed25519\xff\xff\xff\xffabc",
+            b"\xff\xff\xff\xffssh-ed25519",
+            &whole[..whole.len() - 1],
+        ] {
+            assert!(key_material(&line(blob)).is_none(), "{blob:?}");
+        }
+        let (kind, _) = key_material(&line(&whole)).unwrap();
+        assert_eq!(kind, "ssh-ed25519");
+    }
+
     #[test]
     fn the_items_are_per_user_with_stable_ids() {
         let ids: Vec<String> = items().iter().map(|i| i.id()).collect();
@@ -1321,8 +1358,197 @@ mod tests {
             "GitItem must proceed with atpkg git instead of waiting on CLT"
         );
 
-        // Once CLT is installed too, CLT still takes precedence over atpkg's shim.
+        // CLT can lag the signed toolset's Git capabilities, so its arrival must not displace
+        // the ready managed build that the repositories and their required dependencies use.
         sys.stat_of(CLT_GIT, exec);
-        assert_eq!(installed_git(&sys), Some(PathBuf::from(CLT_GIT)));
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
+    }
+
+    #[test]
+    fn ready_managed_git_precedes_system_git_on_linux_without_lookup_processes() {
+        let who = User {
+            home: "/home/alice".into(),
+            ..alice()
+        };
+        let mut sys = Fake::root();
+        sys.linux = true;
+        sys.logged_in(&who);
+        let prefix = "/home/alice/.local/share/aterm/pkg";
+        let shim = format!("{prefix}/bin/git");
+        let exec = Stat {
+            mode: 0o755,
+            ..FILE
+        };
+        // An explicit prefix keeps this Linux fixture independent of the test host's OS.
+        sys.file(
+            "/home/alice/.config/aterm/aterm.toml",
+            format!("[packages]\nprefix = \"{prefix}\"\n").as_bytes(),
+        );
+        assert_eq!(installed_git(&sys), None, "no Git is still missing");
+        sys.stat_of(SYSTEM_GIT, exec);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(SYSTEM_GIT)));
+        sys.stat_of(&shim, exec);
+        sys.link(&format!("{prefix}/store/git/current"), "12");
+        sys.stat_of(&format!("{prefix}/store/git/12/bin/git"), exec);
+        assert_eq!(
+            installed_git(&sys),
+            Some(PathBuf::from(SYSTEM_GIT)),
+            "a stub or unfinished install cannot displace system Git"
+        );
+        sys.stat_of(&format!("{prefix}/store/git/12.ready"), FILE);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
+        assert_eq!(
+            installed_git_without_atpkg(&sys),
+            Some(PathBuf::from(SYSTEM_GIT))
+        );
+        assert!(
+            sys.calls().is_empty(),
+            "lookups spawn no capability processes"
+        );
+
+        let command = crate::checkout::git(&sys, &who, None)
+            .arg("--no-lazy-fetch")
+            .arg("--version");
+        sys.on(&command.display(), Ran::ok("git version 2.56.0\n"));
+        assert!(sys.run_complete_stdout(&command).unwrap().success());
+        assert_eq!(sys.calls(), vec![command.display()]);
+
+        // A disabled or invalid managed shim immediately returns selection to the system Git.
+        sys.stat_of(&shim, FILE);
+        assert_eq!(installed_git(&sys), Some(PathBuf::from(SYSTEM_GIT)));
+    }
+
+    #[test]
+    fn managed_git_uses_the_named_accounts_store_before_the_process_accounts_store() {
+        let sys = Fake::root();
+        sys.logged_in(&alice());
+        let exec = Stat {
+            mode: 0o755,
+            ..FILE
+        };
+        let install = |home: &Path, build: &str| {
+            let prefix = atpkg_prefix_for(&sys, home);
+            let store = prefix.join("store/git");
+            sys.link(store.join("current").to_str().unwrap(), build);
+            sys.stat_of(store.join(format!("{build}.ready")).to_str().unwrap(), FILE);
+            sys.stat_of(store.join(build).join("bin/git").to_str().unwrap(), exec);
+            let shim = prefix.join("bin/git");
+            sys.stat_of(shim.to_str().unwrap(), exec);
+            shim
+        };
+        let own = install(Path::new(&alice().home), "12");
+        let named = install(Path::new("/Users//bob"), "13");
+        sys.stat_of(CLT_GIT, exec);
+        assert_eq!(installed_git(&sys), Some(own.clone()));
+        assert_eq!(
+            installed_git_for(&sys, Some(Path::new("/Users//bob"))),
+            Some(named.clone())
+        );
+        assert_actor_git(&sys, &alice(), &own);
+        assert_actor_git(
+            &sys,
+            &User {
+                name: "bob".into(),
+                uid: 503,
+                home: "/Users//bob".into(),
+                ..alice()
+            },
+            &named,
+        );
+        assert!(sys.calls().is_empty(), "account lookup stays in process");
+    }
+
+    fn assert_actor_git(sys: &Fake, user: &User, program: &Path) {
+        let checkout = crate::checkout::git(sys, user, None);
+        assert_eq!(checkout.program, program);
+        assert_eq!(checkout.user.as_ref(), Some(user));
+        let credential = crate::git_credential::Git::for_user(sys, user).cmd(Some(user));
+        assert_eq!(credential.program, program);
+        assert_eq!(credential.user.as_ref(), Some(user));
+    }
+
+    #[test]
+    fn a_named_account_without_managed_git_never_borrows_the_process_accounts_build() {
+        for linux in [false, true] {
+            let mut sys = Fake::root();
+            sys.linux = linux;
+            sys.logged_in(&alice());
+            let exec = Stat {
+                mode: 0o755,
+                ..FILE
+            };
+            let prefix = atpkg_prefix_for(&sys, Path::new(&alice().home));
+            let store = prefix.join("store/git");
+            sys.link(store.join("current").to_str().unwrap(), "12");
+            sys.stat_of(store.join("12.ready").to_str().unwrap(), FILE);
+            sys.stat_of(store.join("12/bin/git").to_str().unwrap(), exec);
+            let own = prefix.join("bin/git");
+            sys.stat_of(own.to_str().unwrap(), exec);
+            assert_eq!(installed_git(&sys), Some(own.clone()));
+            let bob = User {
+                name: "bob".into(),
+                uid: 503,
+                home: "/Users//bob".into(),
+                ..alice()
+            };
+            assert_eq!(
+                installed_git_for(&sys, Some(Path::new(&bob.home))),
+                None,
+                "Linux: {linux}: no native or Bob-owned Git"
+            );
+            assert!(!crate::git_credential::Git::for_user(&sys, &bob).installed(&sys));
+            let native = if linux { SYSTEM_GIT } else { CLT_GIT };
+            assert_actor_git(&sys, &bob, Path::new(native));
+            sys.stat_of(native, exec);
+            assert_eq!(
+                installed_git_for(&sys, Some(Path::new(&bob.home))),
+                Some(PathBuf::from(native)),
+                "Linux: {linux}: another account's store is not Bob's fallback"
+            );
+            assert_actor_git(&sys, &bob, Path::new(native));
+            assert_actor_git(&sys, &alice(), &own);
+            assert_eq!(installed_git(&sys), Some(own));
+            assert!(sys.calls().is_empty(), "selection still spawns nothing");
+        }
+    }
+
+    #[test]
+    fn an_unadmitted_managed_runtime_never_hides_a_usable_native_git() {
+        for linux in [false, true] {
+            let mut sys = Fake::root();
+            sys.linux = linux;
+            let user = alice();
+            sys.logged_in(&user);
+            let prefix = atpkg_prefix_for(&sys, Path::new(&user.home));
+            let store = prefix.join("store/git");
+            let build = store.join("42");
+            let exec = Stat {
+                mode: 0o755,
+                ..FILE
+            };
+            let native = if linux { SYSTEM_GIT } else { CLT_GIT };
+            sys.stat_of(native, exec);
+            sys.link(store.join("current").to_str().unwrap(), "42");
+            sys.stat_of(store.join("42.ready").to_str().unwrap(), FILE);
+            sys.stat_of(build.join("bin/git").to_str().unwrap(), exec);
+            sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
+            assert_eq!(
+                installed_git_for(&sys, Some(Path::new(&user.home))),
+                Some(prefix.join("bin/git"))
+            );
+            sys.runtime_unready(&build, "requires GNU libc 2.39; this host has 2.35");
+            assert_eq!(
+                installed_git_for(&sys, Some(Path::new(&user.home))),
+                Some(native.into()),
+                "ready marker and executable presence do not establish runtime admission"
+            );
+            assert_actor_git(&sys, &user, Path::new(native));
+            assert!(sys.calls().is_empty(), "runtime selection starts no child");
+            sys.runtime_ready(&build);
+            assert_eq!(
+                installed_git_for(&sys, Some(Path::new(&user.home))),
+                Some(prefix.join("bin/git"))
+            );
+        }
     }
 }

@@ -922,6 +922,7 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
                 &guard,
                 &|_| panic!("unknown records cannot dispatch a sign-in"),
                 None,
+                None,
             );
             assert_eq!(dispatch, RenewalDispatch::Fenced, "{cli:?}/{bad}");
             assert!(guard.lock().unwrap().last_attempt.is_empty());
@@ -1536,7 +1537,7 @@ fn upkeep_over(bed: &Bed, step: UpkeepStep) -> usize {
 /// `run` over the window's effects in a test: renewals handed to `spawn`, a named source read
 /// by `fetch`, no browser, no vault.
 fn with_effects<R>(
-    spawn: &SpawnRenewal,
+    spawn: &SpawnRenewal<'_>,
     fetch: &Fetch<'_>,
     run: impl FnOnce(&UpkeepEffects<'_>) -> R,
 ) -> R {
@@ -1552,22 +1553,25 @@ fn with_effects<R>(
 
 /// [`with_effects`] keeping what the upkeep remembers in `rediscovery` and logging to `log`.
 fn with_logged_effects<R>(
-    (spawn, fetch): (&SpawnRenewal, &Fetch<'_>),
+    (spawn, fetch): (&SpawnRenewal<'_>, &Fetch<'_>),
     (rediscovery, log): (&Mutex<Rediscovery>, SignInLog),
     run: impl FnOnce(&UpkeepEffects<'_>) -> R,
 ) -> R {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let cooldown = Mutex::new(None);
     let fx = UpkeepEffects {
+        scope: None,
         fetch,
         spawn_renewal: spawn,
         sync_cooldown: &cooldown,
         rediscovery,
         renew_guard: &guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log,
         run_attempt: None,
@@ -1609,7 +1613,7 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
         )
     };
     let roster_path = |bed: &Bed| bed.config.join(accounts::ACCOUNTS_FILE);
-    let inert: &SpawnRenewal = &|_work| Ok(());
+    let inert: &SpawnRenewal<'_> = &|_work| Ok(());
     for off in [true, false] {
         let want = (!off, !off);
         let label = if off { "off" } else { "CONTROL: on" };
@@ -2839,15 +2843,18 @@ region = \"global\"
     let cooldown = Mutex::new(None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &fresh_guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -2918,15 +2925,18 @@ region = \"global\"
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         let cooldown = Mutex::new(None);
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
             find_browser: &|_: &Path| false,
-            vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+            vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_work| Ok(()),
-            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            default_check: |_: &Path, _scope| {
+                crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+            },
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
@@ -2964,14 +2974,17 @@ fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> 
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let cooldown = Mutex::new(None);
     let fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         spawn_vault: &|_work| Ok(()),
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
@@ -3262,6 +3275,7 @@ region = \"global\"
                 now + 901,
                 &guard,
                 &spawn,
+                None,
             ),
             RenewalDispatch::Started,
             "CONTROL: a person's own selection starts at once (bound here: {bound})"
@@ -3470,15 +3484,18 @@ region = \"global\"
     let cooldown = Mutex::new(None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &pool_guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -3705,15 +3722,18 @@ region = \"global\"
     // and `accounts renew --cli kimi --due` reports nothing due.
     let idle_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let idle_fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &idle_guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -3743,7 +3763,7 @@ region = \"global\"
             vendor: accounts::Vendor::default(),
         },
         &env,
-        &super::super::cli::LiveAccounts,
+        &super::super::cli::LiveAccounts::default(),
         &mut out,
         &mut err,
     );
@@ -3775,15 +3795,18 @@ region = \"global\"
         .unwrap();
     let wall_guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let wall_fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &wall_guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -3865,6 +3888,7 @@ fn a_pin_request_on_a_default_codex_row_with_no_login_file_is_not_pinned() {
             now,
             &guard,
             &noop_spawn,
+            None,
         )
     };
     let missing = renew(store.request_pin("main", now).unwrap());
@@ -3972,6 +3996,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
             now,
             &guard,
             &noop_spawn,
+            None,
         ),
         RenewalDispatch::Held,
         "in-flight Claude renewal must hold Codex's request without cancelling it"
@@ -3997,6 +4022,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
             now,
             &guard,
             &noop_spawn,
+            None,
         ),
         RenewalDispatch::Superseded
     );
@@ -4020,15 +4046,18 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     let cooldown = Mutex::new(None);
     let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
     let fx = UpkeepEffects {
+        scope: None,
         fetch: &fetch,
         spawn_renewal: &noop_spawn,
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -4098,14 +4127,17 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         let cooldown = Mutex::new(None);
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
             find_browser: &|_: &Path| true,
-            vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
-            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
+            default_check: |_: &Path, _scope| {
+                crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+            },
             spawn_vault: &|_work| Ok(()),
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
@@ -4734,6 +4766,37 @@ fn with_no_home_a_claude_row_with_no_login_is_unread() {
     let others = read(&env);
     assert!(others.unread.contains("other"), "{others:?}");
     assert_eq!(others.unread_why, Some(accounts::UnreadWhy::Source));
+}
+
+/// A VAULT THAT CANNOT BE READ LEAVES THE ROW UNREAD, never another Mac's: the swarm roster in it
+/// may name this Mac by a name it had, so a source's row could be this Mac's own. CONTROL: the same
+/// source and the same row read as another Mac's while the vault reads.
+#[cfg(unix)]
+#[test]
+fn a_vault_that_cannot_be_read_leaves_the_row_unread() {
+    let bed = Bed::new("other-macs-vault");
+    keep_a_row_with_no_login(&bed, Cli::Claude);
+    fs::write(bed.aterm_toml(), "[fleet]\nmachine = \"m16\"\n").unwrap();
+    fs::write(
+        bed.config.join(FLEET_ROSTER_FILE),
+        "opt_in = \"named\"\n\n[[account]]\nlabel = \"other\"\n\
+         email = \"other@example.test\"\nmachines = [\"m22\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        other_macs_of(&bed, Cli::Claude),
+        other_held_by("m22"),
+        "CONTROL"
+    );
+    // A vault with no lock file is "no copy applied here", which is no roster and no error.
+    let vault = aterm_secrets::client::Paths::for_home(&bed.home).dir;
+    fs::create_dir_all(vault.join(".lock")).unwrap();
+    let unread = other_macs_of(&bed, Cli::Claude);
+    assert_eq!(
+        unread,
+        other_unread(accounts::UnreadWhy::Source),
+        "{unread:?}"
+    );
 }
 
 /// Sheet rows that conflict over an address say whose it is as one row would. Each names another

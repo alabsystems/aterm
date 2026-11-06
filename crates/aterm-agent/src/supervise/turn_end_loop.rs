@@ -370,6 +370,14 @@ pub(super) const CUSTODY_DUE: &str = "the line held is looked at again";
 /// decided on ([`Session::custody_gate`]).
 const CUSTODY_DRAWN: &str = "the line held was drawn";
 
+/// The reason of the due a point judged without its task record stands on, its read lost
+/// ([`Session::record_unread`]).
+pub(super) const RECORD_UNREAD: &str = "the task record's read was lost";
+
+/// The reason of the due a point decided to do nothing stands on where the host's record read it
+/// as nobody's under a conversation on screen ([`Session::record_contradicted`]).
+pub(super) const RECORD_TRAILS: &str = "the conversation's record is read again";
+
 /// Why no restart in place is made for a line held in [`Custody`] where the loop runs with no
 /// host to make one, as its `WAITING` records say.
 pub(super) const NO_HOST: &str = "no restart in place (no host)";
@@ -1507,6 +1515,48 @@ impl<C: Ctl> Session<'_, C> {
                 })
     }
 
+    /// WHETHER THE HOST'S RECORD OF THE CONVERSATION CAN TRAIL THE SESSION'S TASK HERE, so its word
+    /// that nobody asked the conversation anything ([`IdleHost::taskless`]) is not asked: at this
+    /// loop's first point ([`Session::point_first`]), where the session's task record stands
+    /// ([`TurnEndState::managed`], read ahead of the point's reading). A worker's task is its
+    /// launch's own prompt, typed by aterm for its manager, and its first reply can end the turn on
+    /// screen before Claude Code writes the task's row: 2.1.318 had written its transcript's mode
+    /// rows and file-history snapshots, and not the task's row, when the lab stub's instant reply
+    /// ended a worker's first turn. At a later point the record's word stands, as for any session:
+    /// one that holds no prompt there is a conversation nobody asked (one `/clear` began, a fresh
+    /// relaunch).
+    pub(super) fn record_trails_task(&self) -> bool {
+        self.point_first && self.turn_end.managed()
+    }
+
+    /// WHETHER NOBODY HAS ASKED THE CONVERSATION AT `screen` ANYTHING, `r` its reading: the screen
+    /// reads it fresh (unless a redraw made it so), the host's record of it says so
+    /// ([`IdleHost::taskless`], not asked where it can trail the session's task:
+    /// [`Self::record_trails_task`]), the launch was nobody's ([`Self::unasked_launch`]), or the
+    /// agent never drew ([`Session::launch_unmet`]). A decision's reading ([`Check::Decide`])
+    /// notes whether the host's record says so of a conversation the screen shows and does not
+    /// read fresh ([`Session::record_contradicted`]).
+    fn taskless_at(
+        &mut self,
+        r: &TurnEndReading,
+        screen: &Screen,
+        host: Option<&Arc<dyn IdleHost>>,
+        check: Check,
+    ) -> bool {
+        let fresh = r.taskless
+            && !self
+                .turn_end
+                .redrawn_fresh(screen.submits, screen.inputs_after);
+        let record = !fresh && !self.record_trails_task() && host.is_some_and(|h| h.taskless());
+        if check == Check::Decide {
+            self.record_contradicted = record && !r.holds_no_conversation();
+        }
+        fresh
+            || record
+            || self.unasked_launch(r, host)
+            || self.launch_unmet(&screen.rows, host.is_some())
+    }
+
     /// Whether the agent process launched after the newest ledger row this loop found.
     fn launched_since_books(&self, host: Option<&Arc<dyn IdleHost>>) -> bool {
         !self.first_books
@@ -1971,19 +2021,7 @@ impl<C: Ctl> Session<'_, C> {
             login_shared,
             login_pin,
             login_moved,
-            // A WORKER'S TASK IS ITS LAUNCH'S OWN PROMPT, typed by aterm for its manager: where its
-            // task record stands (`TurnEndState::managed`, read before the first point's reading)
-            // the conversation's record is not asked whether anyone asked it anything, as that
-            // record can only lag the task. Claude Code 2.1.318 had written its transcript's mode
-            // rows and file-history snapshots, and not the task's row, when the lab stub's
-            // instant reply ended the worker's first turn on screen.
-            taskless: (r.taskless
-                && !self
-                    .turn_end
-                    .redrawn_fresh(screen.submits, screen.inputs_after))
-                || (!self.turn_end.managed() && host.is_some_and(|h| h.taskless()))
-                || self.unasked_launch(&r, host)
-                || self.launch_unmet(&screen.rows, host.is_some()),
+            taskless: self.taskless_at(&r, screen, host, check),
             finished_record: self
                 .turn_end
                 .reads_record(&r)
@@ -3243,6 +3281,8 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end_due = None;
             self.edge_moved = false;
         }
+        self.record_contradicted = false;
+        self.record_looked_again = false;
         if worked.is_some() {
             self.draft_left = None;
         }
@@ -3301,14 +3341,19 @@ impl<C: Ctl> Session<'_, C> {
                 .then(|| self.unseen_act_work(&point.screen.rows))
                 .flatten()
         });
+        // The point is folded under the word it is decided under: a switch a wait noted
+        // ([`Self::word_moved`]) is read once it has stood its settle, as the decision reads it
+        // ([`Self::decide_to_act_now`]), so Land never lands a turn Cruise then acts on.
         if !self.autopilot.read()
+            || self.word_at.is_some_and(|at| self.fx.mono() >= at)
             || worked.is_some() && (self.turn_end.landed() || self.turn_end.landed_seed_armed())
         {
             self.autopilot.begin();
             self.autopilot_read(opts)?;
         }
         // The record ahead of the reading: whether a manager waits on the session is part of
-        // what the first point reads (its `taskless`).
+        // what the first point reads (its `taskless`, `Self::record_trails_task`).
+        self.point_first = self.turn_end.point_number().is_none();
         let record = self.task_ahead(opts)?;
         let mut r = self.turn_end_reading(&point.screen, worked, opts);
         if !self.fx.replay_lacks_host_door("host.answered")
@@ -3569,6 +3614,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok((TurnEndAction::Nothing, false));
         }
         self.autopilot.begin();
+        let folded = r.autopilot;
         r.autopilot = Autopilot::Cruise;
         let mut action = self.turn_end_decision(&r, &opts.policy, now, "pass:cruise", trace);
         let mut cfg = std::borrow::Cow::Borrowed(&opts.policy);
@@ -3603,6 +3649,28 @@ impl<C: Ctl> Session<'_, C> {
         }
         if r.autopilot != Autopilot::Cruise {
             action = self.turn_end_decision(&r, &cfg, now, "pass:autopilot", trace);
+        }
+        // A SWITCH TO CRUISE NO WAIT NOTED, read first here: made after the turn's last wait, it
+        // left the point folded under the word before it, whose books stand landed, and Cruise
+        // unlands only books it folds ([`TurnEndState::unlanded`]). Cruise types nothing into
+        // them: the switch is noted as a wait notes one ([`Session::word_moved`]), and the word
+        // edge folds the point again under Cruise, which opens the record before Cruise types
+        // ([`Session::word_edge`]).
+        if noted.is_none()
+            && folded != Autopilot::Cruise
+            && r.autopilot == Autopilot::Cruise
+            && self.turn_end.landed()
+        {
+            self.autopilot.reported(Some(Autopilot::Cruise));
+            self.word_at = Some(self.fx.mono() + self.word_settle);
+            if let Some(steps) = trace.as_mut() {
+                steps.push(TraceStep {
+                    check: "word-unseen-by-fold",
+                    rule: action.rule_id(),
+                    outcome: TraceOutcome::Decided(format!("{:?}", TurnEndAction::Nothing)),
+                });
+            }
+            action = TurnEndAction::Nothing;
         }
         if action.rule_id().is_some() {
             self.program = self.foreground_program()?;
@@ -4286,6 +4354,21 @@ impl<C: Ctl> Session<'_, C> {
         self.hold_point(&point.screen, acts, Some(&opts.policy), review);
         let (text, rule) = match &action {
             TurnEndAction::Nothing => {
+                // A POINT JUDGED WITHOUT ITS TASK RECORD, its read lost ([`Self::task_ahead`]),
+                // rests as a session with no record does, and is decided again soon, reading the
+                // record again: whether a manager waits on the session can change what the point
+                // is (`Self::record_trails_task`), and a screen at rest brings no next point.
+                if self.record_unread {
+                    self.redecide_soon(RECORD_UNREAD);
+                } else if self.record_contradicted && !self.record_looked_again {
+                    // A POINT THE HOST'S RECORD READ AS NOBODY'S WHILE ITS SCREEN SHOWS A
+                    // CONVERSATION ([`Self::record_contradicted`]) is decided again once, soon:
+                    // Claude Code can write a prompt's row after a reply that came at once has
+                    // ended the turn on screen, and a screen at rest brings no next point to read
+                    // the record again.
+                    self.record_looked_again = true;
+                    self.redecide_soon(RECORD_TRAILS);
+                }
                 // LAND RESTS ON A NEED ([`TurnEndState::land_resting`]): said once, quietly; the
                 // need is on the menu bar already, and nothing is typed until someone else's turn.
                 if self.turn_end.rest_untold() {

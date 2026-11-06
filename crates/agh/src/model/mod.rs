@@ -561,12 +561,8 @@ impl Sha256Digest {
     #[must_use]
     pub fn parse(text: &str) -> Option<Sha256Digest> {
         let hex = text.strip_prefix("sha256:")?;
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let bytes = aterm_codec::hex::decode_vec(hex.as_bytes())?;
-        let array: [u8; 32] = bytes.try_into().ok()?;
-        Some(Sha256Digest(array))
+        let mut array = [0u8; 32];
+        aterm_codec::hex::decode_into(hex.as_bytes(), &mut array).then_some(Sha256Digest(array))
     }
 
     /// The SHA-256 digest of `bytes`, hashed here; its `Display` is `sha256:{hex}`, the form

@@ -65,19 +65,18 @@ pub fn open_secrets(
             if check::protected(row) {
                 continue;
             }
-            let values: Vec<&aterm_json::Value> = match row.fields.get(column.name) {
-                Some(Field::Value(candidate)) => vec![&candidate.value.x],
-                Some(Field::Conflict { candidates, .. }) => {
-                    candidates.iter().map(|c| &c.value.x).collect()
-                }
-                Some(Field::Set(_)) | None => Vec::new(),
-            };
-            if values.iter().all(|value| value.is_null()) {
+            let candidates_slice: &[crate::typed::cell::Candidate] =
+                match row.fields.get(column.name) {
+                    Some(Field::Value(candidate)) => std::slice::from_ref(candidate),
+                    Some(Field::Conflict { candidates, .. }) => candidates.as_slice(),
+                    Some(Field::Set(_)) | None => &[],
+                };
+            if candidates_slice.iter().all(|c| c.value.x.is_null()) {
                 continue;
             }
-            let candidates: Option<Vec<Option<String>>> = values
-                .into_iter()
-                .map(|value| match value {
+            let candidates: Option<Vec<Option<String>>> = candidates_slice
+                .iter()
+                .map(|c| match &c.value.x {
                     aterm_json::Value::Null => Some(None),
                     aterm_json::Value::String(token) if crate::typed::secret::is_sealed(token) => {
                         Some(Some(token.clone()))

@@ -213,6 +213,10 @@ fn mem_and_margin(mem: u64, margin: u64) -> String {
 /// One thing a waiter is short of.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Short {
+    /// Background work waits while a foreground claim is present.
+    Foreground,
+    /// No core remains after held grants and higher ranked reservations.
+    Cores,
     /// A typed timing need has no qualifying actual CPU observation yet.
     Timing(crate::TimingIssue),
     /// Memory: it needs `need`, with `margin` spare beside it; `available` is free now, and the claims ahead reserve `reserved` of it.
@@ -338,6 +342,8 @@ pub(crate) const UNSERVABLE: &str = "; no claim's end can make room for its disk
 impl fmt::Display for Short {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Short::Foreground => f.write_str("background work yields to foreground claims"),
+            Short::Cores => f.write_str("all cores are held or reserved by higher priority work"),
             Short::Timing(why) => write!(f, "measurement readiness: {why}"),
             Short::Memory {
                 need,
@@ -451,39 +457,50 @@ pub struct Holder {
 
 impl fmt::Display for Holder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut parts = Vec::new();
-        if self.alone {
-            parts.push(format!("{} of memory alone", gib(self.claimed)));
-        } else if self.mem > 0 {
-            parts.push(format!("{} of memory", gib(self.mem)));
-        } else if self.claimed > 0 {
-            parts.push(format!(
-                "{} of memory, all of it in use by its tree",
-                gib(self.claimed)
-            ));
-        }
-        if self.disk > 0 {
-            parts.push(format!("{} of disk", gib(self.disk)));
-        }
-        if self.quiet {
-            parts.push("the quiet machine".to_owned());
-        }
-        if parts.is_empty() {
-            parts.push("a claim".to_owned());
-        }
         write!(
             f,
-            "pid {} {} {} for {}: \"{}\"",
+            "pid {} {} ",
             self.pid,
             if self.held {
                 "holds"
             } else {
                 "waits ahead for"
             },
-            parts.join(" and "),
-            span(self.age),
-            self.what
         )?;
+        let mut any = false;
+        let mut join = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
+            if any {
+                f.write_str(" and ")?;
+            }
+            any = true;
+            Ok(())
+        };
+        if self.alone {
+            join(f)?;
+            write!(f, "{} of memory alone", gib(self.claimed))?;
+        } else if self.mem > 0 {
+            join(f)?;
+            write!(f, "{} of memory", gib(self.mem))?;
+        } else if self.claimed > 0 {
+            join(f)?;
+            write!(
+                f,
+                "{} of memory, all of it in use by its tree",
+                gib(self.claimed)
+            )?;
+        }
+        if self.disk > 0 {
+            join(f)?;
+            write!(f, "{} of disk", gib(self.disk))?;
+        }
+        if self.quiet {
+            join(f)?;
+            f.write_str("the quiet machine")?;
+        }
+        if !any {
+            f.write_str("a claim")?;
+        }
+        write!(f, " for {}: \"{}\"", span(self.age), self.what)?;
         if !self.checkout.is_empty() {
             write!(f, " in {}", self.checkout)?;
         }
@@ -515,11 +532,13 @@ impl Shortfall {
 /// The claims ahead that reserve any of the disk `short` is short of, each by its place in the
 /// queue ([`Holder::order`]); none where it is short of no disk.
 fn disk_reservers(short: &Shortfall) -> Vec<(u64, u32, u64)> {
-    let short_of_disk = short.shorts.iter().any(|s| matches!(s, Short::Disk { .. }));
+    if !short.shorts.iter().any(|s| matches!(s, Short::Disk { .. })) {
+        return Vec::new();
+    }
     short
         .holders
         .iter()
-        .filter(|h| short_of_disk && h.disk > 0)
+        .filter(|h| h.disk > 0)
         .map(|h| h.order)
         .collect()
 }
@@ -547,6 +566,7 @@ impl fmt::Display for Shortfall {
 }
 
 /// A claim in the ledger and what its holder's process tree, and the processes it is credited with, use now.
+#[derive(Clone)]
 pub(crate) struct Other<'a> {
     pub(crate) record: &'a Record,
     /// The holder's tree ([`crate::Procs::trees`]): the same for every claim one process holds, and credited once among them ([`reservations`]).
@@ -658,14 +678,20 @@ pub(crate) fn others<'r>(
 /// is reserved as any other's, since memory does come back as holders end. Once its need fits
 /// the room again it reserves its disk again, in its turn. A held claim always reserves.
 fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
-    let mut credit: HashMap<u32, TreeUse> = HashMap::new();
+    let mut credit: HashMap<u32, TreeUse> = HashMap::with_capacity(ahead.len());
     for o in ahead {
         if o.record.accounting == crate::Accounting::Holder {
             credit.entry(o.record.pid).or_insert(o.used);
         }
     }
     let mut order: Vec<usize> = (0..ahead.len()).collect();
-    order.sort_by_key(|&i| (ahead[i].record.held.is_none(), ahead[i].record.order()));
+    order.sort_unstable_by_key(|&i| {
+        (
+            ahead[i].record.held.is_none(),
+            ahead[i].record.need.rank,
+            ahead[i].record.order(),
+        )
+    });
     let mut out = vec![Reserve::default(); ahead.len()];
     for i in order {
         let record = ahead[i].record;
@@ -845,6 +871,51 @@ pub fn covering(
     Ok(covering_of(pid, &all, line()).cloned())
 }
 
+/// THE DISK CLAIM THAT COVERS THE RUN `pid` ([`crate::DISK_COVER_ENV`]), read from `ledger` on
+/// `machine`; `None` where none does. `marker` is the claim's name `pid` inherited
+/// ([`Record::cover_marker`]): it covers only where its holder is `pid` or one of its ancestors
+/// ([`Machine::lineage`]), and then only by that one claim of the holder's ([`Ledger::of_pid`]),
+/// held, accounted to its holder, and of disk, and only where the run's writes, landing at `on`,
+/// land on that claim's volume (the mount `machine` reads for `on` is the one its record names).
+/// Nothing else covers: not another claim of the holder's, not any other ancestor's disk claim (a
+/// VM's disk, which its own work writes), not a claim that still waits or that ended (its file's
+/// lock let go, whatever pid holds the number now), not one on another volume or on none read
+/// (which reserves nothing where the run writes), and not a marker of another form. Unlike
+/// [`covering`], no marker, or one that names nothing of the line, leaves nothing to answer: a
+/// run under no named claim claims for itself.
+///
+/// # Errors
+/// The holder's claims could not be read.
+pub fn covering_disk(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    pid: u32,
+    marker: &str,
+    on: &Path,
+) -> io::Result<Option<Record>> {
+    let marker = marker.trim();
+    let Some(holder) = Record::marker_holder(marker) else {
+        return Ok(None);
+    };
+    if holder != pid
+        && !machine
+            .lineage(pid)
+            .is_some_and(|line| line.ancestors(pid).contains(&holder))
+    {
+        return Ok(None);
+    }
+    let Some(by) = ledger.of_pid(holder)?.into_iter().find(|r| {
+        r.accounting == crate::Accounting::Holder
+            && r.cover_marker() == marker
+            && r.held.is_some()
+            && r.need.disk > 0
+    }) else {
+        return Ok(None);
+    };
+    let mount = machine.read(Some(on)).volume.map(|v| v.mount);
+    Ok((mount.is_some() && by.need.path == mount).then_some(by))
+}
+
 /// The claims a waiter of the process `pid` is held to: every other claim but those its
 /// ancestors hold or wait for, and the held ones that credit it or an ancestor ([`credits`]). A waiter whose ancestor holds a claim is that admitted work going
 /// on (verify's run starting the lab's VM boot, which claims the VM's disk for itself), so it is
@@ -891,7 +962,8 @@ pub(crate) fn reserving<'r>(
     records
         .iter()
         .filter(|r| {
-            r.order() < mine.order() && (r.accounting == crate::Accounting::Whole || !kin(r.pid))
+            (r.held.is_some() || (r.need.rank, r.order()) < (mine.need.rank, mine.order()))
+                && (r.accounting == crate::Accounting::Whole || !kin(r.pid))
         })
         .find_map(|r| r.reserves(now).map(|left| (*r, left)))
 }
@@ -952,7 +1024,9 @@ pub(crate) fn decide(
 ) -> Result<Grant, Shortfall> {
     let ahead: Vec<&Other<'_>> = others
         .iter()
-        .filter(|o| o.record.held.is_some() || o.record.order() < mine)
+        .filter(|o| {
+            o.record.held.is_some() || (o.record.need.rank, o.record.order()) < (need.rank, mine)
+        })
         .collect();
     let volume = reading.volume.as_ref();
     let reserves = reservations(&ahead, volume);
@@ -960,6 +1034,14 @@ pub(crate) fn decide(
     // of this one's memory back.
     let sibling = |o: &Other<'_>| o.record.held.is_none() && o.record.pid == mine.1;
     let mut shorts = Vec::new();
+    if need.rank == crate::Rank::Background
+        && others.iter().any(|o| {
+            o.record.need.rank == crate::Rank::Release
+                || (o.record.need.rank == crate::Rank::Ordinary && o.record.held.is_none())
+        })
+    {
+        shorts.push(Short::Foreground);
+    }
     let (mut want_mem, mut want_disk, mut want_quiet) = (false, false, false);
     let mut want_alone = None;
     let mut alone = None;
@@ -1041,6 +1123,10 @@ pub(crate) fn decide(
             shorts.push(Short::Load { load1, max });
         }
     }
+    let cores = ranked_grant(need, mine, reading, others, now);
+    if need.cores > 0 && cores == 0 {
+        shorts.push(Short::Cores);
+    }
     if !shorts.is_empty() {
         let holders = ahead
             .iter()
@@ -1069,21 +1155,49 @@ pub(crate) fn decide(
             .collect();
         return Err(Shortfall { shorts, holders });
     }
-    Ok(Grant {
-        cores: grant(need.cores, reading, others, now),
-        alone,
-    })
+    Ok(Grant { cores, alone })
 }
 
-/// THE CORES A CLAIM ASKING `asked` IS GRANTED, never waited for (CORES-GRANT): its share of
-/// the room, split evenly between the parties that contend for it.
-/// - The room is the cores less what every held claim was granted, so claims together hold
-///   about a job a core at most (a grant is at least one, and `--admit now` short of anything
-///   else takes all it asked): half the quiet bound ([`crate::quiet_bound`]). Past about half
+/// Bound every new grant by physical room. Earlier waiters in rank/arrival order reserve
+/// their requested room without changing any running grant.
+fn ranked_grant(
+    need: &Need,
+    mine: (u64, u32, u64),
+    reading: &Reading,
+    others: &[Other<'_>],
+    now: u64,
+) -> u32 {
+    let held = others
+        .iter()
+        .filter_map(|o| o.record.held.map(|h| h.cores))
+        .fold(0u32, u32::saturating_add);
+    let reserved = others
+        .iter()
+        .filter(|o| {
+            o.record.held.is_none() && (o.record.need.rank, o.record.order()) < (need.rank, mine)
+        })
+        .map(|o| o.record.need.cores)
+        .fold(0u32, u32::saturating_add);
+    let room = reading.cores.saturating_sub(held).saturating_sub(reserved);
+    if need.rank == crate::Rank::Release {
+        return need.cores.min(room);
+    }
+    let peers: Vec<_> = others
+        .iter()
+        .filter(|o| {
+            o.record.held.is_some() || (o.record.need.rank, o.record.order()) < (need.rank, mine)
+        })
+        .cloned()
+        .collect();
+    grant(need.cores, reading, &peers, now).min(room)
+}
+
+/// The fair share before `ranked_grant` applies reservations and the physical core bound.
+/// - The room is the cores less what every held claim was granted. Past about half
 ///   the bound of unclaimed load that no longer keeps a quiet waiter's room; its reservation
 ///   ([`Short::Reserved`]) does, holding back a cores claim made after it like any claimed work.
-/// - The parties are this claim, every other claim of cores not yet admitted (whatever it waits
-///   for: memory, disk or a reservation, since no claim waits for cores), and the work no claim
+/// - The parties are this claim, earlier claims of cores not yet admitted (whatever each waits
+///   for: memory, disk, cores or a reservation), and the work no claim
 ///   holds, counted in machines' worth: the 5-minute load less what the held claims' jobs have
 ///   put into it ([`LOAD5_TIME_CONSTANT`]), over the cores, since a plain build runs a job a core.
 ///   A load that reads as no number is the load unread.
@@ -1163,6 +1277,7 @@ impl fmt::Display for QuietStart {
 /// retain their complete reservation independently of holder death and descriptor closure.
 #[derive(Debug)]
 pub struct Claim {
+    _background: Option<crate::background::Guard>,
     laid: Laid,
     record: Record,
     waited: Duration,
@@ -1534,6 +1649,24 @@ impl Claim {
         self.waited
     }
 
+    /// Whether repeatable background work must end before its next stage. Ledger errors
+    /// propagate rather than letting a background holder silently outrank foreground work.
+    /// # Errors
+    /// The ledger cannot be read.
+    pub fn should_yield(&self) -> io::Result<bool> {
+        if self.record.need.rank != crate::Rank::Background {
+            return Ok(false);
+        }
+        let dir = self
+            .path()
+            .parent()
+            .ok_or_else(|| io::Error::other("claim has no ledger directory"))?;
+        Ok(Ledger::at(dir).list()?.iter().any(|r| {
+            r.need.rank == crate::Rank::Release
+                || (r.need.rank == crate::Rank::Ordinary && r.held.is_none())
+        }))
+    }
+
     /// How a quiet claim started: the load, whether at its bound, how long it reserved the
     /// machine. `None` for any other claim, one a held quiet claim covers, or one `--admit now`
     /// admitted.
@@ -1614,6 +1747,13 @@ impl Claim {
     pub fn adopt(fd: std::os::fd::OwnedFd, path: &Path) -> io::Result<Claim> {
         let (record, laid) = Laid::adopt(fd, path, None)?;
         Ok(Claim {
+            _background: crate::background::Guard::start(
+                &Ledger::at(
+                    path.parent()
+                        .ok_or_else(|| io::Error::other("claim has no parent"))?,
+                ),
+                record.need.rank,
+            )?,
             laid,
             record,
             waited: Duration::ZERO,
@@ -1670,6 +1810,7 @@ impl Claim {
     ) -> io::Result<Claim> {
         let (record, laid) = Laid::adopt(fd, path, Some(writer))?;
         Ok(Claim {
+            _background: None,
             laid,
             record,
             waited: Duration::ZERO,
@@ -1851,6 +1992,24 @@ impl Waiter {
     /// # Errors
     /// The ledger's directory or the claim file could not be made, locked or written.
     pub fn enter(ledger: &Ledger, machine: &dyn Machine, mut need: Need) -> io::Result<Waiter> {
+        if machine.release_run() {
+            need.rank = crate::Rank::Release;
+        }
+        if need.rank == crate::Rank::Background {
+            #[cfg(unix)]
+            // SAFETY: getpgrp has no pointer arguments. Background work may authorize
+            // cancellation only of its own dedicated group, never the agent's group.
+            if ledger.cohort_aware()? || unsafe { libc::getpgrp() } != std::process::id() as i32 {
+                return Err(io::Error::other(
+                    "background admission requires a dedicated process group and holder ledger",
+                ));
+            }
+            #[cfg(not(unix))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "background process groups require Unix",
+            ));
+        }
         let at = need.path.clone().or_else(|| std::env::current_dir().ok());
         need.path = (need.disk > 0)
             .then(|| machine.read(at.as_deref()).volume.map(|v| v.mount))
@@ -2192,6 +2351,7 @@ impl Waiter {
             (granted, quiet)
         });
         Ok(Found {
+            cores: ranked_grant(&need, mine, &reading, &others, now),
             decided,
             cpu: cpu.ok(),
             load1: reading.load1,
@@ -2257,11 +2417,12 @@ impl Waiter {
                 };
                 laid.append(&Record::timing_line(record.timing))?;
             }
-            Ok(())
+            crate::background::Guard::start(&ledger, record.need.rank)
         });
         let polled = match admitted {
-            Ok(()) => {
+            Ok(background) => {
                 let claim = Claim {
+                    _background: background,
                     laid,
                     record,
                     waited: since.elapsed(),
@@ -2335,11 +2496,24 @@ impl Waiter {
                 return Ok(Forced::Turn(self, Shortfall::only(Short::Turn { holder })));
             }
         };
+        let found = self.look(machine)?;
+        // An override may bypass resource-only memory/disk admission, never a Release's
+        // core reservation or the physical core bound.
+        if self.record.need.cores > 0 && found.cores == 0 {
+            return Ok(Forced::Turn(self, Shortfall::only(Short::Cores)));
+        }
+        if self.record.need.rank == crate::Rank::Background
+            && found
+                .decided
+                .as_ref()
+                .is_err_and(|s| s.shorts.contains(&Short::Foreground))
+        {
+            return Ok(Forced::Turn(self, Shortfall::only(Short::Foreground)));
+        }
         let asked = Grant {
-            cores: self.record.need.cores,
+            cores: found.cores,
             alone: None,
         };
-        let found = self.look(machine)?;
         let timed = Timed {
             loaded: false,
             spent: false,
@@ -2448,6 +2622,7 @@ pub(crate) fn stuck(holders: &[Holder]) -> Option<aterm_toolchain::waits::Stuck>
 /// What one look found ([`Waiter::look`]): admitted with what it is granted ([`Grant`]) and, for
 /// a quiet claim, how it started; or what it is short of.
 struct Found {
+    cores: u32,
     decided: Result<(Grant, Option<QuietStart>), Shortfall>,
     cpu: Option<crate::CpuWindow>,
     load1: Option<f64>,
@@ -2761,17 +2936,20 @@ fn admit_waiting(
 fn admit_deciding(
     ledger: &Ledger,
     machine: &dyn Machine,
-    need: Need,
+    mut need: Need,
     mode: Admit,
     pace: Pace,
     relief: &mut dyn Relief,
     say: &mut dyn FnMut(&str),
     stopped: &dyn Fn() -> bool,
 ) -> Result<Claim, Error> {
+    if mode == Admit::Preemptible {
+        need.rank = crate::Rank::Background;
+    }
     if need.quiet_policy == crate::QuietPolicy::Timing && mode == Admit::Now {
         return Err(Error::Timing(crate::TimingIssue::Now));
     }
-    let watch = (mode == Admit::Wait).then(aterm_toolchain::interrupt::Watch::enter);
+    let watch = (mode != Admit::Now).then(aterm_toolchain::interrupt::Watch::enter);
     let ended = || match watch
         .as_ref()
         .and_then(aterm_toolchain::interrupt::Watch::take)
@@ -2789,7 +2967,7 @@ fn admit_deciding(
     let at = need.path.clone().or_else(|| std::env::current_dir().ok());
     let reading = machine.read(at.as_deref());
     let refused = never(&need, &reading);
-    if mode == Admit::Wait
+    if mode != Admit::Now
         && let Some(why) = refused
     {
         return Err(Error::Never(why));

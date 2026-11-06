@@ -507,3 +507,37 @@ fn someone_elses_live_turn_and_a_persons_own_exchange_never_said_done() {
     assert!(!st.left_to_person());
     assert!(st.said_done());
 }
+
+/// CRUISE'S UNLANDING IS ITS POINT'S OWN ([`TurnEndState::unlanded`]): Land's landing read again
+/// under Cruise drops to a done claim and says so at that point, through Cruise's act there; the
+/// next point folded unlands nothing of its own, so no later point's record is opened by it.
+/// Control: the landing read again under Land unlands nothing.
+#[test]
+fn cruises_unlanding_is_said_at_the_point_that_unlands_and_at_no_later_one() {
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    now += 2 * MIN;
+    now = lands_on_check(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
+    assert!(st.landed() && !st.unlanded(), "a landing unlands nothing");
+    now += MIN;
+    at(&mut st, &land(idle(LANDED_WORD, None)), now);
+    assert!(st.landed() && !st.unlanded(), "Land rests on its landing");
+    now += MIN;
+    act(
+        &mut st,
+        &under(Autopilot::Cruise, idle(LANDED_WORD, None)),
+        now,
+    );
+    assert!(
+        !st.landed() && !st.task_done() && st.unlanded(),
+        "Cruise takes the landing on: {st:?}"
+    );
+    now += 3 * MIN;
+    at(
+        &mut st,
+        &under(Autopilot::Cruise, idle(PROGRESS, Some(3 * MIN))),
+        now,
+    );
+    assert!(!st.unlanded(), "the next point unlands nothing of its own");
+}

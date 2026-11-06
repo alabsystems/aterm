@@ -115,7 +115,7 @@ const TRUNCATED_NOTE: &str = "drop-oldest evicted the head; leading ANSI state i
 const HANDOFF_NOTE: &str = "recording restarted at a seamless update; the output and screen \
                             before it are not in this recording";
 
-/// Append `header` and `events` as asciicast v2 text: the header line, then one newline-terminated line per event with `t` printed to six decimals.
+/// Append `header` and `events` as asciicast v2 text: the header line, then one newline-terminated line per event with `t` printed to six decimals (an impossible `t` as 0).
 pub fn write_into<D: AsRef<[u8]>>(out: &mut String, header: &CastHeader, events: &[CastEvent<D>]) {
     use std::fmt::Write as _;
     out.reserve(len_hint(events));
@@ -164,15 +164,24 @@ pub fn write_into<D: AsRef<[u8]>>(out: &mut String, header: &CastHeader, events:
     for ev in events {
         match ev {
             CastEvent::Output { t, data } => {
+                let t = written_time(*t);
                 let _ = write!(out, "[{t:.6}, \"o\", \"");
                 escape_bytes_into(out, data.as_ref());
                 out.push_str("\"]\n");
             }
             CastEvent::Resize { t, cols, rows } => {
+                let t = written_time(*t);
                 let _ = writeln!(out, "[{t:.6}, \"r\", \"{cols}x{rows}\"]");
             }
         }
     }
+}
+
+/// `t` as [`write_into`] prints it: a time no recording can hold (NaN, infinite, or not above 0,
+/// which would print as `-0.000000`) becomes 0, so every line stays a non-negative JSON number.
+#[inline]
+fn written_time(t: f64) -> f64 {
+    if t.is_finite() && t > 0.0 { t } else { 0.0 }
 }
 
 /// An upper bound on [`write_into`]'s text before escaping expands a payload:
@@ -764,6 +773,45 @@ mod tests {
         assert_eq!(
             parse(&written(&uncounted, &none)).unwrap().header.dropped,
             Some(CastDrops::default())
+        );
+    }
+
+    /// A time no recording can hold (NaN, infinite, negative, or one that prints as `-0`) is
+    /// written as 0, so every event line stays one the reader takes; a real time is written as
+    /// given.
+    #[test]
+    fn an_impossible_event_time_is_written_as_zero() {
+        let header = CastHeader {
+            width: 80,
+            height: 24,
+            evicted: 0,
+            dropped: None,
+            resize_undo: Some(true),
+            resize_laws: CastHeader::laws_named(Some(ResizeLaw::default().header_value())),
+            handoff: None,
+        };
+        let output = |t: f64| CastEvent::Output {
+            t,
+            data: b"a".to_vec(),
+        };
+        let mut events = [f64::NAN, -1.0, f64::INFINITY, -1e-9, -0.0]
+            .map(output)
+            .to_vec();
+        events.push(CastEvent::Resize {
+            t: f64::NEG_INFINITY,
+            cols: 100,
+            rows: 30,
+        });
+        let text = written(&header, &events);
+        assert!(!text.contains("-0.000000"), "{text}");
+        let read = parse(&text).expect("every line is a valid event");
+        assert!(read.events.iter().all(|e| e.t().to_bits() == 0), "{text}");
+
+        let real = written(&header, &[output(1.5)]);
+        assert_eq!(
+            parse(&real).expect("parses").events,
+            [output(1.5)],
+            "{real}"
         );
     }
 

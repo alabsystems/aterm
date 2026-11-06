@@ -651,12 +651,34 @@ pub(crate) fn endorse(
     session: &Session<'_>,
     directory: &Directory,
     snapshot: &crate::catalog::Snapshot,
-) {
-    for (_, descriptor, declared, judged) in later_generations(session, directory, snapshot) {
-        if !declared && judged == Judged::Opens {
-            let _ = directory.endorse(session, &descriptor);
+) -> bool {
+    let trust = directory.trust();
+    let chain = att::REGISTRY.chain();
+    let mut endorsed = false;
+    for pair in chain.windows(2) {
+        let [previous, compiled] = pair else {
+            continue;
+        };
+        let Ok(descriptor) = compiled.descriptor(trust) else {
+            continue;
+        };
+        let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
+            continue;
+        };
+        if entry
+            .declarations
+            .iter()
+            .any(|d| d.actor == session.actor())
+        {
+            continue;
+        }
+        if judge(session, directory, previous, compiled) == Judged::Opens
+            && directory.endorse(session, &descriptor).is_ok()
+        {
+            endorsed = true;
         }
     }
+    endorsed
 }
 
 /// A later registry generation whose `Secret` cells do not all open under its key, as `aterm db
@@ -751,7 +773,7 @@ impl Registry {
                     }
                     let view = View::read(to.table, &session, &log);
                     let carried =
-                        carried_origins(log.eligible().iter().map(|(_, command)| command));
+                        carried_origins(log.eligible().into_iter().map(|(_, command)| command));
                     // What is carried already is each record that authenticates, wherever
                     // it was written: a cell some other writer put at a record's key first
                     // must not keep that record from being carried.
@@ -789,7 +811,7 @@ impl Registry {
                 }
                 // A row the old generation itself read from an archived record is carried with
                 // that record's archived row, a register like any other.
-                let Some(wire) = old.wire(&session, &operation)? else {
+                let Some(wire) = old.wire_unchecked(&operation) else {
                     continue;
                 };
                 rows.push(archive_row(&operation, from.generation, wire)?);
@@ -912,8 +934,10 @@ impl Registry {
             .map_err(crate::table::failure)?;
         let session = Session::from_admitted_journal_until(&bootstrap, journal, Some(deadline))?;
         let directory = Directory::new(&paths, bootstrap.trust());
-        endorse(&session, &directory, &directory.snapshot(&session)?);
-        let snapshot = directory.snapshot(&session)?;
+        let mut snapshot = directory.snapshot(&session)?;
+        if endorse(&session, &directory, &snapshot) {
+            snapshot = directory.snapshot(&session)?;
+        }
         directory.release_sealed(&session, &snapshot, now_ms / 1000, &covered)
     }
 

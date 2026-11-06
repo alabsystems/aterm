@@ -830,7 +830,7 @@ fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
     );
     assert!(app.needs_attention());
     let line = crate::system_state_access::menu_line(&status, false).expect("a menu line");
-    assert_eq!(line.label, "System State: Secrets vault needs you");
+    assert_eq!(line.label, "System State: Needs you: Secrets vault");
     assert_eq!(line.note.as_deref(), Some(move_it));
 }
 
@@ -5640,7 +5640,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_an
             format!("Needs you: {name}"),
             Some(Chip::NeedsYou),
             Mark::NeedsYou,
-            Some(format!("System State: {name} needs you")),
+            Some(format!("System State: Needs you: {name}")),
             true,
         )
     };
@@ -6220,7 +6220,7 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
     assert!(row.install_tools && button);
     assert!(app.needs_attention());
     let line = line.expect("the person is needed now");
-    assert_eq!(line.label, "System State: GitHub repositories needs you");
+    assert_eq!(line.label, "System State: Needs you: GitHub repositories");
     assert_eq!(
         line.note.as_deref(),
         Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING),
@@ -6286,8 +6286,44 @@ fn the_command_line_tools_row_says_where_a_press_or_apples_window_stands() {
     assert!(app.needs_attention());
     assert_eq!(
         line.map(|line| line.label),
-        Some("System State: GitHub repositories needs you".to_owned())
+        Some("System State: Needs you: GitHub repositories".to_owned())
     );
+}
+
+/// Apple's installer window may sit behind other windows (§3.3): while the row reads it, the card
+/// beside `Finish in Apple's installer window` offers Go to installer, which only goes there. A
+/// press once the row reads otherwise (an install under way, the Mac Setup tab's password) asks
+/// for nothing, and no card offers it then.
+#[test]
+fn the_apple_window_card_goes_to_the_installer_and_a_stale_press_goes_nowhere() {
+    let offered = |app: &SystemStateApp| {
+        compile(app, &SystemStateViewState::default(), 999.0, 1400.0)
+            .semantic(&UiKey::new(GO_TO_TOOLS_INSTALLER))
+            .map(|go| go.label.clone())
+    };
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("clt-apple-window"));
+    assert_eq!(
+        offered(&app).as_deref(),
+        Some(lines::GO_TO_INSTALLER_LABEL),
+        "the card offers Apple's window, and VoiceOver hears where it goes"
+    );
+    act(&mut app, GO_TO_TOOLS_INSTALLER);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::GoToToolsInstaller)
+    ));
+    assert!(app.take_action().is_none(), "one press, one action");
+
+    for other in ["clt-installing", "clt-password", "clt-missing"] {
+        app.publish(status_of(other));
+        assert_eq!(offered(&app), None, "{other}: no window to go to");
+        act(&mut app, GO_TO_TOOLS_INSTALLER);
+        assert!(
+            app.take_action().is_none(),
+            "{other}: a stale press asks for nothing"
+        );
+    }
 }
 
 /// Low Data Mode holding the tools' download back is a wait that ends by itself (§3.3): calm,
@@ -6909,10 +6945,13 @@ fn automatic_admission_never_renders_a_phrase_prompt() {
 /// Each thing a phrase can come to has its own words under the field. One that reached no Mac in
 /// ALab was asked nothing, so its words stay for another Join under the not-reached line (the
 /// Local Network one while macOS's switch for aterm is off); one refused is spent, the field
-/// empties and the refused line shows; one that let this Mac in empties the field too.
+/// empties and the refused line shows; one that let this Mac in empties the field too. One a Mac
+/// a rotation dropped typed (one-mesh E2, f299) is spent as well, and its line says how that Mac
+/// comes back, never to press Allow again.
 ///
 /// NEGATIVE CONTROL: have `phrase_finished` wipe the field for `NotReached` too: the words the
-/// person still holds good are gone.
+/// person still holds good are gone. Have `phrase_help` read `Dropped` as `Refused`: the line
+/// says to press Allow again.
 #[test]
 fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_field() {
     assert_eq!(
@@ -6922,11 +6961,12 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
             PHRASE_NOT_REACHED,
             PHRASE_STOPPED,
             PHRASE_LOCAL_NETWORK_OFF,
+            PHRASE_DROPPED,
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         .len(),
-        5,
+        6,
         "each outcome has its own words"
     );
     let asking = status_of("vault-asking");
@@ -6964,6 +7004,12 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     try_with(&mut app, &mut view, PhraseOutcome::Joined);
     assert_eq!(app.phrase_help(), PHRASE_HELP);
     assert_eq!(typed(&app), "", "a phrase that let this Mac in is spent");
+
+    try_with(&mut app, &mut view, PhraseOutcome::Dropped);
+    assert_eq!(app.phrase_help(), PHRASE_DROPPED);
+    assert!(!PHRASE_DROPPED.contains("Allow"), "{PHRASE_DROPPED}");
+    assert!(PHRASE_DROPPED.contains("new Mac"), "{PHRASE_DROPPED}");
+    assert_eq!(typed(&app), "", "no phrase lets a dropped Mac in");
 
     // A try whose worker ended before it said what the phrase came to may not have sent it: the
     // line says plainly that the try stopped, and the words stay for Join to try again.

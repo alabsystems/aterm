@@ -10128,6 +10128,7 @@ impl App {
         }
         #[cfg(not(a11y_tree))]
         let _ = motion_only;
+        self.note_cells_composed(id, plan);
         true
     }
 
@@ -11035,6 +11036,7 @@ impl App {
         }
         self.paint_pane_headers(id);
         self.splice_tab_strip_with(id, tab_strip);
+        self.note_cells_composed(id, plan);
         Some(title)
     }
 
@@ -11461,9 +11463,7 @@ impl App {
             self.settle_motion_policy_transition();
         }
 
-        if let Some(window) = window {
-            self.update_accessibility(id, window, presented_plan);
-        }
+        self.update_accessibility(id, presented_plan);
         let fallback_pending = self.backend.fallback_parse_pending();
         if let Some(state) = self.windows.get_mut(&id) {
             let fallback_was = state.cpu_cache.swap_fallback_pending(fallback_pending);
@@ -14626,7 +14626,10 @@ impl App {
             after_extract,
             Some(&mut held_retry_at),
         ) {
-            Some(prepared) => CapturePreparation::Ready(prepared),
+            Some(prepared) => {
+                self.note_cells_composed(wid, &prepared.1);
+                CapturePreparation::Ready(prepared)
+            }
             None => held_retry_at.map_or(CapturePreparation::Unavailable, |retry_at| {
                 CapturePreparation::Held { retry_at }
             }),

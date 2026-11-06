@@ -3,13 +3,87 @@
 
 //! Concurrent stage scheduler ([`Lane`], [`StageSpec::after_stages`],
 //! [`crate::plan::StageId::opens_windows`], [`crate::plan::Lane::AfterCompile`], [`awaited`],
-//! [`check_waits`]), within the run's memory budget ([`StageSpec::mem`], [`memory_holders`]).
+//! [`check_waits`]), within the run's memory budget ([`StageSpec::mem`], [`memory_holders`]),
+//! ended early by its first proven red under `release` and `--fail-fast` ([`Halt`]).
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::ladder::Report;
 use crate::plan::{Lane, StageSpec};
+
+/// What a run's first proven red ends (design §4.3, A3): set once, by the first stage row that is
+/// a finding or the first test binary that ended FAIL, in a run that stops there (`release`, or
+/// `--fail-fast`); a bare run never halts and keeps its full sweep. Once set, no stage or test
+/// binary starts: [`run_stages`] stops holding a waiting stage back, so each starts at once and
+/// says NOT RUN with [`Halt::words`] (`staged`'s first look); the test dispatcher starts no
+/// binary; and the end it was given ends the run's live children (`exec::group::halt`: SIGTERM,
+/// a grace, then SIGKILL, each read as stopped rather than as a finding). A NOT RUN for the
+/// machine and a skip are no proven red, and set nothing.
+#[derive(Debug)]
+pub struct Halt {
+    /// What a red ends, when it ends anything: the subject its words name ("the release", "the
+    /// run") and what else ends with it.
+    armed: Option<Armed>,
+    /// The halt's words, once set: `stopped: <subject> failed at <check>`.
+    words: OnceLock<String>,
+}
+
+#[derive(Debug)]
+struct Armed {
+    subject: &'static str,
+    end: fn(&str),
+}
+
+impl Halt {
+    /// A run that never halts: its full sweep runs whatever fails.
+    #[must_use]
+    pub const fn off() -> Self {
+        Self {
+            armed: None,
+            words: OnceLock::new(),
+        }
+    }
+
+    /// A run its first proven red ends: `subject` is what its words say failed ("the release",
+    /// "the run"), and `end` ends what else the run has running, given the words.
+    #[must_use]
+    pub const fn at_first_red(subject: &'static str, end: fn(&str)) -> Self {
+        Self {
+            armed: Some(Armed { subject, end }),
+            words: OnceLock::new(),
+        }
+    }
+
+    /// Whether a proven red ends this run.
+    #[must_use]
+    pub const fn armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// A proven red of `check`: the first one in an armed run halts it, ending what else runs,
+    /// and is `true`; any later one, and any in a run that never halts, changes nothing.
+    pub fn red(&self, check: &str) -> bool {
+        let Some(armed) = &self.armed else {
+            return false;
+        };
+        let mut first = false;
+        let words = self.words.get_or_init(|| {
+            first = true;
+            format!("stopped: {} failed at {check}", armed.subject)
+        });
+        if first {
+            (armed.end)(words);
+        }
+        first
+    }
+
+    /// What every row the halt stopped or kept from starting says, once the run is halted.
+    #[must_use]
+    pub fn words(&self) -> Option<&str> {
+        self.words.get().map(String::as_str)
+    }
+}
 
 /// Live scheduler bookkeeping.
 #[derive(Debug)]
@@ -139,9 +213,23 @@ pub fn check_waits(specs: &[StageSpec]) -> Result<(), String> {
     Ok(())
 }
 
+/// How often a stage waiting in a run that can halt looks for the halt between the wakes a
+/// stage's end brings: a halt set while a stage still runs (a test binary's FAIL) releases the
+/// waiting stages within this, not when that stage ends.
+const HALT_LOOK: Duration = Duration::from_millis(50);
+
 /// Run every stage under the rule above, its stages that claim memory within `budget` bytes
-/// together ([`ready`]); `run` is told what memory held each stage back ([`Held`]).
-pub fn run_stages<R, P>(specs: &[StageSpec], budget: u64, run: R, mut on_report: P) -> Vec<Report>
+/// together ([`ready`]); `run` is told what memory held each stage back ([`Held`]). Once `halt`
+/// is set ([`Halt::red`]) nothing holds a stage back any more: each that has not started starts
+/// within [`HALT_LOOK`], so `run` says what the halt kept from running without waiting for its
+/// lane, its memory or an exclusive stage to come free.
+pub fn run_stages<R, P>(
+    specs: &[StageSpec],
+    budget: u64,
+    halt: &Halt,
+    run: R,
+    mut on_report: P,
+) -> Vec<Report>
 where
     R: Fn(&StageSpec, &Held) -> Report + Sync,
     P: FnMut(usize, &Report),
@@ -172,7 +260,9 @@ where
                 {
                     let mut g = state.lock().expect("scheduler mutex");
                     let mut since: Option<Instant> = None;
-                    while !ready(specs, &g.started, &g.done, g.running, i, budget) {
+                    while halt.words().is_none()
+                        && !ready(specs, &g.started, &g.done, g.running, i, budget)
+                    {
                         let holders =
                             memory_holders(specs, &g.started, &g.done, g.running, i, budget);
                         if unconstrained(specs, &g.started, &g.done, g.running, i)
@@ -187,7 +277,11 @@ where
                         } else if let Some(at) = since.take() {
                             held.waited += at.elapsed();
                         }
-                        g = cv.wait(g).expect("scheduler condvar");
+                        g = if halt.armed() {
+                            cv.wait_timeout(g, HALT_LOOK).expect("scheduler condvar").0
+                        } else {
+                            cv.wait(g).expect("scheduler condvar")
+                        };
                     }
                     if let Some(at) = since {
                         held.waited += at.elapsed();
@@ -245,13 +339,15 @@ mod tests {
     }
 
     /// The selections whose plans the laws below are checked over: each check
-    /// alone, both sets, and every check at once.
+    /// alone, both sets, the release's two halves, and every check at once.
     fn selections() -> Vec<Vec<crate::checks::Check>> {
         let every: Vec<crate::checks::Check> =
             crate::checks::CHECKS.iter().map(|s| s.check).collect();
         let mut v: Vec<Vec<crate::checks::Check>> = every.iter().map(|c| vec![*c]).collect();
         v.push(crate::checks::DEV.to_vec());
         v.push(crate::checks::RELEASE.to_vec());
+        v.push(crate::checks::RELEASE_TREE.to_vec());
+        v.push(crate::checks::RELEASE_BUNDLE.to_vec());
         v.push(every);
         v
     }
@@ -318,6 +414,7 @@ mod tests {
         let reports = run_stages(
             specs,
             u64::MAX,
+            &Halt::off(),
             |s, _| {
                 let start = Instant::now();
                 std::thread::sleep(Duration::from_millis(30));
@@ -348,6 +445,7 @@ mod tests {
         let reports = run_stages(
             specs,
             u64::MAX,
+            &Halt::off(),
             |s, _| {
                 let start = Instant::now();
                 let partners: Vec<&str> = meet
@@ -388,6 +486,7 @@ mod tests {
         let reports = run_stages(
             &specs,
             u64::MAX,
+            &Halt::off(),
             |s, _| {
                 // Pure stages finish instantly; the compile takes its time. The
                 // ladder must not reorder because of it.
@@ -408,6 +507,98 @@ mod tests {
             (0..specs.len()).collect::<Vec<_>>()
         );
         assert_eq!(seen.into_iter().map(|(_, t)| t).collect::<Vec<_>>(), want);
+    }
+
+    /// Run [`plan_shape`] under `halt` where the test compile, the first stage, meets a red
+    /// ([`Halt::red`]) and then, if `wait`, holds its slot until the test run (its own lane,
+    /// after it) and the measure tail (exclusive, after everything) have started or the hang
+    /// detector runs out: whether both had started while it still ran, and every stage's report.
+    fn red_while_the_compile_runs(halt: &Halt, wait: bool) -> (bool, Vec<Report>) {
+        let started: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        let arrived = std::sync::Condvar::new();
+        let both = ["test", "measure"];
+        let met = std::sync::atomic::AtomicBool::new(false);
+        let reports = run_stages(
+            &plan_shape(),
+            u64::MAX,
+            halt,
+            |s, _| {
+                let mut g = started.lock().expect("started");
+                g.push(s.title.clone());
+                arrived.notify_all();
+                if s.title == "compile" {
+                    halt.red("test");
+                    let deadline = Instant::now() + HANG_DETECTOR;
+                    while wait && !both.iter().all(|b| g.iter().any(|t| t == b)) {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        g = arrived.wait_timeout(g, left).expect("started").0;
+                    }
+                    met.store(
+                        both.iter().all(|b| g.iter().any(|t| t == b)),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                Report::new(s.title.clone())
+            },
+            |_, _| {},
+        );
+        (met.into_inner(), reports)
+    }
+
+    /// The words each halt below was given to end its run with.
+    static ENDED: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+    fn end(words: &str) {
+        ENDED.lock().expect("ended").push(words.to_owned());
+    }
+
+    /// A HALTED RUN HOLDS NOTHING BACK: once the test compile halts the run, the test run behind
+    /// it in its lane and the exclusive measure tail start while it still runs (each to say what
+    /// the halt kept from running), every stage still reports once and in declared order, the
+    /// halt's words name the check, only the first red sets them, and the run's end is given them
+    /// once; reverted, the waiting stages start only after the compile, past the hang detector.
+    /// CONTROL: in a run that never halts the same red sets nothing and ends nothing, and every
+    /// stage reports (its lanes and barriers are the other tests' here: lanes in
+    /// `stages_sharing_a_lane_never_overlap_and_keep_their_order`, the rest in
+    /// `no_starvation_and_no_deadlock`).
+    #[test]
+    fn a_halted_run_starts_every_waiting_stage_at_once() {
+        let halt = Halt::at_first_red("the release", end);
+        let (met, reports) = red_while_the_compile_runs(&halt, true);
+        assert!(
+            met,
+            "the waiting stages started while the halting stage ran"
+        );
+        assert_eq!(
+            reports.iter().map(|r| r.title.clone()).collect::<Vec<_>>(),
+            plan_shape()
+                .iter()
+                .map(|s| s.title.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(halt.words(), Some("stopped: the release failed at test"));
+        assert!(!halt.red("lint"), "only the first red halts");
+        assert_eq!(halt.words(), Some("stopped: the release failed at test"));
+        let ended = |words: &str| {
+            ENDED
+                .lock()
+                .expect("ended")
+                .iter()
+                .filter(|w| *w == words)
+                .count()
+        };
+        assert_eq!(ended("stopped: the release failed at test"), 1);
+
+        let bare = Halt::off();
+        let (_, reports) = red_while_the_compile_runs(&bare, false);
+        assert_eq!(reports.len(), plan_shape().len());
+        assert_eq!(
+            (bare.armed(), bare.red("test"), bare.words()),
+            (false, false, None)
+        );
     }
 
     #[test]
@@ -1066,6 +1257,7 @@ mod tests {
                     let reports = run_stages(
                         &specs,
                         budget,
+                        &Halt::off(),
                         |s, held| {
                             let me = index(&s.title);
                             {

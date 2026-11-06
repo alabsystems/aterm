@@ -255,6 +255,33 @@ impl AtermGpuTerminal {
         Some(key)
     }
 
+    /// One tick through the frame gate, shared by `render` and `render_headless`: the geometry
+    /// preflight, then a refusal before `init` (`ready` false) that runs no pump and builds no
+    /// frame, then `open_frame`, `build_frame` and `present`. The frame counts as on glass only
+    /// once `present` succeeded; a failed present leaves the gate open. `Ok(true)` when the gate
+    /// held the tick.
+    fn present_frame(
+        &mut self,
+        ready: bool,
+        present: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.checked_surface_size()?;
+        if !ready {
+            return Err("render() before init()".to_string());
+        }
+        let Some(key) = self.open_frame() else {
+            return Ok(true);
+        };
+        self.build_frame();
+        let presented = present(self);
+        if presented.is_ok() {
+            self.record_presented_frame(key);
+        } else {
+            self.last_frame_key = None;
+        }
+        presented.map(|()| false)
+    }
+
     /// Record the frame `build_frame` just produced as the one on glass.
     #[inline]
     const fn record_presented_frame(&mut self, key: FrameGateKey) {
@@ -1226,44 +1253,37 @@ impl AtermGpuTerminal {
 
     /// Present one frame on the GPU canvas.
     pub fn render(&mut self) -> Result<(), String> {
-        self.checked_surface_size()?;
-        let Some(key) = self.open_frame() else {
-            return if self.gpu.is_some() {
-                Ok(())
-            } else {
-                Err("render() before init()".to_string())
-            };
-        };
-        self.build_frame();
-        self.record_presented_frame(key);
-        let gpu = self.gpu.as_mut().ok_or("render() before init()")?;
-        #[cfg(all(target_arch = "wasm32", debug_assertions))]
-        if gpu.lane_crown {
-            gpu.renderer.reset_glow_ease_for_test(&mut gpu.win);
-        }
-        #[cfg(all(target_arch = "wasm32", debug_assertions))]
-        if !gpu.lane_art.is_empty() {
-            let layers = &mut self.frame_scratch.fx_layers;
-            layers.retain(|l| !gpu.lane_art.iter().any(|a| a.id == l.id));
-            layers.extend(gpu.lane_art.iter().cloned());
-        }
-        let presented = webgl_present_result(gpu.renderer.present_input(
-            &mut gpu.win,
-            &mut gpu.surface,
-            &self.frame_scratch,
-            false,
-            None,
-            None,
-        ));
-        if presented.is_err() {
-            self.last_frame_key = None;
-        }
-        presented
+        let ready = self.gpu.is_some();
+        self.present_frame(ready, |t| {
+            let gpu = t.gpu.as_mut().ok_or("render() before init()")?;
+            #[cfg(all(target_arch = "wasm32", debug_assertions))]
+            if gpu.lane_crown {
+                gpu.renderer.reset_glow_ease_for_test(&mut gpu.win);
+            }
+            #[cfg(all(target_arch = "wasm32", debug_assertions))]
+            if !gpu.lane_art.is_empty() {
+                let layers = &mut t.frame_scratch.fx_layers;
+                layers.retain(|l| !gpu.lane_art.iter().any(|a| a.id == l.id));
+                layers.extend(gpu.lane_art.iter().cloned());
+            }
+            webgl_present_result(gpu.renderer.present_input(
+                &mut gpu.win,
+                &mut gpu.surface,
+                &t.frame_scratch,
+                false,
+                None,
+                None,
+            ))
+        })
+        .map(|_| ())
     }
 
     /// Render the current grid offscreen and read the pixels back into the internal RGBA8 buffer, for GPU-vs-CPU pixel comparison (a WebGL swapchain is not CPU-readable).
     pub fn render_offscreen(&mut self) -> Result<(), String> {
         let (width, height) = self.checked_surface_size()?;
+        if self.gpu.is_none() {
+            return Err("render_offscreen() before init()".to_string());
+        }
         let bytes = width * height * 4;
         self.rgba
             .try_reserve_exact(bytes.saturating_sub(self.rgba.len()))
@@ -1490,13 +1510,7 @@ impl AtermGpuTerminal {
 impl AtermGpuTerminal {
     /// The native half of `render`: the same frame gate and frame build, minus the WebGL present.
     pub fn render_headless(&mut self) -> Result<bool, String> {
-        self.checked_surface_size()?;
-        let Some(key) = self.open_frame() else {
-            return Ok(true);
-        };
-        self.build_frame();
-        self.record_presented_frame(key);
-        Ok(false)
+        self.present_frame(true, |_| Ok(()))
     }
 
     pub fn new_from_system(rows: u16, cols: u16, px: f32) -> Option<AtermGpuTerminal> {
@@ -1817,6 +1831,34 @@ mod tests {
         t.render_headless().expect("renderable frame");
         assert!(t.last_render_skipped(), "setup must reach a settled frame");
         t
+    }
+
+    /// A tick refused before `init`, or one whose present fails, puts nothing on glass, so it
+    /// leaves the frame gate open; only a presented frame settles it.
+    #[test]
+    fn only_a_presented_frame_consumes_the_frame_gate() {
+        let mut t = settled(8, 40);
+        t.process(b"!");
+        let mut presented = false;
+        assert_eq!(
+            t.present_frame(false, |_| {
+                presented = true;
+                Ok(())
+            }),
+            Err("render() before init()".to_string())
+        );
+        assert!(!presented, "a refusal before init presents nothing");
+        assert!(t.needs_frame(), "and leaves the gate open");
+
+        assert_eq!(
+            t.present_frame(true, |_| Err("surface lost".to_string())),
+            Err("surface lost".to_string())
+        );
+        assert!(t.needs_frame(), "a failed present leaves the gate open");
+
+        assert_eq!(t.render_headless(), Ok(false), "the next tick draws");
+        assert!(!t.needs_frame(), "a presented frame settles the gate");
+        assert_eq!(t.render_headless(), Ok(true));
     }
 
     /// The frame gate, both sides: a settled tick skips the whole frame, and

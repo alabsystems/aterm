@@ -2639,12 +2639,14 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         Unused::Stale {
             incremental,
             units,
+            superseded,
             after,
         } => format!(
             "what no build reads again, moved aside from a build directory that stays: \
-             {incremental} incremental crate folder(s) and {units} unit(s) built by a compiler \
-             that is no longer the store's current one, each unwritten for {} or more; no \
-             build held its locks",
+             {incremental} incremental crate folder(s), {units} unit(s) built by a compiler \
+             that is no longer the store's current one and {superseded} unit(s) its last \
+             passing release run superseded with another build of the same package and kind, \
+             each unwritten for {} or more; no build held its locks",
             span(after)
         ),
         Unused::Stayed { stayed, freed } => format!(
@@ -2690,9 +2692,11 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
         Unused::Stale {
             incremental,
             units,
+            superseded,
             after,
         } => format!(
-            "{incremental} incremental folder(s) and {units} old-compiler unit(s) unwritten {}",
+            "{incremental} incremental folder(s), {units} old-compiler unit(s) and {superseded} \
+             superseded release unit(s) unwritten {}",
             sweep_span(after)
         ),
         Unused::Stayed { stayed, .. } => format!(
@@ -3367,9 +3371,13 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     } else {
         let named: Vec<&str> = top.iter().take(2).map(String::as_str).collect();
         if named.is_empty() {
-            format!("aterm freed {}", human_bytes(freed))
+            format!("aterm removed {} of file allocation", human_bytes(freed))
         } else {
-            format!("aterm freed {} ({})", human_bytes(freed), named.join("; "))
+            format!(
+                "aterm removed {} of file allocation ({})",
+                human_bytes(freed),
+                named.join("; ")
+            )
         }
     };
     format!(
@@ -3791,30 +3799,52 @@ fn walk_bytes_until(
     size: impl Fn(&std::fs::Metadata) -> u64,
     deadline: Option<std::time::Instant>,
 ) -> (u64, bool) {
+    walk_bytes_with(dir, enter, size, deadline, |path| std::fs::read_dir(path))
+}
+
+/// Stream entries and their metadata without discarding read failures. Failed entries consume
+/// the same walk budget as readable ones; a vanished entry contributes nothing to the tree.
+fn walk_bytes_with<I>(
+    dir: &Path,
+    enter: impl Fn(&std::fs::Metadata) -> bool,
+    size: impl Fn(&std::fs::Metadata) -> u64,
+    deadline: Option<std::time::Instant>,
+    mut read: impl FnMut(&Path) -> std::io::Result<I>,
+) -> (u64, bool)
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
     let mut total: u64 = 0;
     let mut seen = 0usize;
     let mut stack = vec![dir.to_path_buf()];
-    let mut unread = false;
+    let mut partial = false;
     while let Some(d) = stack.pop() {
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return (total, true);
         }
-        let rd = match std::fs::read_dir(&d) {
+        let rd = match read(&d) {
             Ok(rd) => rd,
             Err(e) => {
-                unread |= e.kind() != std::io::ErrorKind::NotFound;
+                partial |= e.kind() != std::io::ErrorKind::NotFound;
                 continue;
             }
         };
-        for entry in rd.flatten() {
+        for entry in rd {
             seen += 1;
             aterm_uds::progress::tick();
             if seen > MAX_WALK_ENTRIES || deadline.is_some_and(|at| std::time::Instant::now() >= at)
             {
                 return (total, true);
             }
-            let Ok(meta) = entry.metadata() else {
-                continue;
+            let (entry, meta) = match entry.and_then(|entry| {
+                let meta = entry.metadata()?;
+                Ok((entry, meta))
+            }) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    partial |= e.kind() != std::io::ErrorKind::NotFound;
+                    continue;
+                }
             };
             if meta.is_symlink() {
                 continue;
@@ -3824,11 +3854,13 @@ fn walk_bytes_until(
                     stack.push(entry.path());
                 }
             } else {
-                total = total.saturating_add(size(&meta));
+                let (bytes, overflow) = total.overflowing_add(size(&meta));
+                total = if overflow { u64::MAX } else { bytes };
+                partial |= overflow;
             }
         }
     }
-    (total, unread)
+    (total, partial)
 }
 
 /// The volume holding `path`, read now through the mount table `table`: one reader with the tools that admit a disk need, so both place a path on the same volume and key its room alike.

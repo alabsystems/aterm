@@ -268,6 +268,23 @@ pub fn verify_published_roster(
     machine_id: &str,
     roster_seq: Option<u64>,
 ) -> Result<u64> {
+    Ok(verify_published_roster_parsed(
+        master_pubkeys,
+        roster_bytes,
+        roster_sig,
+        machine_id,
+        roster_seq,
+    )?
+    .roster_seq)
+}
+
+pub(crate) fn verify_published_roster_parsed(
+    master_pubkeys: &[&str],
+    roster_bytes: Vec<u8>,
+    roster_sig: &[u8],
+    machine_id: &str,
+    roster_seq: Option<u64>,
+) -> Result<Roster> {
     let verified = verify_roster(master_pubkeys, roster_bytes, roster_sig).map_err(|e| {
         Error::new(format!(
             "the published release's machine roster does not verify under this tree's \
@@ -297,7 +314,7 @@ pub fn verify_published_roster(
              contradicts the signed manifest"
         )));
     }
-    Ok(roster.roster_seq)
+    Ok(roster)
 }
 
 /// Stamp attribution into the manifest before it is serialized and signed: `machine_id` makes the signature unrelabellable and `roster_seq` stops an old roster being paired with this release.

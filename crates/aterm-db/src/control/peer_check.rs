@@ -15,7 +15,7 @@
 
 use super::{
     Custody, Error, Request, Result, Trust, denied_or_last, failure, held_records, local_failure,
-    removed_in, roster_or_last, roster_to_check,
+    roster_or_last, roster_to_check,
 };
 use aterm_db_core::peer_check::{self as kernel, Read, Stage};
 use aterm_secrets::{
@@ -111,8 +111,8 @@ fn removed() -> Error {
 /// Check `judged` against this Mac's own records and roster at `custody`.
 ///
 /// At a [`Custody::Log`] endpoint every record this Mac holds can take the peer out
-/// ([`removed_in`]), acknowledged or not: a `Remove` stands from the moment it is durable here,
-/// as admission holds out what records ahead of their acknowledgement hold out
+/// ([`Log::seat_removed`]), acknowledged or not: a `Remove` stands from the moment it is durable
+/// here, as admission holds out what records ahead of their acknowledgement hold out
 /// ([`aterm_secrets::client::load_acknowledged_and_ahead`]). The rest of the judgement reads the
 /// acknowledged log ([`aterm_secrets::client::acknowledged_commons_log`]).
 ///
@@ -279,7 +279,7 @@ fn held(paths: &aterm_secrets::client::Paths, trust: Trust, judged: &Judged<'_>)
             Error::new("this Mac's membership records belong to another root"),
         );
     }
-    if removed_in(log, judged.binding()) {
+    if log.seat_removed(judged.binding()) {
         return Reading::of(Read::Out, removed());
     }
     Reading::clear()
@@ -383,7 +383,7 @@ fn combined(
     Reading::clear()
 }
 
-/// Whether `log` denies `request`'s peer: it removes the peer ([`removed_in`]), leaves its
+/// Whether `log` denies `request`'s peer: it removes the peer ([`Log::seat_removed`]), leaves its
 /// recipient out of a newest epoch, the log's roster (or, while the log has none, `roster`)
 /// denies it, or a seat that shares its actor or recipient is left out or denied. A log roster
 /// that does not read denies it.
@@ -398,20 +398,17 @@ fn denied_by(
     let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log(paths, log) else {
         return true;
     };
-    let log_roster = log_roster.or_else(|| roster.cloned());
+    let log_roster = log_roster.as_ref().or(roster);
     let membership = log.membership();
-    removed_in(log, binding)
+    log.seat_removed(binding)
         || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
         || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
-        || log_roster
-            .as_ref()
-            .is_some_and(|r| crate::table::binding_denied_in_roster(r, binding))
+        || log_roster.is_some_and(|r| crate::table::binding_denied_in_roster(r, binding))
         || membership.members().iter().any(|(m_actor, m)| {
             (*m_actor == actor || m.binding.recipient() == recipient)
                 && (log.audience_left_out(&EpochAudience::Commons, m_actor)
                     || log.audience_left_out(&EpochAudience::Everyone, m_actor)
                     || log_roster
-                        .as_ref()
                         .is_some_and(|r| aterm_secrets::client::member_denied_by_roster(r, m)))
         })
 }

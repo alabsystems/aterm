@@ -509,7 +509,9 @@ impl Repair {
 /// Bounded scheduling hints for one runtime, retained across endpoint rebuilds.
 /// These hold public IDs and round metadata, never a bootstrap or authority lease.
 #[derive(Default)]
-pub(crate) struct PeerCache(Mutex<Option<CacheScope>>);
+pub(crate) struct PeerCache {
+    scope: Mutex<Option<CacheScope>>,
+}
 
 struct CacheScope {
     trust: Trust,
@@ -626,6 +628,26 @@ impl Endpoint {
             })
             .collect()
     }
+    /// The current seats whose fleet node key `speaks` names (it speaks `Bus`), by this
+    /// endpoint's log: only a key that is one member's current node key names a seat, so neither
+    /// a removed, replaced nor contested key holds anyone out of repair.
+    pub(crate) fn bus_actors(
+        &self,
+        speaks: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> std::collections::BTreeSet<Actor> {
+        use aterm_secrets::membership_log::NodeStanding;
+        let Some(log) = &self.snapshot_log else {
+            return std::collections::BTreeSet::new();
+        };
+        log.membership()
+            .nodes()
+            .iter()
+            .filter_map(|(key, standing)| match standing {
+                NodeStanding::Member(actor) if speaks(key) => Some(*actor),
+                _ => None,
+            })
+            .collect()
+    }
     /// Legacy protocols carry no crossed-state metadata. Read the durable mark even when
     /// the endpoint's cached witness or the current records file is short.
     #[cfg_attr(
@@ -653,7 +675,10 @@ impl Endpoint {
     /// Reuse only volatile repair hints for this same pinned trust and local
     /// writer. Every new connection still authenticates before leasing them.
     pub(crate) fn with_repair_cache(mut self, cache: &PeerCache) -> Self {
-        let mut current = cache.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut current = cache
+            .scope
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !current
             .as_ref()
             .is_some_and(|scope| scope.trust == self.trust && scope.actor == self.actor)
@@ -1877,7 +1902,7 @@ fn admit_by_log_witness(
     binding: &aterm_secrets::commons::binding::Binding,
 ) -> Result<()> {
     if !log.has_historical_seat(binding)
-        || removed_in(log, binding)
+        || log.seat_removed(binding)
         || log.audience_left_out(
             &aterm_secrets::membership_log::EpochAudience::Commons,
             &binding.actor(),
@@ -1898,27 +1923,6 @@ fn admit_by_log_witness(
         return Err(Error::new("Commons peer lacks historical log approval"));
     }
     Ok(())
-}
-
-/// Whether `log` takes the Mac of `binding` out: an effective `Remove` of its actor, its
-/// recipient bound to a Mac now out, its writer key, or the node key of a seat that shares its
-/// actor or recipient, one a Mac now out bound.
-fn removed_in(
-    log: &aterm_secrets::membership_log::Log,
-    binding: &aterm_secrets::commons::binding::Binding,
-) -> bool {
-    use aterm_secrets::membership_log::NodeStanding;
-    let membership = log.membership();
-    membership.removal(&binding.actor()).is_some()
-        || log.recipient_is_removed(&binding.recipient())
-        || matches!(membership.node(binding.writer()), NodeStanding::Removed(_))
-        || membership.members().iter().any(|(m_actor, m)| {
-            (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
-                && m.node_key.is_some_and(|nk| {
-                    nk != [0; 32]
-                        && matches!(membership.nodes().get(&nk), Some(NodeStanding::Removed(_)))
-                })
-        })
 }
 
 /// How many vault folders [`LastRead`] keeps an answer for: a process reads one; tests read many.
@@ -2358,28 +2362,32 @@ impl Store for Disk<'_> {
         // Reject garbage before taking the writer lock or replaying a large
         // journal. Authenticated legacy evidence is still retained: omitting it
         // could hide restrictions that this version cannot safely interpret.
-        let valid: Vec<bool> = wires
+        let valid: Vec<Option<Digest>> = wires
             .iter()
             .map(|wire| {
-                Node::verify(wire, self.trust.network, self.trust.authority).is_ok_and(|node| {
-                    node.kind() != Kind::Genesis || node.id() == self.trust.genesis
-                })
+                Node::verify(wire, self.trust.network, self.trust.authority)
+                    .ok()
+                    .filter(|node| node.kind() != Kind::Genesis || node.id() == self.trust.genesis)
+                    .map(|node| node.id())
             })
             .collect();
-        if !valid.iter().any(|valid| *valid) {
-            return Ok(valid);
+        if !valid.iter().any(Option::is_some) {
+            return Ok(vec![false; wires.len()]);
         }
         // Peers mostly offer what is already held. Acknowledge those from the
         // lock-free view; take the writer only when a valid record is new.
         let known = Journal::read_existing(self.dir, self.trust)
             .map_err(|error| local_failure("retain inventory", error))?;
-        let held: Vec<bool> = wires
+        let held: Vec<bool> = valid
             .iter()
-            .zip(&valid)
-            .map(|(wire, valid)| *valid && known.receipt(&Sha256::digest(wire)).is_some())
+            .map(|id| id.is_some_and(|id| known.receipt(&id).is_some()))
             .collect();
         drop(known);
-        let writer = if valid.iter().zip(&held).any(|(valid, held)| *valid && !held) {
+        let writer = if valid
+            .iter()
+            .zip(&held)
+            .any(|(id, held)| id.is_some() && !*held)
+        {
             match Journal::open_existing_until(
                 self.dir,
                 self.trust,
@@ -2408,13 +2416,10 @@ impl Store for Disk<'_> {
         Ok(wires
             .iter()
             .zip(valid)
-            .map(|(wire, valid)| {
+            .map(|(wire, id)| {
                 // Journal verifies signatures and pins and commits its checkpoint
                 // before returning a receipt. Uncertain appends yield no positive ack.
-                valid
-                    && journal
-                        .ingest(wire)
-                        .is_ok_and(|receipt| receipt.id == Sha256::digest(wire))
+                id.is_some_and(|id| journal.ingest(wire).is_ok_and(|receipt| receipt.id == id))
             })
             .collect())
     }
@@ -2781,10 +2786,12 @@ fn send_inventory(stream: &mut impl Write, ids: &BTreeSet<Digest>) -> Result<()>
     if ids.len() > MAX_NODES {
         return Err(Error::new("Commons inventory exceeds its bound"));
     }
-    stream.write_all(&(ids.len() as u32).to_le_bytes())?;
+    let mut frame = Vec::with_capacity(4 + ids.len() * 32);
+    frame.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for id in ids {
-        stream.write_all(id)?;
+        frame.extend_from_slice(id);
     }
+    stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
@@ -2794,12 +2801,14 @@ fn receive_inventory(stream: &mut impl Read) -> Result<BTreeSet<Digest>> {
         return Err(Error::new("Commons inventory exceeds its bound"));
     }
     let mut ids = BTreeSet::new();
+    let mut previous: Option<Digest> = None;
     for _ in 0..n {
         let mut id = [0; 32];
         stream.read_exact(&mut id)?;
-        if ids.last().is_some_and(|previous| previous >= &id) {
+        if previous.is_some_and(|last| last >= id) {
             return Err(Error::new("Commons inventory is not sorted and unique"));
         }
+        previous = Some(id);
         ids.insert(id);
     }
     Ok(ids)
@@ -2847,13 +2856,13 @@ fn receive_batch<S: Store>(stream: &mut (impl Read + Write), store: &S) -> Resul
         return Err(Error::new("invalid local Commons receipt count"));
     }
     let mut retained = 0;
+    let mut acks = Vec::with_capacity(n * 33);
     for (digest, durable) in digests.iter().zip(verdicts) {
-        let mut ack = [0u8; 33];
-        ack[..32].copy_from_slice(digest);
-        ack[32] = u8::from(durable);
-        stream.write_all(&ack)?;
+        acks.extend_from_slice(digest);
+        acks.push(u8::from(durable));
         retained += usize::from(durable);
     }
+    stream.write_all(&acks)?;
     stream.flush()?;
     Ok((retained, n - retained))
 }

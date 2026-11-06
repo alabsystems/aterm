@@ -375,7 +375,7 @@ only when all of these hold:
   - no process of yours has a working directory, an executable or an open file under it;
   - aterm's own grant is on (`disk.auto_free_gib` > 0), as for the window's pass.
 Each removal is journalled to `<state>/disk.jsonl` (`disk-free` rows) before it starts, and
-one the journal cannot record does not start; a row after it says the bytes it released.
+one the journal cannot record does not start; a row after it reports the file allocation counted.
 Each refusal prints one line with why. `--dry-run` says what would go and why not, whatever
 the grant, and removes and journals nothing; `--dry-run` with no path lists what the cache
 roots hold that may go, largest first (at most 24), so nothing under `~/Library` is listed or
@@ -5590,26 +5590,30 @@ fn run_disk_free_with(
             journal.append_raw(row, &mut io::sink())
         })
     };
-    for o in &outcomes {
-        if ask.json {
-            let value = o.to_json(ask.dry_run, world.grant());
-            let _ = writeln!(out, "{}", aterm_json::to_string(&value).unwrap_or_default());
-        } else {
-            let _ = writeln!(out, "{}", o.line());
+    let summary = disk::free::Summary::from_outcomes(&outcomes);
+    let written = (|| -> io::Result<()> {
+        for o in &outcomes {
+            if ask.json {
+                let value = o.to_json(ask.dry_run, world.grant());
+                let json = aterm_json::to_string(&value).map_err(io::Error::other)?;
+                writeln!(out, "{json}")?;
+            } else {
+                writeln!(out, "{}", o.line())?;
+            }
         }
-    }
-    let refused = outcomes.iter().filter(|o| o.refused()).count();
-    if !ask.json {
-        let went = outcomes.len() - refused;
-        let bytes: u64 = outcomes.iter().map(disk::free::Outcome::bytes).sum();
+        if !ask.json {
+            writeln!(out, "{}", summary.line(ask.dry_run))?;
+        }
+        out.flush()
+    })();
+    if let Err(error) = written {
         let _ = writeln!(
-            out,
-            "{} {} from {went} path(s); {refused} refused",
-            if ask.dry_run { "would free" } else { "freed" },
-            disk::human_bytes(bytes)
+            err,
+            "aterm harness disk free: could not write results: {error}"
         );
+        return ExitCode::from(1);
     }
-    if refused > 0 {
+    if summary.refused > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -6109,7 +6113,7 @@ fn run_disk(
             let _ = writeln!(out, "{}", done.headline());
             for (row, removed) in &done.removed {
                 let line = format!(
-                    "  removed {} — {}; freed about {}",
+                    "  removed {} — {}; counted {} of file allocation",
                     row.path.display(),
                     row.witness.describe(),
                     disk::human_bytes(removed.bytes)
@@ -6205,17 +6209,25 @@ pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
 
 /// Cut the journal at `path` back to its newest `keep` rows once it is larger than `max_bytes`.
 pub fn bound_ledger(path: &Path, max_bytes: u64, keep: usize) -> io::Result<bool> {
+    if !ledger_over_bound(path, max_bytes)? {
+        return Ok(false);
+    }
+    let lock = aterm_uds::line_log::lock(path)?;
+    if !ledger_over_bound(path, max_bytes)? {
+        return Ok(false);
+    }
+    let rows = tail_lines(path, keep)?;
+    replace_ledger_rows(path, &rows, &lock)?;
+    Ok(true)
+}
+
+fn ledger_over_bound(path: &Path, max_bytes: u64) -> io::Result<bool> {
     let len = match std::fs::symlink_metadata(path) {
         Ok(m) => m.len(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    if len <= max_bytes {
-        return Ok(false);
-    }
-    let rows = tail_lines(path, keep)?;
-    replace_ledger_rows(path, &rows)?;
-    Ok(true)
+    Ok(len > max_bytes)
 }
 
 /// The rows a cut keeps of a ledger ([`bound_ledger_cut`]), handed its rows in order (the cut must read them all), the files beside it read by the reader it is handed; `None` keeps the ledger as it is.
@@ -6235,12 +6247,11 @@ fn bound_ledger_cut_with_cap(
 ) -> io::Result<bool> {
     use std::io::Read as _;
 
-    let len = match std::fs::symlink_metadata(path) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    if len <= max_bytes {
+    if !ledger_over_bound(path, max_bytes)? {
+        return Ok(false);
+    }
+    let lock = aterm_uds::line_log::lock(path)?;
+    if !ledger_over_bound(path, max_bytes)? {
         return Ok(false);
     }
     let Ok((file, before)) = open_regular(path) else {
@@ -6295,27 +6306,12 @@ fn bound_ledger_cut_with_cap(
     if !complete.get() || broken.get() || !unchanged(&file, &before, read_bytes.get())? {
         return Ok(false);
     }
-    replace_ledger_rows(path, &rows)?;
+    replace_ledger_rows(path, &rows, &lock)?;
     Ok(true)
 }
 
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let file = options.open(path)?;
-    let before = file.metadata()?;
-    if !before.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a regular file",
-        ));
-    }
-    Ok((file, before))
+    aterm_uds::regular_file::open(path)
 }
 
 fn unchanged(file: &std::fs::File, before: &std::fs::Metadata, read: u64) -> io::Result<bool> {
@@ -6356,7 +6352,11 @@ pub(super) fn read_complete_text(path: &Path, cap: u64) -> io::Result<String> {
 }
 
 /// Replace the ledger at `path` with `rows` as [`bound_ledger`] does: written to a sibling `.tmp` file (`0600`), ordered and renamed over it, so a reader sees the old file or the new one and never half of either.
-pub fn replace_ledger_rows(path: &Path, rows: &[String]) -> io::Result<()> {
+fn replace_ledger_rows(
+    path: &Path,
+    rows: &[String],
+    _lock: &aterm_uds::file_lock::LockFile,
+) -> io::Result<()> {
     let mut body = String::new();
     for row in rows {
         body.push_str(row);
@@ -7081,6 +7081,15 @@ pub const MAX_AUTH_STDOUT: usize = 64 * 1024;
 
 /// What `accounts login` and `renew` need of the machine beyond files: their `claude` runs (a sign-in flow, and the check after one that exits 0), native fleet renewal, whether stdin is a terminal and whether this runs over SSH, this executable, and the clock once a flow has ended.
 pub trait AccountsHost {
+    /// The existing automatic operation lifetime, without sign-in authority.
+    fn work_scope(&self) -> Option<super::account_work::Scope> {
+        None
+    }
+    /// Whether this automatic work scope has closed; this grants no sign-in authority.
+    fn work_cancelled(&self) -> bool {
+        false
+    }
+
     /// Whether this host supplies native Kimi profile I/O. This is a backend
     /// capability, not account authority; the pool checks policy separately.
     #[cfg(unix)]
@@ -7415,15 +7424,28 @@ impl From<i32> for RenewalExit {
 }
 
 impl RenewalExit {
+    /// An authenticated service refusal cannot authorize a fresh status or adoption step.
+    pub fn is_deferred(&self) -> bool {
+        self.met
+            .as_ref()
+            .is_some_and(super::open_url::Met::is_service_unavailable)
+    }
     pub(super) fn from_capture(
         (ran, met): (Captured, Option<super::open_url::Met>),
     ) -> Result<Self, RenewalFailure> {
         match ran.code {
             Some(code) => Ok(Self { code, met }),
-            None => Err(RenewalFailure {
-                reason: "provider flow ended without an exit code".into(),
-                met,
-            }),
+            None => {
+                let deferred = met
+                    .as_ref()
+                    .is_some_and(super::open_url::Met::is_service_unavailable);
+                let mut failure =
+                    RenewalFailure::new("provider flow ended without an exit code", met);
+                if deferred {
+                    failure.kind = RenewalFailureKind::Deferred;
+                }
+                Err(failure)
+            }
         }
     }
 
@@ -7435,13 +7457,14 @@ impl RenewalExit {
     }
 }
 
-/// Safe facts from exactly one provider invocation. These do not authorize a login,
-/// establish shared custody, or change the renewal's retry decision.
+/// Safe facts from exactly one provider invocation. These do not authorize a login or
+/// establish shared custody. Typed service unavailability can defer work without an auth penalty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenewalObservation {
     exit_code: Option<i32>,
     met: Option<super::open_url::Met>,
     capture_failed: bool,
+    service_deferred: bool,
 }
 
 impl RenewalObservation {
@@ -7456,6 +7479,9 @@ impl RenewalObservation {
             // retaining anything for process-local history or a UI reader.
             met: met.and_then(|met| super::open_url::Met::parse(&met.line())),
             capture_failed,
+            service_deferred: outcome
+                .as_ref()
+                .map_or_else(RenewalFailure::is_deferred, RenewalExit::is_deferred),
         }
     }
 
@@ -7474,6 +7500,12 @@ impl RenewalObservation {
         self.capture_failed
     }
 
+    /// Exact service unavailability from this invocation, not an authentication failure.
+    #[must_use]
+    pub fn service_deferred(&self) -> bool {
+        self.service_deferred
+    }
+
     /// Explain validated helper facts and the process exit, never provider output.
     #[must_use]
     pub fn words(&self) -> String {
@@ -7490,10 +7522,28 @@ impl RenewalObservation {
 }
 
 /// The shipped [`AccountsHost`]: `claude` as PATH resolves it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LiveAccounts;
+#[derive(Debug, Clone, Default)]
+pub struct LiveAccounts {
+    work: Option<super::account_work::Scope>,
+}
+
+impl LiveAccounts {
+    /// Retains an explicit automatic operation through every provider effect.
+    pub fn with_work(scope: super::account_work::Scope) -> Self {
+        Self { work: Some(scope) }
+    }
+}
 
 impl AccountsHost for LiveAccounts {
+    fn work_scope(&self) -> Option<super::account_work::Scope> {
+        self.work.clone()
+    }
+    fn work_cancelled(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+    }
+
     #[cfg(all(unix, not(test)))]
     fn renews_kimi_profiles(&self) -> bool {
         true
@@ -7550,15 +7600,16 @@ impl AccountsHost for LiveAccounts {
         let user_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or("provider flow has no machine home")?;
-        RenewalExit::from_capture(super::accounts_sync::shared_renewal::sign_in_with_inputs(
-            &user_home,
-            home,
-            email,
-            browser,
-            true,
-            None,
-            Some(inputs),
-        )?)
+        RenewalExit::from_capture(
+            super::accounts_sync::shared_renewal::sign_in_with_inputs_scoped(
+                &user_home,
+                home,
+                email,
+                browser,
+                (true, None, Some(inputs)),
+                self.work.as_ref(),
+            )?,
+        )
     }
     fn shared_claude_profile(
         &self,
@@ -7582,7 +7633,15 @@ impl AccountsHost for LiveAccounts {
             .as_deref()
             .map(super::accounts_sync::resolve_claude_program)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        auth_status_of(prog.as_os_str(), login, &|name| std::env::var_os(name))
+        match &self.work {
+            Some(scope) => auth_status_of_scoped(
+                prog.as_os_str(),
+                login,
+                &|name| std::env::var_os(name),
+                scope,
+            ),
+            None => auth_status_of(prog.as_os_str(), login, &|name| std::env::var_os(name)),
+        }
     }
 
     fn unaskable(&self) -> Option<String> {
@@ -7627,13 +7686,14 @@ impl AccountsHost for LiveAccounts {
             .as_deref()
             .map(super::accounts_sync::resolve_claude_program)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        renew_flow_of(
+        renew_flow_of_with_work(
             prog.as_os_str(),
             home,
             email,
             browser,
             &|name| std::env::var_os(name),
             (!self.stdin_is_terminal()).then_some(UNATTENDED_RENEWAL_BUDGET),
+            self.work.as_ref(),
         )
     }
 
@@ -7643,12 +7703,21 @@ impl AccountsHost for LiveAccounts {
             .as_deref()
             .map(super::accounts_sync::resolve_claude_program)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        status_in_home_within(
-            prog.as_os_str(),
-            home,
-            &|name| std::env::var_os(name),
-            AUTH_CHECK_BUDGET,
-        )
+        match &self.work {
+            Some(scope) => status_in_home_within_scoped(
+                prog.as_os_str(),
+                home,
+                &|name| std::env::var_os(name),
+                AUTH_CHECK_BUDGET,
+                scope,
+            ),
+            None => status_in_home_within(
+                prog.as_os_str(),
+                home,
+                &|name| std::env::var_os(name),
+                AUTH_CHECK_BUDGET,
+            ),
+        }
     }
 
     fn claude_principal_in_home(&self, home: &str) -> Option<[u8; 32]> {
@@ -7719,7 +7788,12 @@ impl AccountsHost for LiveAccounts {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        super::login_drive::sign_in_live(req, &home, &|name| std::env::var_os(name))
+        super::login_drive::sign_in_live_scoped(
+            req,
+            &home,
+            &|name| std::env::var_os(name),
+            self.work.clone(),
+        )
     }
 
     #[cfg(all(unix, not(test)))]
@@ -7747,7 +7821,7 @@ impl AccountsHost for LiveAccounts {
             .ok_or("Google login row has no email")?;
         let previous = Some(req.row.dir.as_deref().map_or(home, Path::new));
         let deadline = std::time::Instant::now() + super::login_drive::HANG;
-        super::agy_signin::run_google_staged(
+        super::agy_signin::run_google_staged_scoped(
             &program,
             state,
             home,
@@ -7759,6 +7833,7 @@ impl AccountsHost for LiveAccounts {
                 recovery: Some(recovery),
             },
             deadline,
+            self.work.clone(),
         )
         .map_err(|error| error.to_string())?
         .verify(deadline)
@@ -7847,7 +7922,13 @@ impl AccountsHost for LiveAccounts {
                 path: browser.to_path_buf(),
                 is_headless_shell: false,
             });
-        super::browser_window::tidy_profile(&headless, profile, session, TIDY_WITHIN)
+        super::browser_window::tidy_profile_scoped(
+            &headless,
+            profile,
+            session,
+            TIDY_WITHIN,
+            self.work.clone(),
+        )
     }
 
     fn hold_window_ends(&self) -> WindowEnds {
@@ -7876,7 +7957,8 @@ pub(super) fn vendor_mailbox_sign_in(
         &req.store.shared_dir(),
         home,
         mailbox,
-    );
+    )
+    .with_work(host.work_scope());
     super::login_drive::sign_in_with(
         req,
         (&program, &[]),
@@ -8092,6 +8174,7 @@ pub(super) fn renew_command(
 
 /// Sign `email` into staging `home`. The mailbox and browser profile come from `var` and the
 /// harness store. An unattended call supplies `within`; an interactive call keeps its terminal.
+#[cfg(any(test, debug_assertions))]
 fn renew_flow_of(
     program: &std::ffi::OsStr,
     home: &str,
@@ -8100,6 +8183,21 @@ fn renew_flow_of(
     var: &dyn Fn(&str) -> Option<OsString>,
     within: Option<std::time::Duration>,
 ) -> Result<RenewalExit, RenewalFailure> {
+    renew_flow_of_with_work(program, home, email, browser, var, within, None)
+}
+
+fn renew_flow_of_with_work(
+    program: &std::ffi::OsStr,
+    home: &str,
+    email: &str,
+    browser: &RenewBrowser,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    within: Option<std::time::Duration>,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<RenewalExit, RenewalFailure> {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return Err(RenewalFailure::cancelled());
+    }
     let mut cmd = renew_command(program, home, email, browser);
     if within.is_some() {
         cmd.envs(unattended_renewal_environment(var)?);
@@ -8138,7 +8236,10 @@ fn renew_flow_of(
         }
     }
     if let Some(within) = within {
-        return RenewalExit::from_capture(capture_unattended_renewal(cmd, within)?);
+        return RenewalExit::from_capture(match scope {
+            Some(scope) => capture_unattended_renewal_scoped(cmd, within, scope)?,
+            None => capture_unattended_renewal(cmd, within)?,
+        });
     }
     // A person's sign-in on this terminal waits for them, unbounded, as Claude Code's own paste
     // prompt does.
@@ -8147,18 +8248,55 @@ fn renew_flow_of(
         .map_err(RenewalFailure::from)
 }
 
-/// A failed provider run and the safe browser outcome recorded before it ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RenewalFailureKind {
+    Provider,
+    Cancelled,
+    Deferred,
+}
+
+/// Failed, cancelled or deferred renewal/adoption work, with its safe browser outcome.
 #[derive(Debug)]
 pub struct RenewalFailure {
+    kind: RenewalFailureKind,
     reason: String,
     pub(super) met: Option<super::open_url::Met>,
 }
 
 impl RenewalFailure {
+    /// Authenticated service unavailability retains uncertainty without an auth penalty.
+    pub fn deferred() -> Self {
+        Self {
+            kind: RenewalFailureKind::Deferred,
+            reason: "the fleet challenge service is unavailable".into(),
+            met: Some(super::open_url::Met::new(
+                super::open_url::MetWord::ServiceUnavailable,
+                None,
+            )),
+        }
+    }
+    /// Whether an authenticated service deferred this work.
+    pub fn is_deferred(&self) -> bool {
+        self.kind == RenewalFailureKind::Deferred
+    }
+    /// Cancellation ends automatic work without an authentication or retry outcome.
+    pub fn cancelled() -> Self {
+        Self {
+            kind: RenewalFailureKind::Cancelled,
+            reason: "automatic account work was cancelled".into(),
+            met: None,
+        }
+    }
+    /// Whether the operation ended because its App work scope closed.
+    pub fn is_cancelled(&self) -> bool {
+        self.kind == RenewalFailureKind::Cancelled
+    }
+
     /// Keep the private failure explanation separate from its optional browser outcome.
     #[must_use]
     pub fn new(reason: impl Into<String>, met: Option<super::open_url::Met>) -> Self {
         Self {
+            kind: RenewalFailureKind::Provider,
             reason: reason.into(),
             met,
         }
@@ -8167,7 +8305,11 @@ impl RenewalFailure {
 
 impl From<String> for RenewalFailure {
     fn from(reason: String) -> Self {
-        Self { reason, met: None }
+        Self {
+            kind: RenewalFailureKind::Provider,
+            reason,
+            met: None,
+        }
     }
 }
 
@@ -8193,26 +8335,85 @@ impl std::fmt::Display for RenewalFailure {
 /// `docs/measured/mailbox-signin-cloudflare-2026-11-01.md`). So the run is an owned capture
 /// ([`super::align::capture_bounded_owned`]): `within` ends it, and so does every other way the
 /// wait for it stops, this process's own end included; on Unix, so does the failure its opener
-/// records in its outcome file ([`super::align::capture_bounded_owned_watching`]).
+/// records in its outcome file ([`super::align::capture_bounded_owned_watching`]). A hosted OAuth
+/// code arrives through the same private channel and is written once to the waiting CLI's stdin.
 pub(super) fn capture_unattended_renewal(
     cmd: aterm_uds::spawnfd::Command,
     within: std::time::Duration,
 ) -> Result<(super::align::Captured, Option<super::open_url::Met>), RenewalFailure> {
-    capture_unattended_renewal_with(cmd, |cmd, outcome| {
+    capture_unattended_renewal_for(cmd, within, None)
+}
+
+/// An automatic renewal bound to its explicit App operation scope.
+pub(super) fn capture_unattended_renewal_scoped(
+    cmd: aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+    scope: &super::account_work::Scope,
+) -> Result<(Captured, Option<super::open_url::Met>), RenewalFailure> {
+    capture_unattended_renewal_for(cmd, within, Some(scope))
+}
+
+#[cfg(unix)]
+enum CaptureStop {
+    Cancelled,
+    Deferred,
+    Failed,
+}
+
+fn capture_unattended_renewal_for(
+    cmd: aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<(Captured, Option<super::open_url::Met>), RenewalFailure> {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return Err(RenewalFailure::cancelled());
+    }
+    #[cfg(unix)]
+    let mut stopped = None;
+    let result = capture_unattended_renewal_with(cmd, |cmd, outcome| {
         #[cfg(unix)]
         {
-            let Some(outcome) = outcome else {
+            if scope.is_none() && outcome.is_none() {
                 return super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT);
-            };
+            }
+            let mut observed = None;
             match super::align::capture_bounded_owned_watching(
                 cmd,
                 within,
                 MAX_AUTH_STDOUT,
-                || super::open_url::read_failed_outcome(outcome).is_some(),
+                |child| {
+                    observed = if scope.is_some_and(super::account_work::Scope::cancelled) {
+                        Some(CaptureStop::Cancelled)
+                    } else {
+                        outcome
+                            .and_then(super::open_url::read_terminal_outcome)
+                            .map(|outcome| match outcome {
+                                super::open_url::TerminalOutcome::Failed(_) => CaptureStop::Failed,
+                                super::open_url::TerminalOutcome::Deferred(_) => {
+                                    CaptureStop::Deferred
+                                }
+                            })
+                    };
+                    if observed.is_some() {
+                        return true;
+                    }
+                    let Some(outcome) = outcome else {
+                        return false;
+                    };
+                    match super::open_url::take_oauth_code(outcome.with_extension("code")) {
+                        Ok(Some(code)) => child
+                            .stdin
+                            .as_mut()
+                            .is_none_or(|stdin| writeln!(stdin, "{code}").is_err()),
+                        Ok(None) => false,
+                        Err(_) => true,
+                    }
+                },
             )? {
                 super::align::Ended::Exited(ran) => Ok(ran),
                 super::align::Ended::Stopped => {
-                    Err("its browser opener failed before authorization completed".to_owned())
+                    stopped = observed;
+                    Err("its browser opener stopped before authorization completed".into())
                 }
             }
         }
@@ -8221,7 +8422,77 @@ pub(super) fn capture_unattended_renewal(
             let _ = outcome;
             super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT)
         }
-    })
+    });
+    #[cfg(unix)]
+    match stopped {
+        Some(CaptureStop::Cancelled) => return Err(RenewalFailure::cancelled()),
+        Some(CaptureStop::Deferred) => return Err(RenewalFailure::deferred()),
+        Some(CaptureStop::Failed) | None => {}
+    }
+    result
+}
+
+/// Checks status in a staging home while retaining the automatic operation.
+pub(super) fn status_in_home_within_scoped(
+    program: &std::ffi::OsStr,
+    home: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    budget: std::time::Duration,
+    scope: &super::account_work::Scope,
+) -> Result<Captured, String> {
+    if scope.cancelled() {
+        return Err(RenewalFailure::cancelled().to_string());
+    }
+    let pass = auth_check_env(var)?;
+    let mut cmd = aterm_uds::spawnfd::Command::new(program);
+    cmd.args(["auth", "status", "--json"])
+        .env(accounts::HOME_ENV, home)
+        .envs(pass);
+    if let Some(home) = var("HOME").filter(|v| !v.is_empty()) {
+        cmd.env("HOME", home);
+    }
+    capture_status_scoped(cmd, budget, scope)
+}
+
+/// Checks a selected login without admitting another subprocess after cancellation.
+pub(super) fn auth_status_of_scoped(
+    program: &std::ffi::OsStr,
+    login: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    scope: &super::account_work::Scope,
+) -> Result<Captured, String> {
+    if scope.cancelled() {
+        return Err(RenewalFailure::cancelled().to_string());
+    }
+    let pass = auth_check_env(var)?;
+    let mut cmd = aterm_uds::spawnfd::Command::new(program);
+    cmd.args(["auth", "status", "--json"])
+        .env(accounts::LOGIN_ENV, login)
+        .envs(pass);
+    capture_status_scoped(cmd, AUTH_CHECK_BUDGET, scope)
+}
+
+fn capture_status_scoped(
+    cmd: aterm_uds::spawnfd::Command,
+    budget: std::time::Duration,
+    scope: &super::account_work::Scope,
+) -> Result<Captured, String> {
+    if scope.cancelled() {
+        return Err(RenewalFailure::cancelled().to_string());
+    }
+    #[cfg(unix)]
+    {
+        match super::align::capture_bounded_owned_watching(cmd, budget, MAX_AUTH_STDOUT, |_| {
+            scope.cancelled()
+        })? {
+            super::align::Ended::Exited(ran) => Ok(ran),
+            super::align::Ended::Stopped => Err(RenewalFailure::cancelled().to_string()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        super::align::capture_bounded_owned(cmd, budget, MAX_AUTH_STDOUT)
+    }
 }
 
 /// TEST SEAM: one renewal's run of `program`, a stand-in for `claude`, in the staging home
@@ -8276,7 +8547,7 @@ fn capture_unattended_renewal_with(
         .and_then(|(path, _)| super::open_url::read_outcome(path));
     match ran {
         Ok(ran) => Ok((ran, met)),
-        Err(reason) => Err(RenewalFailure { reason, met }),
+        Err(reason) => Err(RenewalFailure::new(reason, met)),
     }
 }
 
@@ -11494,7 +11765,7 @@ fn write_combined_accounts_report(
             let _ = write!(
                 out,
                 "{}",
-                super::account_catalog::text(catalog, cli, roster)
+                super::account_catalog::text_here(catalog, cli, roster)
             );
         }
     }
@@ -13416,6 +13687,9 @@ fn renew_one_observed(
     observation: &mut Option<RenewalObservation>,
 ) -> Renewal {
     *observation = None;
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     let row = policy.row;
     let label = row.label.as_str();
     if !signin.names(Cli::Claude, label) {
@@ -13472,6 +13746,10 @@ fn renew_one_observed(
         say(err, "the staging directory's name is not UTF-8");
         return Renewal::Failed;
     };
+    if host.work_cancelled() {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     let began = match guard.begin(store, policy, &staging_text, env.now) {
         Ok(logins) => logins,
         Err(why) => {
@@ -13515,8 +13793,23 @@ fn renew_one_observed(
         say(err, &why);
         return Renewal::Deferred;
     }
+    if host.work_cancelled() {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     let exited = host.renew_outcome(&staging_text, email, browser);
+    if host.work_cancelled() || exited.as_ref().is_err_and(|failure| failure.is_cancelled()) {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     *observation = Some(RenewalObservation::from_outcome(&exited));
+    if exited
+        .as_ref()
+        .map_or_else(RenewalFailure::is_deferred, RenewalExit::is_deferred)
+    {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     let now = host.now().max(env.now);
     if let Err(why) = guard.check_policy(store, policy, now) {
         say(
@@ -13562,6 +13855,10 @@ fn renew_one_observed(
         );
         return Renewal::AuthFailed;
     }
+    if host.work_cancelled() {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     let facts = match host.status_in_home(&staging_text) {
         Ok(got) => status_facts(&got, row.expected_identity_email().unwrap_or(email))
             .map(|facts| (facts, got.code))
@@ -13573,6 +13870,10 @@ fn renew_one_observed(
             }),
         Err(why) => Err(super::one_line(&why, 160)),
     };
+    if host.work_cancelled() {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
     let (facts, status_code) = match facts {
         Ok(facts) => facts,
         Err(why) => {
@@ -13598,6 +13899,9 @@ fn renew_one_observed(
             &mut None,
             policy,
             |_, logins| {
+                if host.work_cancelled() {
+                    return Err(RenewalFailure::cancelled().to_string());
+                }
                 guard.check(row)?;
                 Ok(accounts::note_wrong_account(logins, label, now))
             },
@@ -13657,12 +13961,21 @@ fn renew_one_observed(
         );
         return Renewal::Deferred;
     }
+    if host.work_cancelled() {
+        discard_staging(&staging, err);
+        return Renewal::Deferred;
+    }
+    let mut cancelled_before_checkpoint = false;
     let done = store.transact_renewal_within(
         &accounts::LOCK_LADDER,
         now,
         &mut None,
         policy,
         |state, logins| {
+            if host.work_cancelled() {
+                cancelled_before_checkpoint = true;
+                return Err(RenewalFailure::cancelled().to_string());
+            }
             if !accounts::login_made(&staging) {
                 return Err("staged Claude login disappeared before publication".into());
             }
@@ -13672,6 +13985,10 @@ fn renew_one_observed(
             );
             if observed.email_matches == Some(false) {
                 return Err("staged Claude login contradicts its completed status check".into());
+            }
+            if host.work_cancelled() {
+                cancelled_before_checkpoint = true;
+                return Err(RenewalFailure::cancelled().to_string());
             }
             guard.publish(logins, row, observed.principal, now)?;
             accounts::write_renewal_checkpoint(
@@ -13715,6 +14032,10 @@ fn renew_one_observed(
             Renewal::Renewed
         }
         Err(why) => {
+            if cancelled_before_checkpoint {
+                discard_staging(&staging, err);
+                return Renewal::Deferred;
+            }
             say(
                 err,
                 &format!(
@@ -13727,7 +14048,7 @@ fn renew_one_observed(
             // A refused policy is distinct from a current policy rejecting the
             // staged identity. Do not label a stale or unreadable attempt a
             // provider failure, or hide a genuine credential contradiction.
-            if guard.check_policy(store, policy, now).is_ok() {
+            if !host.work_cancelled() && guard.check_policy(store, policy, now).is_ok() {
                 Renewal::Failed
             } else {
                 Renewal::Deferred
@@ -15069,6 +15390,9 @@ fn bind_signed_in(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Renewal {
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     let label = row.label.as_str();
     let c = cli.connector();
     let say = |err: &mut dyn Write, what: &str| {
@@ -15191,6 +15515,9 @@ fn bind_signed_in(
         now,
         &mut note,
         |raw, state, logins| {
+            if host.work_cancelled() {
+                return Err(RenewalFailure::cancelled().to_string());
+            }
             // Roster writers use this store lock. Recheck after the provider probe
             // and before creating any recoverable completion checkpoint.
             plan.require_workflow(raw, logins, label)?;
@@ -15258,6 +15585,9 @@ fn bind_signed_in(
                     row.expected_identity_email(),
                 )
                 .map_err(|why| why.to_string())?;
+            }
+            if host.work_cancelled() {
+                return Err(RenewalFailure::cancelled().to_string());
             }
             if !email.is_empty() {
                 let checkpoint = if cli == Cli::Agy {
@@ -15444,6 +15774,9 @@ pub(super) fn renew_one_for(
     err: &mut dyn Write,
 ) -> Renewal {
     use super::login_drive::Outcome;
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     let label = row.label.as_str();
     let c = cli.connector();
     let email = renewal_identity_email(cli, row).unwrap_or("");
@@ -15531,7 +15864,13 @@ pub(super) fn renew_one_for(
         sign_in_words(cli, label, plan.route, plan.hosts)
     );
     let _ = out.flush();
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     let drove = plan.drive(cli, host, row, store);
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     let now = host.now().max(floor);
     let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
     if let Err(why) = policy_unchanged() {
@@ -15619,7 +15958,11 @@ pub(super) fn renew_one_for(
                 return if matches!(other, Outcome::BotCheck(_)) {
                     Renewal::BotCheck
                 } else {
-                    Renewal::Failed
+                    if host.work_cancelled() {
+                        Renewal::Deferred
+                    } else {
+                        Renewal::Failed
+                    }
                 };
             }
             match person_step(cli, other) {
@@ -15656,6 +15999,9 @@ pub(super) fn renew_one_for(
             };
         }
     };
+    if host.work_cancelled() {
+        return Renewal::Deferred;
+    }
     bind_signed_in(
         cli,
         floor,
@@ -17372,9 +17718,11 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::Upgrade { sid, dry_run, json } => run_upgrade(env, sid, *dry_run, *json, out, err),
         Cmd::UpgradeOwner { sid, ask, json } => run_upgrade_owner(env, sid, *ask, *json, out, err),
         Cmd::UpgradeModels { set } => run_upgrade_models(env, set.as_deref(), out, err),
-        Cmd::Accounts(form) => run_accounts(form, env, &LiveAccounts, out, err),
-        Cmd::AccountsOf(of) => run_accounts_of(of, env, &LiveAccounts, out, err),
-        Cmd::AccountsAll { json } => run_accounts_all(*json, env, &LiveAccounts, out, err),
+        Cmd::Accounts(form) => run_accounts(form, env, &LiveAccounts::default(), out, err),
+        Cmd::AccountsOf(of) => run_accounts_of(of, env, &LiveAccounts::default(), out, err),
+        Cmd::AccountsAll { json } => {
+            run_accounts_all(*json, env, &LiveAccounts::default(), out, err)
+        }
         Cmd::AccountsSourceTable { cli, json } => {
             run_accounts_source_table(*cli, env, *json, out, err)
         }

@@ -7042,6 +7042,85 @@ struct Rediscovery {
     sheet_said: Vec<SheetConflict>,
 }
 
+enum SyncScheduleChange {
+    Read(Option<Instant>, Option<Instant>),
+    Default(Option<(String, Instant)>, Option<(String, Instant)>),
+    Key(Option<LocalSourceAttempt>, Option<LocalSourceAttempt>),
+}
+
+/// Only observations installed by this operation can be restored on cancellation.
+struct SyncScheduleClaim<'a> {
+    rediscovery: &'a std::sync::Mutex<Rediscovery>,
+    scope: Option<&'a super::account_work::Scope>,
+    changes: Vec<SyncScheduleChange>,
+}
+
+impl<'a> SyncScheduleClaim<'a> {
+    fn new(
+        rediscovery: &'a std::sync::Mutex<Rediscovery>,
+        scope: Option<&'a super::account_work::Scope>,
+    ) -> Self {
+        Self {
+            rediscovery,
+            scope,
+            changes: Vec::new(),
+        }
+    }
+}
+
+impl Drop for SyncScheduleClaim<'_> {
+    fn drop(&mut self) {
+        if !self
+            .scope
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
+        let mut held = self
+            .rediscovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for change in self.changes.drain(..).rev() {
+            match change {
+                SyncScheduleChange::Read(before, own) if held.read_at == own => {
+                    held.read_at = before
+                }
+                SyncScheduleChange::Default(before, own) if held.synced_for == own => {
+                    held.synced_for = before
+                }
+                SyncScheduleChange::Key(before, own) if held.key_attempt == own => {
+                    held.key_attempt = before
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+struct SyncCooldownClaim<'a> {
+    held: &'a std::sync::Mutex<Option<Instant>>,
+    scope: Option<&'a super::account_work::Scope>,
+    before: Option<Instant>,
+    own: Instant,
+}
+
+impl Drop for SyncCooldownClaim<'_> {
+    fn drop(&mut self) {
+        if self
+            .scope
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            let mut held = self
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *held == Some(self.own) {
+                *held = self.before;
+            }
+        }
+    }
+}
+
 static REDISCOVERY: std::sync::Mutex<Rediscovery> = std::sync::Mutex::new(Rediscovery {
     read_at: None,
     synced_for: None,
@@ -7099,7 +7178,10 @@ fn note_sync_result(
 
 /// Whether [`REDISCOVER_EVERY`] has passed since the upkeep last read this machine's logins and
 /// transcripts for new accounts; when it has, that read is counted from now.
-fn rediscover_due(rediscovery: &std::sync::Mutex<Rediscovery>) -> bool {
+fn rediscover_due(
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+    claim: &mut SyncScheduleClaim<'_>,
+) -> bool {
     let mut held = rediscovery
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7109,7 +7191,11 @@ fn rediscover_due(rediscovery: &std::sync::Mutex<Rediscovery>) -> bool {
     {
         return false;
     }
+    let before = held.read_at;
     held.read_at = Some(Instant::now());
+    claim
+        .changes
+        .push(SyncScheduleChange::Read(before, held.read_at));
     true
 }
 
@@ -7133,6 +7219,7 @@ fn default_login_unlisted(
     (roster_path, config): (&Path, &Path),
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
+    claim: Option<&mut SyncScheduleClaim<'_>>,
 ) -> bool {
     if configured_source(Some(config), Some(roster_path)).is_none()
         && !lab_chosen(Cli::Claude, roster_path, config)
@@ -7163,7 +7250,13 @@ fn default_login_unlisted(
     }) {
         return false;
     }
+    let before = held.synced_for.clone();
     held.synced_for = Some((email, Instant::now()));
+    if let Some(claim) = claim {
+        claim
+            .changes
+            .push(SyncScheduleChange::Default(before, held.synced_for.clone()));
+    }
     true
 }
 
@@ -7215,8 +7308,9 @@ pub enum Upkept {
 }
 
 struct UpkeepEffects<'a> {
+    scope: Option<super::account_work::Scope>,
     fetch: &'a Fetch<'a>,
-    spawn_renewal: &'a SpawnRenewal,
+    spawn_renewal: &'a SpawnRenewal<'a>,
     sync_cooldown: &'a std::sync::Mutex<Option<Instant>>,
     /// When the upkeep last caught its roster up with this machine's own logins
     /// ([`rediscover_due`], [`default_login_unlisted`]).
@@ -7225,13 +7319,13 @@ struct UpkeepEffects<'a> {
     /// Whether a headless-capable browser is installed for `home` ([`browser_installed`]).
     find_browser: &'a (dyn Fn(&Path) -> bool + Sync),
     /// One bounded `aterm secrets sync` for `home` ([`run_vault_sync`]).
-    vault_sync: fn(&Path) -> super::sign_in_ladder::Vault,
+    vault_sync: fn(&Path, Option<&super::account_work::Scope>) -> super::sign_in_ladder::Vault,
     /// Where that sync, and the default login's one check ([`Self::default_check`]), run, off
     /// the caller's thread ([`spawn_vault_thread`]).
-    spawn_vault: &'a SpawnRenewal,
+    spawn_vault: &'a SpawnRenewal<'a>,
     /// One read-only check of this machine's own login, the default home's
     /// ([`default_login_check_live`]).
-    default_check: fn(&Path) -> super::cli::LoginCheck,
+    default_check: fn(&Path, Option<&super::account_work::Scope>) -> super::cli::LoginCheck,
     /// What the configured mailbox offers a row's sign-in ([`ladder_mailbox_live`]).
     mailbox: &'a LadderMailbox,
     /// Where automatic sign-ins and source refresh refusals go ([`log_sign_in`]).
@@ -7242,7 +7336,7 @@ struct UpkeepEffects<'a> {
     shared: shared_renewal::Effects<'a>,
 }
 
-type SpawnRenewal = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync;
+type SpawnRenewal<'a> = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync + 'a;
 
 /// [`UpkeepEffects::mailbox`]: what the configured mailbox offers `row` for `home` and `store`,
 /// and its masked login where it has one ([`mailbox_offer`]).
@@ -7282,7 +7376,10 @@ const VAULT_SYNC_BUDGET: Duration = Duration::from_secs(45);
 /// The live [`UpkeepEffects::vault_sync`]: this program's own `secrets sync`, with no terminal,
 /// its stdin empty, at most [`VAULT_SYNC_BUDGET`] (the LAN vault's fetch, its verification and
 /// the files it delivers, `~/.secrets/ai-mailbox.toml` among them).
-fn run_vault_sync(home: &Path) -> super::sign_in_ladder::Vault {
+fn run_vault_sync(
+    home: &Path,
+    scope: Option<&super::account_work::Scope>,
+) -> super::sign_in_ladder::Vault {
     use super::sign_in_ladder::Vault;
     // Only the shipped executable (or a build of it) takes `secrets sync`: a test binary or
     // another host of this library would read the words as its own arguments.
@@ -7296,7 +7393,23 @@ fn run_vault_sync(home: &Path) -> super::sign_in_ladder::Vault {
     let mut cmd = aterm_uds::spawnfd::command(&exe);
     cmd.args(["secrets", "sync", "--diagnostic"])
         .env("HOME", home);
-    match super::align::capture_bounded(cmd, VAULT_SYNC_BUDGET, 16 * 1024) {
+    let ran = match scope {
+        #[cfg(unix)]
+        Some(scope) => {
+            if scope.cancelled() {
+                return Vault::Failed("account work was cancelled".to_owned());
+            }
+            super::align::capture_bounded_owned_watching(cmd, VAULT_SYNC_BUDGET, 16 * 1024, |_| {
+                scope.cancelled()
+            })
+            .and_then(|ended| match ended {
+                super::align::Ended::Exited(ran) => Ok(ran),
+                super::align::Ended::Stopped => Err("account work was cancelled".to_owned()),
+            })
+        }
+        _ => super::align::capture_bounded_owned(cmd, VAULT_SYNC_BUDGET, 16 * 1024),
+    };
+    match ran {
         Ok(ran) => Vault::of_sync(&String::from_utf8_lossy(&ran.stdout), ran.code),
         Err(why) => Vault::of_run_error(&why, VAULT_SYNC_BUDGET),
     }
@@ -7307,12 +7420,24 @@ fn run_vault_sync(home: &Path) -> super::sign_in_ladder::Vault {
 /// empty [`accounts::LOGIN_ENV`]: the default home), read as [`super::cli::login_check`] reads it.
 /// It only asks; it never signs in.
 fn default_login_check_live(home: &Path) -> super::cli::LoginCheck {
+    default_login_check_scoped(home, None)
+}
+
+fn default_login_check_scoped(
+    home: &Path,
+    scope: Option<&super::account_work::Scope>,
+) -> super::cli::LoginCheck {
     let program = resolve_claude_program(home);
-    super::cli::login_check(super::cli::auth_status_of(
-        program.as_os_str(),
-        "",
-        &|name| std::env::var_os(name),
-    ))
+    let got = match scope {
+        Some(scope) => super::cli::auth_status_of_scoped(
+            program.as_os_str(),
+            "",
+            &|name| std::env::var_os(name),
+            scope,
+        ),
+        None => super::cli::auth_status_of(program.as_os_str(), "", &|name| std::env::var_os(name)),
+    };
+    super::cli::login_check(got)
 }
 
 /// How many of the ledger's newest events [`default_login_heal_due`] reads for the default
@@ -7331,6 +7456,57 @@ struct DefaultHeal {
     /// The row the default login held before it moved onto `label`, where that row holds no
     /// login bound elsewhere: the sessions on record under it ran on the default login.
     was: Option<String>,
+}
+
+/// An unstarted or cancelled check must not suppress the next admitted check.
+struct DefaultCheckClaim {
+    guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    key: (String, i64),
+    completed: bool,
+}
+
+impl DefaultCheckClaim {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+struct VaultWorkClaim {
+    guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    context: super::sign_in_ladder::VaultContext,
+    completed: bool,
+}
+
+impl VaultWorkClaim {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for VaultWorkClaim {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ladder
+                .vault_cancelled(self.context);
+        }
+    }
+}
+
+impl Drop for DefaultCheckClaim {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut guard = self
+                .guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.default_checked.as_ref() == Some(&self.key) {
+                guard.default_checked = None;
+            }
+        }
+    }
 }
 
 /// Whether the default login's one check is due: the roster's default row is the account the
@@ -7475,6 +7651,13 @@ fn heal_default_login_in_upkeep(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return;
+    }
     let Ok(roster) = Roster::load(roster_path) else {
         return;
     };
@@ -7493,15 +7676,34 @@ fn heal_default_login_in_upkeep(
         }
         guard.default_checked = Some(key);
     }
+    let mut claim = DefaultCheckClaim {
+        guard: fx.renew_guard.clone(),
+        key: (heal.label.clone(), heal.signed_out_at),
+        completed: false,
+    };
     let (check, log, home, roster_path) = (
         fx.default_check,
         std::sync::Arc::clone(&fx.log),
         home.to_path_buf(),
         roster_path.to_path_buf(),
     );
+    let scope = fx.scope.clone();
     let _ = (fx.spawn_vault)(Box::new(move || {
-        let found = check(&home);
+        if scope
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
+        let found = check(&home, scope.as_ref());
+        if scope
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
         let healed = apply_default_heal(&store, &home, &roster_path, &heal, &found, now);
+        claim.complete();
         log(&default_heal_line(&heal, &found, healed));
     }));
 }
@@ -7637,12 +7839,86 @@ pub fn upkeep_live(
     now: i64,
     step: UpkeepStep,
 ) -> Upkept {
-    upkeep(home, state_dir, (roster_path, now, step), &live_effects())
+    let lifetime = super::account_work::Lifetime::default();
+    let scope = lifetime.enter().expect("new account lifetime admits work");
+    upkeep_live_scoped(scope, home, state_dir, roster_path, now, step)
+}
+
+/// Runs App-owned upkeep under its already admitted lifetime, including detached work.
+pub fn upkeep_live_scoped(
+    scope: super::account_work::Scope,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    step: UpkeepStep,
+) -> Upkept {
+    if scope.cancelled() {
+        return Upkept::Off;
+    }
+    with_live_scope(scope, |fx| {
+        upkeep(home, state_dir, (roster_path, now, step), fx)
+    })
+}
+
+fn with_live_scope<T>(
+    scope: super::account_work::Scope,
+    run: impl FnOnce(&UpkeepEffects<'_>) -> T,
+) -> T {
+    with_scope_effects(scope, live_effects(), run)
+}
+
+fn with_scope_effects<T>(
+    scope: super::account_work::Scope,
+    fx: UpkeepEffects<'_>,
+    run: impl FnOnce(&UpkeepEffects<'_>) -> T,
+) -> T {
+    let renewal_scope = scope.clone();
+    let vault_scope = scope.clone();
+    let renewal_spawn = fx.spawn_renewal;
+    let vault_spawn = fx.spawn_vault;
+    let fetch_source = fx.fetch;
+    let spawn_renewal = |work: Box<dyn FnOnce() + Send>| {
+        let work = Box::new(renewal_scope.clone().wrap(work));
+        if renewal_scope.cancelled() {
+            drop(work);
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        renewal_spawn(work)
+    };
+    let spawn_vault = |work: Box<dyn FnOnce() + Send>| {
+        let work = Box::new(vault_scope.clone().wrap(work));
+        if vault_scope.cancelled() {
+            drop(work);
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        vault_spawn(work)
+    };
+    let fetch_scope = scope.clone();
+    let fetch = |env: &Env, source: &str| {
+        if fetch_scope.cancelled() {
+            return Err("account work was cancelled".to_owned());
+        }
+        let result = fetch_source(env, source);
+        if fetch_scope.cancelled() {
+            return Err("account work was cancelled".to_owned());
+        }
+        result
+    };
+    let fx = UpkeepEffects {
+        scope: Some(scope),
+        spawn_renewal: &spawn_renewal,
+        spawn_vault: &spawn_vault,
+        fetch: &fetch,
+        ..fx
+    };
+    run(&fx)
 }
 
 /// The effects the live upkeep makes.
-fn live_effects() -> UpkeepEffects<'static> {
+fn live_effects<'a>() -> UpkeepEffects<'a> {
     UpkeepEffects {
+        scope: None,
         fetch: &fetch_source_text,
         spawn_renewal: &spawn_renewal_thread,
         sync_cooldown: &AUTO_SYNC_COOLDOWN,
@@ -7651,7 +7927,7 @@ fn live_effects() -> UpkeepEffects<'static> {
         find_browser: &browser_installed,
         vault_sync: run_vault_sync,
         spawn_vault: &spawn_vault_thread,
-        default_check: default_login_check_live,
+        default_check: default_login_check_scoped,
         mailbox: &ladder_mailbox_live,
         log: std::sync::Arc::new(log_sign_in),
         run_attempt: None,
@@ -7669,6 +7945,13 @@ fn upkeep(
     (roster_path, now, step): (&Path, i64, UpkeepStep),
     fx: &UpkeepEffects<'_>,
 ) -> Upkept {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Upkept::Off;
+    }
     let config = config_beside(roster_path);
     let Ok((policy, _)) = crate::supervise::config::SupervisorConfig::read_path(Some(&config))
     else {
@@ -7689,8 +7972,22 @@ fn upkeep(
     if step.renews() && harness_sign_ins_on(&config) {
         shared_renewal::adopt_first(home, state_dir, roster_path, now, fx);
     }
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Upkept::Off;
+    }
     let claude = upkeep_claude(home, state_dir, (roster_path, now, step), fx);
     upkeep_pools(home, state_dir, (roster_path, now, step), fx);
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return claude;
+    }
     if step.syncs() {
         log_sheet_conflicts(home, &config, fx);
     }
@@ -7724,13 +8021,35 @@ fn upkeep_claude(
     (roster_path, now, step): (&Path, i64, UpkeepStep),
     fx: &UpkeepEffects<'_>,
 ) -> Upkept {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Upkept::Off;
+    }
     let config = config_beside(roster_path);
     let syncs = step.syncs() && !accounts_sync_off(Some(&config));
+    let mut scheduling = SyncScheduleClaim::new(fx.rediscovery, fx.scope.as_ref());
     if syncs
-        && sync_called_for(home, state_dir, (roster_path, &config), now, fx.rediscovery)
+        && sync_called_for_recording(
+            home,
+            state_dir,
+            (roster_path, &config),
+            now,
+            fx.rediscovery,
+            &mut scheduling,
+        )
         && let Some((Err(why), true)) = periodic_sync(home, state_dir, (roster_path, now), fx)
     {
         (fx.log)(&format!("accounts sync: {why}"));
+    }
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Upkept::Off;
     }
     if step.syncs() {
         heal_default_login_in_upkeep(home, state_dir, roster_path, now, fx);
@@ -8082,6 +8401,24 @@ fn sync_called_for(
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
 ) -> bool {
+    sync_called_for_recording(
+        home,
+        state_dir,
+        (roster_path, config),
+        now,
+        rediscovery,
+        &mut SyncScheduleClaim::new(rediscovery, None),
+    )
+}
+
+fn sync_called_for_recording(
+    home: &Path,
+    state_dir: &Path,
+    (roster_path, config): (&Path, &Path),
+    now: i64,
+    rediscovery: &std::sync::Mutex<Rediscovery>,
+    claim: &mut SyncScheduleClaim<'_>,
+) -> bool {
     if accounts::Store::at(state_dir).sync_needs_recovery() {
         return true;
     }
@@ -8102,6 +8439,7 @@ fn sync_called_for(
             (roster_path, config),
             now,
             rediscovery,
+            Some(claim),
         );
     }
     let secrets = home.join(".secrets");
@@ -8109,12 +8447,16 @@ fn sync_called_for(
     // A mode change invalidates this process's observation. Returning to the same path
     // must not inherit the timer from a source which stopped being authoritative.
     let key_changed = if matches!(configured, Some(FleetSource::Key(_))) {
-        key_file_changed(home, state_dir, config, now, rediscovery)
+        key_file_changed(home, state_dir, config, now, rediscovery, Some(&mut *claim))
     } else {
-        rediscovery
+        let mut held = rediscovery
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .key_attempt = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(before) = held.key_attempt.take() {
+            claim
+                .changes
+                .push(SyncScheduleChange::Key(Some(before), None));
+        }
         false
     };
     let unconfigured_with_secrets = configured.is_none()
@@ -8142,9 +8484,16 @@ fn sync_called_for(
             state_dir,
             roster_path,
             now,
-            rediscover_due(rediscovery),
+            rediscover_due(rediscovery, claim),
         )
-        || default_login_unlisted(home, state_dir, (roster_path, config), now, rediscovery)
+        || default_login_unlisted(
+            home,
+            state_dir,
+            (roster_path, config),
+            now,
+            rediscovery,
+            Some(claim),
+        )
         || key_changed
 }
 
@@ -8162,6 +8511,13 @@ fn periodic_sync(
     (roster_path, now): (&Path, i64),
     fx: &UpkeepEffects<'_>,
 ) -> Option<(Result<InitSynced, String>, bool)> {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return None;
+    }
     let inputs = sync_inputs(home, state_dir, roster_path, now);
     let recovering = accounts::Store::at(state_dir).sync_needs_recovery();
     if !recovering
@@ -8176,6 +8532,13 @@ fn periodic_sync(
         return None;
     }
     let synced = sync_accounts_for_init_with(home, state_dir, roster_path, now, || {}, fx.fetch);
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Some((synced, false));
+    }
     let news = note_sync_result(
         &mut fx
             .rediscovery
@@ -8282,6 +8645,7 @@ fn key_file_changed(
     config: &Path,
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
+    claim: Option<&mut SyncScheduleClaim<'_>>,
 ) -> bool {
     let path = key_source_file(&quiet_env(home, state_dir, config, now));
     let version = path.map(|path| {
@@ -8293,12 +8657,21 @@ fn key_file_changed(
     let mut held = rediscovery
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(version) = version {
+    let before = held.key_attempt.clone();
+    let changed = if let Some(version) = version {
         schedule_local_source(&mut held.key_attempt, version, Instant::now())
     } else {
         held.key_attempt = None;
         false
+    };
+    if let Some(claim) = claim
+        && held.key_attempt != before
+    {
+        claim
+            .changes
+            .push(SyncScheduleChange::Key(before, held.key_attempt.clone()));
     }
+    changed
 }
 
 /// The local file `[fleet] accounts_source` in `env`'s config names, where it names one.
@@ -8313,7 +8686,7 @@ fn key_source_file(env: &Env) -> Option<PathBuf> {
 
 type LocalSourceVersion = (PathBuf, Option<(std::time::SystemTime, u64)>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalSourceAttempt {
     version: LocalSourceVersion,
     at: Instant,
@@ -8384,10 +8757,17 @@ fn sync_if_missing(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return false;
+    }
     if roster_path.exists() {
         return true;
     }
-    {
+    let _cooldown = {
         let mut guard = fx
             .sync_cooldown
             .lock()
@@ -8395,8 +8775,16 @@ fn sync_if_missing(
         if guard.is_some_and(|last| last.elapsed() < Duration::from_secs(600)) {
             return false;
         }
-        *guard = Some(Instant::now());
-    }
+        let before = *guard;
+        let own = Instant::now();
+        *guard = Some(own);
+        SyncCooldownClaim {
+            held: fx.sync_cooldown,
+            scope: fx.scope.as_ref(),
+            before,
+            own,
+        }
+    };
     let env = Env {
         state: state_dir.to_path_buf(),
         aterm_state: state_dir
@@ -11342,6 +11730,13 @@ fn upkeep_pools(
     let config = config_beside(roster_path);
     let syncs = step.syncs() && !accounts_sync_off(Some(&config));
     for cli in OTHER_CLIS {
+        if fx
+            .scope
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
         let Some(path) = accounts::roster_beside_for(&config, cli) else {
             continue;
         };
@@ -11356,6 +11751,13 @@ fn upkeep_pools(
                     now,
                     (fx.fetch, &[]),
                 );
+                if fx
+                    .scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+                {
+                    return;
+                }
                 let read = by_default.filter(|_| default_sync_settled(&synced));
                 note_default_sync(fx.rediscovery, cli, read);
                 has_roster = path.is_file();
@@ -11505,6 +11907,13 @@ fn renew_pool_due(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return false;
+    }
     if let Some(pending) = resume_pending_pin_for(cli, home, state_dir, roster_path, now, fx) {
         return pending.progressed();
     }
@@ -11547,6 +11956,7 @@ fn renew_pool_due(
             fx.renew_guard,
             fx.spawn_renewal,
             None,
+            fx.scope.as_ref(),
         )
         .progressed()
         {
@@ -13234,6 +13644,31 @@ struct AutoRenewPermit {
     guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     wake_pending: Option<PathBuf>,
     key: String,
+    attempt_at: Instant,
+    before_attempt: Option<Instant>,
+    scope: Option<super::account_work::Scope>,
+    started: bool,
+    completed: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Scheduling evidence only: the admitted work recorded a definite result.
+#[derive(Clone)]
+struct RenewalCompletion(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl RenewalCompletion {
+    fn complete(&self) {
+        self.0.store(2, std::sync::atomic::Ordering::Release);
+    }
+
+    fn defer(&self) {
+        // A definite completed result is never downgraded by a later service refusal.
+        let _ = self.0.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
 }
 
 enum RenewalPreparation<'a> {
@@ -13242,6 +13677,13 @@ enum RenewalPreparation<'a> {
 }
 
 impl AutoRenewPermit {
+    fn start(&mut self) {
+        self.started = true;
+    }
+    fn follow_scope(&mut self, scope: Option<&super::account_work::Scope>) -> RenewalCompletion {
+        self.scope = scope.cloned();
+        RenewalCompletion(self.completed.clone())
+    }
     #[cfg(test)]
     fn claim(
         state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
@@ -13395,6 +13837,11 @@ impl AutoRenewPermit {
             }
             None => {}
         }
+        let before_attempt = if preparation_changed || mailbox_changed {
+            None
+        } else {
+            guard.last_attempt.get(label).copied()
+        };
         guard.in_flight = true;
         guard.last_attempt.insert(label.to_owned(), now);
         // The retry belongs to this new permit immediately. Until attribute()
@@ -13404,6 +13851,11 @@ impl AutoRenewPermit {
             guard: std::sync::Arc::clone(state),
             wake_pending: None,
             key: label.to_owned(),
+            attempt_at: now,
+            before_attempt,
+            scope: None,
+            started: false,
+            completed: std::sync::Arc::default(),
         })
     }
 
@@ -13447,10 +13899,31 @@ impl AutoRenewPermit {
 
 impl Drop for AutoRenewPermit {
     fn drop(&mut self) {
-        self.guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .in_flight = false;
+        {
+            let mut guard = self
+                .guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = self.completed.load(std::sync::atomic::Ordering::Acquire);
+            let interrupted = result == 1
+                || self
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| !self.started || (scope.cancelled() && result != 2));
+            // This permit still owns the sole in-flight slot. Restore only its unchanged
+            // scheduling claim before allowing another admission; credential journals stand.
+            if interrupted && guard.last_attempt.get(&self.key) == Some(&self.attempt_at) {
+                match self.before_attempt {
+                    Some(before) => {
+                        guard.last_attempt.insert(self.key.clone(), before);
+                    }
+                    None => {
+                        guard.last_attempt.remove(&self.key);
+                    }
+                }
+            }
+            guard.in_flight = false;
+        }
         // Publish the wake only after admission is available to the next upkeep.
         if let Some(state_dir) = &self.wake_pending {
             let now = crate::supervise::limit::unix_now();
@@ -13484,10 +13957,8 @@ struct AutoRenewWork<W> {
 
 impl<W: FnOnce()> AutoRenewWork<W> {
     fn run(self) {
-        let Self {
-            work,
-            permit: _permit,
-        } = self;
+        let Self { work, mut permit } = self;
+        permit.start();
         work();
     }
 }
@@ -13556,7 +14027,7 @@ fn resolve_opener_link(
         }
         return super::cli::opener_link(store, &HomeOpenerHost(custom_opener));
     }
-    super::cli::opener_link(store, &super::cli::LiveAccounts)
+    super::cli::opener_link(store, &super::cli::LiveAccounts::default())
 }
 
 pub(super) fn resolve_mailbox_dir(home: Option<&Path>, store: &accounts::Store) -> Option<PathBuf> {
@@ -15004,6 +15475,13 @@ fn auto_renew_next_account(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return false;
+    }
     if let Some(pending) = resume_pending_pin(home, state_dir, roster_path, now, fx) {
         return pending.progressed();
     }
@@ -15098,6 +15576,7 @@ fn auto_renew_next_account(
             fx.renew_guard,
             fx.spawn_renewal,
             Some(&ladder),
+            fx.scope.as_ref(),
         )
         .progressed()
         {
@@ -15143,14 +15622,26 @@ pub fn auto_renew_next_account_interactive_for(
     roster_path: &Path,
     now: i64,
 ) -> bool {
-    auto_renew_next_account_interactive_with(
-        cli,
-        home,
-        state_dir,
-        roster_path,
-        now,
-        &live_effects(),
-    )
+    let lifetime = super::account_work::Lifetime::default();
+    let scope = lifetime.enter().expect("new account lifetime admits work");
+    auto_renew_next_account_interactive_for_scoped(scope, cli, home, state_dir, roster_path, now)
+}
+
+/// Starts interactive App-owned work only under the caller's admitted scope.
+pub fn auto_renew_next_account_interactive_for_scoped(
+    scope: super::account_work::Scope,
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+) -> bool {
+    if scope.cancelled() {
+        return false;
+    }
+    with_live_scope(scope, |fx| {
+        auto_renew_next_account_interactive_with(cli, home, state_dir, roster_path, now, fx)
+    })
 }
 
 /// [`auto_renew_next_account_interactive_for`] making `fx`'s effects. The config beside the
@@ -15166,6 +15657,13 @@ fn auto_renew_next_account_interactive_with(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> bool {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return false;
+    }
     let config = config_beside(roster_path);
     if accounts_sync_off(Some(&config)) {
         return false;
@@ -15218,6 +15716,7 @@ fn auto_renew_next_account_interactive_with(
             fx.renew_guard,
             fx.spawn_renewal,
             None,
+            fx.scope.as_ref(),
         )
         .progressed()
         {
@@ -15374,6 +15873,13 @@ fn resume_pending_pin_for(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) -> Option<RenewalDispatch> {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Some(RenewalDispatch::Held);
+    }
     let store = accounts::Store::at_for(state_dir, cli, home);
     if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
         return Some(RenewalDispatch::store_refusal(&why));
@@ -15391,6 +15897,7 @@ fn resume_pending_pin_for(
         now,
         fx.renew_guard,
         fx.spawn_renewal,
+        fx.scope.as_ref(),
     );
     if result == RenewalDispatch::Failed {
         if let Err(why) = store.cancel_pin_request(&request, now) {
@@ -15428,16 +15935,37 @@ pub fn auto_renew_account_by_label_for(
     request: accounts::PinRequest,
     now: i64,
 ) -> RenewalDispatch {
-    renew_requested_pin_for(
-        cli,
-        home,
-        state_dir,
-        roster_path,
-        request,
-        now,
-        &AUTO_RENEW_GUARD,
-        &spawn_renewal_thread,
-    )
+    let lifetime = super::account_work::Lifetime::default();
+    let scope = lifetime.enter().expect("new account lifetime admits work");
+    auto_renew_account_by_label_for_scoped(scope, cli, home, state_dir, roster_path, request, now)
+}
+
+/// Renews a saved App selection under the caller's admitted lifetime.
+pub fn auto_renew_account_by_label_for_scoped(
+    scope: super::account_work::Scope,
+    cli: Cli,
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::PinRequest,
+    now: i64,
+) -> RenewalDispatch {
+    if scope.cancelled() {
+        return RenewalDispatch::Held;
+    }
+    with_live_scope(scope, |fx| {
+        renew_requested_pin_for(
+            cli,
+            home,
+            state_dir,
+            roster_path,
+            request,
+            now,
+            fx.renew_guard,
+            fx.spawn_renewal,
+            fx.scope.as_ref(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -15448,7 +15976,7 @@ fn renew_requested_pin(
     request: accounts::PinRequest,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn_renewal: &SpawnRenewal,
+    spawn_renewal: &SpawnRenewal<'_>,
 ) -> RenewalDispatch {
     renew_requested_pin_for(
         Cli::Claude,
@@ -15459,6 +15987,7 @@ fn renew_requested_pin(
         now,
         renew_guard,
         spawn_renewal,
+        None,
     )
 }
 
@@ -15482,8 +16011,12 @@ fn renew_requested_pin_for(
     request: accounts::PinRequest,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn_renewal: &SpawnRenewal,
+    spawn_renewal: &SpawnRenewal<'_>,
+    scope: Option<&super::account_work::Scope>,
 ) -> RenewalDispatch {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return RenewalDispatch::Held;
+    }
     let store = accounts::Store::at_for(state_dir, cli, home);
     if let Err(why) = store.recover_sync_within(&accounts::LOCK_LADDER, roster_path) {
         return RenewalDispatch::store_refusal(&why);
@@ -15562,16 +16095,18 @@ fn renew_requested_pin_for(
         renew_guard,
         spawn_renewal,
         None,
+        scope,
     )
 }
 
 /// What the automatic ladder of [`spawn_row_renewal`] reaches with ([`UpkeepEffects`]' seams).
 struct LadderCtx<'a> {
+    scope: Option<super::account_work::Scope>,
     /// The roster whose current row must still admit an observation.
     roster_path: PathBuf,
     find_browser: &'a (dyn Fn(&Path) -> bool + Sync),
-    vault_sync: fn(&Path) -> super::sign_in_ladder::Vault,
-    spawn_vault: &'a SpawnRenewal,
+    vault_sync: fn(&Path, Option<&super::account_work::Scope>) -> super::sign_in_ladder::Vault,
+    spawn_vault: &'a SpawnRenewal<'a>,
     mailbox: &'a LadderMailbox,
     log: SignInLog,
     run_attempt: Option<RunAttempt>,
@@ -15584,6 +16119,7 @@ impl<'a> LadderCtx<'a> {
     fn of(fx: &UpkeepEffects<'a>, roster_path: &Path) -> Self {
         let config = config_beside(roster_path);
         Self {
+            scope: fx.scope.clone(),
             roster_path: roster_path.to_path_buf(),
             find_browser: fx.find_browser,
             vault_sync: fx.vault_sync,
@@ -15852,6 +16388,13 @@ fn ladder_route_in_context(
     ctx: &LadderCtx<'_>,
     clock: &dyn Fn() -> Instant,
 ) -> LadderStep {
+    if ctx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return LadderStep::Held;
+    }
     use super::sign_in_ladder::{Vault, VaultTurn};
     fn lock(
         guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
@@ -15938,20 +16481,34 @@ fn ladder_route_in_context(
                     VaultTurn::Running | VaultTurn::Unavailable => return LadderStep::Held,
                     VaultTurn::Due => {
                         let guard = std::sync::Arc::clone(renew_guard);
+                        let mut claim = VaultWorkClaim {
+                            guard: guard.clone(),
+                            context: key,
+                            completed: false,
+                        };
                         let (sync, home_owned) = (ctx.vault_sync, home.to_path_buf());
-                        let started = (ctx.spawn_vault)(Box::new(move || {
-                            let seen = sync(&home_owned);
+                        let scope = ctx.scope.clone();
+                        let _ = (ctx.spawn_vault)(Box::new(move || {
+                            if scope
+                                .as_ref()
+                                .is_some_and(super::account_work::Scope::cancelled)
+                            {
+                                return;
+                            }
+                            let seen = sync(&home_owned, scope.as_ref());
+                            if scope
+                                .as_ref()
+                                .is_some_and(super::account_work::Scope::cancelled)
+                            {
+                                return;
+                            }
                             guard
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .ladder
                                 .vault_done(seen);
+                            claim.complete();
                         }));
-                        if started.is_err() {
-                            lock(renew_guard)
-                                .ladder
-                                .vault_done(Vault::Failed("it could not be started".to_owned()));
-                        }
                         let Some(seen) = lock(renew_guard).ladder.vault_result(key, at) else {
                             return LadderStep::Held;
                         };
@@ -16291,9 +16848,13 @@ fn spawn_row_renewal(
     (pin_request, allow_default_browser): (Option<accounts::PinRequest>, bool),
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn_renewal: &SpawnRenewal,
+    spawn_renewal: &SpawnRenewal<'_>,
     ladder: Option<&LadderCtx<'_>>,
+    scope: Option<&super::account_work::Scope>,
 ) -> RenewalDispatch {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return RenewalDispatch::Held;
+    }
     if !sign_in.names(cli, &next_row.label) {
         return RenewalDispatch::Failed;
     }
@@ -16310,6 +16871,7 @@ fn spawn_row_renewal(
             now,
             renew_guard,
             spawn_renewal,
+            scope,
         );
     }
     let store = accounts::Store::at(state_dir);
@@ -16506,7 +17068,11 @@ fn spawn_row_renewal(
     ) else {
         return RenewalDispatch::Held;
     };
+    let completion = permit.follow_scope(scope);
     // The start, under the lock this work holds until it ends: the spacing clock records it.
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return RenewalDispatch::Held;
+    }
     let signin = match sign_in.begin(cli, &next_label, signin, &store, now) {
         Ok(begun) => begun,
         Err(refused) => return spacing_refusal(&refused),
@@ -16527,6 +17093,8 @@ fn spawn_row_renewal(
     let run_seam = ladder.and_then(|ctx| ctx.run_attempt.clone());
     let shared_host = ladder.and_then(|ctx| ctx.shared.host.clone());
     let captured_logins = logins.clone();
+    let worker_scope = scope.cloned();
+    let scope = worker_scope.clone();
     let started = start_auto_renew(
         permit,
         move || {
@@ -16534,6 +17102,12 @@ fn spawn_row_renewal(
 
             let store = accounts::Store::at(&state_owned);
             let _signin = signin;
+            if scope
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return;
+            }
             if !queued_pin_admitted(
                 &store,
                 accounts::RenewalPolicy {
@@ -16586,13 +17160,13 @@ fn spawn_row_renewal(
                         .or_else(|| (name == "USER").then(|| std::ffi::OsString::from("aterm")))
                 };
                 let claude_prog = resolve_claude_program(&home_owned);
-                let ran = shared_renewal::sign_in(
+                let ran = shared_renewal::sign_in_with_inputs_scoped(
                     &home_owned,
                     &staging_text,
                     &next_email,
                     browser,
-                    force_headless,
-                    mailbox_dir.as_deref(),
+                    (force_headless, mailbox_dir.as_deref(), None),
+                    scope.as_ref(),
                 );
                 let ran = match ran {
                     Ok((ran, seen)) => {
@@ -16600,23 +17174,70 @@ fn spawn_row_renewal(
                         ran
                     }
                     Err(failure) => {
+                        if failure.is_deferred() {
+                            completion.defer();
+                            deferred.set(true);
+                            let _ = fs::remove_dir_all(&staging);
+                            return Renewal::Deferred;
+                        }
+                        if failure.is_cancelled() {
+                            deferred.set(true);
+                            let _ = fs::remove_dir_all(&staging);
+                            return Renewal::Deferred;
+                        }
                         cause.replace(Some(failure.to_string()));
                         met.replace(failure.met);
                         let _ = fs::remove_dir_all(&staging);
                         return Renewal::Failed;
                     }
                 };
+                if met
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(super::open_url::Met::is_service_unavailable)
+                {
+                    completion.defer();
+                    deferred.set(true);
+                    let _ = fs::remove_dir_all(&staging);
+                    return Renewal::Deferred;
+                }
                 if ran.code != Some(0) || !accounts::login_made(&staging) {
                     let _ = fs::remove_dir_all(&staging);
                     exited.set(ran.code);
                     return Renewal::authentication_failed(ran.code);
                 }
-                let Ok(status_got) = super::cli::status_in_home_within(
-                    claude_prog.as_os_str(),
-                    &staging_text,
-                    &env_var,
-                    super::cli::AUTH_CHECK_BUDGET,
-                ) else {
+                if scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+                {
+                    deferred.set(true);
+                    let _ = fs::remove_dir_all(&staging);
+                    return Renewal::Deferred;
+                }
+                let status_got = match scope.as_ref() {
+                    Some(scope) => super::cli::status_in_home_within_scoped(
+                        claude_prog.as_os_str(),
+                        &staging_text,
+                        &env_var,
+                        super::cli::AUTH_CHECK_BUDGET,
+                        scope,
+                    ),
+                    None => super::cli::status_in_home_within(
+                        claude_prog.as_os_str(),
+                        &staging_text,
+                        &env_var,
+                        super::cli::AUTH_CHECK_BUDGET,
+                    ),
+                };
+                if scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+                {
+                    deferred.set(true);
+                    let _ = fs::remove_dir_all(&staging);
+                    return Renewal::Deferred;
+                }
+                let Ok(status_got) = status_got else {
                     let _ = fs::remove_dir_all(&staging);
                     return Renewal::Failed;
                 };
@@ -16635,6 +17256,13 @@ fn spawn_row_renewal(
                 )
             };
             let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
+                if scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+                {
+                    deferred.set(true);
+                    return Renewal::Deferred;
+                }
                 shared_observation.replace(None);
                 let snapshot = &captured_logins;
                 let route = if force_headless && has_headless_profile {
@@ -16652,6 +17280,7 @@ fn spawn_row_renewal(
                         now,
                     );
                     let host = shared_renewal::BackgroundHost {
+                        scope: scope.as_ref(),
                         home: &home_owned,
                         mailbox: mailbox_dir.as_deref(),
                         headless: force_headless,
@@ -16679,6 +17308,25 @@ fn spawn_row_renewal(
                         browser,
                         authority,
                     );
+                    if result.renewal.published() {
+                        completion.complete();
+                    }
+                    if result
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.service_deferred())
+                    {
+                        completion.defer();
+                        deferred.set(true);
+                        return Renewal::Deferred;
+                    }
+                    if scope
+                        .as_ref()
+                        .is_some_and(super::account_work::Scope::cancelled)
+                    {
+                        deferred.set(true);
+                        return Renewal::Deferred;
+                    }
                     if result.renewal != Renewal::Renewed
                         && let Some(observation) = result.observation.as_ref()
                     {
@@ -16730,6 +17378,16 @@ fn spawn_row_renewal(
                         None => live_attempt(browser, force_headless, snapshot),
                     }
                 };
+                if result.published() {
+                    completion.complete();
+                }
+                if scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+                {
+                    deferred.set(true);
+                    return Renewal::Deferred;
+                }
                 if matches!(result, Renewal::Busy | Renewal::Deferred) {
                     deferred.set(true);
                     return result;
@@ -16817,7 +17475,11 @@ fn spawn_row_renewal(
                 }
                 Err(how(result))
             })();
-            if deferred.get() {
+            if deferred.get()
+                || scope
+                    .as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+            {
                 ladder_guard
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -16911,6 +17573,7 @@ fn spawn_row_renewal(
                     ));
                 }
             }
+            completion.complete();
             if let Some(request) = &pin_request {
                 if !renewed {
                     let _ = store.cancel_pin_request(request, now_done);
@@ -16929,6 +17592,12 @@ fn spawn_row_renewal(
             "account {label}: automatic sign-in started by its {route} route"
         ));
     }
+    if worker_scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return RenewalDispatch::Held;
+    }
     started.map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
 }
 
@@ -16944,7 +17613,7 @@ fn spawn_vendor_renewal(
     next_row: accounts::Row,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn_renewal: &SpawnRenewal,
+    spawn_renewal: &SpawnRenewal<'_>,
 ) -> RenewalDispatch {
     spawn_vendor_renewal_with(
         cli,
@@ -16961,6 +17630,7 @@ fn spawn_vendor_renewal(
         now,
         renew_guard,
         spawn_renewal,
+        None,
     )
 }
 
@@ -16993,8 +17663,12 @@ fn spawn_vendor_renewal_with(
     pin_request: Option<accounts::PinRequest>,
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn_renewal: &SpawnRenewal,
+    spawn_renewal: &SpawnRenewal<'_>,
+    scope: Option<&super::account_work::Scope>,
 ) -> RenewalDispatch {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return RenewalDispatch::Held;
+    }
     let store = accounts::Store::at_for(state_dir, cli, home);
     if let Err(why) = store.check_signin_state(now) {
         return RenewalDispatch::store_refusal(&why);
@@ -17082,6 +17756,9 @@ fn spawn_vendor_renewal_with(
     {
         return RenewalDispatch::Held;
     }
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        return RenewalDispatch::Held;
+    }
     // The spacing clock is read under the lock, which the worker takes again to start.
     match renewal_signin_admission(&store) {
         Ok(probe) => {
@@ -17111,15 +17788,24 @@ fn spawn_vendor_renewal_with(
     ) else {
         return RenewalDispatch::Held;
     };
+    let completion = permit.follow_scope(scope);
     permit.wake_pending = Some(state_dir.to_path_buf());
     permit.attribute_row(&store, cli, &next_row, &raw_workflow, now, logins);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let roster_path = roster_path.to_path_buf();
     let parker = std::sync::Arc::clone(renew_guard);
     let captured_logins = logins.clone();
-    start_auto_renew(
+    let worker_scope = scope.cloned();
+    let scope = worker_scope.clone();
+    let started = start_auto_renew(
         permit,
         move || {
+            if scope
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return;
+            }
             if !queued_pin_admitted(
                 &store,
                 accounts::RenewalPolicy {
@@ -17137,10 +17823,14 @@ fn spawn_vendor_renewal_with(
             let renewal = {
                 let _activity =
                     LoginActivityGuard::begin_row(&parker, &store, cli, &next_row, None);
+                let host = scope.clone().map_or_else(
+                    super::cli::LiveAccounts::default,
+                    super::cli::LiveAccounts::with_work,
+                );
                 super::cli::renew_one_for(
                     cli,
                     now,
-                    &super::cli::LiveAccounts,
+                    &host,
                     &store,
                     (&next_row, &roster_path, &captured_logins),
                     (own_dir.as_deref(), sign_in),
@@ -17148,6 +17838,15 @@ fn spawn_vendor_renewal_with(
                     &mut io::sink(),
                 )
             };
+            if renewal.published() {
+                completion.complete();
+            }
+            if scope
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return;
+            }
             note_vendor_renewal_end(
                 &parker,
                 &publication_claims,
@@ -17157,6 +17856,7 @@ fn spawn_vendor_renewal_with(
                 (&roster_path, &raw_workflow, &captured_logins),
                 renewal,
             );
+            completion.complete();
             if let Some(request) = &pin_request {
                 let now_done = crate::supervise::limit::unix_now().max(now);
                 match renewal {
@@ -17176,8 +17876,14 @@ fn spawn_vendor_renewal_with(
             }
         },
         spawn_renewal,
-    )
-    .map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
+    );
+    if worker_scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return RenewalDispatch::Held;
+    }
+    started.map_or(RenewalDispatch::Failed, |()| RenewalDispatch::Started)
 }
 
 /// Run `aterm harness accounts serve [--bind <addr:port>] [<source>] [--machine <mN>]`.
@@ -17326,7 +18032,7 @@ pub fn run_accounts_serve(
                 let reported = super::cli::run_accounts(
                     &super::cli::AccountsCmd::Report { json: true },
                     &fresh_env,
-                    &super::cli::LiveAccounts,
+                    &super::cli::LiveAccounts::default(),
                     &mut report_out,
                     &mut report_err,
                 );
@@ -17383,7 +18089,7 @@ pub fn run_accounts_serve(
                 let used = super::cli::run_accounts(
                     &cmd,
                     &fresh_env,
-                    &super::cli::LiveAccounts,
+                    &super::cli::LiveAccounts::default(),
                     &mut use_out,
                     &mut use_err,
                 );
@@ -19922,14 +20628,17 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fetched: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fetch: Box<Fetch<'static>>,
-        spawn: Box<SpawnRenewal>,
+        spawn: Box<SpawnRenewal<'static>>,
         cooldown: std::sync::Mutex<Option<Instant>>,
         rediscovery: std::sync::Mutex<Rediscovery>,
         guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
         /// Whether a headless browser is installed: none unless a test says so.
         browser: Box<dyn Fn(&Path) -> bool + Sync>,
         /// The vault's sync: this machine is in none unless a test says so.
-        vault_sync: fn(&Path) -> super::super::sign_in_ladder::Vault,
+        vault_sync: fn(
+            &Path,
+            Option<&crate::harness::account_work::Scope>,
+        ) -> super::super::sign_in_ladder::Vault,
         /// The automatic sign-ins' lines, as the window's `aterm.log` would have them.
         logged: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// One run of a route: none unless a test scripts one.
@@ -19963,7 +20672,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 rediscovery: std::sync::Mutex::new(Rediscovery::default()),
                 guard: std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default())),
                 browser: Box::new(|_: &Path| false),
-                vault_sync: |_: &Path| super::super::sign_in_ladder::Vault::NotMember,
+                vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
                 logged: std::sync::Arc::default(),
                 run_attempt: None,
             }
@@ -19972,6 +20681,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fn fx(&self) -> UpkeepEffects<'_> {
             let logged = std::sync::Arc::clone(&self.logged);
             UpkeepEffects {
+                scope: None,
                 fetch: &*self.fetch,
                 spawn_renewal: &*self.spawn,
                 sync_cooldown: &self.cooldown,
@@ -19980,7 +20690,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 find_browser: &*self.browser,
                 vault_sync: self.vault_sync,
                 spawn_vault: &run_inline,
-                default_check: |_: &Path| {
+                default_check: |_: &Path, _scope| {
                     crate::harness::cli::LoginCheck::CouldNotRun(String::new())
                 },
                 mailbox: &ladder_mailbox_files,
@@ -21743,15 +22453,18 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         };
         let cooldown = Mutex::new(None);
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
             find_browser: &|_: &Path| false,
-            vault_sync: |_: &Path| super::super::sign_in_ladder::Vault::NotMember,
+            vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_work| Ok(()),
-            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            default_check: |_: &Path, _scope| {
+                crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+            },
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
@@ -21850,6 +22563,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 &guard,
                 &spawn,
                 None,
+                None,
             ),
             RenewalDispatch::Held,
             "ordinary interactive rotation still observes the per-label cooldown"
@@ -21858,6 +22572,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let refusal =
             |_work: Box<dyn FnOnce() + Send>| Err(io::Error::other("injected spawn refusal"));
         let refused_fx = UpkeepEffects {
+            scope: None,
             spawn_renewal: &refusal,
             ..fx
         };
@@ -22260,7 +22975,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 label: "m27".to_owned(),
             },
             &env,
-            &super::super::cli::LiveAccounts,
+            &super::super::cli::LiveAccounts::default(),
             &mut out,
             &mut err,
         );
@@ -22314,7 +23029,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 on: None,
             },
             &env,
-            &super::super::cli::LiveAccounts,
+            &super::super::cli::LiveAccounts::default(),
             &mut out,
             &mut err,
         );
@@ -23867,6 +24582,99 @@ totp = "JBSWY3DPEHPK3PXP"
         (w, row)
     }
 
+    #[test]
+    fn vault_work_claims_retire_without_penalizing_unstarted_or_cancelled_work() {
+        use super::super::sign_in_ladder::{Vault, VaultTurn};
+        for mode in 0..6 {
+            let (w, row) = vault_ladder_fixture();
+            let witness = Witness::answering("");
+            let VaultInput::Read(key) = vault_input(&w.home) else {
+                panic!("fixture source is readable")
+            };
+            let queued = std::sync::Mutex::new(Vec::<Box<dyn FnOnce() + Send>>::new());
+            let spawn = |work: Box<dyn FnOnce() + Send>| match mode {
+                1 => {
+                    drop(work);
+                    Err(io::Error::other("synthetic refusal"))
+                }
+                3 | 4 => {
+                    work();
+                    Ok(())
+                }
+                _ => {
+                    queued.lock().unwrap().push(work);
+                    Ok(())
+                }
+            };
+            let mut fx = witness.fx();
+            fx.spawn_vault = &spawn;
+            fx.vault_sync = if mode == 3 {
+                |_, _| panic!("synthetic vault unwind")
+            } else {
+                |_, scope| {
+                    assert!(scope.is_some());
+                    Vault::Unchanged(83)
+                }
+            };
+            let lifetime = crate::harness::account_work::Lifetime::default();
+            let scope = lifetime.enter().unwrap();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_scope_effects(scope, fx, |fx| {
+                    let ctx = LadderCtx::of(fx, &w.roster());
+                    ladder_route(
+                        &w.home,
+                        &accounts::Store::at(&w.state),
+                        &row,
+                        UPKEEP_NOW,
+                        &witness.guard,
+                        &ctx,
+                    )
+                })
+            }));
+            assert_eq!(ran.is_err(), mode == 3);
+            let pause = lifetime.pause().unwrap();
+            if matches!(mode, 0 | 2 | 5) {
+                assert_eq!(queued.lock().unwrap().len(), 1);
+                assert_eq!(
+                    witness
+                        .guard
+                        .lock()
+                        .unwrap()
+                        .ladder
+                        .vault_turn(Some(key), Instant::now()),
+                    VaultTurn::Running
+                );
+            }
+            let other = [42; 32];
+            if mode == 5 {
+                let mut guard = witness.guard.lock().unwrap();
+                guard.ladder.vault_cancelled(key);
+                assert_eq!(
+                    guard.ladder.vault_turn(Some(other), Instant::now()),
+                    VaultTurn::Due
+                );
+            }
+            if mode == 2 {
+                queued.lock().unwrap().pop().unwrap()();
+            } else {
+                queued.lock().unwrap().clear();
+            }
+            let drained = pause.try_wait().expect("all actual work has retired");
+            let next = witness
+                .guard
+                .lock()
+                .unwrap()
+                .ladder
+                .vault_turn(Some(if mode == 5 { other } else { key }), Instant::now());
+            match mode {
+                4 => assert_eq!(next, VaultTurn::Seen(Vault::Unchanged(83))),
+                5 => assert_eq!(next, VaultTurn::Running),
+                _ => assert_eq!(next, VaultTurn::Due),
+            }
+            assert!(drained.resume().is_ok());
+        }
+    }
+
     fn vault_ladder_pass(w: &World, witness: &Witness, row: &Row) -> LadderStep {
         let mut roster = Roster::load(&w.roster()).unwrap();
         if roster.row(&row.label) != Some(row) {
@@ -23916,7 +24724,7 @@ totp = "JBSWY3DPEHPK3PXP"
         let source = w.home.join(".config/aterm/secrets/source.toml");
         let stamp = fs::metadata(&source).unwrap().modified().unwrap();
         let mut witness = Witness {
-            vault_sync: old_source,
+            vault_sync: |home, _scope| old_source(home),
             ..Witness::answering("")
         };
         let pass = |witness: &Witness| vault_ladder_pass(&w, witness, &row);
@@ -23930,7 +24738,7 @@ totp = "JBSWY3DPEHPK3PXP"
             .unwrap()
             .set_modified(stamp)
             .unwrap();
-        witness.vault_sync = new_source;
+        witness.vault_sync = |home, _scope| new_source(home);
         assert!(matches!(pass(&witness), LadderStep::NoRoute));
         assert_eq!(
             NEW.load(Ordering::SeqCst),
@@ -23986,7 +24794,7 @@ totp = "JBSWY3DPEHPK3PXP"
             let (w, mut row) = vault_ladder_fixture();
             row.browser = Some("Profile 1".to_owned());
             let witness = Witness {
-                vault_sync: |_| Vault::Unchanged(83),
+                vault_sync: |_, _scope| Vault::Unchanged(83),
                 ..Witness::answering("")
             };
             assert!(matches!(
@@ -24075,7 +24883,7 @@ totp = "JBSWY3DPEHPK3PXP"
         fs::create_dir(&source).unwrap();
         assert_eq!(vault_input(&w.home), VaultInput::Unreadable);
         let witness = Witness {
-            vault_sync: |_| Vault::Unchanged(83),
+            vault_sync: |_, _scope| Vault::Unchanged(83),
             ..Witness::answering("")
         };
         assert!(matches!(
@@ -24124,7 +24932,7 @@ totp = "JBSWY3DPEHPK3PXP"
         }
         let (w, row) = vault_ladder_fixture();
         let mut witness = Witness {
-            vault_sync: changed,
+            vault_sync: |home, _scope| changed(home),
             ..Witness::answering("")
         };
         assert!(matches!(
@@ -24139,7 +24947,7 @@ totp = "JBSWY3DPEHPK3PXP"
                 .get("m2")
                 .is_none()
         );
-        witness.vault_sync = |_| Vault::Unchanged(83);
+        witness.vault_sync = |_, _scope| Vault::Unchanged(83);
         assert!(matches!(
             vault_ladder_pass(&w, &witness, &row),
             LadderStep::NoRoute
@@ -24164,7 +24972,7 @@ totp = "JBSWY3DPEHPK3PXP"
         use super::super::sign_in_ladder::Vault;
         let (w, row) = vault_ladder_fixture();
         let witness = Witness {
-            vault_sync: |_| Vault::Unchanged(83),
+            vault_sync: |_, _scope| Vault::Unchanged(83),
             ..Witness::answering("")
         };
         let guard = std::sync::Arc::clone(&witness.guard);
@@ -24213,7 +25021,7 @@ totp = "JBSWY3DPEHPK3PXP"
                 ..row.clone()
             };
             let witness = Witness {
-                vault_sync: synced,
+                vault_sync: |home, _scope| synced(home),
                 ..Witness::answering("")
             };
             assert!(matches!(
@@ -24328,7 +25136,7 @@ totp = "JBSWY3DPEHPK3PXP"
                 fs::write(w.home.join("bring-mailbox"), "").unwrap();
             }
             let witness = Witness {
-                vault_sync: applied,
+                vault_sync: |home, _scope| applied(home),
                 ..Witness::answering("")
             };
             assert!(matches!(
@@ -24386,7 +25194,7 @@ totp = "JBSWY3DPEHPK3PXP"
                 fs::write(w.home.join("bring-mailbox"), "").unwrap();
             }
             let witness = Witness {
-                vault_sync: partial,
+                vault_sync: |home, _scope| partial(home),
                 ..Witness::answering("")
             };
             let first = vault_ladder_pass(&w, &witness, &row);
@@ -24511,7 +25319,7 @@ totp = "JBSWY3DPEHPK3PXP"
         fs::write(secrets_config.join("source.toml"), "# a vault member\n").unwrap();
 
         let wit = Witness {
-            vault_sync: vault_brings_nothing,
+            vault_sync: |home, _scope| vault_brings_nothing(home),
             ..Witness::answering("")
         };
         let pass = |wit: &Witness| {
@@ -24546,7 +25354,7 @@ totp = "JBSWY3DPEHPK3PXP"
         );
 
         let wit = Witness {
-            vault_sync: vault_brings_a_mailbox,
+            vault_sync: |home, _scope| vault_brings_a_mailbox(home),
             ..Witness::answering("")
         };
         assert!(pass(&wit), "the mailbox the vault brought is a route");
@@ -24648,17 +25456,26 @@ totp = "JBSWY3DPEHPK3PXP"
             .unwrap();
             Vault::Applied(4)
         }
-        fn brings_an_http_mailbox(home: &Path) -> Vault {
+        fn brings_an_http_mailbox(
+            home: &Path,
+            _scope: Option<&crate::harness::account_work::Scope>,
+        ) -> Vault {
             brings(home, "http_url = \"http://127.0.0.1:9/inbox\"\n")
         }
-        fn brings_a_webmail_mailbox(home: &Path) -> Vault {
+        fn brings_a_webmail_mailbox(
+            home: &Path,
+            _scope: Option<&crate::harness::account_work::Scope>,
+        ) -> Vault {
             brings(
                 home,
                 "webmail_url = \"https://mail.example.test/inbox\"\n\
                  user = \"m29@example.test\"\npassword = \"p\"\n",
             )
         }
-        fn brings_a_webmail_mailbox_with_no_password(home: &Path) -> Vault {
+        fn brings_a_webmail_mailbox_with_no_password(
+            home: &Path,
+            _scope: Option<&crate::harness::account_work::Scope>,
+        ) -> Vault {
             brings(
                 home,
                 "webmail_url = \"https://mail.example.test/inbox\"\nuser = \"m29@example.test\"\n",
@@ -24666,14 +25483,18 @@ totp = "JBSWY3DPEHPK3PXP"
         }
         /// The lab's own answer to `mailbox:m29`: the `m29_password` entry, beside a webmail
         /// file that names no password.
-        fn brings_the_rows_password_beside_webmail(home: &Path) -> Vault {
-            brings_a_webmail_mailbox_with_no_password(home);
+        fn brings_the_rows_password_beside_webmail(
+            home: &Path,
+            _scope: Option<&crate::harness::account_work::Scope>,
+        ) -> Vault {
+            brings_a_webmail_mailbox_with_no_password(home, None);
             fs::write(home.join(".secrets/m29_password"), "p\n").unwrap();
             Vault::Applied(4)
         }
         for (brought, browser, routed, meets) in [
             (
-                brings_an_http_mailbox as fn(&Path) -> Vault,
+                brings_an_http_mailbox
+                    as fn(&Path, Option<&crate::harness::account_work::Scope>) -> Vault,
                 false,
                 true,
                 true,
@@ -24692,7 +25513,10 @@ totp = "JBSWY3DPEHPK3PXP"
     /// that is a route and `meets` whether it ends the ask.
     #[cfg(unix)]
     fn its_arrival_meets_the_need(
-        brought: fn(&Path) -> super::super::sign_in_ladder::Vault,
+        brought: fn(
+            &Path,
+            Option<&crate::harness::account_work::Scope>,
+        ) -> super::super::sign_in_ladder::Vault,
         browser: bool,
         routed: bool,
         meets: bool,
@@ -24758,7 +25582,7 @@ totp = "JBSWY3DPEHPK3PXP"
         };
 
         let wit = Witness {
-            vault_sync: nothing_new,
+            vault_sync: |home, _scope| nothing_new(home),
             ..Witness::answering("")
         };
         assert!(!pass(&wit), "no route");
@@ -24798,6 +25622,76 @@ totp = "JBSWY3DPEHPK3PXP"
         );
         if meets {
             assert!(need::exceptions(&need::peek(&paths).unwrap()).is_empty());
+        }
+    }
+    #[test]
+    fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {
+        for cancel_during_fetch in [false, true] {
+            let w = World::new();
+            w.write_config(&format!(
+                "[fleet]\naccounts_source = \"{LOOPBACK_SOURCE}\"\nmachine = \"m1\"\n"
+            ));
+            let wit = Witness::answering(ONE_ACCOUNT_CSV);
+            let prior_failure = cancel_during_fetch.then(|| FailedSync {
+                inputs: [99; 32],
+                at: Instant::now(),
+                why: "an earlier independent source failure".to_owned(),
+                holds: true,
+            });
+            wit.rediscovery.lock().unwrap().failed = prior_failure.clone();
+            let lifetime = crate::harness::account_work::Lifetime::default();
+            let scope = lifetime.enter().unwrap();
+            let paused = std::sync::Mutex::new(None);
+            let fetch = |env: &Env, source: &str| {
+                let result = (wit.fetch)(env, source);
+                if cancel_during_fetch {
+                    *paused.lock().unwrap() = lifetime.pause();
+                }
+                result
+            };
+            let mut fx = wit.fx();
+            fx.fetch = &fetch;
+            with_scope_effects(scope, fx, |fx| {
+                upkeep(
+                    &w.home,
+                    &w.state,
+                    (&w.roster(), UPKEEP_NOW, UpkeepStep::Sync),
+                    fx,
+                )
+            });
+            assert_eq!(wit.fetched(), vec![LOOPBACK_SOURCE.to_owned()]);
+            assert_eq!(w.roster().exists(), !cancel_during_fetch);
+            assert_eq!(wit.spawned(), 0);
+            assert_eq!(wit.rediscovery.lock().unwrap().failed, prior_failure);
+            if let Some(pause) = paused.into_inner().unwrap() {
+                assert!(
+                    pause
+                        .try_wait()
+                        .expect("all actual work has retired")
+                        .resume()
+                        .is_ok()
+                );
+                let scope = lifetime.enter().unwrap();
+                with_scope_effects(scope, wit.fx(), |fx| {
+                    upkeep(
+                        &w.home,
+                        &w.state,
+                        (&w.roster(), UPKEEP_NOW, UpkeepStep::Sync),
+                        fx,
+                    )
+                });
+                assert!(
+                    w.roster().exists(),
+                    "resumed work retries the same inputs immediately"
+                );
+                assert_eq!(
+                    wit.fetched(),
+                    vec![LOOPBACK_SOURCE.to_owned(), LOOPBACK_SOURCE.to_owned()]
+                );
+                // This missing-roster path publishes through sync_if_missing, not the
+                // periodic failure ledger. Cancellation must preserve unrelated history.
+                assert_eq!(wit.rediscovery.lock().unwrap().failed, prior_failure);
+            }
         }
     }
 }

@@ -223,8 +223,9 @@ impl Model {
         out
     }
     pub fn summary(&self) -> String {
+        let variants = self.variants();
         let mut kinds = BTreeMap::<&str, usize>::new();
-        for it in self.variants() {
+        for it in &variants {
             *kinds.entry(&it.kind).or_default() += 1
         }
         format!(
@@ -235,7 +236,7 @@ impl Model {
             self.requested.len(),
             self.seeds.len(),
             self.keep.len(),
-            self.variants().len()
+            variants.len()
         )
     }
 }
@@ -360,11 +361,13 @@ impl Harvest<'_> {
         segs: &[String],
         pos: usize,
     ) -> Result<Option<Vec<String>>> {
-        let where_ = format!(
-            "{}:{}",
-            self.file.display(),
-            self.source[..pos].bytes().filter(|b| *b == b'\n').count() + 1
-        );
+        let where_ = || {
+            format!(
+                "{}:{}",
+                self.file.display(),
+                self.source[..pos].bytes().filter(|b| *b == b'\n').count() + 1
+            )
+        };
         if segs.len() > 1
             && HAND_WRITTEN
                 .iter()
@@ -375,7 +378,8 @@ impl Harvest<'_> {
         }
         let Some(key) = self.up.resolve(base, segs) else {
             self.notes.push(format!(
-                "{where_}: {} names no upstream item",
+                "{}: {} names no upstream item",
+                where_(),
                 segs.join("::")
             ));
             return Ok(None);
@@ -384,7 +388,7 @@ impl Harvest<'_> {
             return Ok(Some(key.0));
         }
         if self.up.variants(&key, self.enabled).is_empty() {
-            return Err(format!("{where_}: {} is gated off", segs.join("::")));
+            return Err(format!("{}: {} is gated off", where_(), segs.join("::")));
         }
         self.seeds
             .entry(key)

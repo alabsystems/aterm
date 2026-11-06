@@ -36,6 +36,59 @@ fn native_preparation_id(key: impl Into<String>) -> super::super::native_keys::P
 }
 
 #[test]
+fn native_cancellation_after_preclaim_before_task_return_retires_the_retry_claim() {
+    use super::super::native_keys::{self, PreparationId, PreparationTask};
+    let bed = Bed::new(None);
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let paused = Arc::new(Mutex::new(None));
+    let cancelled = paused.clone();
+    let owner = lifetime.clone();
+    let discovery = Box::new(
+        move |_: &Path,
+              _: &Path,
+              _: &Path,
+              admit: &mut dyn FnMut(&PreparationId) -> bool|
+              -> Result<Option<PreparationTask>, String> {
+            assert!(admit(&native_preparation_id("native:prestart")));
+            *cancelled.lock().unwrap() = owner.pause();
+            Err("synthetic discovery error after preclaim".to_owned())
+        },
+    );
+    native_keys::with_test_discovery(discovery, || {
+        let log: SignInLog = Arc::new(|_| {});
+        assert!(!shared_renewal::prepare_native(
+            &bed.home,
+            &bed.state,
+            &config_beside(&bed.roster),
+            &guard,
+            &|_| panic!("discovery returned no task"),
+            &log,
+            Some(&scope)
+        ));
+    });
+    assert!(scope.cancelled());
+    assert!(!guard.lock().unwrap().in_flight);
+    assert!(
+        !guard
+            .lock()
+            .unwrap()
+            .last_attempt
+            .contains_key("native:prestart")
+    );
+    drop(scope);
+    let pause = paused.lock().unwrap().take().unwrap();
+    assert!(
+        pause
+            .try_wait()
+            .expect("preclaim retired without a worker")
+            .resume()
+            .is_ok()
+    );
+}
+
+#[test]
 fn native_admission_preserves_busy_candidates_and_skips_longer_guard_cooldowns() {
     use super::super::native_keys::{self, PreparationQueue, PreparationTask};
     let bed = Bed::new(None);
@@ -83,6 +136,7 @@ fn native_admission_preserves_busy_candidates_and_skips_longer_guard_cooldowns()
                 &guard,
                 &inline,
                 &log,
+                None,
             )
         };
         let held = AutoRenewPermit::claim(&guard, "other", start, false).unwrap();
@@ -132,6 +186,7 @@ fn native_tasks_need_the_exact_admitted_identity_before_they_can_run() {
                 &guard,
                 &inline,
                 &log,
+                None,
             ));
             assert!(!guard.lock().unwrap().in_flight);
         });
@@ -160,6 +215,7 @@ impl NativeRevisionFixture {
             &self.guard,
             &inline,
             &log,
+            None,
         );
     }
 
@@ -505,7 +561,7 @@ impl Bed {
     fn preparations(
         &self,
         discover: &shared_renewal::Discovery,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         guard: &Arc<Mutex<AutoRenewGuard>>,
     ) {
         self.with_preparations(discover, spawn, guard, |fx| {
@@ -516,19 +572,20 @@ impl Bed {
     fn with_preparations<T>(
         &self,
         discover: &shared_renewal::Discovery,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         guard: &Arc<Mutex<AutoRenewGuard>>,
         run: impl FnOnce(&UpkeepEffects<'_>) -> T,
     ) -> T {
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
             sync_cooldown: &Mutex::new(None),
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: guard,
             find_browser: &|_| false,
-            vault_sync: |_| super::super::sign_in_ladder::Vault::NotMember,
-            default_check: |_| super::super::cli::LoginCheck::CouldNotRun(String::new()),
+            vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
+            default_check: |_, _scope| super::super::cli::LoginCheck::CouldNotRun(String::new()),
             spawn_vault: &inline,
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(|_| {}),
@@ -626,7 +683,7 @@ impl Bed {
     fn upkeep(
         &self,
         factory: Option<&shared_renewal::Factory>,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         mailbox: bool,
     ) -> Upkept {
         let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
@@ -636,7 +693,7 @@ impl Bed {
     fn upkeep_observed(
         &self,
         factory: Option<&shared_renewal::Factory>,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         mailbox: bool,
         guard: &Arc<Mutex<AutoRenewGuard>>,
         log: SignInLog,
@@ -648,20 +705,21 @@ impl Bed {
         &self,
         factory: Option<&shared_renewal::Factory>,
         discover: Option<&shared_renewal::Discovery>,
-        spawn: &SpawnRenewal,
+        spawn: &SpawnRenewal<'_>,
         mailbox: bool,
         guard: &Arc<Mutex<AutoRenewGuard>>,
         log: SignInLog,
     ) -> Upkept {
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
             sync_cooldown: &Mutex::new(None),
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: guard,
             find_browser: &|_| false,
-            vault_sync: |_| super::super::sign_in_ladder::Vault::NotMember,
-            default_check: |_| super::super::cli::LoginCheck::CouldNotRun(String::new()),
+            vault_sync: |_, _scope| super::super::sign_in_ladder::Vault::NotMember,
+            default_check: |_, _scope| super::super::cli::LoginCheck::CouldNotRun(String::new()),
             spawn_vault: &inline,
             mailbox: &move |_, _, _| {
                 if mailbox {

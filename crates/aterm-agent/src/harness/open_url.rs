@@ -50,6 +50,8 @@ pub enum MetWord {
     BrowserStart,
     /// Browser initialization or a terminal DevTools operation failed.
     BrowserControl,
+    /// The authenticated issuer could not admit work; no bad login was proved.
+    ServiceUnavailable,
     /// Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
     BotCheck,
@@ -66,6 +68,7 @@ impl MetWord {
         match self {
             MetWord::BrowserStart => "browser-start",
             MetWord::BrowserControl => "browser-control",
+            MetWord::ServiceUnavailable => "service-unavailable",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
             MetWord::Stall => "stall",
@@ -135,6 +138,7 @@ impl Met {
         let word = [
             MetWord::BrowserStart,
             MetWord::BrowserControl,
+            MetWord::ServiceUnavailable,
             MetWord::BotCheck,
             MetWord::BlockPage,
             MetWord::Stall,
@@ -152,6 +156,12 @@ impl Met {
         matches!(self.word, MetWord::BotCheck | MetWord::BlockPage)
     }
 
+    /// Whether authenticated service admission was unavailable rather than a bad login.
+    #[must_use]
+    pub const fn is_service_unavailable(&self) -> bool {
+        matches!(self.word, MetWord::ServiceUnavailable)
+    }
+
     /// Its words in a renewal's record: a local browser failure or what the page met,
     /// naming Cloudflare where it was Cloudflare's.
     #[must_use]
@@ -162,6 +172,7 @@ impl Met {
             .map_or_else(String::new, |host| format!(" on {host}"));
         match self.word {
             MetWord::BrowserStart => "its headless browser could not start".to_owned(),
+            MetWord::ServiceUnavailable => "its fleet challenge service is unavailable".to_owned(),
             MetWord::BrowserControl => {
                 "it could not communicate with its headless browser".to_owned()
             }
@@ -180,7 +191,8 @@ impl Met {
     }
 }
 
-/// Atomically publishes a terminal failed opener's `met` at absolute `path` ([`OUTCOME_ENV`]).
+/// Atomically publishes a terminal opener's `met` at absolute `path` ([`OUTCOME_ENV`]).
+/// Service unavailability is explicitly deferred, never an authentication failure.
 /// A file that cannot be written is left, since the opener's exit still says it failed.
 pub fn write_outcome(path: &Path, met: &Met) {
     write_outcome_phase(path, met, OutcomePhase::Failed);
@@ -190,9 +202,18 @@ pub fn write_outcome(path: &Path, met: &Met) {
 enum OutcomePhase {
     Continuing,
     Failed,
+    Deferred,
 }
 
 fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
+    let phase = if met.is_service_unavailable() {
+        OutcomePhase::Deferred
+    } else {
+        phase
+    };
+    if phase == OutcomePhase::Deferred && !met.is_service_unavailable() {
+        return;
+    }
     if !path.is_absolute() {
         return;
     }
@@ -206,6 +227,7 @@ fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
             match phase {
                 OutcomePhase::Continuing => "continuing",
                 OutcomePhase::Failed => "failed",
+                OutcomePhase::Deferred => "deferred",
             },
             met.line()
         )
@@ -219,17 +241,80 @@ fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
     );
 }
 
+fn valid_oauth_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 16 * 1024
+        && !code.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+/// Publish one hosted OAuth code for the owning renewal, never in its log or ordinary outcome.
+pub(super) fn write_oauth_code(path: PathBuf, code: &str) -> Result<(), &'static str> {
+    if !path.is_absolute() || !valid_oauth_code(code) {
+        return Err("the hosted OAuth authorization code is invalid");
+    }
+    aterm_uds::atomic_file::write_checked(path.as_path(), code.as_bytes(), 0o600, || {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(std::io::Error::other("OAuth code is not a regular file")),
+        }
+    })
+    .map_err(|_| "the hosted OAuth authorization code could not be retained")
+}
+
+/// Take a hosted code once, removing it before the waiting CLI reads it from its own stdin.
+#[cfg(unix)]
+pub(super) fn take_oauth_code(path: PathBuf) -> Result<Option<String>, &'static str> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    use std::os::unix::fs::OpenOptionsExt as _;
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = match opts.open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("the hosted OAuth authorization code could not be read"),
+    };
+    if !file
+        .metadata()
+        .map_err(|_| "the hosted OAuth authorization code could not be checked")?
+        .is_file()
+    {
+        return Err("the hosted OAuth authorization code is not a regular file");
+    }
+    let mut code = String::new();
+    file.take(16 * 1024 + 1)
+        .read_to_string(&mut code)
+        .map_err(|_| "the hosted OAuth authorization code could not be read")?;
+    if !valid_oauth_code(&code) {
+        return Err("the hosted OAuth authorization code is invalid");
+    }
+    std::fs::remove_file(&path)
+        .map_err(|_| "the hosted OAuth authorization code could not be retired")?;
+    Ok(Some(code))
+}
+
 /// The [`Met`] the outcome file at `path` holds, read once (at most a few hundred bytes).
 #[must_use]
 pub fn read_outcome(path: &Path) -> Option<Met> {
     read_outcome_record(path).map(|(_, met)| met)
 }
 
-/// Only an explicit terminal opener failure can stop its still-running provider.
+/// The explicit per-attempt reason for stopping an incomplete provider capture.
 #[cfg(unix)]
-pub(super) fn read_failed_outcome(path: &Path) -> Option<Met> {
-    read_outcome_record(path)
-        .and_then(|(phase, met)| (phase == OutcomePhase::Failed).then_some(met))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TerminalOutcome {
+    Failed(Met),
+    Deferred(Met),
+}
+
+/// Only an explicit terminal record can stop its still-running provider.
+#[cfg(unix)]
+pub(super) fn read_terminal_outcome(path: &Path) -> Option<TerminalOutcome> {
+    match read_outcome_record(path)? {
+        (OutcomePhase::Failed, met) => Some(TerminalOutcome::Failed(met)),
+        (OutcomePhase::Deferred, met) => Some(TerminalOutcome::Deferred(met)),
+        (OutcomePhase::Continuing, _) => None,
+    }
 }
 
 fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Met)> {
@@ -258,10 +343,14 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Met)> {
     let phase = match lines.next()? {
         "phase=continuing" => OutcomePhase::Continuing,
         "phase=failed" => OutcomePhase::Failed,
+        "phase=deferred" => OutcomePhase::Deferred,
         _ => return None,
     };
     let line = lines.next()?.strip_prefix("met=")?;
     let met = Met::parse(line)?;
+    if (phase == OutcomePhase::Deferred) != met.is_service_unavailable() {
+        return None;
+    }
     if met.line() != line || !lines.next()?.is_empty() || lines.next().is_some() {
         return None;
     }
@@ -274,6 +363,12 @@ fn profile_fallback_outcome(
     met: Option<&Met>,
     open: impl FnOnce() -> (u8, Option<String>),
 ) -> (u8, Option<String>) {
+    if let Some(met) = met.filter(|met| met.is_service_unavailable()) {
+        if let Some(path) = path {
+            write_outcome_phase(path, met, OutcomePhase::Deferred);
+        }
+        return (1, Some("the fleet challenge service is unavailable".into()));
+    }
     if let (Some(path), Some(met)) = (path, met) {
         write_outcome_phase(path, met, OutcomePhase::Continuing);
     }
@@ -3799,19 +3894,19 @@ fn one_query_param(url: &str, key: &str) -> Option<String> {
     values.next().is_none().then_some(value)
 }
 
-/// The pages a sign-in flow may visit ([`MailboxFlow::pinned`]): Claude Code's authorize
-/// endpoints, each with the one origin a flow it starts stays on ([`CLAUDE_PIN`]), or a vendor
-/// route's pinned hosts, any `https` page on them (`connector::Route::hosts`).
+/// The pages a sign-in flow may visit ([`MailboxFlow::pinned`]): Claude Code's exact authorize
+/// endpoints, with navigation on either pinned Claude host ([`CLAUDE_PIN`]), or a vendor route's
+/// pinned hosts, any `https` page on them (`connector::Route::hosts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pin {
-    /// Each authorize endpoint and the one origin a flow it starts may visit.
+    /// Exact authorize endpoints and their provider origins.
     Endpoints(&'static [(&'static str, &'static str)]),
     /// Any `https` page on these hosts ([`super::login_drive::pinned`]).
     Hosts(&'static [&'static str]),
 }
 
-/// Claude Code's pin: claude.ai's and claude.com's authorize endpoints, each flow kept on the
-/// origin it started on.
+/// Claude Code's pin: exact claude.ai and claude.com authorize endpoints, with navigation on
+/// either host and only the started flow's loopback or hosted-code callback outside them.
 pub const CLAUDE_PIN: Pin = Pin::Endpoints(&[
     ("https://claude.ai/oauth/authorize", "https://claude.ai/"),
     (
@@ -3841,7 +3936,7 @@ fn hosted_url(url: &str, hosts: &[&str]) -> bool {
 /// The pages one flow may visit, fixed when it starts ([`MailboxFlow::pinned`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
-    /// One origin of [`CLAUDE_PIN`]'s.
+    /// One authorize origin of [`CLAUDE_PIN`]'s, with navigation allowed on both Claude hosts.
     Prefix(&'static str),
     /// A vendor route's hosts.
     Hosts(&'static [&'static str]),
@@ -3849,12 +3944,15 @@ enum Origin {
 
 /// Only the callback endpoint and state actually named by this authorize
 /// request can leave the provider origin.
+const HOSTED_CALLBACK: &str = "https://platform.claude.com/oauth/code/callback";
+
 pub(super) struct MailboxFlow {
     origin: Origin,
     bound: super::headless_oauth::FlowBound,
     callback_port: u16,
     callback_path: String,
     state: String,
+    hosted: bool,
 }
 
 impl MailboxFlow {
@@ -3880,8 +3978,13 @@ impl MailboxFlow {
             .map_err(|_| "the authorize URL has conflicting flow parameters")?;
         let callback = one_query_param(authorize_url, "redirect_uri")
             .ok_or("the authorize URL has no single local callback")?;
-        let (port, path, query) =
-            loopback_parts(&callback).ok_or("the authorize callback is not a local endpoint")?;
+        let hosted =
+            callback == HOSTED_CALLBACK && matches!(origin, Origin::Prefix("https://claude.com/"));
+        let (port, path, query) = if hosted {
+            (0, "", None)
+        } else {
+            loopback_parts(&callback).ok_or("the authorize callback is not a local endpoint")?
+        };
         if query.is_some() {
             return Err("the authorize callback must name an endpoint without a query");
         }
@@ -3892,28 +3995,46 @@ impl MailboxFlow {
             callback_path: path.to_owned(),
             state: one_query_param(authorize_url, "state")
                 .ok_or("the authorize URL has no single state")?,
+            hosted,
         })
     }
 
     pub(super) fn admits_provider_url(&self, url: &str) -> bool {
+        self.provider_refusal(url).is_none()
+    }
+
+    pub(super) fn provider_refusal(&self, url: &str) -> Option<String> {
+        if self.hosted && self.is_callback(url) {
+            return None;
+        }
         let hosts: &[&str] = match self.origin {
-            Origin::Prefix(prefix) => {
-                if !(url.starts_with(prefix) && provider_url(url)) {
-                    return false;
+            Origin::Prefix(_) => {
+                if !provider_url(url) {
+                    return Some("the page is not an https page on Claude's pinned hosts".into());
                 }
-                &["claude.ai", "claude.com"]
+                if self.hosted {
+                    &["claude.ai", "claude.com", "platform.claude.com"]
+                } else {
+                    &["claude.ai", "claude.com"]
+                }
             }
             Origin::Hosts(hosts) => {
                 if !hosted_url(url, hosts) {
-                    return false;
+                    return Some("the page is outside its vendor's pinned hosts".into());
                 }
                 hosts
             }
         };
-        self.bound.outside(url, hosts).is_none()
+        self.bound.outside(url, hosts)
     }
 
     pub(super) fn is_callback(&self, url: &str) -> bool {
+        if self.hosted {
+            return url.split('?').next() == Some(HOSTED_CALLBACK)
+                && one_query_param(url, "state").as_deref() == Some(self.state.as_str())
+                && one_query_param(url, "code").is_some()
+                && super::headless_oauth::query_values(url, "error").is_empty();
+        }
         loopback_parts(url).is_some_and(|(port, path, _)| {
             port == self.callback_port
                 && path == self.callback_path
@@ -3921,6 +4042,10 @@ impl MailboxFlow {
                 && one_query_param(url, "code").is_some()
                 && super::headless_oauth::query_values(url, "error").is_empty()
         })
+    }
+
+    pub(super) fn hosted(&self) -> bool {
+        self.hosted
     }
 }
 
@@ -3976,6 +4101,14 @@ fn follow_until_page_or_callback_until(
     for _ in 0..8 {
         deadline.left()?;
         if flow.is_callback(&current_url) {
+            if flow.hosted() {
+                let code = one_query_param(&current_url, "code")
+                    .ok_or("the hosted OAuth callback has no authorization code")?;
+                let outcome = std::env::var_os(OUTCOME_ENV)
+                    .ok_or("the hosted OAuth callback has no renewal input channel")?;
+                write_oauth_code(Path::new(&outcome).with_extension("code"), &code)?;
+                return Ok(StepOutcome::CallbackDelivered);
+            }
             let cb_resp = exchange("GET", &current_url, &mut BTreeMap::new(), None)?;
             deadline.left()?;
             if (200..400).contains(&cb_resp.status) {
@@ -4668,6 +4801,16 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                         return ExitCode::from(1);
                     }
                     continuing_met = super::headless_oauth::take_met();
+                    if let Some(met) = continuing_met
+                        .as_ref()
+                        .filter(|met| met.is_service_unavailable())
+                    {
+                        if let Some(path) = &outcome_path {
+                            write_outcome_phase(Path::new(path), met, OutcomePhase::Deferred);
+                        }
+                        eprintln!("{OPENER}: not authorized: {why}");
+                        return ExitCode::from(1);
+                    }
                 }
             }
         } else if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {

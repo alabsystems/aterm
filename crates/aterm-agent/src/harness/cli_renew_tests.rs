@@ -161,6 +161,8 @@ fn cached_profile_only(env: &Env) {
 }
 
 struct RenewHost {
+    service_unavailable: bool,
+    work: Option<crate::harness::account_work::Scope>,
     tty: bool,
     ssh_session: bool,
     exe: Option<PathBuf>,
@@ -183,6 +185,8 @@ struct RenewHost {
 impl RenewHost {
     fn new() -> RenewHost {
         RenewHost {
+            service_unavailable: false,
+            work: None,
             tty: true,
             ssh_session: false,
             exe: Some(std::env::current_exe().expect("the test executable")),
@@ -220,6 +224,25 @@ fn status_for(email: Option<&str>) -> Captured {
 }
 
 impl AccountsHost for RenewHost {
+    fn renew_outcome(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<RenewalExit, RenewalFailure> {
+        let code = self.renew_flow(home, email, browser)?;
+        if self.service_unavailable {
+            Err(RenewalFailure::deferred())
+        } else {
+            Ok(code.into())
+        }
+    }
+    fn work_cancelled(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(crate::harness::account_work::Scope::cancelled)
+    }
+
     fn stdin_is_terminal(&self) -> bool {
         self.tty
     }
@@ -2127,6 +2150,23 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
 
 #[cfg(unix)]
 #[test]
+fn an_unattended_renewal_injects_a_hosted_code_into_the_provider_stdin() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let program = tmp.path().join("provider");
+    aterm_tempfile::stand_in(
+        &program,
+        "#!/bin/sh\nprintf secret > \"$ATERM_OPEN_URL_OUTCOME.code\"\nread answer\nprintf '%s' \"$answer\"\n",
+    )
+    .unwrap();
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.env("PATH", "/usr/bin:/bin");
+    let (ran, _) = capture_unattended_renewal(cmd, std::time::Duration::from_secs(60)).unwrap();
+    assert_eq!(ran.code, Some(0));
+    assert_eq!(ran.stdout, b"secret");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
     use std::io::Write as _;
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -2608,4 +2648,335 @@ fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identit
             ));
         }
     }
+}
+
+#[test]
+fn closing_automatic_work_between_provider_and_status_defers_without_adoption() {
+    for close_at_status in [false, true] {
+        let (_tmp, env) = renew_env("renew-work-cancel");
+        let before = logins_of(&env).get("work-2").cloned();
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let mut host = RenewHost::new();
+        host.work = Some(lifetime.enter().unwrap());
+        let close = Box::new(move || {
+            drop(lifetime.pause().unwrap());
+        });
+        if close_at_status {
+            host.during_status = Some(close);
+        } else {
+            host.during_flow = Some(close);
+        }
+        let result = acc(renew(&["work-2"], false, None), &env, &host);
+        assert_ne!(result.0, exit(0));
+        assert_eq!(host.flows.borrow().len(), 1);
+        assert_eq!(host.checked.borrow().len(), usize::from(close_at_status));
+        assert_eq!(logins_of(&env).get("work-2").cloned(), before);
+        assert!(
+            host.flows
+                .borrow()
+                .iter()
+                .all(|(home, _, _)| !Path::new(home).exists()),
+            "cancelled local staging was not retired"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_an_owned_provider_capture_retires_its_scope_and_signin_lock() {
+    use std::io::Write as _;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let store = accounts::Store::at(tmp.path());
+    let signin = store.signin_now().unwrap().unwrap();
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let gate = tmp.path().join("gate");
+    let ready = tmp.path().join("ready");
+    let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: this is a new FIFO in the test's private temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate)
+        .unwrap();
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.args([
+        "-c",
+        "printf ready > \"$READY\"; read answer < \"$GATE\"; exit 7",
+    ])
+    .env("READY", &ready)
+    .env("GATE", &gate);
+    let (done, result) = std::sync::mpsc::channel();
+    let borrowed = scope.clone();
+    let worker = std::thread::spawn(scope.wrap(move || {
+        let _signin = signin;
+        let answer =
+            capture_unattended_renewal_scoped(cmd, std::time::Duration::from_secs(3600), &borrowed);
+        let _ = done.send(answer);
+    }));
+    let started = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(10),
+        || ready.exists().then_some(()),
+    );
+    let pause = lifetime.pause().unwrap();
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    // Always release the owned stand-in cooperatively and join before assertions.
+    writeln!(release, "finish").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(started.is_some());
+    assert!(returned, "cancellation did not end the owned provider work");
+    assert!(answer.unwrap_err().is_cancelled());
+    assert!(store.signin_now().unwrap().is_some());
+    assert!(pause.try_wait().unwrap().resume().is_ok());
+}
+
+#[test]
+fn already_closed_work_refuses_provider_and_status_spawns() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let _pause = lifetime.pause().unwrap();
+    let marker = tmp.path().join("must-not-exist");
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.args(["-c", "printf spawned > \"$MARKER\""])
+        .env("MARKER", &marker);
+    assert!(
+        capture_unattended_renewal_scoped(cmd, aterm_spec::wait::MUST_HAPPEN, &scope)
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(
+        status_in_home_within_scoped(
+            std::ffi::OsStr::new("does-not-exist"),
+            "unused",
+            &|name| (name == "USER").then(|| "fixture".into()),
+            aterm_spec::wait::MUST_HAPPEN,
+            &scope
+        )
+        .is_err()
+    );
+    assert!(!marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_the_follow_on_status_capture_retires_the_operation() {
+    use std::io::Write as _;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let program = tmp.path().join("status-provider");
+    let gate = tmp.path().join("gate");
+    let ready = tmp.path().join("ready");
+    let c = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: this is a new FIFO in the test's private temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate)
+        .unwrap();
+    aterm_tempfile::stand_in(
+        &program,
+        "#!/bin/sh\nprintf ready > \"${0%/*}/ready\"\nread answer < \"${0%/*}/gate\"\nexit 0\n",
+    )
+    .unwrap();
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let borrowed = scope.clone();
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(scope.wrap(move || {
+        let answer = status_in_home_within_scoped(
+            program.as_os_str(),
+            "unused",
+            &|name| (name == "USER").then(|| "fixture".into()),
+            std::time::Duration::from_secs(3600),
+            &borrowed,
+        );
+        let _ = done.send(answer);
+    }));
+    let started = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(10),
+        || ready.exists().then_some(()),
+    );
+    let pause = lifetime.pause().unwrap();
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    writeln!(release, "finish").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(started.is_some());
+    assert!(
+        returned,
+        "cancelled status held the scope until its work budget"
+    );
+    assert!(answer.is_err());
+    assert!(pause.try_wait().unwrap().resume().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_open_work_scope_preserves_actual_provider_exit_codes() {
+    for code in [0, 1, 130] {
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+        cmd.args(["-c", &format!("printf complete; exit {code}")]);
+        let (ran, met) =
+            capture_unattended_renewal_scoped(cmd, aterm_spec::wait::MUST_HAPPEN, &scope).unwrap();
+        assert_eq!(ran.code, Some(code));
+        assert_eq!(ran.stdout, b"complete");
+        assert!(met.is_none());
+        assert!(!scope.cancelled());
+    }
+}
+
+#[test]
+fn typed_service_unavailability_defers_before_status_and_preserves_the_stored_login() {
+    let (_tmp, env) = renew_env("renew-service-deferred");
+    let store = env.accounts_store();
+    let path = env.accounts_roster().unwrap();
+    let records = store.read_account_records(Some(&path), env.now).unwrap();
+    let roster = accounts::bound(&records.raw_roster, &records.logins);
+    let row = roster.row("work-2").unwrap();
+    let before = records.logins.get(&row.label).cloned();
+    let signin = crate::harness::sign_in_ladder::begun_fixture(
+        store.signin_now().unwrap().unwrap(),
+        Cli::Claude,
+        &row.label,
+    );
+    let mut host = RenewHost::new();
+    host.service_unavailable = true;
+    let mut observation = None;
+    let result = renew_one_observed(
+        &env,
+        &host,
+        &store,
+        &signin,
+        accounts::RenewalPolicy {
+            roster_path: &path,
+            roster: &roster,
+            row,
+            logins: &records.logins,
+        },
+        records
+            .raw_roster
+            .row(&row.label)
+            .and_then(|row| row.dir.as_deref()),
+        &RenewBrowser::Remote { opener: None },
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut shared_renewal::Guard::Local,
+        &mut observation,
+    );
+    assert_eq!(result, Renewal::Deferred);
+    assert!(observation.unwrap().service_deferred());
+    assert_eq!(host.flows.borrow().len(), 1);
+    assert!(host.checked.borrow().is_empty());
+    assert_eq!(
+        store
+            .load_logins(env.now)
+            .unwrap()
+            .0
+            .get(&row.label)
+            .cloned(),
+        before
+    );
+    assert!(
+        host.flows
+            .borrow()
+            .iter()
+            .all(|(home, _, _)| !Path::new(home).exists())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_deferred_opener_stops_the_owned_provider_without_an_auth_failure_or_exit_code() {
+    use std::io::Write as _;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let gate = tmp.path().join("gate");
+    let name = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: this names a fresh FIFO in this test's private directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut release = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate)
+        .unwrap();
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.args(["-c", "printf 'opener-outcome=1\\nphase=deferred\\nmet=service-unavailable\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7"]).env("GATE", &gate);
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = done.send(capture_unattended_renewal(
+            cmd,
+            std::time::Duration::from_secs(3600),
+        ));
+    });
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    writeln!(release, "finish").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(returned);
+    let failure = answer.expect_err("deferred stopping never fabricates a provider exit");
+    assert!(failure.is_deferred());
+    assert!(!failure.is_cancelled());
+    let observation = RenewalObservation::from_outcome(&Err(failure));
+    assert_eq!(observation.exit_code(), None);
+    assert!(observation.service_deferred());
+}
+
+#[test]
+fn natural_provider_status_is_retained_but_typed_unavailability_vetoes_follow_on_work() {
+    for code in [0, 1, 130] {
+        let cmd = aterm_uds::spawnfd::command("unused-test-program");
+        let (ran, met) = capture_unattended_renewal_with(cmd, |_, outcome| {
+            super::super::super::open_url::write_outcome(
+                outcome.unwrap(),
+                &super::super::super::open_url::Met::new(
+                    super::super::super::open_url::MetWord::ServiceUnavailable,
+                    None,
+                ),
+            );
+            Ok(Captured {
+                code: Some(code),
+                stdout: b"actual-provider-status".to_vec(),
+            })
+        })
+        .unwrap();
+        assert_eq!(ran.code, Some(code));
+        assert_eq!(ran.stdout, b"actual-provider-status");
+        let exit = RenewalExit::from_capture((ran, met)).unwrap();
+        assert_eq!(exit.code, code);
+        assert!(exit.is_deferred());
+    }
+}
+
+#[test]
+fn a_capture_error_is_not_relabelled_a_deferred_stop_by_its_diagnostic_record() {
+    let cmd = aterm_uds::spawnfd::command("unused-test-program");
+    let failure = capture_unattended_renewal_with(cmd, |_, outcome| {
+        crate::harness::open_url::write_outcome(
+            outcome.unwrap(),
+            &crate::harness::open_url::Met::new(
+                crate::harness::open_url::MetWord::ServiceUnavailable,
+                None,
+            ),
+        );
+        Err("synthetic owning cleanup failure".into())
+    })
+    .unwrap_err();
+    assert!(!failure.is_deferred());
+    assert!(!failure.is_cancelled());
+    let observed = RenewalObservation::from_outcome(&Err(failure));
+    assert!(observed.capture_failed());
+    assert!(!observed.service_deferred());
+    assert!(observed.met().unwrap().is_service_unavailable());
 }

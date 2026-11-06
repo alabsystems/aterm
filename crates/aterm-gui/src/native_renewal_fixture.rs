@@ -639,7 +639,10 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         active,
         store,
         proxy: event_loop.create_proxy(),
-        interactive_browser: false,
+        account_services: AccountServices {
+            lifetime: Default::default(),
+            interactive_browser: false,
+        },
         token: Arc::new(token),
         sock_dir: config.root.clone(),
         recovery_count_admission: Arc::new(

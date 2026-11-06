@@ -717,20 +717,31 @@ pub(in super::super) fn land_published(
     let stored: Vec<[u8; 32]> = std::iter::once(*version)
         .chain(parents.iter().copied())
         .collect();
-    if land_sets(paths, identity, &mut sets, &stored).is_err() || took.is_empty() {
+    if land_sets(paths, identity, &mut sets, &stored).is_err() {
         return;
     }
     for set in &mut sets {
-        if set.seq > seq || set.reach.iter().any(|url| url == REACH_UNKNOWN) {
+        // The held drafts' gate and reach rule, no_lost_edit's kernels (one-mesh P3): the sets the
+        // spine names landed above, so none descends here.
+        if nle::Gate::of(false, set.seq, seq, !took.is_empty()) != nle::Gate::Reach {
             continue;
         }
-        let before = set.reach.len();
-        set.reach
-            .retain(|url| !names_one_server(url) || !took.contains(url));
-        if set.reach.is_empty() {
-            let _ = remove_if_there(&set.file(paths));
-        } else if set.reach.len() < before {
-            let _ = write_pending(paths, identity, set);
+        let reach: Option<Vec<(bool, bool)>> = (!set.reach.iter().any(|url| url == REACH_UNKNOWN))
+            .then(|| {
+                set.reach
+                    .iter()
+                    .map(|url| (names_one_server(url), took.contains(url)))
+                    .collect()
+            });
+        match nle::settle_reach(reach.as_deref()) {
+            nle::Settle::Goes => {
+                let _ = remove_if_there(&set.file(paths));
+            }
+            nle::Settle::Stays => {}
+            nle::Settle::Narrows(left) => {
+                set.reach = left.iter().map(|&i| set.reach[i].clone()).collect();
+                let _ = write_pending(paths, identity, set);
+            }
         }
     }
 }
@@ -750,37 +761,66 @@ fn land_sets(
     sets: &mut Vec<Pending>,
     stored: &[[u8; 32]],
 ) -> crate::Result<()> {
-    let mut waiting: Option<Waiting> = None;
-    let mut landed = Vec::new();
-    let mut at = 0;
-    while at < sets.len() {
-        if !stored.contains(&sets[at].version) {
-            at += 1;
-            continue;
-        }
-        let landing = sets.remove(at);
-        for earlier in &mut sets[..at] {
-            let before = earlier.writes.0.len();
-            earlier
+    // Which sets land, which pending writes stay and which set's write of each name waits is
+    // no_lost_edit's `land` (one-mesh P3), whose island proves no write of a stored version lost.
+    let mut names: Vec<String> = Vec::new();
+    let shape: Vec<(bool, Vec<usize>)> = sets
+        .iter()
+        .map(|set| {
+            let writes = set
                 .writes
                 .0
-                .retain(|name, _| !landing.writes.0.contains_key(name));
-            if earlier.writes.0.len() != before {
-                write_pending(paths, identity, earlier)?;
+                .keys()
+                .map(|name| match names.iter().position(|known| known == name) {
+                    Some(at) => at,
+                    None => {
+                        names.push(name.clone());
+                        names.len() - 1
+                    }
+                })
+                .collect();
+            (stored.contains(&set.version), writes)
+        })
+        .collect();
+    let shape_view: Vec<(bool, &[usize])> = shape
+        .iter()
+        .map(|(lands, writes)| (*lands, writes.as_slice()))
+        .collect();
+    let landing = nle::land(&shape_view, names.len());
+    for (at, set) in sets.iter_mut().enumerate() {
+        if landing.lands[at] {
+            continue;
+        }
+        let leaves: Vec<&String> = shape[at]
+            .1
+            .iter()
+            .zip(&landing.keeps[at])
+            .filter(|&(_, &keeps)| !keeps)
+            .map(|(&name, _)| &names[name])
+            .collect();
+        if !leaves.is_empty() {
+            set.writes.0.retain(|name, _| !leaves.contains(&name));
+            write_pending(paths, identity, set)?;
+        }
+    }
+    if landing.lands.iter().any(|&lands| lands) {
+        let mut held = read_waiting(paths, identity)?;
+        for (name, at) in names.iter().zip(&landing.waits) {
+            if let Some(at) = at
+                && let Some(write) = sets[*at].writes.0.get(name)
+            {
+                held.0.insert(name.clone(), write.clone());
             }
         }
-        let held = match &mut waiting {
-            Some(held) => held,
-            None => waiting.insert(read_waiting(paths, identity)?),
-        };
-        for (name, write) in &landing.writes.0 {
-            held.0.insert(name.clone(), write.clone());
-        }
-        landed.push(landing);
+        write_waiting(paths, identity, &held)?;
     }
-    sets.retain(|set| !set.writes.is_empty());
-    if let Some(held) = &waiting {
-        write_waiting(paths, identity, held)?;
+    let mut landed = Vec::new();
+    for (set, &lands) in std::mem::take(sets).into_iter().zip(&landing.lands) {
+        if lands {
+            landed.push(set);
+        } else if !set.writes.is_empty() {
+            sets.push(set);
+        }
     }
     for set in &landed {
         remove_if_there(&set.file(paths))?;
@@ -1007,11 +1047,15 @@ pub(in super::super) fn everyone_edit(
     let mut writes = BTreeMap::new();
     let mut settles = BTreeMap::new();
     let mut shows = Vec::new();
-    let names: BTreeSet<&String> = entries
-        .keys()
-        .chain(shown.0.keys())
-        .chain(now.0.keys())
-        .collect();
+    let names: BTreeSet<&String> = if names_unmerged() {
+        entries.keys().collect()
+    } else {
+        entries
+            .keys()
+            .chain(shown.0.keys())
+            .chain(now.0.keys())
+            .collect()
+    };
     for name in names {
         let to = entries.get(name);
         let read = log.get(name);
@@ -1145,18 +1189,32 @@ pub(in super::super) fn sign_waiting_writes_by(
         let Some(opened) = log.open_audience_entries(&identity)? else {
             return none();
         };
-        if rotation_due(&log, &opened, &EpochAudience::Everyone) {
-            return none();
-        }
+        let due = rotation_due(&log, &opened, &EpochAudience::Everyone);
         let waiting = read_waiting(paths, &identity)?;
         let newest = opened
             .maximal_epochs
             .get(&EpochAudience::Everyone)
             .cloned()
             .unwrap_or_default();
-        if newest.is_empty() || !opens_newest(&opened, &EpochAudience::Everyone) {
+        let opens = !newest.is_empty() && opens_newest(&opened, &EpochAudience::Everyone);
+        // A name a pending set of this Mac writes is this Mac's own later edit of it, in flight
+        // or of a version whose fate is not known yet: its write here waits for that set, which
+        // lands over it or goes and leaves it. Signed now, it would land under the later edit;
+        // read as overtaken by it, the person's own newer edit would read as another's. A set
+        // this Mac cannot read may write any name: then no write is signed or dropped while it is
+        // there (one-mesh W3).
+        let deferred = if race_undeferred() {
+            Some(BTreeSet::new())
+        } else {
+            pending_names(paths, &identity)
+        };
+        // Whether the pass signs at all is no_lost_edit's kernel (one-mesh P3).
+        if !nle::pass_signs(due, opens, deferred.is_some()) {
             return none();
         }
+        let Some(deferred) = deferred else {
+            return none();
+        };
         let roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
         let denied = |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), &log, r);
         let membership = log.membership();
@@ -1209,51 +1267,41 @@ pub(in super::super) fn sign_waiting_writes_by(
             Some((epoch, zeroize::Zeroizing::new(**key)))
         };
         let view = opened.by_audience.get(&Audience::Everyone);
-        // A name a pending set of this Mac writes is this Mac's own later edit of it, in flight
-        // or of a version whose fate is not known yet: its write here waits for that set, which
-        // lands over it or goes and leaves it. Signed now, it would land under the later edit;
-        // read as overtaken by it, the person's own newer edit would read as another's.
-        let deferred = if race_undeferred() {
-            BTreeSet::new()
-        } else {
-            match pending_names(paths, &identity) {
-                Some(names) => names,
-                // A set this Mac cannot read may write any of these names: none is signed or
-                // dropped while it is there (one-mesh W3).
-                None => return none(),
-            }
-        };
         let mut settled = Waiting::default();
         let mut overtaken = Vec::new();
         let mut puts: Vec<&Entry> = Vec::new();
         let mut deletes: Vec<&String> = Vec::new();
         for (name, write) in &waiting.0 {
-            if deferred.contains(name) {
-                continue;
-            }
             let read = view.and_then(|view| view.get(name));
             let conflicted = opened
                 .conflicts
                 .contains(&(Audience::Everyone, name.clone()));
-            settled.0.insert(name.clone(), write.clone());
-            if write.done(read, conflicted) {
+            // Each write's verdict is no_lost_edit's kernel (one-mesh P3). A take-back not done
+            // here finds the name held: never signed as a `Delete` (F15).
+            let verdict = nle::Verdict::of(
+                deferred.contains(name),
+                write.done(read, conflicted),
+                write.stands_over(read),
+                write.to.is_none(),
+            );
+            if verdict == nle::Verdict::Leaves {
                 continue;
             }
-            // A take-back not done here finds the name held: never signed as a `Delete` (F15).
-            if !write.stands_over(read) || write.to.is_none() {
-                overtaken.push(Overtaken {
+            settled.0.insert(name.clone(), write.clone());
+            match (verdict, &write.to) {
+                (nle::Verdict::Overtaken, _) => overtaken.push(Overtaken {
                     name: name.clone(),
                     by: overtaker(&log, &opened, name),
                     dropped_ms: now_ms,
                     shown: false,
-                });
-                continue;
-            }
-            if let Some(to) = &write.to {
-                if write.resolve {
-                    deletes.push(name);
+                }),
+                (nle::Verdict::Signs, Some(to)) => {
+                    if write.resolve {
+                        deletes.push(name);
+                    }
+                    puts.push(to);
                 }
-                puts.push(to);
+                _ => {}
             }
         }
         let authored_ms = now_ms;
@@ -1567,7 +1615,11 @@ thread_local! {
     /// as before W3; `unread-as-none`, a pending set, or the waiting writes, that this Mac cannot
     /// read reads as none (the set's file removed), as before W3; `draft-unclaimed`, a publish
     /// takes no claim ([`claim_draft`]), as before W3, so a pass may sign between its draft and
-    /// its pending set.
+    /// its pending set; `names-unmerged`, an edit reviews only the names its own entries hold
+    /// ([`everyone_edit`]), not those the view showed waiting or that stand now, so it never
+    /// takes back a name only a waiting write added; `settle-uncarried`, a save that leaves a
+    /// waiting settle of a conflict as its view showed it signs the name without settling it, as
+    /// before 24410be588 (`draft_document_diff_with`'s `resolving`).
     pub(crate) static VIEW_WITHOUT_WAITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static BASES_LOG_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static OVERTAKEN_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1576,6 +1628,8 @@ thread_local! {
     pub(crate) static RACE_UNDEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static UNREAD_AS_NONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static DRAFT_UNCLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static NAMES_UNMERGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static SETTLE_UNCARRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether [`DRAFT_UNCLAIMED`] is on; never in a release build, which has neither switch.
@@ -1595,6 +1649,32 @@ fn draft_unclaimed() -> bool {
 fn view_without_waiting() -> bool {
     VIEW_WITHOUT_WAITING.with(std::cell::Cell::get)
         || aterm_types::negative_control::on("view-without-waiting")
+}
+
+/// Whether [`NAMES_UNMERGED`] is on; never in a release build, which has neither switch.
+fn names_unmerged() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        NAMES_UNMERGED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("names-unmerged")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Whether [`SETTLE_UNCARRIED`] is on; never in a release build, which has neither switch.
+pub(super) fn settle_uncarried() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        SETTLE_UNCARRIED.with(std::cell::Cell::get)
+            || aterm_types::negative_control::on("settle-uncarried")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 /// Whether [`BASES_LOG_ONLY`] is on; never in a release build, which has neither switch.

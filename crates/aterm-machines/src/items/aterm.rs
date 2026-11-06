@@ -484,12 +484,12 @@ impl Item for Cli {
             }
             Ok(st) if !st.symlink => format!("{} is a file, not a link", link.display()),
             Ok(_) => match sys.run(&Cmd::new("/usr/bin/readlink").arg(&link)) {
-                Ok(ran) if ran.success() && ran.out().trim() == EXE => {
+                Ok(ran) if ran.success() && link_target(&ran.out()) == EXE => {
                     return Probe::Ok {
                         now: format!("{} -> {EXE}", link.display()),
                     };
                 }
-                Ok(ran) if ran.success() => format!("a link to {}", ran.out().trim()),
+                Ok(ran) if ran.success() => format!("a link to {}", link_target(&ran.out())),
                 Ok(ran) => {
                     return Probe::Unusable {
                         why: format!("readlink {}: {}", link.display(), ran.describe()),
@@ -782,6 +782,12 @@ fn doctor_says(ran: &Ran, user: &str, to: String) -> Probe {
             if complete { "complete" } else { "not complete" }
         )),
     }
+}
+
+/// The target `readlink` printed: its answer without the one newline it ends with. Other
+/// trailing whitespace belongs to the target, so a link to `<exe> ` never reads as `<exe>`.
+fn link_target(printed: &str) -> &str {
+    printed.strip_suffix('\n').unwrap_or(printed)
 }
 
 fn is_dns_label(label: &str) -> bool {
@@ -1545,6 +1551,42 @@ mod tests {
         assert!(
             matches!(items[1].probe(&sys, &ctx), Probe::Change { from, .. } if from.starts_with("a link to /Users//admin/Applications"))
         );
+    }
+
+    /// A link whose target differs from the app's executable only by trailing whitespace is a
+    /// link elsewhere, not the command. NEGATIVE CONTROL: the newline `readlink` ends its
+    /// answer with is still not part of the target.
+    #[test]
+    fn a_link_to_the_executable_with_a_trailing_space_is_not_the_command() {
+        let link = "/Users//admin/.local/bin/aterm";
+        for (printed, is_command) in [
+            ("/Applications/aterm.app/Contents/MacOS/aterm \n", false),
+            ("/Applications/aterm.app/Contents/MacOS/aterm\t\n", false),
+            ("/Applications/aterm.app/Contents/MacOS/aterm\n", true),
+        ] {
+            let sys = Fake::root();
+            sys.stat_of(
+                link,
+                Stat {
+                    symlink: true,
+                    dir: false,
+                    ..dir()
+                },
+            );
+            sys.on(&format!("/usr/bin/readlink {link}"), ok(printed));
+            let ctx = ctx_with(&sys, &[(INSTALL_SH_SHA, b"#!/bin/bash")], true);
+            let items = expand(&table(), &ctx).unwrap();
+            let probe = items[1].probe(&sys, &ctx);
+            if is_command {
+                assert!(matches!(probe, Probe::Ok { .. }), "{printed:?}: {probe:?}");
+            } else {
+                let target = printed.strip_suffix('\n').unwrap();
+                assert!(
+                    matches!(&probe, Probe::Change { from, .. } if *from == format!("a link to {target}")),
+                    "{printed:?}: {probe:?}"
+                );
+            }
+        }
     }
 
     #[test]

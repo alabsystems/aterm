@@ -377,6 +377,13 @@ pub(super) fn adopt_first(
     now: i64,
     fx: &UpkeepEffects<'_>,
 ) {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::super::account_work::Scope::cancelled)
+    {
+        return;
+    }
     let Some(pass) = PreparationPass::claim(fx.renew_guard) else {
         return;
     };
@@ -389,6 +396,7 @@ pub(super) fn adopt_first(
                 fx.renew_guard,
                 fx.spawn_renewal,
                 &fx.log,
+                fx.scope.as_ref(),
             ),
             PreparationKind::Shared => prepare_shared(home, state_dir, roster, now, fx),
         };
@@ -417,6 +425,13 @@ pub(super) fn prepare_shared_with_clock(
     fx: &UpkeepEffects<'_>,
     clock: impl Fn() -> Instant,
 ) -> bool {
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::super::account_work::Scope::cancelled)
+    {
+        return false;
+    }
     let Some(discover) = fx.shared.discover else {
         return false;
     };
@@ -424,6 +439,13 @@ pub(super) fn prepare_shared_with_clock(
         return false;
     };
     for candidate in ordered_shared_candidates(candidates, fx.renew_guard) {
+        if fx
+            .scope
+            .as_ref()
+            .is_some_and(super::super::account_work::Scope::cancelled)
+        {
+            return false;
+        }
         let cli = candidate.cli;
         let store = accounts::Store::at_for(state_dir, cli, home);
         let Some(target_roster) = accounts::roster_beside_for(&config_beside(roster), cli) else {
@@ -461,11 +483,12 @@ pub(super) fn prepare_shared_with_clock(
         if !matches!(sign_in.spaced(&store, now), Ok(None)) {
             return false;
         }
-        let Some(permit) =
+        let Some(mut permit) =
             AutoRenewPermit::claim_preparation(fx.renew_guard, &key, clock(), &grant)
         else {
             continue;
         };
+        let completion = permit.follow_scope(fx.scope.as_ref());
         let Ok(signin) = sign_in.begin(cli, &label, signin, &store, now) else {
             return false;
         };
@@ -473,13 +496,21 @@ pub(super) fn prepare_shared_with_clock(
         let state_dir = state_dir.to_owned();
         let roster = target_roster;
         let host = fx.shared.host.clone();
+        let scope = fx.scope.clone();
         let log = fx.log.clone();
         let _ = start_auto_renew(
             permit,
             move || {
+                if scope
+                    .as_ref()
+                    .is_some_and(super::super::account_work::Scope::cancelled)
+                {
+                    return;
+                }
                 let store = accounts::Store::at_for(&state_dir, cli, &home);
                 let env = quiet_env(&home, &state_dir, &config_beside(&roster), now);
                 let background = BackgroundHost {
+                    scope: scope.as_ref(),
                     home: &home,
                     mailbox: None,
                     headless: true,
@@ -487,9 +518,25 @@ pub(super) fn prepare_shared_with_clock(
                 let host = host
                     .as_deref()
                     .map_or(&background as &dyn AccountsHost, |host| host);
-                if let Err(why) = super::super::cli::shared_adoption::adopt(
+                let result = super::super::cli::shared_adoption::adopt(
                     &env, host, &store, &signin, &roster, candidate,
-                ) {
+                );
+                if result.as_ref().is_err_and(|failure| failure.is_deferred()) {
+                    completion.defer();
+                    return;
+                }
+                if result.is_ok()
+                    || !scope
+                        .as_ref()
+                        .is_some_and(super::super::account_work::Scope::cancelled)
+                {
+                    completion.complete();
+                }
+                if let Err(why) = result
+                    && !scope
+                        .as_ref()
+                        .is_some_and(super::super::account_work::Scope::cancelled)
+                {
                     log(&format!("shared account adoption: {why}"));
                 }
             },
@@ -752,25 +799,46 @@ pub(super) fn prepare_native(
     state: &Path,
     config: &Path,
     guard: &Arc<std::sync::Mutex<AutoRenewGuard>>,
-    spawn: &SpawnRenewal,
+    spawn: &SpawnRenewal<'_>,
     log: &SignInLog,
+    scope: Option<&super::super::account_work::Scope>,
 ) -> bool {
+    if scope.is_some_and(super::super::account_work::Scope::cancelled) {
+        return false;
+    }
     let mut permit = None;
     let task = super::super::native_keys::preparation(home, state, config, &mut |id| {
+        if scope.is_some_and(super::super::account_work::Scope::cancelled) {
+            return false;
+        }
         if permit.is_some() {
             return false;
         }
-        permit = AutoRenewPermit::claim_native_preparation(guard, Instant::now(), id)
-            .map(|permit| (permit, id.clone()));
+        permit = AutoRenewPermit::claim_native_preparation(guard, Instant::now(), id).map(
+            |mut permit| {
+                permit.follow_scope(scope);
+                (permit, id.clone())
+            },
+        );
         permit.is_some()
     });
     match (task, permit) {
-        (Ok(Some(task)), Some((permit, admitted))) if task.preparation == admitted => {
+        (Ok(Some(task)), Some((mut permit, admitted))) if task.preparation == admitted => {
+            let completion = permit.follow_scope(scope);
             let log = log.clone();
+            let scope = scope.cloned();
             let _ = start_auto_renew(
                 permit,
                 move || {
-                    if let Err(why) = (task.run)() {
+                    if scope
+                        .as_ref()
+                        .is_some_and(super::super::account_work::Scope::cancelled)
+                    {
+                        return;
+                    }
+                    let result = (task.run)();
+                    completion.complete();
+                    if let Err(why) = result {
                         log(&format!("native account preparation: {why}"));
                     }
                 },
@@ -836,14 +904,13 @@ fn environment(home: &Path, name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
 }
 
-/// One bounded background provider flow, shared with ordinary automatic renewal.
-pub(super) fn sign_in(
+pub(in crate::harness) fn sign_in_with_inputs_scoped(
     home: &Path,
     staging: &str,
     email: &str,
     browser: &RenewBrowser,
-    headless: bool,
-    mailbox: Option<&Path>,
+    (headless, mailbox, inputs): (bool, Option<&Path>, Option<&Path>),
+    scope: Option<&super::super::account_work::Scope>,
 ) -> Result<
     (
         super::super::align::Captured,
@@ -851,24 +918,9 @@ pub(super) fn sign_in(
     ),
     super::super::cli::RenewalFailure,
 > {
-    sign_in_with_inputs(home, staging, email, browser, headless, mailbox, None)
-}
-
-pub(crate) fn sign_in_with_inputs(
-    home: &Path,
-    staging: &str,
-    email: &str,
-    browser: &RenewBrowser,
-    headless: bool,
-    mailbox: Option<&Path>,
-    inputs: Option<&Path>,
-) -> Result<
-    (
-        super::super::align::Captured,
-        Option<super::super::open_url::Met>,
-    ),
-    super::super::cli::RenewalFailure,
-> {
+    if scope.is_some_and(super::super::account_work::Scope::cancelled) {
+        return Err(super::super::cli::RenewalFailure::cancelled());
+    }
     let pass_env =
         super::super::cli::unattended_renewal_environment(&|name| environment(home, name))?;
     let prog = resolve_claude_program(home);
@@ -887,16 +939,34 @@ pub(crate) fn sign_in_with_inputs(
     if headless || inputs.is_some() {
         cmd.env(super::super::headless_oauth::HEADLESS_ENV, "1");
     }
-    super::super::cli::capture_unattended_renewal(cmd, super::super::cli::UNATTENDED_RENEWAL_BUDGET)
+    match scope {
+        Some(scope) => super::super::cli::capture_unattended_renewal_scoped(
+            cmd,
+            super::super::cli::UNATTENDED_RENEWAL_BUDGET,
+            scope,
+        ),
+        None => super::super::cli::capture_unattended_renewal(
+            cmd,
+            super::super::cli::UNATTENDED_RENEWAL_BUDGET,
+        ),
+    }
 }
 
 pub(super) struct BackgroundHost<'a> {
+    pub scope: Option<&'a super::super::account_work::Scope>,
     pub home: &'a Path,
     pub mailbox: Option<&'a Path>,
     pub headless: bool,
 }
 
 impl AccountsHost for BackgroundHost<'_> {
+    fn work_scope(&self) -> Option<super::super::account_work::Scope> {
+        self.scope.cloned()
+    }
+    fn work_cancelled(&self) -> bool {
+        self.scope
+            .is_some_and(super::super::account_work::Scope::cancelled)
+    }
     fn automatic_sign_in(&self) -> bool {
         true
     }
@@ -924,14 +994,13 @@ impl AccountsHost for BackgroundHost<'_> {
         browser: &RenewBrowser,
         inputs: &Path,
     ) -> Result<super::super::cli::RenewalExit, super::super::cli::RenewalFailure> {
-        super::super::cli::RenewalExit::from_capture(sign_in_with_inputs(
+        super::super::cli::RenewalExit::from_capture(sign_in_with_inputs_scoped(
             self.home,
             staging,
             email,
             browser,
-            true,
-            None,
-            Some(inputs),
+            (true, None, Some(inputs)),
+            self.scope,
         )?)
     }
     fn shared_claude_profile(
@@ -951,9 +1020,12 @@ impl AccountsHost for BackgroundHost<'_> {
         &self,
         request: &super::super::login_drive::Request<'_>,
     ) -> super::super::login_drive::Drove {
-        super::super::login_drive::sign_in_live(request, self.home, &|name| {
-            environment(self.home, name)
-        })
+        super::super::login_drive::sign_in_live_scoped(
+            request,
+            self.home,
+            &|name| environment(self.home, name),
+            self.scope.cloned(),
+        )
     }
     fn vendor_sign_in_with_mailbox(
         &self,
@@ -1000,16 +1072,25 @@ impl AccountsHost for BackgroundHost<'_> {
         email: &str,
         browser: &RenewBrowser,
     ) -> Result<super::super::cli::RenewalExit, super::super::cli::RenewalFailure> {
-        super::super::cli::RenewalExit::from_capture(sign_in(
+        super::super::cli::RenewalExit::from_capture(sign_in_with_inputs_scoped(
             self.home,
             staging,
             email,
             browser,
-            self.headless,
-            self.mailbox,
+            (self.headless, self.mailbox, None),
+            self.scope,
         )?)
     }
     fn status_in_home(&self, staging: &str) -> Result<super::super::align::Captured, String> {
+        if let Some(scope) = self.scope {
+            return super::super::cli::status_in_home_within_scoped(
+                resolve_claude_program(self.home).as_os_str(),
+                staging,
+                &|name| environment(self.home, name),
+                super::super::cli::AUTH_CHECK_BUDGET,
+                scope,
+            );
+        }
         super::super::cli::status_in_home_within(
             resolve_claude_program(self.home).as_os_str(),
             staging,

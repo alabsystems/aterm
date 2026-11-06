@@ -6,7 +6,8 @@
 //!
 //! Publishes [`TurnEndState::landed`] and [`TurnEndState::gave_up`] points
 //! ([`TurnEndState::point_number`],
-//! [`TurnEndState::left_to_person`], [`TurnEndState::followed`]) with result snapshots
+//! [`TurnEndState::left_to_person`], [`TurnEndState::followed`],
+//! [`TurnEndState::unlanded`]) with result snapshots
 //! ([`crate::harness::result::snapshot`], [`DoneBy`], [`crate::harness::result::snapshot_screen`],
 //! [`crate::harness::result::with_report`], [`result::prune_results`]) and seeds loops from
 //! existing records, read ahead of the first fold ([`Session::task_ahead`],
@@ -178,6 +179,15 @@ pub const REPEATED_WHY: &str = GaveUp::Repeated.word();
 /// A carried failure from the former usage-wall policy. The successor reopens this task.
 pub const USAGE_LIMIT_WHY: &str = GaveUp::UsageLimit.word();
 
+/// The ended records someone else's turn opens again ([`Session::reopen_task`]): a `done` one, and
+/// a `failed` one, whose conclusion the turn lifts.
+const BY_TURN: &[&str] = &["done", "failed"];
+
+/// The ended record Cruise's unlanding opens again ([`Session::reopen_task`],
+/// [`TurnEndState::unlanded`]): a `done` one alone. Its books were landed, so the record
+/// reads its landing; a `failed` one is not the unlanding's to lift.
+const BY_UNLANDING: &[&str] = &["done"];
+
 /// Whether the record `t` is a landing this harness published: `done
 /// why=landed` ([`LANDED_WHY`]).
 fn is_landing(t: &TaskRead) -> bool {
@@ -212,7 +222,11 @@ impl<C: Ctl> Session<'_, C> {
                 self.task_point = at;
             }
         } else if was_done && te.followed().is_none() {
-            self.reopen_task(seq, review)?;
+            self.reopen_task(seq, BY_TURN, review)?;
+        } else if was_done && te.unlanded() {
+            // Cruise's unlanding ([`TurnEndState::unlanded`]); any other act of this loop's opens
+            // nothing. It takes a landing on, never a failed conclusion.
+            self.reopen_task(seq, BY_UNLANDING, review)?;
         }
         Ok(())
     }
@@ -413,17 +427,19 @@ impl<C: Ctl> Session<'_, C> {
     /// THE TASK RECORD AHEAD OF THIS LOOP'S FIRST FOLD, read once per loop, right before that
     /// point's reading: whether a manager waits on the session is known to the point the fold
     /// judges ([`TurnEndState::set_managed`]), so a managed worker's opening exchange is its
-    /// task's, never left to a person, its conversation is never read as taskless by its record
-    /// ([`IdleHost::taskless`], which can only lag the task its launch typed), and its
-    /// `Could not finish:` concludes at that point. A lost read
-    /// leaves the session unmanaged, as a session with no record is, and is tried again at the
-    /// next point. The rest the record seeds waits for the fold ([`Self::task_seed`]).
+    /// task's, never left to a person, its first point is not read as taskless by the host's
+    /// record of its conversation ([`Self::record_trails_task`]), and its `Could not finish:`
+    /// concludes at that point. A lost read leaves the session unmanaged, as a session with no
+    /// record is, and is tried again at the next decision: the next point's, or the same point's
+    /// where that one rests ([`Self::record_unread`]). The rest the record seeds waits for the
+    /// fold ([`Self::task_seed`]).
     pub(super) fn task_ahead(&mut self, opts: &SuperviseOpts) -> Result<Option<TaskRead>, Fail> {
         if self.task_seeded || opts.tasks.is_none() || self.claim.watching_behind().is_some() {
             return Ok(None);
         }
         let r = self.call(&["task"])?;
-        if r.lost() {
+        self.record_unread = r.lost();
+        if self.record_unread {
             return Ok(None);
         }
         self.task_seeded = true;
@@ -496,12 +512,18 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
-    /// The task opened again by someone else's turn: a `done` or `failed` record marked
-    /// `working why=turn`.
-    fn reopen_task(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+    /// The task opened again: a record whose state is one of `ended` marked `working why=turn`
+    /// (someone else's turn opens a `done` or `failed` one, [`BY_TURN`]; Cruise unlanding it a
+    /// `done` one alone, [`BY_UNLANDING`]).
+    fn reopen_task(
+        &mut self,
+        seq: u64,
+        ended: &[&str],
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
         let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         let r = self.call(&["task"])?;
-        if task_read(&r).is_none_or(|t| !matches!(t.state.as_str(), "done" | "failed")) {
+        if task_read(&r).is_none_or(|t| !ended.contains(&t.state.as_str())) {
             return Ok(());
         }
         let r = self.call(&["task", "mark", "working", "why=turn"])?;

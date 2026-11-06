@@ -126,6 +126,10 @@ impl Policy {
         self.grants.values()
     }
 
+    pub(super) fn into_grants(self) -> impl Iterator<Item = Grant> {
+        self.grants.into_values()
+    }
+
     pub(super) fn grant(&self, id: [u8; 16]) -> Result<&Grant> {
         self.grants
             .get(&id)

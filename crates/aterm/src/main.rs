@@ -14,6 +14,8 @@ mod lab_window;
 
 #[cfg(target_os = "macos")]
 mod compact_zone;
+#[cfg(target_os = "macos")]
+mod input_attachments;
 #[cfg(unix)]
 mod machine_status;
 #[cfg(test)]
@@ -307,6 +309,11 @@ fn spawn_node_commons_runtime() {
             return;
         };
         let runtime = NODE_COMMONS.get_or_init(|| runtime);
+        // With the one mesh on, a peer that speaks `Bus` with the node service's mesh gets no
+        // repair round or redial, and a push waits for the relay's ack (§11 B7b).
+        if aterm_types::mesh_switch::MESH {
+            relay_tables(runtime);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let _ = NODE_OBSERVATION.set(runtime.network_observation());
@@ -318,8 +325,27 @@ fn spawn_node_commons_runtime() {
     });
 }
 
-/// Background Commons runtime and steward enroller held by `aterm node serve` (C22), yielding
-/// local observation and transport whenever an interactive window runs.
+/// Hand the node service's Commons `runtime` its mesh: which peers speak `Bus`
+/// ([`aterm_mesh::Mesh::speaks_bus`]) and a push's relay ack ([`aterm_mesh::Mesh::push_table`]),
+/// each read from the mesh open now, so a mesh that closes leaves the old path.
+#[cfg(unix)]
+fn relay_tables(runtime: &aterm_db::runtime::Runtime) {
+    runtime.speaks_bus(std::sync::Arc::new(|key| {
+        aterm_mesh::current().is_some_and(|mesh| mesh.speaks_bus(key))
+    }));
+    runtime.pusher().relay(std::sync::Arc::new(
+        |table, deadline| match aterm_mesh::current()?.push_table(table, deadline)? {
+            aterm_mesh::Pushed::Reached => Some(aterm_db::runtime::Pushed::Reached),
+            aterm_mesh::Pushed::TimedOut => Some(aterm_db::runtime::Pushed::TimedOut),
+        },
+    ));
+}
+
+/// Background Commons runtime and steward enroller held by `aterm node serve` (C22). Before the
+/// one-mesh transport it yields local observation and transport whenever an interactive window
+/// runs; with `aterm_types::mesh_switch::MESH` on it yields to none (the runtime reads the
+/// switch once: [`aterm_db::runtime::Runtime::start_background`]), and the node service is the
+/// one owner.
 #[cfg(unix)]
 fn start_node_commons_runtime(
     paths: aterm_secrets::client::Paths,
@@ -644,6 +670,15 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     // connector rows say where each keeps it (aterm-secrets cannot read them itself).
     #[cfg(unix)]
     aterm_secrets::text::on_cli_login(aterm_agent::ai::connector::login_file);
+    // With the one mesh on, each durable table append and membership write of any aterm process
+    // reaches the node service's egress (in-process there, by its wake socket elsewhere), which
+    // publishes it on `tables.log` (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7b).
+    #[cfg(unix)]
+    if aterm_types::mesh_switch::MESH
+        && let Some(state_dir) = aterm_types::dirs::state_dir()
+    {
+        aterm_mesh::stores::vault::wake_sinks(&state_dir);
+    }
     // A mailbox the harness opens to read a sign-in code tells the lab registry which addresses
     // it receives (a release build only; the hook is inert in tests and debug builds).
     #[cfg(unix)]
@@ -1532,6 +1567,7 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(target_os = "macos")]
     if ordinary {
         spawn_acaffeine_watch();
+        input_attachments::spawn();
     }
     #[cfg(target_os = "macos")]
     if runs_step && let Some(config) = aterm_types::dirs::aterm_config_path() {
@@ -4374,15 +4410,27 @@ fn run_setup_retry<H: SetupRetryHost>(
 /// How long a parked run waits before it reads its mark again by itself: until its next retry
 /// falls due (`next_due`, seconds since the epoch, against `now`), or with no timer at all when
 /// none is ahead. A run whose facts are not all `watched` (a watch that could not start) reads
-/// them at least once a minute, as before watches.
+/// them at least once a minute, as before watches. First-use door conditions are
+/// process-local, so a waiting door is read each second even with healthy file watches.
 #[cfg(any(target_os = "macos", test))]
-fn park_wait_limit(next_due: Option<u64>, now: u64, watched: bool) -> Option<std::time::Duration> {
+fn park_wait_limit(
+    next_due: Option<u64>,
+    now: u64,
+    watched: bool,
+    door_waiting: bool,
+) -> Option<std::time::Duration> {
     const UNWATCHED: std::time::Duration = std::time::Duration::from_secs(60);
+    const DOOR_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
     let due = next_due.map(|due| std::time::Duration::from_secs(due.saturating_sub(now).max(1)));
-    if watched {
+    let normal = if watched {
         due
     } else {
         Some(due.map_or(UNWATCHED, |due| due.min(UNWATCHED)))
+    };
+    if door_waiting {
+        Some(normal.map_or(DOOR_LOOK, |due| due.min(DOOR_LOOK)))
+    } else {
+        normal
     }
 }
 
@@ -4637,7 +4685,12 @@ impl SetupRetryHost for LiveSetupRetry {
                 let watched = watching.as_ref().is_some_and(|(on, started)| {
                     on.none() || started.as_ref().is_some_and(ParkWatch::whole)
                 }) && !setup_watch_owed();
-                limit.set(park_wait_limit(mark.next_due(), unix_seconds(), watched));
+                limit.set(park_wait_limit(
+                    mark.next_due(),
+                    unix_seconds(),
+                    watched,
+                    mark.waits_on_lan_door(),
+                ));
                 previous = Some(mark.clone());
                 mark
             },
@@ -5635,23 +5688,70 @@ mod setup_retry_tests {
     fn a_park_on_a_person_alone_has_no_timer() {
         use super::park_wait_limit;
         use std::time::Duration;
-        assert_eq!(park_wait_limit(None, 100, true), None);
+        assert_eq!(park_wait_limit(None, 100, true, false), None);
         assert_eq!(
-            park_wait_limit(Some(130), 100, true),
+            park_wait_limit(Some(130), 100, true, false),
             Some(Duration::from_secs(30))
         );
         assert_eq!(
-            park_wait_limit(Some(100), 100, true),
+            park_wait_limit(Some(100), 100, true, false),
             Some(Duration::from_secs(1)),
             "a retry the clock calls due now waits a second, never spins"
         );
         assert_eq!(
-            park_wait_limit(None, 100, false),
+            park_wait_limit(None, 100, false, false),
             Some(Duration::from_secs(60))
         );
         assert_eq!(
-            park_wait_limit(Some(110), 100, false),
+            park_wait_limit(Some(110), 100, false, false),
             Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn a_park_observes_first_lan_readiness_without_a_focus_or_file_wake() {
+        use aterm_types::macos_setup::lan_first_use::Door;
+        use std::cell::Cell;
+        use std::time::Duration;
+        let door = Cell::new(Door::Waiting);
+        let limit = Cell::new(None);
+        let looks = Cell::new(0);
+        let ready = super::wait_for_setup_park_change_since(
+            Some(&Door::Waiting),
+            || {
+                limit.set(super::park_wait_limit(
+                    None,
+                    100,
+                    true,
+                    door.get() == Door::Waiting,
+                ));
+                door.get()
+            },
+            |_| false,
+            |now, before| now != before,
+            || true,
+            || {
+                assert_eq!(
+                    looks.replace(1),
+                    0,
+                    "unchanged conditions run no setup effects"
+                );
+                assert_eq!(
+                    limit.get(),
+                    Some(Duration::from_secs(1)),
+                    "healthy file watches cannot hide local readiness"
+                );
+                // The keyboard rests while System State remains behind the terminal.
+                // No focus, file or network wake is delivered.
+                door.set(Door::Ready);
+            },
+        );
+        assert_eq!(ready, Door::Ready);
+        assert_eq!(looks.get(), 1);
+        assert_eq!(
+            super::park_wait_limit(None, 100, true, false),
+            None,
+            "ready/open doors need no readiness polling"
         );
     }
 
@@ -6871,7 +6971,6 @@ fn wait_while_queued(let_go: impl Fn() -> bool) -> bool {
 const SETUP_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
     stop: setup_stop_requested,
     stage: setup_stage,
-    developer_tools: aterm_gui::offer_developer_tools_install,
 };
 
 /// What System State's worker does outside this process: the doctor's records
@@ -7673,6 +7772,10 @@ fn join_alab_with_phrase(
                         "system state: the phrase reached no ALab Mac, so it stays good: {why}"
                     );
                     PhraseOutcome::NotReached
+                }
+                PhraseTry::Dropped(words) => {
+                    aterm_log::warn!("system state: no phrase lets this Mac in: {words}");
+                    PhraseOutcome::Dropped
                 }
             });
             request_observation(

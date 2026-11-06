@@ -1131,6 +1131,66 @@ fn automatic_allocation_does_not_take_an_explicit_fixed_slot() {
     );
 }
 
+/// Sweeps of a Meta automatic allocation at `now` plus a number of seconds, and a fresh grant
+/// with a request under it (the last grant's warm slot set aside first).
+fn allocation_sweeps(approved: &Approved, config: &Path) -> (impl Fn(u64) -> usize, impl Fn()) {
+    let paths = approved.paths.clone();
+    let expected = approved.expected.clone();
+    let config = config.to_owned();
+    let now = Instant::now();
+    let home = paths.home.clone();
+    let sweep = {
+        let paths = paths.clone();
+        move |at: u64| {
+            let admin = client::admin_cached(&paths).unwrap();
+            allocation::step_at(
+                &paths,
+                &admin,
+                &config,
+                deadline(),
+                now + Duration::from_secs(at),
+            )
+            .unwrap()
+        }
+    };
+    let grant_and_ask = move || {
+        set_policy(&home, [7; 32], Vec::new()).unwrap();
+        set_policy_mode(&home, [7; 32], Vec::new(), true).unwrap();
+        let (policy, _) = policy(&paths, &expected).unwrap().unwrap();
+        let subject = policy.automatic(Provider::Meta).unwrap().unwrap().subject;
+        allocation::request(&paths, &policy, subject, deadline()).unwrap();
+    };
+    (sweep, grant_and_ask)
+}
+
+/// A ready allocation sweep with nothing to change leaves the cooldown unspent, so a request
+/// that arrives after it is published at the next sweep. Control: the first sweep of a grant
+/// waits the cooldown out.
+#[test]
+fn an_idle_ready_allocation_sweep_leaves_the_cooldown_unspent() {
+    let (_temp, approved, config) = fixture(Provider::Meta, true);
+    let (sweep, grant_and_ask) = allocation_sweeps(&approved, &config);
+    grant_and_ask();
+    assert_eq!(sweep(0), 0, "the first sight starts the cooldown");
+    assert_eq!(sweep(60), 1);
+    assert_eq!(sweep(120), 0, "ready, with nothing to change");
+    grant_and_ask();
+    assert_eq!(sweep(121), 1, "the idle sweep left the cooldown unspent");
+}
+
+/// The sweep that publishes starts the cooldown: a request after it waits the cooldown out.
+#[test]
+fn an_allocation_publication_starts_the_cooldown() {
+    let (_temp, approved, config) = fixture(Provider::Meta, true);
+    let (sweep, grant_and_ask) = allocation_sweeps(&approved, &config);
+    grant_and_ask();
+    assert_eq!(sweep(0), 0);
+    assert_eq!(sweep(60), 1);
+    grant_and_ask();
+    assert_eq!(sweep(61), 0, "the publication at 60 started the cooldown");
+    assert_eq!(sweep(120), 1);
+}
+
 #[test]
 fn automatic_wait_survives_a_temporarily_busy_vault_before_the_grant() {
     let (_temp, approved, config) = fixture(Provider::Google, true);
@@ -1624,6 +1684,50 @@ fn native_launch_without_shared_selection_does_not_require_commons() {
         assert!(!selected_launch(&paths, &config, provider, deadline()).unwrap());
     }
     assert!(!paths.dir.join(SELECTION).exists());
+}
+
+/// A piped native key of at most 16 KiB is taken with its one LF or CR LF dropped; a longer
+/// input is refused whole. The row the old two-byte margin cut: a full key, its CR LF, and more
+/// that was never read.
+#[test]
+fn a_piped_native_key_past_its_bound_is_refused_not_cut() {
+    let key = vec![b'k'; 16 * 1024];
+    let piped = |tail: &[u8]| {
+        let mut bytes = key.clone();
+        bytes.extend_from_slice(tail);
+        input::read_piped_key(bytes.as_slice()).map(|secret| secret.expose().to_vec())
+    };
+    for ending in [&b""[..], b"\n", b"\r\n"] {
+        assert_eq!(piped(ending).unwrap(), key, "{ending:?}");
+    }
+    for longer in [&b"\r\nx"[..], b"\nx", b"k", b"\n\n"] {
+        assert!(piped(longer).is_err(), "{longer:?}");
+    }
+}
+
+/// The Gemini CLI is handed its profile folder byte for byte: a name with `=` in it through the
+/// launch, and one that is not UTF-8, which `display()` would have turned into another folder.
+#[test]
+fn the_gemini_profile_folder_is_handed_over_byte_for_byte() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let profile = temp.path().join("google-=dir");
+    let command = child_command(
+        Provider::Google,
+        Path::new("/not-executed"),
+        &profile,
+        &[],
+        [],
+    )
+    .unwrap();
+    let mut want = OsString::from("--gemini_dir=");
+    want.push(profile.as_os_str());
+    assert_eq!(command.get_args().collect::<Vec<_>>(), [want.as_os_str()]);
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let foreign = Path::new(std::ffi::OsStr::from_bytes(b"/profiles/google-\xff"));
+    assert_eq!(
+        gemini_dir(foreign).into_vec(),
+        b"--gemini_dir=/profiles/google-\xff"
+    );
 }
 
 #[test]

@@ -2392,6 +2392,9 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
             crate::menu::MenuAction::RecordUnseenKeys => {
                 "View \u{25b8} Record Keys Not Echoed\u{2026}, then aterm's alert"
             }
+            crate::menu::MenuAction::ChangeNickname => {
+                "the machine menu \u{25b8} Change Nickname\u{2026}; from a shell, `aterm name nick`"
+            }
             _ => "Agents \u{25b8} Take Over This Tab / Hand Back This Tab",
         };
         format!("ERR denied: {name} is the person's own act at the window ({at})\n")
@@ -3772,6 +3775,18 @@ impl crate::App {
         sid: &str,
         worker: WorkerStart,
     ) -> Result<crate::task_launch::Launch, String> {
+        #[cfg(unix)]
+        let account_scope = if crate::task_launch::native_google_agent(worker.order.agent) {
+            Some(
+                self.account_work
+                    .enter()
+                    .ok_or("account preparation is paused for shutdown or update")?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let account_scope = None;
         let (newborn, caller) = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             let newborn = g
@@ -3816,6 +3831,7 @@ impl crate::App {
             caller,
             chrome: worker.order.chrome,
             approve: self.harness_policy.get().policy.approve,
+            account_scope,
         })
     }
 
@@ -5081,6 +5097,64 @@ mod worker_start_app_tests {
 
     fn ctx_of(app: &App, local: u64) -> Arc<crate::SessionCtx> {
         app.pool.get(local).expect("live session").ctx.clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn google_worker_preparation_enters_the_apps_scope_before_any_launcher() {
+        let state = aterm_tempfile::TempDir::new().unwrap();
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let app = App::headless_for_test();
+            let sid = sid_of(&app, 0);
+            let ctx = ctx_of(&app, 0);
+            let before = ctx.timeline.lock().unwrap().task().cloned();
+            let drained = app.account_work.pause().unwrap().try_wait().unwrap();
+            let mut ask = worker();
+            ask.order.agent = aterm_phase::Program::Agy;
+            assert!(
+                app.start_worker(&sid, ask)
+                    .is_err_and(|why| why.contains("paused"))
+            );
+            assert_eq!(ctx.timeline.lock().unwrap().task().cloned(), before);
+            assert!(ctx.timeline.lock().unwrap().worker_launch().is_none());
+            drained.resume().unwrap();
+
+            let mut ask = worker();
+            ask.order.agent = aterm_phase::Program::Agy;
+            let launch = app.start_worker(&sid, ask).unwrap();
+            assert!(launch.account_scope.is_some());
+            crate::feed_session_for_test(&app, 0, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let prompt =
+                crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO).unwrap();
+            let pause = app.account_work.pause().unwrap();
+            assert!(launch.account_scope.as_ref().unwrap().cancelled());
+            let pause = pause.try_wait().unwrap_err();
+            let result = crate::task_launch::type_at_prompt(&launch, prompt, |prompt| {
+                Ok::<_, std::convert::Infallible>(crate::task_launch::type_scoped_launch_line(
+                    &app.store,
+                    &launch.ctx.self_id,
+                    launch.ctx.nonce,
+                    prompt,
+                    "never typed",
+                    launch.account_scope.as_ref(),
+                ))
+            });
+            assert!(result.is_none());
+            let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+            assert_eq!(
+                (record.state, record.why),
+                (TaskState::Stalled, Some("held"))
+            );
+            assert!(
+                !record.attention,
+                "shutdown cancellation is not provider failure"
+            );
+            // Dropping an unstarted preparation retires its launch captures before its scope.
+            drop(launch);
+            let drained = pause.try_wait().unwrap();
+            drained.resume().unwrap();
+            assert!(app.account_work.enter().is_some());
+        });
     }
 
     #[test]

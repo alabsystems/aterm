@@ -50,14 +50,25 @@ pub(crate) fn record_attempt(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn report_inputs(report: &Path, commit: &str, executable: &str) -> Result<String, String> {
+    let report_sha256 = crate::artifact::file_sha256(report)?;
+    report_inputs_with_sha256(report, commit, executable, &report_sha256)
+}
+
+fn report_inputs_with_sha256(
+    report: &Path,
+    commit: &str,
+    executable: &str,
+    report_sha256: &str,
+) -> Result<String, String> {
     let text = crate::durable::read_regular_text(&report.with_extension("inputs.toml"), 64 * 1024)
         .map_err(|error| error.to_string())?;
     let attempt: Attempt = aterm_toml::from_str(&text).map_err(|error| error.to_string())?;
     if attempt.exit_code != 1
         || attempt.commit != commit
         || attempt.executable != executable
-        || attempt.report_sha256 != crate::artifact::file_sha256(report)?
+        || attempt.report_sha256 != report_sha256
     {
         return Err("the failed verification attempt does not match its report".into());
     }
@@ -76,24 +87,24 @@ fn report_is_measure_only(text: &str) -> bool {
         .filter(|check| **check != aterm_verify::checks::Check::Measure)
         .map(|check| check.name())
         .collect();
-    let passed: std::collections::BTreeSet<_> = text
-        .lines()
-        .filter(|line| line.starts_with("ok "))
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .collect();
-    let failed: Vec<_> = text
-        .lines()
-        .filter(|line| line.starts_with("FAIL "))
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .collect();
-    passed == required
-        && failed == ["measure"]
-        && text.lines().any(|line| {
-            line.starts_with(&format!(
-                "verify: FAIL — measure failed; {} ok in ",
-                required.len()
-            ))
-        })
+    let summary_prefix = format!("verify: FAIL — measure failed; {} ok in ", required.len());
+    let mut passed = std::collections::BTreeSet::new();
+    let mut failed = Vec::new();
+    let mut has_summary = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("ok ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                passed.insert(name);
+            }
+        } else if let Some(rest) = line.strip_prefix("FAIL ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                failed.push(name);
+            }
+        } else if line.starts_with(&summary_prefix) {
+            has_summary = true;
+        }
+    }
+    passed == required && failed == ["measure"] && has_summary
 }
 
 /// Record an explicit instruction to ship despite the measurement failure in `report`.
@@ -123,14 +134,22 @@ pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
     if crate::artifact::macho_sha256(&artifact.app)? != artifact.macho_sha256 {
         return Err("the built executable changed since measurement".into());
     }
+    let report_sha256 =
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(text.as_bytes()));
     let inputs = crate::build_inputs::current()?;
-    if report_inputs(&report, &journal.commit, &artifact.macho_sha256)? != inputs {
+    if report_inputs_with_sha256(
+        &report,
+        &journal.commit,
+        &artifact.macho_sha256,
+        &report_sha256,
+    )? != inputs
+    {
         return Err("the measurement report has no matching compiler/SDK content identity; rerun verification".into());
     }
     let acceptance = Acceptance {
         commit: journal.commit,
         executable: artifact.macho_sha256,
-        report_sha256: crate::artifact::file_sha256(&report)?,
+        report_sha256,
         report,
         reason: reason.trim().into(),
         inputs,
@@ -160,15 +179,18 @@ fn read(git: &dyn GitRunner, commit: &str) -> Result<Option<Acceptance>, String>
     if held.inputs.is_empty() {
         return Ok(None);
     }
-    if report_inputs(&held.report, &held.commit, &held.executable)? != held.inputs {
+    let report_text = crate::durable::read_text(&held.report).map_err(|e| e.to_string())?;
+    let report_sha256 =
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(report_text.as_bytes()));
+    if report_inputs_with_sha256(&held.report, &held.commit, &held.executable, &report_sha256)?
+        != held.inputs
+    {
         return Err("owner acceptance no longer matches its build inputs".into());
     }
     if held.commit != commit
         || held.reason.is_empty()
-        || crate::artifact::file_sha256(&held.report)? != held.report_sha256
-        || !report_is_measure_only(
-            &crate::durable::read_text(&held.report).map_err(|e| e.to_string())?,
-        )
+        || report_sha256 != held.report_sha256
+        || !report_is_measure_only(&report_text)
     {
         return Err("owner acceptance no longer matches its complete measurement report".into());
     }
@@ -193,52 +215,6 @@ pub fn accepted(
     Ok(Some(acceptance).filter(|a| a.executable == executable).map(|a| {
         format!("OWNER ACCEPTED measure failure: {}; all other release checks passed; report {} (not a full verification pass)", a.reason, a.report.display())
     }))
-}
-
-/// A cutter carrying only release-tool changes may apply the recorded exception to its source.
-pub fn policy_cutter(git: &dyn GitRunner, source: &str, cutter: &str) -> bool {
-    let source = if read(git, source).ok().flatten().is_some() {
-        source.to_string()
-    } else {
-        let Ok(parent) = git.git(&["rev-parse", &format!("{source}^1")]) else {
-            return false;
-        };
-        if !parent.success() {
-            return false;
-        }
-        let parent = parent.stdout_utf8().trim().to_string();
-        let Ok(diff) = git.git(&["diff", "--name-only", "--no-renames", &parent, source]) else {
-            return false;
-        };
-        if !diff.success()
-            || diff.stdout.is_empty()
-            || !diff
-                .stdout_utf8()
-                .lines()
-                .all(|p| crate::gates::CLAIM_FILES.contains(&p))
-            || read(git, &parent).ok().flatten().is_none()
-        {
-            return false;
-        }
-        parent
-    };
-    let Ok(diff) = git.git(&["diff", "--name-only", "--no-renames", &source, cutter]) else {
-        return false;
-    };
-    diff.success() && policy_paths_only(&diff.stdout_utf8())
-}
-
-fn policy_paths_only(paths: &str) -> bool {
-    const POLICY: &[&str] = &[
-        "crates/aterm-release/src/accepted_measure.rs",
-        "crates/aterm-release/src/cli.rs",
-        "crates/aterm-release/src/gates.rs",
-        "crates/aterm-release/src/main.rs",
-        "crates/aterm-release/src/release_steps.rs",
-        "crates/aterm-release/src/hook.rs",
-        "crates/aterm-release/tests/it/main.rs",
-    ];
-    !paths.is_empty() && paths.lines().all(|p| POLICY.contains(&p))
 }
 
 #[cfg(test)]
@@ -283,17 +259,5 @@ mod tests {
         assert!(!report_is_measure_only(
             &report.replace("FAIL measure", "NOT RUN measure")
         ));
-    }
-
-    #[test]
-    fn an_owner_acceptance_never_authorizes_a_changed_app() {
-        assert!(super::policy_paths_only(
-            "crates/aterm-release/src/accepted_measure.rs\n"
-        ));
-        assert!(!super::policy_paths_only("crates/aterm-gui/src/spawn.rs\n"));
-        assert!(!super::policy_paths_only(
-            "crates/aterm-release/src/gates.rs\nCargo.toml\n"
-        ));
-        assert!(!super::policy_paths_only(""));
     }
 }

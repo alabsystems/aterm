@@ -6738,11 +6738,13 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Stale {
             incremental,
             units,
+            superseded,
             after,
         } => format!(
-            "partial cleanup candidate: {incremental} incremental crate folder(s) and {units} \
-             unit(s) built by a compiler that is no longer the store's current one, each \
-             unwritten for {} or more",
+            "partial cleanup candidate: {incremental} incremental crate folder(s), {units} \
+             unit(s) built by a compiler that is no longer the store's current one and \
+             {superseded} unit(s) its last passing release run superseded with another build of \
+             the same package and kind, each unwritten for {} or more",
             days(after)
         ),
         Unused::Stayed { stayed, freed } => format!(
@@ -6870,8 +6872,8 @@ fn reclaim_build_cache() -> usize {
     }
     if parts > 0 {
         println!(
-            "removed stale incremental folders and old-compiler units from {parts} Rust \
-             build cache folder(s)"
+            "removed stale incremental folders, old-compiler units and superseded release \
+             units from {parts} Rust build cache folder(s)"
         );
     }
     removed.len() - kept + retired

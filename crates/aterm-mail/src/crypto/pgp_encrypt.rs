@@ -1,15 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //! OpenPGP ECDH session-key wrapping and integrity-protected message creation.
-use super::{Key, aes, armor, hash, key_len, mpi, packet};
+use super::{CURVE25519_OID, Key, aes, armor, hash, key_len, mpi, packet};
 use zeroize::Zeroizing;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Recipient {
     id: [u8; 8],
     fingerprint: [u8; 20],
     public: [u8; 32],
-    oid: Vec<u8>,
     hash: u8,
     cipher: u8,
 }
@@ -19,7 +18,6 @@ impl Key {
             id: self.id,
             fingerprint: self.fingerprint,
             public: self.public,
-            oid: self.oid.clone(),
             hash: self.hash,
             cipher: self.cipher,
         }
@@ -40,7 +38,7 @@ pub fn public_keys(armored: &str) -> Result<Vec<Recipient>, String> {
         let oid = body
             .get(7..7 + oid_len)
             .ok_or("Truncated public-key curve")?;
-        if oid != [43, 6, 1, 4, 1, 151, 85, 1, 5, 1] {
+        if oid != CURVE25519_OID {
             continue;
         }
         let (point, kdf) = mpi(body.get(7 + oid_len..).ok_or("Truncated public key")?)?;
@@ -60,7 +58,6 @@ pub fn public_keys(armored: &str) -> Result<Vec<Recipient>, String> {
             id: fingerprint[12..].try_into().map_err(|_| "Invalid key ID")?,
             fingerprint,
             public: point[1..].try_into().map_err(|_| "Invalid public key")?,
-            oid: oid.to_vec(),
             hash: kdf[2],
             cipher: kdf[3],
         });
@@ -115,23 +112,21 @@ impl EncryptedBody {
         let mut digest = ring::digest::Context::new(hash(recipient.hash)?);
         digest.update(&[0, 0, 0, 1]);
         digest.update(shared.as_ref());
-        digest.update(&[recipient.oid.len() as u8]);
-        digest.update(&recipient.oid);
+        digest.update(&[CURVE25519_OID.len() as u8]);
+        digest.update(&CURVE25519_OID);
         digest.update(&[18, 3, 1, recipient.hash, recipient.cipher]);
         digest.update(b"Anonymous Sender    ");
         digest.update(&recipient.fingerprint);
         let derived = Zeroizing::new(digest.finish().as_ref().to_vec());
-        let mut plain = Zeroizing::new(Vec::with_capacity(40));
-        plain.push(9);
-        plain.extend_from_slice(self.session.as_ref());
+        let mut plain = Zeroizing::new([5u8; 40]);
+        plain[0] = 9;
+        plain[1..33].copy_from_slice(self.session.as_ref());
         let sum = self
             .session
             .iter()
             .fold(0u16, |a, b| a.wrapping_add(u16::from(*b)));
-        plain.extend_from_slice(&sum.to_be_bytes());
-        let padding = 8 - plain.len() % 8;
-        plain.extend(std::iter::repeat_n(padding as u8, padding));
-        let wrapped = aes::wrap(&derived[..key_len(recipient.cipher)?], &plain)?;
+        plain[33..35].copy_from_slice(&sum.to_be_bytes());
+        let wrapped = aes::wrap(&derived[..key_len(recipient.cipher)?], plain.as_ref())?;
         let mut packet = Vec::with_capacity(14 + 32 + wrapped.len());
         packet.push(3);
         packet.extend_from_slice(&recipient.id);
@@ -142,7 +137,9 @@ impl EncryptedBody {
         Ok(frame(1, &packet))
     }
     pub fn armored(&self, recipient: &Recipient) -> Result<String, String> {
-        let mut bytes = self.key_packet(recipient)?;
+        let key_pkt = self.key_packet(recipient)?;
+        let mut bytes = Vec::with_capacity(key_pkt.len() + self.data.len());
+        bytes.extend_from_slice(&key_pkt);
         bytes.extend_from_slice(&self.data);
         let encoded =
             aterm_codec::base64::encode(&bytes).map_err(|_| "Could not encode encrypted mail")?;
@@ -162,7 +159,8 @@ impl EncryptedBody {
 }
 
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![0xc0 | tag, 255];
+    let mut bytes = Vec::with_capacity(6 + body.len());
+    bytes.extend_from_slice(&[0xc0 | tag, 255]);
     bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
     bytes.extend_from_slice(body);
     bytes

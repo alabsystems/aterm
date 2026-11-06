@@ -172,18 +172,17 @@ pub fn running_processes() -> Option<Vec<RunningProcess>> {
 /// Every cut staging directory under `dist` that a process in `processes` executes out of, with the pids, sorted by directory.
 #[must_use]
 pub fn live_staging_dirs(dist: &Path, processes: &[RunningProcess]) -> Vec<(PathBuf, Vec<String>)> {
-    let mut roots = vec![dist.to_path_buf()];
+    let mut prefixes = vec![format!("{}/", dist.display())];
     if let Ok(resolved) = std::fs::canonicalize(dist)
         && resolved != dist
     {
-        roots.push(resolved);
+        prefixes.push(format!("{}/", resolved.display()));
     }
     let mut live: std::collections::BTreeMap<PathBuf, Vec<String>> =
         std::collections::BTreeMap::new();
     for (pid, comm) in processes {
-        for root in &roots {
-            let prefix = format!("{}/", root.display());
-            let Some(rest) = comm.strip_prefix(&prefix) else {
+        for prefix in &prefixes {
+            let Some(rest) = comm.strip_prefix(prefix.as_str()) else {
                 continue;
             };
             let Some((name, _)) = rest.split_once('/') else {

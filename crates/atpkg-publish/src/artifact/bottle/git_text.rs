@@ -16,6 +16,10 @@ use crate::error::{Error, Result};
 /// An unreadable helper, an unknown script language or an unsupported prefix literal.
 pub(super) fn rewrite(stage: &Path, version: &str) -> Result<()> {
     let prefix = format!("@@HOMEBREW_CELLAR@@/git/{version}");
+    rewrite_prefix(stage, &prefix)
+}
+
+pub(super) fn rewrite_prefix(stage: &Path, prefix: &str) -> Result<()> {
     for rel in relocate::walk_files(stage).map_err(Error::refused)? {
         let path = stage.join(&rel);
         let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
@@ -40,7 +44,11 @@ pub(super) fn rewrite(stage: &Path, version: &str) -> Result<()> {
                 rel.display()
             )));
         }
-        let rendered = literals(text, &prefix, perl)?;
+        let mut rendered = text.to_string();
+        for actual in bottled_prefixes(text, prefix)? {
+            rendered = literals(&rendered, &actual, perl)
+                .map_err(|error| Error::refused(format!("{}: {error}", rel.display())))?;
+        }
         let setup = if perl {
             let levels = rel.parent().map_or(0, |parent| parent.components().count());
             let mut parent = String::with_capacity(levels.saturating_mul(3));
@@ -98,6 +106,28 @@ pub(super) fn rewrite(stage: &Path, version: &str) -> Result<()> {
             .map_err(|error| Error::io("restore Git helper mode", &error))?;
     }
     Ok(())
+}
+
+fn bottled_prefixes(text: &str, prefix: &str) -> Result<Vec<String>> {
+    let mut prefixes = std::collections::BTreeSet::new();
+    for rest in text.split(prefix).skip(1) {
+        let revision = rest
+            .strip_prefix('_')
+            .map(|suffix| suffix.bytes().take_while(u8::is_ascii_digit).count());
+        let length = match revision {
+            Some(0) => return Err(Error::refused("invalid Git bottle revision suffix")),
+            Some(digits) => digits + 1,
+            None => 0,
+        };
+        let tail = &rest[length..];
+        if !tail.is_empty() && !tail.starts_with(['/', '\'', '"']) {
+            return Err(Error::refused(
+                "Git bottle prefix does not match its upstream version",
+            ));
+        }
+        prefixes.insert(format!("{prefix}{}", &rest[..length]));
+    }
+    Ok(prefixes.into_iter().rev().collect())
 }
 
 fn literals(text: &str, prefix: &str, perl: bool) -> Result<String> {
@@ -159,6 +189,20 @@ mod tests {
         assert!(literals(&format!("root={prefix}/share/gitweb\n"), prefix, false).is_err());
         assert!(literals(&format!("root='{prefix}/$unsafe'\n"), prefix, false).is_err());
         assert!(literals(&format!("our $root='{prefix}/@unsafe';\n"), prefix, true).is_err());
+    }
+
+    #[test]
+    fn formula_revision_is_part_of_the_relocated_prefix() {
+        let prefix = "@@HOMEBREW_CELLAR@@/git/2.56.0";
+        let text = format!("root='{prefix}_2/share/locale'\n");
+        let actual = bottled_prefixes(&text, prefix).unwrap();
+        assert_eq!(actual, [format!("{prefix}_2")]);
+        assert_eq!(
+            literals(&text, &actual[0], false).unwrap(),
+            "root=\"${ATERM_GIT_ROOT}/share/locale\"\n"
+        );
+        assert!(bottled_prefixes(&format!("root='{prefix}1/share'"), prefix).is_err());
+        assert!(bottled_prefixes(&format!("root='{prefix}_bad/share'"), prefix).is_err());
     }
 
     #[cfg(target_os = "macos")]

@@ -117,6 +117,10 @@ aterm-db = { workspace = true }
 # request digests; both libraries are already present through aterm-db.
 aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
+# The node service's mesh moves tables (docs/DESIGN-alab-one-mesh-2026-11-05.md §11 B7b): every
+# process's store sinks wake its egress, and its Commons runtime asks it who speaks `Bus` and for
+# a push's relay ack. Already in the graph through aterm-gui.
+aterm-mesh = { workspace = true }
 
 # `aterm init` (crates/aterm-machines' `init`): on a Mac the workstation too; elsewhere the
 # base layer, the vault and the repositories. `aterm machines` itself stays macOS-only

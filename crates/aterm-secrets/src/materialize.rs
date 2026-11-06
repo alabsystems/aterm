@@ -868,13 +868,25 @@ pub fn holds_digest(home: &Path, name: &str, digest: &str) -> bool {
 
 /// Whether entry `name`'s file under `home` is a gap a pass writes: missing, with no directory
 /// on its way that a pass refuses (a symlink, or one it does not own) ([`Places::reachable`]).
+/// A bare name's way is `~/.secrets` ([`secrets_reachable`]).
 pub fn is_gap(home: &Path, name: &str) -> bool {
-    let reachable = name
-        .strip_prefix("~/")
-        .is_none_or(|rel| refused_dir(home, rel, own_dir(home)).is_none());
+    let reachable = match name.strip_prefix("~/") {
+        Some(rel) => refused_dir(home, rel, own_dir(home)).is_none(),
+        None => secrets_reachable(home),
+    };
     reachable
         && target_path(home, name)
             .is_ok_and(|target| matches!(fsx::kind(&target), Ok(Kind::Missing)))
+}
+
+/// Whether a pass writes in `~/.secrets` under `home`, judged without making or narrowing it:
+/// it is missing (a pass makes it), or a directory, not a symlink, this user owns (a pass narrows
+/// its mode). [`fsx::ensure_private_dir`] refuses anything else, so a pass writes no file there.
+fn secrets_reachable(home: &Path) -> bool {
+    match std::fs::symlink_metadata(home.join(".secrets")) {
+        Ok(meta) => meta.file_type().is_dir() && meta.uid() == fsx::euid(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
@@ -964,6 +976,43 @@ mod tests {
             if_absent: false,
             anchor: None,
         }
+    }
+
+    /// A missing plain entry is a gap only where a pass writes it: with `~/.secrets` missing or
+    /// this user's directory. A symlinked `~/.secrets` (to a directory the link makes look
+    /// writable) is no gap, as the pass beside it writes nothing there; a file in its place
+    /// neither. Control: the same names in a private `~/.secrets` are gaps, and a pass fills them.
+    #[test]
+    fn a_plain_entry_is_a_gap_only_where_a_pass_writes_it() {
+        let root = scratch();
+        let entries = [entry("token", b"value")];
+        let gap = |home: &Path| is_gap(home, "token");
+
+        let missing = root.path().join("missing");
+        std::fs::create_dir(&missing).unwrap();
+        assert!(gap(&missing), "a pass makes ~/.secrets");
+
+        let linked = root.path().join("linked");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join(".secrets")).unwrap();
+        assert!(!gap(&linked));
+        let (_, report) = apply(&linked, &entries, &Manifest::default(), 1).unwrap();
+        assert!(report.written.is_empty(), "{report:?}");
+        assert!(!elsewhere.join("token").exists());
+
+        let filed = root.path().join("filed");
+        std::fs::create_dir(&filed).unwrap();
+        std::fs::write(filed.join(".secrets"), b"not a directory").unwrap();
+        assert!(!gap(&filed));
+
+        let private = root.path().join("private");
+        std::fs::create_dir_all(private.join(".secrets")).unwrap();
+        assert!(gap(&private));
+        let (_, report) = apply(&private, &entries, &Manifest::default(), 1).unwrap();
+        assert_eq!(report.written, ["token"]);
+        assert!(!gap(&private), "the pass filled it");
     }
 
     #[test]

@@ -580,6 +580,13 @@ impl Probe<'_> {
                 "git config --list",
             ));
         }
+        if listed.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+            return Err(format!(
+                "cannot read the whole git config in {}: over {} bytes",
+                dir.display(),
+                aterm_uds::deadline::OUTPUT_KEEP
+            ));
+        }
         let mut view = GitView {
             config: parse_config_list(&listed.stdout),
             external_diff: self
@@ -648,6 +655,13 @@ impl Probe<'_> {
                 "git ls-files --stage",
             ));
         }
+        if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+            return Err(format!(
+                "cannot list the whole index in {}: over {} bytes",
+                top.display(),
+                aterm_uds::deadline::OUTPUT_KEEP
+            ));
+        }
         Ok(String::from_utf8_lossy(&out.stdout)
             .split('\0')
             .filter_map(|entry| {
@@ -664,20 +678,37 @@ impl Probe<'_> {
             .ok()
             .filter(|o| o.status.success())?
             .stdout;
-        let mut child = self
-            .git(top)
-            .args(["check-attr", "--stdin", "-z", "filter"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .ok()?;
-        let mut stdin = child.stdin.take()?;
-        let writer = std::thread::spawn(move || {
+        if paths.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+            return None;
+        }
+        self.drivers_selected(top, paths, GIT_READ_WAIT)
+    }
+
+    /// The filter drivers the attributes in `top` select for `paths` (`ls-files -z` output),
+    /// read by one `check-attr` that is killed, and the read refused, once `wait` has passed.
+    fn drivers_selected(
+        &self,
+        top: &Path,
+        paths: Vec<u8>,
+        wait: std::time::Duration,
+    ) -> Option<Vec<String>> {
+        let (reader, mut writer) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        let wrote = std::thread::spawn(move || {
             use std::io::Write as _;
-            stdin.write_all(&paths)
+            writer.write_all(&paths)
         });
-        let out = child.wait_with_output().ok()?;
-        writer.join().ok()?.ok()?;
-        if !out.status.success() {
+        // The command holds this process's copy of the pipe's read end until it drops, at the
+        // block's end: then a git that exited, or was killed, without reading all of `paths`
+        // fails the writer's write instead of leaving it blocked.
+        let out = {
+            let mut cmd = self.git(top);
+            cmd.args(["check-attr", "--stdin", "-z", "filter"]);
+            aterm_uds::deadline::output_within_from(&mut cmd, Stdio::from(reader), wait).ok()
+        };
+        let wrote = wrote.join().ok()?;
+        let out = out?;
+        wrote.ok()?;
+        if !out.status.success() || out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
             return None;
         }
         let text = String::from_utf8_lossy(&out.stdout);

@@ -1318,34 +1318,11 @@ impl Log {
         out
     }
 
-    /// Whether `recipient` belongs to a Mac that was removed and not restored in this log.
+    /// Whether `recipient` belongs to a Mac that was removed and not restored in this log
+    /// ([`super::Membership::recipient_removed`]).
     #[must_use]
     pub fn recipient_is_removed(&self, recipient: &Recipient) -> bool {
-        let membership = self.membership_ref();
-        if membership.removed_recipients().contains(recipient) {
-            return true;
-        }
-        let mut any_for_recipient = false;
-        for m in membership.members().values() {
-            if m.binding.recipient() == *recipient {
-                any_for_recipient = true;
-                if !membership.member_node_removed(m) {
-                    return false;
-                }
-            }
-        }
-        for f in membership.unproved() {
-            if f.recipient == *recipient {
-                any_for_recipient = true;
-                let node_removed = f.node_key.is_some_and(|nk| {
-                    nk != [0; 32] && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
-                });
-                if !node_removed {
-                    return false;
-                }
-            }
-        }
-        any_for_recipient
+        self.membership_ref().recipient_removed(recipient)
     }
 
     /// Whether an effective [`Body::Wrap`] in this log is addressed to `recipient`.

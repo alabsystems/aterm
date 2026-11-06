@@ -23,15 +23,16 @@ pub use initial::{
     InitialSetupObserved, InitialSetupParkMark, InitialSetupRestart, InitialSetupSnapshot,
     InitialSetupSnapshotError, InitialSetupUpgrade, LAN_KEEPER, LocalNetworkFirstUse,
     LocalNetworkHeard, ParkWatch, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
-    SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, alab_mac, apply_initial_setup,
-    apply_initial_setup_observed, automatic_plan, bring_forward_restored_setup,
-    bring_forward_restored_setup_observing, check_background_workstation, check_initial_setup,
-    check_initial_setup_observed, forget_set_aside_setup, initial_setup_access_revision,
-    initial_setup_access_step, initial_setup_admission, initial_setup_finished,
-    initial_setup_holds, initial_setup_keeps_vault_sync, initial_setup_observation,
-    initial_setup_owes_secrets_stage, initial_setup_park_mark, initial_setup_permission_steps,
-    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
-    initial_setup_snapshot_read_only, local_network_first_use, local_network_heard,
+    SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, activate_input_attachments, alab_mac,
+    apply_initial_setup, apply_initial_setup_observed, automatic_plan,
+    bring_forward_restored_setup, bring_forward_restored_setup_observing,
+    check_background_workstation, check_initial_setup, check_initial_setup_observed,
+    forget_set_aside_setup, initial_setup_access_revision, initial_setup_access_step,
+    initial_setup_admission, initial_setup_finished, initial_setup_holds,
+    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
+    initial_setup_park_mark, initial_setup_permission_steps, initial_setup_review_revision,
+    initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_read_only,
+    input_activation_revision, local_network_first_use, local_network_heard,
     local_network_question_is_own, look_for_the_alab_vault, note_person_asked_for_access,
     note_setup_interrupted, observe_initial_setup, probe_local_network_again,
     provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
@@ -3311,11 +3312,7 @@ fn save_withheld_reading_revision(
             }),
         );
     }
-    match std::fs::remove_file(root.join(WITHHELD_RECORD)) {
-        Ok(()) => durable_directory(root).map_err(|e| format!("{}: {e}", root.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("clear withheld preferences: {e}")),
-    }
+    remove_record(root, WITHHELD_RECORD, "clear withheld preferences")
 }
 
 fn record_withheld(
@@ -4043,11 +4040,7 @@ fn save_restore_waiting(root: &Path, targets: &[Target]) -> Result<(), String> {
     if !targets.is_empty() {
         return save_targets_record(root, RESTORE_WAITING, targets);
     }
-    match std::fs::remove_file(root.join(RESTORE_WAITING)) {
-        Ok(()) => durable_directory(root).map_err(|e| format!("{}: {e}", root.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("clear the waiting restore: {e}")),
-    }
+    remove_record(root, RESTORE_WAITING, "clear the waiting restore")
 }
 
 /// Put back what a Restore left for want of Full Disk Access, once aterm has it (System State
@@ -4184,10 +4177,17 @@ fn finish_waiting_restore(root: &Path, host: &mut dyn Host) -> Result<Option<Rep
 }
 
 fn clear_pending_refresh(root: &Path) -> Result<(), String> {
-    match std::fs::remove_file(root.join("pending-refresh.json")) {
-        Ok(()) => Ok(()),
+    remove_record(root, "pending-refresh.json", "clear pending activation")
+}
+
+/// Remove the record `name` from `root`, then flush `root`, so the record stays gone after a
+/// crash as a write of it stays written; one already gone needs neither. An error names `what`
+/// was being done, or `root` when its flush failed.
+fn remove_record(root: &Path, name: &str, what: &str) -> Result<(), String> {
+    match std::fs::remove_file(root.join(name)) {
+        Ok(()) => durable_directory(root).map_err(|e| format!("{}: {e}", root.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("clear pending activation: {e}")),
+        Err(e) => Err(format!("{what}: {e}")),
     }
 }
 
@@ -8507,6 +8507,38 @@ mod tests {
         );
         assert_eq!(host.writes.len(), writes);
         assert!(!root.path().join("pending-refresh.json").exists());
+    }
+
+    /// Clearing a record (the pending activation, the waiting restore, the withheld
+    /// preferences) flushes its directory once the record is gone, as writing one does, so a
+    /// crash cannot bring it back. NEGATIVE CONTROL: clearing a record already gone flushes
+    /// nothing.
+    #[test]
+    fn a_cleared_record_s_removal_is_flushed() {
+        type Clear = fn(&Path) -> Result<(), String>;
+        let clears: [(&str, Clear); 3] = [
+            ("pending-refresh.json", clear_pending_refresh),
+            (RESTORE_WAITING, |root| save_restore_waiting(root, &[])),
+            (WITHHELD_RECORD, |root| {
+                save_withheld_reading_revision(root, &Withheld::default(), || {
+                    unreachable!("an empty record is removed without its revision")
+                })
+            }),
+        ];
+        for (name, clear) in clears {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            std::fs::write(root.path().join(name), b"{}").expect("record");
+            let recording = aterm_durable::seam::Recording::start();
+            clear(root.path()).expect("cleared");
+            assert!(!root.path().join(name).exists(), "{name}");
+            assert_eq!(
+                recording.take(),
+                [aterm_durable::Flush::Durable],
+                "{name}: its directory is flushed once it is gone"
+            );
+            clear(root.path()).expect("already clear");
+            assert_eq!(recording.take(), [], "{name}: nothing to flush");
+        }
     }
 
     #[test]

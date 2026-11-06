@@ -378,24 +378,34 @@ fn send<S: Stream>(writer: &Mutex<S>, frame: &Frame) -> Result<(), wire::WireErr
     wire::write_frame(&mut *w, frame)
 }
 
-/// Copy `from` to the host as `wrap` frames until EOF. Once the host is gone it keeps
+/// Copy `from` to the host as `kind` frames until EOF. Once the host is gone it keeps
 /// reading, so the command never blocks on a full pipe before its group is killed.
 fn pump<S: Stream>(
     mut from: impl Read + Send + 'static,
     writer: Arc<Mutex<S>>,
-    wrap: fn(Vec<u8>) -> Frame,
+    kind: u8,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("vz-agent output".into())
         .spawn(move || {
-            let mut buf = vec![0u8; CHUNK];
+            let mut buf = vec![0u8; wire::HEADER + CHUNK];
+            buf[0] = kind;
             let mut host = true;
             loop {
-                match from.read(&mut buf) {
+                match from.read(&mut buf[wire::HEADER..]) {
                     Ok(0) => return,
                     Ok(n) => {
                         if host {
-                            host = send(&writer, &wrap(buf[..n].to_vec())).is_ok();
+                            buf[1..wire::HEADER].copy_from_slice(&(n as u32).to_le_bytes());
+                            host = writer
+                                .lock()
+                                .ok()
+                                .and_then(|mut w| {
+                                    w.write_all(&buf[..wire::HEADER + n])
+                                        .and_then(|()| w.flush())
+                                        .ok()
+                                })
+                                .is_some();
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -489,15 +499,15 @@ fn run<S: Stream>(conn: S, reader: S, exec: &Exec, system: &dyn System) {
             }
             None => None,
         };
-        let mut pumps = Vec::new();
+        let mut pumps = Vec::with_capacity(2);
         if let Some(out) = merged {
-            pumps.push(pump(out, Arc::clone(&writer), Frame::Out)?);
+            pumps.push(pump(out, Arc::clone(&writer), wire::OUT)?);
         }
         if let Some(out) = child.stdout.take() {
-            pumps.push(pump(out, Arc::clone(&writer), Frame::Out)?);
+            pumps.push(pump(out, Arc::clone(&writer), wire::OUT)?);
         }
         if let Some(err) = child.stderr.take() {
-            pumps.push(pump(err, Arc::clone(&writer), Frame::Err)?);
+            pumps.push(pump(err, Arc::clone(&writer), wire::ERR)?);
         }
         let done = Arc::clone(&completion);
         let input = thread::Builder::new()

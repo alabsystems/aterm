@@ -144,10 +144,8 @@ fn write_guard(req: &WireRequest<'_>) -> Option<WireError> {
 }
 
 fn guard(req: &WireRequest<'_>) -> Option<WireError> {
-    if !req.method.is_read()
-        && let Some(refusal) = write_guard(req)
-    {
-        return Some(refusal);
+    if !req.method.is_read() {
+        return write_guard(req);
     }
     let auth = req.auth?;
     let target = Origin::parse(&req.url).map(|(origin, _)| origin);

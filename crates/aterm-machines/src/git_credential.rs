@@ -206,11 +206,11 @@ pub(crate) struct Git {
 }
 
 impl Git {
-    /// The installed git ([`crate::items::github::git_program`]): what `aterm init`, the vault's
-    /// converge pass and every clone run.
-    pub(crate) fn new(sys: &dyn System) -> Self {
+    /// The installed git for `user` ([`crate::items::github::git_program_for_user`]): what
+    /// `aterm init`, the vault's converge pass and every clone run as that account.
+    pub(crate) fn for_user(sys: &dyn System, user: &User) -> Self {
         Self {
-            program: crate::items::github::git_program(sys),
+            program: crate::items::github::git_program_for_user(sys, user),
             env: Vec::new(),
         }
     }
@@ -989,7 +989,7 @@ pub(crate) mod script {
     use crate::port::{Fake, Ran, System as _};
     use std::path::{Path, PathBuf};
 
-    /// The Command Line Tools' git, as [`Git::new`] finds it on a Mac with the tools.
+    /// The Command Line Tools' git, as [`Git::for_user`] finds it without a managed build.
     fn clt() -> Git {
         Git {
             program: PathBuf::from(crate::items::github::CLT_GIT),
@@ -997,10 +997,9 @@ pub(crate) mod script {
         }
     }
 
-    /// The git `sys` runs as these scripts key it: the tools' on a Mac, and elsewhere the
-    /// distribution's ([`Git::new`]).
-    fn host(sys: &Fake) -> Git {
-        if sys.macos() { clt() } else { Git::new(sys) }
+    /// The git selected for this account, including a ready managed build ([`Git::for_user`]).
+    fn host(sys: &Fake, user: &User) -> Git {
+        Git::for_user(sys, user)
     }
 
     /// CLT git's own configuration file, which names `osxkeychain` for every host.
@@ -1063,7 +1062,7 @@ pub(crate) mod script {
             .map(|[file, key, value]| (file.as_str(), key.as_str(), value.as_str()))
             .collect();
         sys.on(
-            &host(sys).read(user, None).display(),
+            &host(sys, user).read(user, None).display(),
             Ran::ok(&printed(&rows)),
         );
     }
@@ -1124,7 +1123,7 @@ pub(crate) mod script {
     /// A read-back through aterm's route with `helper` that hands back `token`.
     pub(crate) fn hands_back(sys: &Fake, user: &User, helper: &Helper, token: &str) {
         sys.on(
-            &host(sys).read_back(user, helper).display(),
+            &host(sys, user).read_back(user, helper).display(),
             Ran::ok(&format!(
                 "protocol=https\nhost=github.com\nusername=fixture\npassword={token}\n"
             )),
@@ -1135,7 +1134,9 @@ pub(crate) mod script {
     /// `account` at `host`).
     pub(crate) fn lookups_hold(sys: &Fake, user: &User, host: &str, account: &str, token: &str) {
         sys.on(
-            &self::host(sys).read_back(user, &helper(user)).display(),
+            &self::host(sys, user)
+                .read_back(user, &helper(user))
+                .display(),
             Ran::ok(&format!(
                 "protocol=https\nhost={host}\nusername={account}\npassword={token}\n"
             )),
@@ -1145,7 +1146,7 @@ pub(crate) mod script {
     /// A read-back aterm's helper has nothing for: git's disabled prompt.
     pub(crate) fn lookups_hold_nothing(sys: &Fake, user: &User) {
         sys.on(
-            &host(sys).read_back(user, &helper(user)).display(),
+            &host(sys, user).read_back(user, &helper(user)).display(),
             Ran::exit(
                 128,
                 "fatal: could not read Password: terminal prompts disabled",
@@ -1198,7 +1199,7 @@ pub(crate) mod script {
     ) -> Vec<String> {
         let global = Path::new(&user.home).join(".gitconfig");
         let config = |args: &[&str]| {
-            host(sys)
+            host(sys, user)
                 .cmd(Some(user))
                 .arg("config")
                 .arg("--file")
@@ -1995,7 +1996,7 @@ mod tests {
                 vec![script::helpers(&who)],
             ),
         ] {
-            let git = Git::new(&sys);
+            let git = Git::for_user(&sys, &who);
             assert_eq!(git.keychain_in_effect(&sys, &who), found, "{label}");
             assert_eq!(sys.calls(), reads, "{label}: no helper ran");
         }
@@ -2009,7 +2010,7 @@ mod tests {
         let who = alice();
         let token = Secret::new(TOKEN.as_bytes()).unwrap();
         let sys = Fake::default();
-        let git = Git::new(&sys);
+        let git = Git::for_user(&sys, &who);
         assert_eq!(Helper::vault(&sys, &who), None, "no launcher, no helper");
         let Lookups::Not(why) = git.lookups(&sys, &who, None, &token).unwrap() else {
             panic!("no route is not ready");
@@ -2031,7 +2032,7 @@ mod tests {
                 None => script::lookups_hold_nothing(&sys, &who),
             }
             let helper = Helper::vault(&sys, &who).expect("the launcher is there");
-            let read = Git::new(&sys)
+            let read = Git::for_user(&sys, &who)
                 .lookups(&sys, &who, Some(&helper), &token)
                 .unwrap();
             assert_eq!(read.ready(), ready, "{answer:?}: {read:?}");
@@ -2045,7 +2046,7 @@ mod tests {
         sys.on(&script::fill(&who), Ran::ok("password=one\npassword=two\n"));
         let helper = Helper::vault(&sys, &who).unwrap();
         assert!(
-            Git::new(&sys)
+            Git::for_user(&sys, &who)
                 .lookups(&sys, &who, Some(&helper), &token)
                 .is_err(),
             "two passwords are no answer"
@@ -2159,7 +2160,7 @@ mod tests {
                 .success()
         };
         assert!(!ask(crate::checkout::git(&live, &who, None)));
-        let open = Cmd::new(crate::items::github::git_program(&live))
+        let open = Cmd::new(crate::items::github::git_program_for_user(&live, &who))
             .as_user(&who)
             .env("GIT_TERMINAL_PROMPT", "0");
         assert!(ask(open), "control: askpass answers where it is left on");

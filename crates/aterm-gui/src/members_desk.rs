@@ -439,7 +439,8 @@ pub(crate) fn undo_notice(offer: &aterm_secrets::client::UndoOffer) -> Message {
 }
 
 /// Whether this Mac's vault says it is no member, and not just for a moment, once [`Local::of`]
-/// found none: none configured, not admitted, revoked, no identity of its own, or Commons control
+/// found none: none configured, not admitted, revoked or dropped (a rotation left it out with no
+/// act against it), no identity of its own, or Commons control
 /// that is not its own while it is no member by its membership log either
 /// ([`aterm_secrets::client::member_by_log`]: the log seats it nowhere, removed it, or it holds no
 /// pinned Commons anchor). A seated member with its pinned anchor whose read found none for a
@@ -453,6 +454,7 @@ fn left(paths: &aterm_secrets::client::Paths) -> bool {
             Unavailable::Unconfigured
             | Unavailable::NotAdmitted
             | Unavailable::Revoked
+            | Unavailable::Dropped
             | Unavailable::MissingIdentity,
         )) => true,
         Ok(Observation::Unavailable(

@@ -53,6 +53,9 @@ aterm-toolchain = { workspace = true }
 # Content-addressed causal control records and their strict local journal.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 aterm-db-core.workspace = true
+# The proved decisions of one-mesh: P6's capacity kernels, and P3's held-draft and waiting-write
+# kernels and folds (`no_lost_edit`). A zero-dependency leaf crate.
+aterm-mesh-core.workspace = true
 aterm-spec-anchor.workspace = true
 # The exceptions digest entry and the step and reason words a credential need's ask is held
 # to (`need::exception`).

@@ -407,8 +407,9 @@ impl Here {
     }
 
     /// Snapshot [`Here`] from the 1-minute listener cache (refreshed once per [`FACTS_CACHE_TTL`],
-    /// or immediately if `<state>/fleet-node` changed), with the home's checkouts as their latest
-    /// read found them.
+    /// immediately if `<state>/fleet-node` changed, and at the next survey after one whose swarm
+    /// roster was unread, [`serves_cached`]), with the home's checkouts as their latest read
+    /// found them.
     #[cfg(any(unix, test))]
     pub(crate) fn cached_for_listener() -> Here {
         static CACHE: std::sync::Mutex<Option<(std::time::Instant, Here)>> =
@@ -420,8 +421,7 @@ impl Here {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((at, cached)) = guard.as_ref()
-                && now.saturating_duration_since(*at) < FACTS_CACHE_TTL
-                && cached.facts.as_ref().and_then(|f| f.node.as_deref()) == live_node.as_deref()
+                && serves_cached(*at, cached, now, live_node.as_deref())
             {
                 // The checkouts' read runs on its own clock ([`refresh_home_repos`]), so a cached
                 // snapshot says the latest one, never one a minute behind it.
@@ -441,6 +441,25 @@ impl Here {
         *guard = Some((now, fresh.clone()));
         fresh
     }
+}
+
+/// Whether the listener answers a survey at `now` with `cached`, the snapshot it took at `at`:
+/// within [`FACTS_CACHE_TTL`], for the node this Mac is now (`live_node`), and only where that
+/// snapshot read its swarm roster. One whose roster was unread (a vault writer held the state lock
+/// past the facts' bounded wait, one-mesh N2) said so of that moment alone, so the next survey
+/// reads the roster afresh rather than repeating that moment for a minute (one-mesh E2: a Mac
+/// whose writer let go still read `roster_unread=1` and no label in every fleet survey of the
+/// minute after).
+#[cfg(any(unix, test))]
+fn serves_cached(
+    at: std::time::Instant,
+    cached: &Here,
+    now: std::time::Instant,
+    live_node: Option<&str>,
+) -> bool {
+    now.saturating_duration_since(at) < FACTS_CACHE_TTL
+        && cached.facts.as_ref().and_then(|f| f.node.as_deref()) == live_node
+        && !cached.facts.as_ref().is_some_and(|f| f.roster_unread)
 }
 
 /// Handle `survey [facts|content]` at the requested level, capped to `most`.

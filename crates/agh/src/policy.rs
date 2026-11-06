@@ -464,9 +464,12 @@ impl Refusal {
     pub fn into_error(self, repo: Option<&Slug>) -> Error {
         let tried = self
             .tried
-            .iter()
+            .into_iter()
             .map(|(step, presence)| Tried::Skipped {
-                as_: step.label().to_string(),
+                as_: match step {
+                    ChainStep::Profile(name) => name,
+                    ChainStep::Anonymous => "anonymous".to_string(),
+                },
                 why: presence.slug().to_string(),
             })
             .collect();
@@ -1138,25 +1141,34 @@ impl Permit {
         let Some(rest) = path.strip_prefix('/') else {
             return false;
         };
-        let mut segments = Vec::new();
-        for raw in rest.split('/') {
+        let mut matched = 0usize;
+        for (at, raw) in rest.split('/').enumerate() {
             if raw.is_empty() || !escapes_well_formed(raw) {
                 return false;
             }
-            let decoded = aterm_codec::pct::decode(raw);
+            let decoded: std::borrow::Cow<'_, str> = if raw.contains('%') {
+                std::borrow::Cow::Owned(aterm_codec::pct::decode(raw))
+            } else {
+                std::borrow::Cow::Borrowed(raw)
+            };
             if decoded == "." || decoded == ".." || decoded.contains('/') {
                 return false;
             }
-            segments.push(decoded);
+            let ok = match (&self.target, at) {
+                (PermitTarget::Repo(_), 0) => decoded.eq_ignore_ascii_case("repos"),
+                (PermitTarget::Repo(slug), 1) => decoded.eq_ignore_ascii_case(slug.owner()),
+                (PermitTarget::Repo(slug), 2) => decoded.eq_ignore_ascii_case(slug.repo()),
+                (PermitTarget::Identity, 0) => decoded.eq_ignore_ascii_case("user"),
+                _ => true,
+            };
+            if !ok {
+                return false;
+            }
+            matched = at + 1;
         }
-        let is = |at: usize, want: &str| {
-            segments
-                .get(at)
-                .is_some_and(|segment| segment.eq_ignore_ascii_case(want))
-        };
         match &self.target {
-            PermitTarget::Repo(slug) => is(0, "repos") && is(1, slug.owner()) && is(2, slug.repo()),
-            PermitTarget::Identity => is(0, "user"),
+            PermitTarget::Repo(_) => matched >= 3,
+            PermitTarget::Identity => matched >= 1,
         }
     }
 

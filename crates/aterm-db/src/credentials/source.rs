@@ -32,14 +32,16 @@ fn header(paths: &Paths, network: [u8; 16], request: [u8; 16]) -> Result<Option<
     header_named(&paths.dir, &name(network, request), network, request)
 }
 
-fn header_named(
-    dir: &std::path::Path,
-    name: &str,
+fn header_from_opened(
+    opened: std::result::Result<
+        (std::fs::File, std::fs::Metadata),
+        aterm_uds::private_file::PrivateFileError,
+    >,
     network: [u8; 16],
     request: [u8; 16],
 ) -> Result<Option<u64>> {
     use std::io::Read as _;
-    let (mut file, _) = match aterm_uds::private_file::open_private(dir, name) {
+    let (mut file, _) = match opened {
         Ok(opened) => opened,
         Err(aterm_uds::private_file::PrivateFileError::Missing) => return Ok(None),
         Err(_) => {
@@ -54,6 +56,19 @@ fn header_named(
         return Err(Error::new("the retained give header is malformed"));
     }
     Ok(Some(u64::from_be_bytes(bytes[36..44].try_into().unwrap())))
+}
+
+fn header_named(
+    dir: &std::path::Path,
+    name: &str,
+    network: [u8; 16],
+    request: [u8; 16],
+) -> Result<Option<u64>> {
+    header_from_opened(
+        aterm_uds::private_file::open_private(dir, name),
+        network,
+        request,
+    )
 }
 
 pub(super) fn held(paths: &Paths, network: [u8; 16], thread: &Thread, now_ms: u64) -> bool {
@@ -186,6 +201,7 @@ pub(super) fn forget(paths: &Paths, network: [u8; 16], request: [u8; 16]) -> Res
 }
 
 pub(super) fn cleanup(paths: &Paths, network: [u8; 16], book: &Book, now_ms: u64) -> Result<()> {
+    let mut judged_dir: Option<aterm_uds::private_file::JudgedDir> = None;
     for file in std::fs::read_dir(&paths.dir)? {
         let file = file?;
         let name = file.file_name();
@@ -201,7 +217,15 @@ pub(super) fn cleanup(paths: &Paths, network: [u8; 16], book: &Book, now_ms: u64
         let (Ok(net), Ok(request)) = (ids(net), ids(request)) else {
             continue;
         };
-        let Some(expiry) = header_named(&paths.dir, name_str, net, request)? else {
+        let dir = match &judged_dir {
+            Some(dir) => dir,
+            None => {
+                let opened = aterm_uds::private_file::JudgedDir::judge(&paths.dir)
+                    .map_err(|_| Error::new("the retained give is not a private regular file"))?;
+                judged_dir.insert(opened)
+            }
+        };
+        let Some(expiry) = header_from_opened(dir.open(name_str), net, request)? else {
             continue;
         };
         let ended = net == network

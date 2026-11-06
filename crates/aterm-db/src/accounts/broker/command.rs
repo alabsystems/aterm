@@ -157,31 +157,36 @@ fn render(logical: [u8; 16], reply: Reply) -> Result<Secret> {
                 .map_err(|_| Error::new("invalid private provider response"))?,
         )
     };
-    let mut out = Zeroizing::new(aterm_json::to_vec(&json!({
-        "request": hex::encode_lower(&logical), "status": status, "entered": reply.entered,
-        "unit": "requests", "http_status": response.map(|(status,_)| status),
-        "body_encoding": if response.is_some_and(|(_,body)| std::str::from_utf8(body).is_err()) { "hex" } else { "utf-8" },
-    })).map_err(|_| Error::new("request result encoding failed"))?);
+    let body_utf8 = response.map(|(_, body)| std::str::from_utf8(body));
+    let mut out = Zeroizing::new(
+        aterm_json::to_vec(&json!({
+            "request": hex::encode_lower(&logical), "status": status, "entered": reply.entered,
+            "unit": "requests", "http_status": response.map(|(status, _)| status),
+            "body_encoding": if matches!(body_utf8, Some(Err(_))) { "hex" } else { "utf-8" },
+        }))
+        .map_err(|_| Error::new("request result encoding failed"))?,
+    );
     out.pop(); // the metadata object is closed here; append the protected body
     // Reserve before private bytes enter this buffer, including the closing
     // bytes written after the body. Growing later can abandon an unwiped copy.
     out.reserve(response.map_or(4, |(_, body)| body.len() * 6 + 2) + 12);
     out.extend_from_slice(b",\"body\":");
     if let Some((_, body)) = response {
-        let encoded = match std::str::from_utf8(body) {
-            Ok(text) => Zeroizing::new(
-                aterm_json::quoted_string(text)
-                    .map_err(|_| Error::new("request body encoding failed"))?,
-            ),
+        match body_utf8.expect("response has utf8 check") {
+            Ok(text) => {
+                let encoded = Zeroizing::new(
+                    aterm_json::quoted_string(text)
+                        .map_err(|_| Error::new("request body encoding failed"))?,
+                );
+                out.extend_from_slice(&encoded);
+            }
             Err(_) => {
                 let text = Zeroizing::new(hex::encode_lower(body));
-                Zeroizing::new(
-                    aterm_json::quoted_string(text.as_str())
-                        .map_err(|_| Error::new("request body encoding failed"))?,
-                )
+                out.push(b'"');
+                out.extend_from_slice(text.as_bytes());
+                out.push(b'"');
             }
-        };
-        out.extend_from_slice(&encoded);
+        }
     } else {
         out.extend_from_slice(b"null");
     }

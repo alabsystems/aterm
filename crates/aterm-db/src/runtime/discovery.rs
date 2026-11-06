@@ -6,7 +6,7 @@
 
 use crate::control::{Repair, Report};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
@@ -151,7 +151,26 @@ pub(super) struct Hints {
     needs_update: BTreeMap<astream_wire::sync::Actor, Option<String>>,
     versions: BTreeMap<astream_wire::sync::Actor, String>,
     addresses: BTreeMap<IpAddr, astream_wire::sync::Actor>,
+    /// Seats that speak `Bus` ([`Self::bus_speakers`]): never dialled or hurried, still known.
+    bus: BTreeSet<astream_wire::sync::Actor>,
 }
+
+/// Whether the peer at `address` is a seat in `bus`, by its signed fleet advertisement's address
+/// or its last authenticated round.
+fn speaks_bus(
+    bus: &BTreeSet<astream_wire::sync::Actor>,
+    addresses: &BTreeMap<IpAddr, astream_wire::sync::Actor>,
+    address: &SocketAddr,
+    peer: &Peer,
+) -> bool {
+    !bus.is_empty()
+        && addresses
+            .get(&address.ip())
+            .copied()
+            .or_else(|| peer.repair.actor())
+            .is_some_and(|actor| bus.contains(&actor))
+}
+
 impl Hints {
     pub(super) fn new(own: [u8; 32]) -> Self {
         Self {
@@ -168,7 +187,15 @@ impl Hints {
             needs_update: BTreeMap::new(),
             versions: BTreeMap::new(),
             addresses: BTreeMap::new(),
+            bus: BTreeSet::new(),
         }
+    }
+    /// The seats that speak `Bus` now, replacing the last set: the mesh carries their tables, so
+    /// [`Self::next_allowed`] never dials them and [`Self::hurry`] neither hurries nor counts
+    /// them. They stay among the peers (no beacon, presence or progress is forgotten), and a seat
+    /// that leaves the set is dialled again at its turn.
+    pub(super) fn bus_speakers(&mut self, bus: BTreeSet<astream_wire::sync::Actor>) {
+        self.bus = bus;
     }
     pub(super) fn rotate(&mut self, own: [u8; 32]) {
         self.previous = Some(self.own);
@@ -367,8 +394,11 @@ impl Hints {
     pub(super) fn established(&self, address: SocketAddr) -> bool {
         self.peers.get(&address).is_some_and(Peer::established)
     }
+    /// Whether a peer this side may dial is established; a `Bus` speaker reserves no capacity.
     pub(super) fn has_established(&self) -> bool {
-        self.peers.values().any(Peer::established)
+        self.peers.iter().any(|(address, peer)| {
+            peer.established() && !speaks_bus(&self.bus, &self.addresses, address, peer)
+        })
     }
     #[cfg(test)]
     pub(super) fn next(&mut self, now: Instant) -> Option<(SocketAddr, Repair)> {
@@ -392,12 +422,17 @@ impl Hints {
         });
         self.follow_up
             .retain(|address| self.peers.contains_key(address));
-        let eligible = |p: &Peer| !p.busy && p.next <= now && (allow_discovery || p.established());
+        // A `Bus` speaker is never dialled; it stays known ([`Self::bus_speakers`]).
+        let dialable = |a: &SocketAddr, p: &Peer| !speaks_bus(&self.bus, &self.addresses, a, p);
+        let eligible = |a: &SocketAddr, p: &Peer| {
+            !p.busy && p.next <= now && (allow_discovery || p.established()) && dialable(a, p)
+        };
         let follow_up = if self.follow_up_left > 0 {
-            self.follow_up
-                .iter()
-                .copied()
-                .find(|address| self.peers.get(address).is_some_and(eligible))
+            self.follow_up.iter().copied().find(|address| {
+                self.peers
+                    .get(address)
+                    .is_some_and(|peer| eligible(address, peer))
+            })
         } else {
             None
         };
@@ -409,9 +444,9 @@ impl Hints {
             && self.follow_up_left > 0
             && follow_up.is_none()
             && self.follow_up.iter().any(|address| {
-                self.peers
-                    .get(address)
-                    .is_some_and(|p| !p.busy && (allow_discovery || p.established()))
+                self.peers.get(address).is_some_and(|p| {
+                    !p.busy && (allow_discovery || p.established()) && dialable(address, p)
+                })
             })
         {
             return None;
@@ -431,7 +466,7 @@ impl Hints {
                 .into_iter()
                 .flat_map(|cursor| self.peers.range(..=cursor));
             tail.chain(head)
-                .filter(|(_, p)| eligible(p))
+                .filter(|(a, p)| eligible(a, p))
                 .map(|(a, _)| *a)
                 .next()
         })?;
@@ -457,12 +492,18 @@ impl Hints {
         Some((address, std::mem::take(&mut peer.repair)))
     }
     /// A push's hurry: dial every verified peer now, one whose round runs now again as that round
-    /// ends. Until [`Self::calm`], progress and the first quiet confirmation are followed at
-    /// once, so a table first advertised in one round can be taken in the next. Further quiet
-    /// rounds keep ordinary spacing. How many peers it hurried; none leaves nothing hurried.
+    /// ends; a `Bus` speaker is left to the mesh ([`Self::bus_speakers`]). Until [`Self::calm`],
+    /// progress and the first quiet confirmation are followed at once, so a table first
+    /// advertised in one round can be taken in the next. Further quiet rounds keep ordinary
+    /// spacing. How many peers it hurried; none leaves nothing hurried.
     pub(super) fn hurry(&mut self, now: Instant) -> usize {
         let mut hurried = 0;
-        for peer in self.peers.values_mut().filter(|peer| peer.verified) {
+        let (bus, addresses) = (&self.bus, &self.addresses);
+        for (_, peer) in self
+            .peers
+            .iter_mut()
+            .filter(|(address, peer)| peer.verified && !speaks_bus(bus, addresses, address, peer))
+        {
             peer.quiet_push = false;
             if peer.busy {
                 peer.hurried = true;
@@ -685,6 +726,53 @@ mod tests {
         );
         hints.observe(&wire(address.port()), address, now);
         assert_eq!(hints.next(now).unwrap().0, address);
+    }
+    /// A seat that speaks `Bus` is the mesh's: discovery never dials it and a push neither
+    /// hurries nor counts it, while it stays known, and it is dialled again once no longer named.
+    /// Another seat is dialled and hurried as before. NEGATIVE CONTROL: with no `Bus` speaker the
+    /// same peer is dialled and hurried.
+    #[test]
+    fn a_bus_speaker_is_never_dialled_or_hurried_but_stays_known() {
+        for speaks in [true, false] {
+            let mut hints = hints();
+            let now = Instant::now();
+            let [mesh, old]: [SocketAddr; 2] =
+                ["10.1.1.1:1234", "10.1.1.2:1234"].map(|address| address.parse().unwrap());
+            hints.advertised_versions(
+                BTreeMap::from([
+                    ([7; 48], (mesh.ip(), "0.160.0".to_owned())),
+                    ([8; 48], (old.ip(), "0.153.0".to_owned())),
+                ]),
+                now,
+            );
+            for address in [mesh, old] {
+                hints.observe(&wire(address.port()), address, now);
+                hints.peers.get_mut(&address).unwrap().verified = true;
+            }
+            if speaks {
+                hints.bus_speakers(BTreeSet::from([[7; 48]]));
+            }
+            let mut dialled = BTreeSet::new();
+            while let Some((address, _)) = hints.next(now) {
+                dialled.insert(address);
+                hints.peers.get_mut(&address).unwrap().busy = false;
+                hints.peers.get_mut(&address).unwrap().next = now + Duration::from_secs(30);
+            }
+            let hurried = hints.hurry(now);
+            if speaks {
+                assert_eq!(dialled, BTreeSet::from([old]), "a Bus speaker was dialled");
+                assert_eq!(hurried, 1, "a push counted a Bus speaker");
+                assert_eq!(hints.next(now).map(|(address, _)| address), Some(old));
+                assert!(hints.next(now).is_none(), "a push dialled a Bus speaker");
+                assert_eq!(hints.count(), 2, "a Bus speaker was forgotten");
+                // Named no longer, it is dialled again.
+                hints.bus_speakers(BTreeSet::new());
+                assert_eq!(hints.next(now).map(|(address, _)| address), Some(mesh));
+            } else {
+                assert_eq!(dialled, BTreeSet::from([mesh, old]));
+                assert_eq!(hurried, 2);
+            }
+        }
     }
     fn hints() -> Hints {
         Hints::new([4; 32])

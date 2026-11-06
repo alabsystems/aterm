@@ -209,6 +209,25 @@ impl Edit {
 }
 
 fn apply(file: &str, text: &str, edits: &[Edit]) -> Result<String, ControlFailure> {
+    if let [
+        Edit::Replace {
+            anchor,
+            with,
+            count,
+        },
+    ] = edits
+    {
+        let found = text.matches(anchor.as_str()).count();
+        if found != *count {
+            return Err(ControlFailure::Anchor {
+                file: file.into(),
+                anchor: anchor.clone(),
+                found,
+                expected: *count,
+            });
+        }
+        return Ok(text.replace(anchor.as_str(), with));
+    }
     let mut out = text.to_string();
     for edit in edits {
         match edit {
@@ -337,8 +356,9 @@ fn sibling_controls(sources: &BTreeMap<&'static str, String>, report: &mut Contr
             &[Edit::once(FD_SET_GOOD, FD_SET_BAD)],
         )
         .and_then(|mutated| {
-            let mut planted = sources.clone();
-            planted.insert(right.source, mutated);
+            let mut planted: BTreeMap<&str, &str> =
+                sources.iter().map(|(&k, v)| (k, v.as_str())).collect();
+            planted.insert(right.source, &mutated);
             let caught = siblings::compare(&planted)
                 .iter()
                 .any(|f| matches!(f, SiblingFinding::Differs { os: o, .. } if *o == os));
@@ -416,6 +436,7 @@ fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
 struct Scratch<'t> {
     ws: Workspace<'t>,
     src: std::path::PathBuf,
+    originals: BTreeMap<&'static str, String>,
     cell: &'static Cell,
 }
 
@@ -427,8 +448,16 @@ impl Scratch<'_> {
         then: impl FnOnce(&Workspace<'_>) -> io::Result<T>,
     ) -> Result<Result<T, ControlFailure>, CouldNotRun> {
         let path = self.src.join(file);
-        let original = crate::read_regular_text(&path).map_err(io_failure("reading the copy"))?;
-        let mutated = match apply(file, &original, edits) {
+        let fallback;
+        let original = match self.originals.get(file) {
+            Some(text) => text.as_str(),
+            None => {
+                fallback =
+                    crate::read_regular_text(&path).map_err(io_failure("reading the copy"))?;
+                fallback.as_str()
+            }
+        };
+        let mutated = match apply(file, original, edits) {
             Ok(mutated) => mutated,
             Err(failure) => return Ok(Err(failure)),
         };
@@ -576,10 +605,14 @@ pub fn run(
     root: &Path,
     cell: &'static Cell,
     reference: &Reference,
+    sources: Option<BTreeMap<&'static str, String>>,
 ) -> Result<ControlsReport, CouldNotRun> {
     let mut report = ControlsReport::default();
-    let sources = siblings::read_sources(&root.join("crates/aterm-libc/src"))
-        .map_err(io_failure("reading the shim's cell sources"))?;
+    let mut sources = match sources {
+        Some(sources) => sources,
+        None => siblings::read_sources(&root.join("crates/aterm-libc/src"))
+            .map_err(io_failure("reading the shim's cell sources"))?,
+    };
     sibling_controls(&sources, &mut report);
 
     let scratch = aterm_tempfile::Builder::new()
@@ -587,13 +620,18 @@ pub fn run(
         .tempdir()
         .map_err(io_failure("creating the controls' scratch directory"))?;
     copy_oracle(root, scratch.path()).map_err(io_failure("copying the oracle"))?;
+    let src = scratch.path().join("crates/aterm-libc/src");
+    let lib_rs =
+        crate::read_regular_text(&src.join("lib.rs")).map_err(io_failure("reading the copy"))?;
+    sources.insert("lib.rs", lib_rs);
     let copy = Scratch {
         ws: Workspace::new(
             trust,
             &scratch.path().join("libc-oracle"),
             &scratch.path().join("target"),
         ),
-        src: scratch.path().join("crates/aterm-libc/src"),
+        src,
+        originals: sources,
         cell,
     };
 

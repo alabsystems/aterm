@@ -128,6 +128,11 @@ pub(super) struct MirrorRun {
     /// slot it asked. The take after its landing drains that backlog, so it is never held for a
     /// commit to carry ([`Bridge::mirror_rides_nothing`], critic item E04's review).
     drains: bool,
+    /// The broker's answer to the pin's settle made this open's fence, and no pass has taken
+    /// since ([`Bridge::pin_settled`], critic item F07's review). The take it lets go is the
+    /// open's first, which E04's hold does not hold ([`Bridge::mirror_rides_nothing`]), as a
+    /// pass that made its fence by its own full flushes takes behind them at once.
+    fence_settled: bool,
     /// The batch in flight and the node's total.
     pin: Pin,
     /// Per slot: whether THIS process may have sent it (a never-sent slot's
@@ -215,6 +220,7 @@ impl MirrorRun {
                 uncarried: None,
                 behind: None,
                 drains: false,
+                fence_settled: false,
                 pin: Pin {
                     key,
                     ..Pin::default()
@@ -813,7 +819,7 @@ impl Bridge {
         }
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing, and for nothing while the pin's settle is owed its answer, which the round that reads it makes the fence of ([`Bridge::make_the_pin_fence`], critic item F07); no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]), nor, for a take inside the endpoint's rate hold that only wakes of the sessions it holds owe, than the owed commit's write ([`Bridge::mirror_behind_the_commit`]).
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing, and for nothing while the pin's settle is owed its answer, which every round's pass looks for first and the round that reads it makes the fence of ([`Bridge::read_the_pins_settle`], [`Bridge::make_the_pin_fence`], critic item F07); no earlier than a held first pass's instant ([`FirstPass::Held`]), nor, for a take nothing would carry once its hold began, than [`IDLE_ACK_GRACE`] past that ([`Bridge::mirror_rides_nothing`]), nor, for a take inside the endpoint's rate hold that only wakes of the sessions it holds owe, than the owed commit's write ([`Bridge::mirror_behind_the_commit`]).
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() || self.pin_settle_owed() {
             return None;
@@ -863,11 +869,13 @@ impl Bridge {
     ///
     /// Not held: a pass with a pinned batch (a resend, a re-pin, a recovered batch); an open's
     /// first pass, which makes the fence and sends the commit its deliveries owe alone ahead of
-    /// it ([`Bridge::commit_ahead_of_the_fence`], critic item D06), so nothing would ride it; and
-    /// the take after a landing whose take left a backlog ([`MirrorRun::drains`]), which drains
-    /// it at once as each batch lands. A post does not end the hold: a take pins its batch before
-    /// any slot goes, so a post that carried one would wait behind the take, and the post's own
-    /// delivery on this node owes the commit the pass then rides.
+    /// it ([`Bridge::commit_ahead_of_the_fence`], critic item D06), so nothing would ride it, and
+    /// where the broker settles the pin, the take its settle's answer lets go
+    /// ([`MirrorRun::fence_settled`], critic item F07's review), the open's first all the same;
+    /// and the take after a landing whose take left a backlog ([`MirrorRun::drains`]), which
+    /// drains it at once as each batch lands. A post does not end the hold: a take pins its batch
+    /// before any slot goes, so a post that carried one would wait behind the take, and the
+    /// post's own delivery on this node owes the commit the pass then rides.
     pub(super) fn mirror_rides_nothing(&self) -> bool {
         #[cfg(test)]
         if self
@@ -885,9 +893,18 @@ impl Bridge {
         };
         #[cfg(not(test))]
         let drains = |m: &MirrorRun| m.drains;
+        #[cfg(test)]
+        let first = |m: &MirrorRun| {
+            m.fence_settled
+                && !self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::SettledFenceTakeWaitsForACommit)
+        };
+        #[cfg(not(test))]
+        let first = |m: &MirrorRun| m.fence_settled;
         self.mirror
             .as_deref()
-            .is_some_and(|m| m.pin.slots.is_empty() && !m.repin && !drains(m))
+            .is_some_and(|m| m.pin.slots.is_empty() && !m.repin && !drains(m) && !first(m))
             && !self.mirror_has_a_commit_to_carry()
             && self.state.logpin_fence_held()
     }
@@ -1097,6 +1114,7 @@ impl Bridge {
             m.unheld = false;
             m.uncarried = None;
             m.behind = None;
+            m.fence_settled = false;
             if m.sent_inc != inc {
                 for o in &mut m.outcome {
                     if *o == Outcome::Sending {
@@ -1524,17 +1542,59 @@ impl Bridge {
     /// ([`StateDir::logpin_settled`]) where the name still holds it, and the mirror's pass, which
     /// waited on the answer ([`Bridge::mirror_due`]), is due. One the name no longer holds is
     /// fenced again by the next pass.
+    /// Where the answer makes the fence, the take it lets go is the open's first
+    /// ([`MirrorRun::fence_settled`]).
     pub(super) fn pin_settled(&mut self) {
-        let _ = self.state.logpin_settled();
+        if self.state.logpin_settled() {
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.fence_settled = true;
+            }
+        }
+    }
+
+    /// THE PIN'S SETTLE IS LOOKED FOR AT EVERY ROUND THAT OWES IT (critic item F07's review):
+    /// while the settle is owed its answer, the round's pass first reads, without waiting, the
+    /// answers already in, up to and through the settle's ([`Bridge::try_settle_acks`]'s read),
+    /// so the round that finds the settle answered makes the fence ([`Bridge::pin_settled`])
+    /// and its pass takes. Left to an idle moment's read or a park that took nothing, the answer
+    /// would sit unread while the loop takes an item every round, and the first pass, which
+    /// D06's hold lets go once its [`FIRST_PASS_HOLD`] is out whatever is still queued
+    /// ([`Bridge::mirror_yields`]), would wait for the queue to drain.
+    pub(super) fn read_the_pins_settle(&mut self) {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::SettleReadOnlyWhenIdle)
+        {
+            return;
+        }
+        if self.pin_settle_owed() {
+            self.grouped(|bridge| while bridge.pin_settle_owed() && bridge.try_settle_one() {});
+        }
     }
 
     /// This link's broker refused the settle (critic item F07): its next fence is the bridge's own
     /// full flush ([`Bridge::broker_settles_the_pin`]), until the next attach asks again.
     pub(super) fn pin_settle_refused(&mut self, e: &io::Error) {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::RefusedSettleMakesTheFence)
+        {
+            self.pin_settled();
+            return;
+        }
         stderr_line!(
             "aterm-link: mirror: the broker refused to settle the pin's fence ({e}); the \
              bridge flushes the pin itself on this link"
         );
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::SettleRefusalForgotten)
+        {
+            return;
+        }
         self.settle_refused = true;
     }
 

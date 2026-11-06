@@ -6,17 +6,18 @@
 use core::fmt;
 
 use aterm_aos::checkpoint::{Checkpoint, CheckpointFault, Provenance, RestoreRefusal};
-use aterm_aos::contract::{Contract, Verdict};
+use aterm_aos::contract::Verdict;
 use aterm_aos::effects::{EffectRecord, EffectRequest, ShadowPort};
 use aterm_aos::log::{EventLog, IdentityMismatch, LogFault, LogFull, LogHeader, Tail};
-use aterm_aos::replay::{Run, replay};
+use aterm_aos::replay::replay_fold;
 use aterm_aos::wire::{Dec, Enc, WireFault};
 use aterm_aos::{BranchId, Digest, Revision, TaskIdentity};
 use aterm_core::terminal::{ClockReading, HostOp};
 
 use crate::{
-    FaithfulReplay, PaneClock, PaneCode, PaneCounts, PaneInput, PaneSchema, PaneState,
-    PrebuiltPane, REPLIES_MATCH, REPLY_TARGET, REPLY_WRITE, pane_identity,
+    PaneClock, PaneCode, PaneCounts, PaneInput, PaneObservation, PaneSchema, PaneState,
+    PrebuiltPane, REPLIES_MATCH, REPLY_TARGET, REPLY_WRITE, check_step, finish_verdict,
+    pane_identity,
 };
 
 /// The bytes that open a pane trace file.
@@ -193,12 +194,38 @@ fn run(
     start: PaneState,
     inputs: &[PaneInput],
     effects: &[EffectRecord],
-) -> (Run<PaneSchema>, PaneCheck) {
+) -> PaneCheck {
     let start_digest = aterm_aos::task::state_digest(schema, &start);
     let mut port = ShadowPort::new(effects);
-    let run = replay(schema, code, start, inputs, 0, &mut port);
+    let mut first_fail = None;
+    let mut matched = 0usize;
+    let folded = replay_fold(
+        schema,
+        code,
+        start,
+        inputs,
+        0,
+        &mut port,
+        |_, at, input, obs| {
+            if matches!(
+                &obs,
+                PaneObservation::Witnessed { live, replayed } if *replayed == Some(*live)
+            ) {
+                matched = matched.saturating_add(1);
+            }
+            if first_fail.is_none() {
+                first_fail = check_step(at, input, &obs);
+            }
+        },
+    );
     let replies_matched = port.matched();
-    let mut verdict = FaithfulReplay::new().judge(schema, inputs, &run);
+    let mut verdict = finish_verdict(
+        first_fail,
+        folded.refused.as_ref(),
+        folded.observations,
+        inputs.len(),
+        || folded.last_cursor.map_or(0, |c| c.saturating_add(1)),
+    );
     if verdict.passed()
         && let Err(d) = port.finish()
     {
@@ -208,16 +235,15 @@ fn run(
             detail: d.to_string(),
         };
     }
-    let check = PaneCheck {
+    PaneCheck {
         code: code.code,
         start: start_digest,
-        state_digest: run.state_digest,
-        observation_chain: run.observation_chain,
-        counts: PaneCounts::of(inputs, &run),
+        state_digest: folded.state_digest,
+        observation_chain: folded.observation_chain,
+        counts: PaneCounts::from_inputs_and_matched(inputs, matched),
         replies_matched,
         verdict,
-    };
-    (run, check)
+    }
 }
 
 impl PaneRecording {
@@ -294,7 +320,6 @@ impl PaneRecording {
             &self.inputs,
             &self.effects,
         )
-        .1
     }
 
     /// The chain as a trace file under `code`, its head the state and chain this process's replay reaches.
@@ -328,7 +353,7 @@ impl PaneRecording {
         for i in &self.inputs {
             log.push(i.clone()).map_err(PaneTraceFault::Full)?;
         }
-        let (_, check) = run(
+        let check = run(
             &self.schema,
             &prebuilt,
             self.start.clone(),
@@ -541,7 +566,7 @@ impl PaneTrace {
         if tail != Tail::Clean {
             return Err(PaneTraceFault::Tail(tail));
         }
-        let (_, check) = run(&schema, &prebuilt, start, log.inputs(), &self.effects);
+        let check = run(&schema, &prebuilt, start, log.inputs(), &self.effects);
         if check.state_digest != self.head_state {
             return Err(PaneTraceFault::State {
                 recorded: self.head_state,

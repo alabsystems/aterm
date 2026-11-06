@@ -1525,6 +1525,10 @@ pub(crate) enum SystemStateAction {
     /// The password headline's Go to tab: the Mac Setup tab comes to the front
     /// (`App::go_to_developer_tools_tab`).
     GoToToolsTab,
+    /// The Apple-window card's Go to installer: Apple's own Command Line Tools installer window,
+    /// already open, comes to the front (`App::go_to_developer_tools_installer`). It starts no
+    /// install and asks for no permission.
+    GoToToolsInstaller,
     /// A Copy Command: the line a vault admin runs to save a new GitHub token
     /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]), or the one an admin Mac runs to
     /// approve this Mac, goes on the clipboard, for a person's press alone.
@@ -1615,6 +1619,14 @@ pub(crate) const PHRASE_HELP: &str =
 /// log, never the page.
 pub(crate) const PHRASE_REFUSED: &str = "That phrase did not let this Mac in. Press Allow again on a Mac in ALab, then type the new \
      phrase it shows.";
+
+/// The line under the phrase field once a try found this Mac dropped from its vault
+/// ([`PhraseOutcome::Dropped`]): no phrase lets its key in, so the line says how it comes back,
+/// naming no path (`aterm secrets status` names the folder), and never sends the person to press
+/// Allow again.
+pub(crate) const PHRASE_DROPPED: &str = "No phrase lets this Mac in: a rotation left it out of \
+    ALab. Set its vault folder aside to join again as a new Mac (aterm secrets status says \
+    where).";
 
 /// The line under the phrase field once a try reached no Mac in ALab: nothing was asked of the
 /// phrase, so the words stay in the field, good for another Join, and the line says what helps.
@@ -2285,6 +2297,11 @@ pub(crate) const INSTALL_TOOLS_LABEL: &str = "Install Command Line Tools…";
 /// The GitHub repositories row's note while Apple's own installer window is open, waiting for the
 /// person's press or running the install a press started ([`ToolsInstall::AppleWindow`]).
 pub(crate) const APPLE_WINDOW_NOTE: &str = "Finish in Apple's installer window";
+
+/// The button of the card's [`APPLE_WINDOW_NOTE`]: Apple's installer window, already open, comes
+/// to the front ([`SystemStateAction::GoToToolsInstaller`]). It only goes there: it starts no
+/// install and asks for no permission.
+pub(crate) const GO_TO_TOOLS_INSTALLER: &str = "system-state/row/repositories/go-to-installer";
 
 /// The GitHub repositories row's note when the tab a press of Install… asked for did not open
 /// because System State was no longer in front ([`NotOpened::LeftPage`]); Install… is there again.
@@ -3483,8 +3500,8 @@ impl SystemStateApp {
         ));
     }
 
-    /// The line under the phrase field: what to type, that the last phrase let nobody in, or
-    /// that it reached no Mac in ALab and is still good.
+    /// The line under the phrase field: what to type, that the last phrase let nobody in, that
+    /// it reached no Mac in ALab and is still good, or that no phrase lets a dropped Mac in.
     /// A try that reached no member while this page reads macOS's Local Network switch for aterm
     /// off names that switch, not the other Mac: macOS let the join reach nobody.
     pub(crate) fn phrase_help(&self) -> &'static str {
@@ -3495,6 +3512,7 @@ impl SystemStateApp {
             }
             Some(PhraseOutcome::NotReached) => PHRASE_NOT_REACHED,
             Some(PhraseOutcome::Stopped) => PHRASE_STOPPED,
+            Some(PhraseOutcome::Dropped) => PHRASE_DROPPED,
             Some(PhraseOutcome::Joined) | None => PHRASE_HELP,
         }
     }
@@ -3509,7 +3527,8 @@ impl SystemStateApp {
     }
 
     /// What the phrase try `sent` came to: once the join answered, a phrase that let this Mac in
-    /// or was refused is spent (one try each), and the field is emptied and wiped; one that
+    /// or was refused is spent (one try each), as is one a dropped Mac typed, which no Join lets
+    /// in, and the field is emptied and wiped; one that
     /// reached no member was asked nothing, and a try that stopped before it said what the phrase
     /// came to may not have sent it, so their words stay for another Join; `None`, a join that
     /// never started, keeps the words too. Only the words that try sent are touched: the answer
@@ -3527,7 +3546,10 @@ impl SystemStateApp {
         self.phrase_sent = None;
         if let Some(outcome) = outcome {
             self.phrase_came_to = Some(outcome);
-            if matches!(outcome, PhraseOutcome::Joined | PhraseOutcome::Refused) {
+            if matches!(
+                outcome,
+                PhraseOutcome::Joined | PhraseOutcome::Refused | PhraseOutcome::Dropped
+            ) {
                 self.phrase.wipe();
             }
         }
@@ -4423,6 +4445,14 @@ impl SystemStateApp {
             }
             GO_TO_TOOLS_TAB if self.headline().go_to_tab => {
                 self.actions.push_back(SystemStateAction::GoToToolsTab);
+            }
+            // Only while the card offers it: a press left from a page that read Apple's window
+            // goes nowhere once the row reads otherwise.
+            GO_TO_TOOLS_INSTALLER
+                if self.status.repositories_tools_wait() == Some(ToolsWait::AppleWindow) =>
+            {
+                self.actions
+                    .push_back(SystemStateAction::GoToToolsInstaller);
             }
             COPY_TOKEN_COMMAND => {
                 if self.reviewed_rows().iter().any(|row| row.copy_command) {

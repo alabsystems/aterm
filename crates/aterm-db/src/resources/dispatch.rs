@@ -273,7 +273,6 @@ impl Resources {
             ));
         }
         self.with_store_deadline(false, deadline, |session, store, _| {
-            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             if let Some(old) = ledger.request(&session.actor(), &request) {
@@ -323,7 +322,6 @@ impl Resources {
         };
         let operation = attempt.operation;
         let recorded = self.with_store(false, |session, store, _| {
-            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             let old = ledger

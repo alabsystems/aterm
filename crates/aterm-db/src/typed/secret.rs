@@ -160,17 +160,18 @@ impl<F: Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>> Sealer for Keyed<'_
     }
 
     fn open(&self, collection: &str, row: &str, column: &str, token: &str) -> Result<Secret> {
-        let key = (self.resolve)(&epoch(token)?)?;
-        open(
-            token,
-            &key,
-            Cell {
-                table: self.table,
-                collection,
-                row,
-                column,
-            },
-        )
+        let token_epoch = epoch(token)?;
+        let cell = Cell {
+            table: self.table,
+            collection,
+            row,
+            column,
+        };
+        if token_epoch == self.epoch {
+            return open(token, &self.key, cell);
+        }
+        let key = (self.resolve)(&token_epoch)?;
+        open(token, &key, cell)
     }
 }
 
@@ -281,7 +282,7 @@ pub fn flag_says(value: &Secret) -> Option<bool> {
     flag_says_str(value.plaintext())
 }
 
-fn flag_says_str(raw: &str) -> Option<bool> {
+pub(crate) fn flag_says_str(raw: &str) -> Option<bool> {
     let text = raw.trim();
     if ["1", "yes", "y", "true", "set", "x"]
         .iter()

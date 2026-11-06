@@ -183,6 +183,10 @@ impl Log {
             done.rotated = true;
             (file, len) = self.open_current()?;
         }
+        if len > 0 && lines.len() == 1 {
+            file.write_all(lines[0].as_bytes())?;
+            return Ok(done);
+        }
         let mut out = String::with_capacity(batch + 256);
         if len == 0 {
             out.push_str(&self.facts.line(crate::now_ms()));

@@ -238,7 +238,7 @@ fn parse_release_metadata(listing: &str) -> Result<Vec<ReleaseMetadata<'_>>> {
         .lines()
         .enumerate()
         .map(|(index, line)| {
-            let fields: Vec<&str> = line.split('\t').collect();
+            let mut cols = line.split('\t');
             let parse_id = |id: &str| {
                 (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
                     .then(|| id.parse::<u64>().ok())
@@ -250,11 +250,22 @@ fn parse_release_metadata(listing: &str) -> Result<Vec<ReleaseMetadata<'_>>> {
                         ))
                     })
             };
-            let (release_id, tag, draft, prerelease, exact_count) = match fields.as_slice() {
-                [tag, draft, exact] => (None, *tag, *draft, "false", *exact),
-                [id, tag, draft, exact] => (Some(parse_id(id)?), *tag, *draft, "false", *exact),
-                [id, tag, draft, prerelease, exact] => {
-                    (Some(parse_id(id)?), *tag, *draft, *prerelease, *exact)
+            let (release_id, tag, draft, prerelease, exact_count) = match (
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+            ) {
+                (Some(tag), Some(draft), Some(exact), None, None, None) => {
+                    (None, tag, draft, "false", exact)
+                }
+                (Some(id), Some(tag), Some(draft), Some(exact), None, None) => {
+                    (Some(parse_id(id)?), tag, draft, "false", exact)
+                }
+                (Some(id), Some(tag), Some(draft), Some(prerelease), Some(exact), None) => {
+                    (Some(parse_id(id)?), tag, draft, prerelease, exact)
                 }
                 _ => {
                     return Err(Error::new(format!(
@@ -903,7 +914,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
         ),
     }
 
-    let live: Vec<u64> = scanned.iter().map(|p| p.build).collect();
+    let live: std::collections::BTreeSet<u64> = scanned.iter().map(|p| p.build).collect();
     let dangling: Vec<String> = records
         .iter()
         .filter(|r| !live.contains(&r.build))

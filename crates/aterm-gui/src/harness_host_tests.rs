@@ -9548,6 +9548,7 @@ fn the_windows_acts_read_the_transcript_of_the_process_in_the_tab() {
     let acts = live_acts(
         crate::session_store::new_store(),
         tmp.path().join("no.sock").to_string_lossy().into_owned(),
+        Default::default(),
     );
     let tail = (acts.transcript_tail)(&Snapshot {
         pid,
@@ -9584,6 +9585,7 @@ fn the_windows_acts_read_a_limits_reset_in_the_agents_own_home() {
     let acts = live_acts(
         crate::session_store::new_store(),
         tmp.path().join("no.sock").to_string_lossy().into_owned(),
+        Default::default(),
     );
     let agent = Snapshot {
         session: Some(talk.to_string()),
@@ -17041,6 +17043,7 @@ fn every_test_host_and_test_instance_gets_the_inert_upkeep() {
     let acts = live_acts(
         crate::session_store::new_store(),
         dir.path().join("no.sock").to_string_lossy().into_owned(),
+        Default::default(),
     );
     assert!(inert(&acts.accounts_upkeep), "live_acts in a test binary");
     let not_owns = [
@@ -17051,7 +17054,12 @@ fn every_test_host_and_test_instance_gets_the_inert_upkeep() {
     for debug in [false, true] {
         for not_own in not_owns {
             assert!(
-                inert(&accounts_upkeep_arm(Some(not_own), false, debug)),
+                inert(&accounts_upkeep_arm(
+                    Some(not_own),
+                    false,
+                    debug,
+                    Default::default()
+                )),
                 "{not_own} (debug {debug})"
             );
         }
@@ -17060,29 +17068,29 @@ fn every_test_host_and_test_instance_gets_the_inert_upkeep() {
     // The shipped build as its account's own is the one that keeps the accounts.
     assert!(
         matches!(
-            accounts_upkeep_arm(None, false, false),
-            AccountsUpkeep::Live
+            accounts_upkeep_arm(None, false, false, Default::default()),
+            AccountsUpkeep::Live(_)
         ),
         "a shipped build as its account's own"
     );
     // A test binary copied under a name that gives it no scratch root reads as its account's own,
     // and a debug build's upkeep stays inert even so: that case started real sign-ins.
     assert!(
-        inert(&accounts_upkeep_arm(None, false, true)),
+        inert(&accounts_upkeep_arm(None, false, true, Default::default())),
         "a debug build"
     );
     // This build is a debug one, and its own arm reads it so: NEGATIVE CONTROL, with
     // `accounts_upkeep_here` passing `false` for `debug`, this goes red.
     assert!(
-        inert(&accounts_upkeep_here(None, false)),
+        inert(&accounts_upkeep_here(None, false, Default::default())),
         "this (debug) build as its account's own"
     );
     for debug in [false, true] {
         for not_own in [None, Some("its HOME is not this account's home")] {
             assert!(
                 matches!(
-                    accounts_upkeep_arm(not_own, true, debug),
-                    AccountsUpkeep::Live
+                    accounts_upkeep_arm(not_own, true, debug, Default::default()),
+                    AccountsUpkeep::Live(_)
                 ),
                 "the admitted seam (debug {debug})"
             );
@@ -41170,6 +41178,7 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
     let stale = Unused::Stale {
         incremental: 1,
         units: 1,
+        superseded: 0,
         after: atpkg::build_cache::RECLAIM_STALE,
     };
     let sized = [
@@ -41600,7 +41609,7 @@ fn the_windows_disk_resume_presents_the_in_memory_token() {
             }
             let _ = tx.send(seen);
         });
-        let acts = live_acts(crate::session_store::new_store(), path);
+        let acts = live_acts(crate::session_store::new_store(), path, Default::default());
         assert_eq!(
             (acts.disk_resume)("s-d", "carry on"),
             expected_step,
@@ -41672,7 +41681,11 @@ fn the_windows_sweeps_present_the_in_memory_token_on_its_own_socket() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&state).unwrap();
     let acts = with_harness_state(&state, || {
-        live_acts(crate::session_store::new_store(), path.clone())
+        live_acts(
+            crate::session_store::new_store(),
+            path.clone(),
+            Default::default(),
+        )
     });
     assert!((acts.snapshot)("s-a").is_none(), "no roster, no snapshot");
     drop(acts);

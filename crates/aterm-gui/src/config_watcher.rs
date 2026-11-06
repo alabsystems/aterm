@@ -510,7 +510,11 @@ fn observed_harness(
 
 fn unread_harness(note: String) -> crate::app_config::HarnessPolicy {
     let (policy, notes) = aterm_agent::supervise::SupervisorConfig::unread_config(note);
-    crate::app_config::HarnessPolicy { policy, notes }
+    crate::app_config::HarnessPolicy {
+        policy,
+        notes,
+        owner: Default::default(),
+    }
 }
 
 fn post_stamp_refusal(

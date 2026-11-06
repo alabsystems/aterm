@@ -215,55 +215,53 @@ impl Item for Repositories {
         let guard = CloneGuard::new(&current);
         let Cloned {
             left,
-            failed,
+            mut failed,
             hooks,
             ..
         } = clone_all(sys, &self.user, &scan.missing, Some(&guard));
-        let after = (|| {
-            current()?;
-            let mut failed = failed;
-            for (repo, path) in scan.dependencies {
-                current()?;
-                if let Err(why) =
-                    super::dependencies::repair(sys, &self.user, &path, &repo, &current)
-                {
-                    failed.push(format!("~/{}: {why}", repo.name));
-                }
-            }
-            for (repo, path, stands) in scan.existing {
-                if !stands.moves() {
-                    continue;
-                }
-                current()?;
-                if let Err(unread) =
-                    crate::checkout::align_guarded(sys, &self.user, &path, &repo.origin(), &current)
-                {
-                    failed.push(format!("~/{}: {}", repo.name, unread.why));
-                }
-            }
-            failed.extend(short_of_room(sys.volume(home).as_ref(), &left, INIT_AGAIN));
-            if failed.is_empty() {
-                Ok(())
-            } else {
-                Err(failed.join("; "))
-            }
-        })();
+        let room = || short_of_room(sys.volume(home).as_ref(), &left, INIT_AGAIN);
         // A failed row is read back by nothing: it says what the clones that went made of their
         // hook installers, after why it failed, a guard that stopped the rest included; a done
         // one leaves that to the read-back's row.
-        match after {
-            Ok(()) => {
-                *self
-                    .hooks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
-                Ok(())
-            }
-            Err(why) => Err(std::iter::once(why)
-                .chain(hooks)
-                .collect::<Vec<_>>()
-                .join("; ")),
+        if let Err(why) = current() {
+            return Err(stopped_after_clones(why, failed, room(), &hooks));
         }
+        for (repo, path) in scan.dependencies {
+            if let Err(why) = current() {
+                return Err(stopped_after_clones(why, failed, room(), &hooks));
+            }
+            if let Err(why) = super::dependencies::repair(sys, &self.user, &path, &repo, &current) {
+                failed.push(format!("~/{}: {why}", repo.name));
+            }
+        }
+        for (repo, path, stands) in scan.existing {
+            if !stands.moves() {
+                continue;
+            }
+            if let Err(why) = current() {
+                return Err(stopped_after_clones(why, failed, room(), &hooks));
+            }
+            if let Err(unread) =
+                crate::checkout::align_guarded(sys, &self.user, &path, &repo.origin(), &current)
+            {
+                failed.push(format!("~/{}: {}", repo.name, unread.why));
+            }
+        }
+        let short = room();
+        if failed.is_empty() && short.is_none() {
+            *self
+                .hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
+            return Ok(());
+        }
+        // A failure the guard caused (the last step it stopped) says why it stopped first.
+        if let Err(why) = current() {
+            return Err(stopped_after_clones(why, failed, short, &hooks));
+        }
+        failed.extend(short);
+        failed.extend(hooks);
+        Err(failed.join("; "))
     }
 }
 
@@ -290,7 +288,11 @@ impl Repositories {
             present,
             dependencies,
             notes,
+            git_waits,
         } = partition(sys, &self.user, &listed.repositories)?;
+        if let Some(why) = named(&git_waits) {
+            return Err(why);
+        }
         let mut aligned = Vec::new();
         let mut recorded = 0;
         for (repo, path) in present {
@@ -341,6 +343,8 @@ pub(super) struct Partition {
     pub(super) present: Vec<(Repo, PathBuf)>,
     pub(super) dependencies: Vec<(Repo, PathBuf)>,
     pub(super) notes: Vec<String>,
+    /// Dependencies whose local inspection waits for a capable Git, without touching them.
+    pub(super) git_waits: Vec<String>,
 }
 
 impl Partition {
@@ -351,13 +355,20 @@ impl Partition {
         let home = Path::new(&user.home);
         for repo in touched {
             let path = home.join(&repo.name);
-            if verify_existing(sys, user, &repo.owner, repo, &path).is_ok()
-                && super::dependencies::ready(sys, user, &path, repo).unwrap_or(false)
-            {
-                self.missing.retain(|missing| missing.name != repo.name);
-                self.dependencies
-                    .retain(|(pending, _)| pending.name != repo.name);
-                self.present.push((repo.clone(), path));
+            if verify_existing(sys, user, &repo.owner, repo, &path).is_err() {
+                continue;
+            }
+            match super::dependencies::ready(sys, user, &path, repo) {
+                Ok(true) => {
+                    self.missing.retain(|missing| missing.name != repo.name);
+                    self.dependencies
+                        .retain(|(pending, _)| pending.name != repo.name);
+                    self.present.push((repo.clone(), path));
+                }
+                Err(super::dependencies::Unready::Git(why)) => {
+                    self.git_waits.push(format!("~/{}: {why}", repo.name));
+                }
+                Ok(false) | Err(super::dependencies::Unready::Preserved(_)) => {}
             }
         }
     }
@@ -420,7 +431,12 @@ pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<P
                     Ok(()) => match super::dependencies::ready(sys, user, &path, repo) {
                         Ok(true) => standing.present.push((repo.clone(), path)),
                         Ok(false) => standing.dependencies.push((repo.clone(), path)),
-                        Err(why) => standing.notes.push(format!("~/{}: {why}", repo.name)),
+                        Err(super::dependencies::Unready::Git(why)) => {
+                            standing.git_waits.push(format!("~/{}: {why}", repo.name));
+                        }
+                        Err(super::dependencies::Unready::Preserved(why)) => {
+                            standing.notes.push(format!("~/{}: {why}", repo.name));
+                        }
                     },
                     Err(why) => standing.notes.push(why),
                 }
@@ -451,14 +467,14 @@ pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
     Ok(())
 }
 
-/// Why [`admit_home`] refuses a Mac with neither the Command Line Tools' git nor Xcode's, or
-/// another system without its distribution's.
+/// Why [`admit_home`] waits for managed Git or a native Git installation.
 pub(super) fn no_git(sys: &dyn System) -> &'static str {
     if sys.macos() {
-        "git is not installed (neither the Command Line Tools nor Xcode); no repositories changed"
+        "Git is not ready yet; the default toolset installs it automatically, and Apple's \
+         Command Line Tools or Xcode also provide Git; no repositories changed"
     } else {
-        "git is not installed at /usr/bin/git (the distribution's git package installs it); no \
-         repositories changed"
+        "neither managed Git nor /usr/bin/git is ready; the distribution's git package can also \
+         provide Git; no repositories changed"
     }
 }
 
@@ -1083,6 +1099,8 @@ pub(super) fn clone_all(
                     };
                     let published =
                         matches!(parent, Ok(Placed::Published | Placed::PublishedStagingLeft));
+                    // Published with its staging left behind, whatever its dependencies do.
+                    let staging_left = matches!(parent, Ok(Placed::PublishedStagingLeft));
                     let result = parent.and_then(|placed| {
                         let current = || guard.map_or(Ok(()), |guard| (guard.current)());
                         super::dependencies::repair(
@@ -1104,7 +1122,7 @@ pub(super) fn clone_all(
                     results
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((repo, result, hooks));
+                        .push((repo, result, staging_left, hooks));
                 }
             });
         }
@@ -1113,20 +1131,18 @@ pub(super) fn clone_all(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let order = |repo: &Repo| missing.iter().position(|listed| listed.name == repo.name);
-    results.sort_by_key(|(repo, _, _)| order(repo));
-    for (repo, result, hooks) in results {
+    results.sort_by_key(|(repo, _, _, _)| order(repo));
+    for (repo, result, staging_left, hooks) in results {
         match result {
-            Ok(placed) => {
-                done.cloned.push(repo.clone());
-                if placed == Placed::PublishedStagingLeft {
-                    done.failed.push(format!(
-                        "~/{}: repository published, but its private empty staging directory \
-                         could not be removed",
-                        repo.name
-                    ));
-                }
-            }
+            Ok(_) => done.cloned.push(repo.clone()),
             Err(why) => done.failed.push(format!("~/{}: {why}", repo.name)),
+        }
+        if staging_left {
+            done.failed.push(format!(
+                "~/{}: repository published, but its private empty staging directory could not \
+                 be removed",
+                repo.name
+            ));
         }
         done.hooks.extend(hooks);
     }
@@ -1187,6 +1203,28 @@ fn installer_in(sys: &dyn System, clone: &Path) -> Option<Result<(), &'static st
     Some(Ok(()))
 }
 
+/// The failed row of a pass its guard stopped once [`clone_all`] was done: `why`, then each
+/// failure its clones met besides the stop itself (a clone the guard stopped says only
+/// `~/<name>: <why>`, which is left out), the room it found short, and what the hook installers
+/// of the clones it published did, so a stop never hides what went before it.
+pub(super) fn stopped_after_clones(
+    why: String,
+    failed: Vec<String>,
+    room: Option<String>,
+    hooks: &[String],
+) -> String {
+    let besides: Vec<String> = failed
+        .into_iter()
+        .filter(|line| line.split_once(": ").is_none_or(|(_, said)| said != why))
+        .collect();
+    std::iter::once(why)
+        .chain(besides)
+        .chain(room)
+        .chain(hooks.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// `probe` with `hooks` (what the last apply's clones made of their hook installers,
 /// [`Cloned::hooks`]) after its line, every one of them, whatever the read-back answers: an
 /// installer runs once, when its clone is published, so the row after it is the only one that
@@ -1219,7 +1257,7 @@ pub(super) fn with_hooks(probe: Probe, hooks: &[String]) -> Probe {
 
 /// The run of `clone`'s [`HOOK_INSTALLER`] ([`install_hooks`]).
 pub(super) fn installer_command(sys: &dyn System, user: &User, clone: &Path) -> Cmd {
-    let git = crate::items::github::git_program(sys);
+    let git = crate::items::github::git_program_for_user(sys, user);
     let bin = git.parent().unwrap_or_else(|| Path::new("/usr/bin"));
     Cmd::new(BASH)
         .as_user(user)

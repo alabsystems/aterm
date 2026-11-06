@@ -193,6 +193,7 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
             Ok(_) => Err(format!("{} is not a regular file", p.display())),
         }
     };
+    let mut read_sources = std::collections::BTreeMap::new();
     for path in &all {
         let raw = read(path)?;
         if let Some(w) = INTERNAL_WORDING.iter().find(|w| {
@@ -204,23 +205,30 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
                 path.display()
             ));
         }
+        read_sources.insert(path.clone(), raw);
     }
-    let against = |path: String, bytes: Vec<u8>, seed: bool| -> Result<Planned, String> {
-        let change = match read_optional_tap(&path)? {
-            Some(now) if now == bytes => Change::Same,
+    let against_live = |path: String, bytes: Vec<u8>, live: Option<&[u8]>, seed: bool| -> Planned {
+        let change = match live {
+            Some(now) if now == bytes.as_slice() => Change::Same,
             Some(_) => Change::Update,
             None if seed => Change::Seed,
             None => Change::Update,
         };
-        Ok(Planned {
+        Planned {
             path,
             bytes,
             change,
-        })
+        }
     };
     let mut out = Vec::new();
     for doc in DOCS {
-        out.push(against(doc.to_string(), read(&src.join(doc))?, false)?);
+        let doc_path = src.join(doc);
+        let bytes = match read_sources.remove(&doc_path) {
+            Some(b) => b,
+            None => read(&doc_path)?,
+        };
+        let live = read_optional_tap(doc)?;
+        out.push(against_live(doc.to_string(), bytes, live.as_deref(), false));
     }
     let casks_dir = src.join("Casks");
     let mut casks = Vec::new();
@@ -245,17 +253,27 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let rel = format!("Casks/{name}");
-        let source = String::from_utf8(read(&cask)?)
-            .map_err(|_| format!("{} is not UTF-8", cask.display()))?;
-        let bytes = match read_optional_tap(&rel)? {
-            Some(live_bytes) => {
-                let live = String::from_utf8(live_bytes)
+        let raw_cask = match read_sources.remove(&cask) {
+            Some(b) => b,
+            None => read(&cask)?,
+        };
+        let source =
+            String::from_utf8(raw_cask).map_err(|_| format!("{} is not UTF-8", cask.display()))?;
+        let live_bytes = read_optional_tap(&rel)?;
+        let bytes = match &live_bytes {
+            Some(live_raw) => {
+                let live = std::str::from_utf8(live_raw)
                     .map_err(|_| format!("{} is not UTF-8", tap.join(&rel).display()))?;
-                keep_live(&source, &live).map_err(|e| format!("{rel} in the tap: {e}"))?
+                keep_live(&source, live).map_err(|e| format!("{rel} in the tap: {e}"))?
             }
             None => source,
         };
-        out.push(against(rel, bytes.into_bytes(), true)?);
+        out.push(against_live(
+            rel,
+            bytes.into_bytes(),
+            live_bytes.as_deref(),
+            true,
+        ));
     }
     Ok(out)
 }

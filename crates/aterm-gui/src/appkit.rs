@@ -106,6 +106,8 @@ pub(crate) mod consts {
     pub(crate) const NS_ALERT_FIRST_BUTTON_RETURN: isize = 1000;
     /// `NSAlertSecondButtonReturn`.
     pub(crate) const NS_ALERT_SECOND_BUTTON_RETURN: isize = 1001;
+    /// `NSAlertThirdButtonReturn`.
+    pub(crate) const NS_ALERT_THIRD_BUTTON_RETURN: isize = 1002;
 
     /// `NSWindow.h:244` — `NSWindowToolbarStyleAutomatic` (`NSInteger`).
     pub(crate) const NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC: isize = 0;

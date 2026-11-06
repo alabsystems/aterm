@@ -36,7 +36,7 @@
 //! less than it writes by at most the difference. Kept nowhere, no cover: the run claims as
 //! before.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::Path;
 
 use aterm_json::{Map, Value};
@@ -357,75 +357,37 @@ impl MachineFootprints {
     /// 16 MiB: a run then claims as before.
     #[must_use]
     pub fn load(path: &Path) -> MachineFootprints {
-        Self::read(path).unwrap_or_default()
+        crate::book::read_text(path, FILE_MAX)
+            .ok()
+            .flatten()
+            .map(|text| Self::decode(&text))
+            .unwrap_or_default()
     }
 
-    /// An absent record starts empty; any other refusal is not an empty record to a writer.
-    fn read(path: &Path) -> io::Result<MachineFootprints> {
-        match crate::read_regular_text(path, FILE_MAX) {
-            Ok(text) => Ok(Self::decode(&text)),
-            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(why) => Err(why),
-        }
-    }
-
-    /// Write the record to `path`: staged in a private folder beside it, then renamed over it,
-    /// so a reader finds the old file or the new one whole.
+    /// Write the record to `path` ([`crate::book::write_staged`]), so a reader finds the old
+    /// file or the new one whole.
     ///
     /// # Errors
-    /// The encoded record exceeds the read bound, its directory could not be made, or the write
-    /// failed: the record kept before stands.
+    /// As [`crate::book::write_staged`]: the record kept before stands.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let encoded = self.encode();
-        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > FILE_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "the machine's footprint record exceeds its read bound; the one before stands",
-            ));
-        }
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::ledger::ensure_dir(dir)?;
-        let stage = aterm_tempfile::Builder::new()
-            .prefix(".disk-footprint-")
-            .tempdir_in(dir)?;
-        let staged = stage.path().join("data");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = options.open(&staged)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-        file.write_all(encoded.as_bytes())?;
-        drop(file);
-        std::fs::rename(&staged, path)
+        crate::book::write_staged(path, self.encode().as_bytes(), ".disk-footprint-", FILE_MAX)
     }
 
     /// Keep `run` under `selection` in the record at `path`: read, pushed ([`Self::push`]) and
-    /// written back whole, holding the record's lock ([`crate::book::lock_path`]) from the read
-    /// to the write, so two runs ending at once in two checkouts each keep theirs.
+    /// written back whole, holding the record's lock from the read to the write
+    /// ([`crate::book::update_text`]), so two runs ending at once in two checkouts each keep
+    /// theirs.
     ///
     /// # Errors
-    /// The existing record could not be read (it is left as it is), the lock could not be made or
-    /// taken, or as [`Self::save`].
+    /// As [`crate::book::update_text`]: an existing record that could not be read is left as it
+    /// is.
     pub fn keep(path: &Path, selection: Selection, run: Footprint) -> io::Result<()> {
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::ledger::ensure_dir(dir)?;
-        let lock = crate::ledger::open_rendezvous(&crate::book::lock_path(path))?;
-        let _held = aterm_toolchain::record_lock::RecordLock::lock(lock, 0)?;
-        let mut record = Self::read(path)?;
-        record.push(selection, run);
-        record.save(path)
+        crate::book::update_text(path, FILE_MAX, ".disk-footprint-", |text| {
+            let mut record = text.map(Self::decode).unwrap_or_default();
+            record.push(selection, run);
+            Some(record.encode())
+        })
+        .map(|_| ())
     }
 }
 

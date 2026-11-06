@@ -2404,7 +2404,9 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(shipped.to_string().contains(&user), "{shipped}");
     assert!(gone.join("debug/deps/liblay.rlib").exists());
 
-    let removed = real_among(now, vec![tests.id(), holder.id()])(&row).expect("nothing uses it");
+    // Both are reaped, so no listing names them, and their pids are free: a process that
+    // took one mid-exec is unreadable and rightly keeps the build. The pass scans none.
+    let removed = real(now)(&row).expect("nothing uses it");
     assert_eq!(removed.units, std::slice::from_ref(&gone));
     assert!(!gone.exists());
 }
@@ -2754,7 +2756,9 @@ fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     assert!(err.to_string().contains("uses"), "{err}");
     assert!(dir.join("debug/deps/liblay.rlib").is_file());
 
-    let removed = real_among(now, vec![inside.id()])(&row).expect("nothing keeps it now");
+    // Reaped, it is in no listing, and its pid is free for a process that may be unreadable
+    // mid-exec: the pass scans none.
+    let removed = real(now)(&row).expect("nothing keeps it now");
     assert_eq!(removed.units, std::slice::from_ref(&dir));
     assert!(!dir.exists());
 }

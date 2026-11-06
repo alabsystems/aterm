@@ -34,6 +34,18 @@ impl Packer for Pack {
     fn pack(&self, ctx: &Ctx, request: &PackRequest) -> Result<PackOutcome> {
         pack_with(ctx, request, &HostTools)
     }
+
+    fn pack_bottle(
+        &self,
+        ctx: &Ctx,
+        request: &super::bottle::upstream::Request,
+    ) -> Result<super::bottle::BottleOutcome> {
+        super::bottle::upstream::pack(ctx, request)
+    }
+
+    fn can_pack_bottle(&self, triple: Triple) -> std::result::Result<(), String> {
+        super::bottle::upstream::can_build(triple).map_err(|error| error.to_string())
+    }
 }
 
 /// How long a pack waits for another publish of the same program to finish.

@@ -1707,6 +1707,17 @@ impl TypingPace {
     }
 }
 
+/// A debug build's `ATERM_DEBUG_TURN_KEY_LAG_MS`: how long each typed key of a turn takes to go,
+/// a loaded worker's lag (m108's keys behind m14's drive went at about 5 a second, 2026-11-04),
+/// so a live drive can type slower than its deadline ([`TypingPace`]). A shipped build (neither
+/// `debug_assertions` nor the `dev-seams` feature) reads nothing and lags no key, and the name is
+/// in `ENV_DENY_VARS`, so no shell an aterm starts hands it to an aterm inside it.
+fn typed_key_lag() -> std::time::Duration {
+    aterm_types::dev_seam!("ATERM_DEBUG_TURN_KEY_LAG_MS")
+        .and_then(|ms| ms.to_str().and_then(|ms| ms.parse::<u64>().ok()))
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis)
+}
+
 /// When the echo's settle after a turn's last write ends at the latest: early enough that the
 /// submit's `window` (its share of the turn, as [`TypingPace`] reserves it) still fits before
 /// `deadline`, never sooner than the `settle` after the typing ended at `typed`, and never past
@@ -3011,6 +3022,7 @@ fn turn_attempt(
                 (submit != "none").then(|| Duration::from_millis(submit_window_ms)),
             );
             let mut due = Instant::now();
+            let key_lag = typed_key_lag();
             for (at, ev) in typed_key_events(head) {
                 let now = Instant::now();
                 if due > now {
@@ -3056,6 +3068,9 @@ fn turn_attempt(
                 due = pressed_at + cadence;
                 pace.pressed(pressed_at, deadline);
                 let first = !wrote.replace(true);
+                if !key_lag.is_zero() {
+                    std::thread::sleep(key_lag);
+                }
                 if !(io.key)(ev) {
                     return undelivered(first, KEY_DELIVERY_FAILED);
                 }

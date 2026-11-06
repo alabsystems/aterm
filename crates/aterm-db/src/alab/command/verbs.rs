@@ -32,6 +32,7 @@ use crate::{
 };
 use aterm_json::{Value, json};
 use aterm_secrets::client::Paths;
+use std::collections::BTreeMap;
 
 /// How far back `log` reads by default, in days: the journal ring's two-week window.
 pub(super) const LOG_DAYS: u64 = 14;
@@ -332,16 +333,20 @@ pub(super) fn machines(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> 
     }
     let (view, lab) = lab(paths)?;
     let rows = view.project(&MACHINE);
-    let mut out = Vec::new();
+    let mut bound_by_machine: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for (uuid, bound) in &lab.bound {
+        bound_by_machine
+            .entry(bound.as_str())
+            .or_default()
+            .push(uuid);
+    }
+    let mut out = Vec::with_capacity(lab.machines.len());
     for (pk, machine) in &lab.machines {
         let row = rows.rows.get(pk);
         let prefers = lab.preferred_by(pk).count();
-        let uuids: Vec<&String> = lab
-            .bound
-            .iter()
-            .filter(|(_, bound)| *bound == pk)
-            .map(|(uuid, _)| uuid)
-            .collect();
+        let uuids = bound_by_machine
+            .get(pk.as_str())
+            .map_or(&[][..], Vec::as_slice);
         out.push(json!({
             "mc": pk,
             "label": machine.label,
@@ -433,20 +438,31 @@ pub(super) fn mail(paths: &Paths) -> Result<Value> {
     let mailboxes = view.project(&MAILBOX);
     let mailbox_label = |pk: &str| mailboxes.rows.get(pk).map(|row| text(row, "label"));
     let accounts = view.project(&ACCOUNT);
-    let mut out = Vec::new();
+    let mut signing_by_address: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for (ac, a) in &accounts.rows {
+        let login = a.get("login").and_then(Value::as_str);
+        let identity = a.get("identity").and_then(Value::as_str);
+        if login.is_some() || identity.is_some() {
+            let entry = json!({"ac": ac, "label": label_of(&lab, ac)});
+            if let Some(addr) = login {
+                signing_by_address
+                    .entry(addr)
+                    .or_default()
+                    .push(entry.clone());
+            }
+            if let Some(addr) = identity
+                && Some(addr) != login
+            {
+                signing_by_address.entry(addr).or_default().push(entry);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(addresses.rows.len());
     for (pk, row) in &addresses.rows {
         let effective = lab.mailbox(pk, &|_| None);
-        let signing: Vec<Value> = accounts
-            .rows
-            .iter()
-            .filter(|(_, a)| {
-                [a.get("login"), a.get("identity")]
-                    .into_iter()
-                    .flatten()
-                    .any(|v| v.as_str() == Some(pk.as_str()))
-            })
-            .map(|(ac, _)| json!({"ac": ac, "label": label_of(&lab, ac)}))
-            .collect();
+        let signing = signing_by_address
+            .get(pk.as_str())
+            .map_or(&[][..], Vec::as_slice);
         out.push(json!({
             "ad": pk,
             "kind": text(row, "kind"),
@@ -749,7 +765,7 @@ fn label_held(machines: &Projection, label: &str, except: Option<&str>) -> bool 
                 || row
                     .fields
                     .get("aliases")
-                    .is_some_and(|field| field.members().contains(label)))
+                    .is_some_and(|field| field.has_member(label)))
     })
 }
 
@@ -941,7 +957,7 @@ pub(super) fn retire(paths: &Paths, args: &Args) -> Result<Value> {
                         || row
                             .fields
                             .get("aliases")
-                            .is_some_and(|field| field.members().contains(label))
+                            .is_some_and(|field| field.has_member(label))
                 })
             })?
         };
@@ -993,7 +1009,7 @@ pub(super) fn relabel(paths: &Paths, args: &Args) -> Result<Value> {
                     || row
                         .fields
                         .get("aliases")
-                        .is_some_and(|field| field.members().contains(label))
+                        .is_some_and(|field| field.has_member(label))
             })
         })?;
         if label_held(&machines, &new, Some(&pk)) {
@@ -1011,7 +1027,7 @@ pub(super) fn relabel(paths: &Paths, args: &Args) -> Result<Value> {
         if from != new
             && !row
                 .and_then(|r| r.fields.get("aliases"))
-                .is_some_and(|field| field.members().contains(from.as_str()))
+                .is_some_and(|field| field.has_member(from.as_str()))
         {
             record.push(cell::change(
                 &MACHINE,

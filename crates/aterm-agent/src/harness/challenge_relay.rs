@@ -3,7 +3,8 @@
 
 //! A caller-bound Claude OAuth challenge handed to the fleet issuer's interactive browser.
 //! The issuer never receives mailbox credentials or a Claude credential file. Its answer is
-//! only the state-checked loopback callback, delivered by the original opener to its own CLI.
+//! only the state-checked loopback or hosted-code callback, delivered by the original opener
+//! to its own CLI.
 
 use std::{
     collections::BTreeMap,
@@ -18,7 +19,7 @@ use aterm_json::json;
 /// The control verb, available only on a serving window with an interactive browser.
 pub const VERB: &str = "claude-challenge";
 #[cfg(unix)]
-const WITHIN: Duration = Duration::from_secs(180);
+const WITHIN: Duration = super::login_drive::HANG;
 const RETAIN: Duration = Duration::from_secs(30 * 60);
 #[cfg(any(unix, test))]
 const DIAL_WITHIN: Duration = Duration::from_secs(20);
@@ -28,6 +29,40 @@ const MAX_JOBS: usize = 16;
 const MAX_URL: usize = 16 * 1024;
 #[cfg(all(unix, not(test)))]
 const MAX_REPLY: usize = 64 * 1024;
+
+/// A service pause is not a provider rejection or proof that execution never began.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// The serving App cannot admit or continue this account operation.
+    Unavailable,
+    /// The admitted service returned a definite failure.
+    Failed(String),
+    /// Transport or protocol evidence cannot establish completion.
+    Unconfirmed(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("central challenge service is unavailable"),
+            Self::Failed(why) | Self::Unconfirmed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+impl From<String> for RequestError {
+    fn from(why: String) -> Self {
+        Self::Unconfirmed(why)
+    }
+}
+
+impl From<&str> for RequestError {
+    fn from(why: &str) -> Self {
+        Self::Unconfirmed(why.to_owned())
+    }
+}
 
 /// The one OAuth flow a request ID names.
 #[derive(Clone, PartialEq, Eq)]
@@ -137,6 +172,7 @@ enum State {
     Working,
     Done(String),
     Failed(String),
+    Unavailable,
 }
 
 struct Entry {
@@ -153,9 +189,10 @@ struct Book {
 impl Book {
     fn start(
         self: &Arc<Self>,
+        lifetime: &super::account_work::Lifetime,
         caller: &str,
         start: Start,
-        run: impl FnOnce(Start) -> Result<String, String> + Send + 'static,
+        run: impl FnOnce(Start, &super::account_work::Scope) -> Result<String, String> + Send + 'static,
     ) -> Result<State, String> {
         let key = (caller.to_owned(), start.nonce.clone());
         let now = Instant::now();
@@ -169,6 +206,9 @@ impl Book {
             }
             return Ok(job.state.clone());
         }
+        let Some(scope) = lifetime.enter() else {
+            return Ok(State::Unavailable);
+        };
         if jobs.values().any(|job| matches!(job.state, State::Working)) {
             return Err("another central challenge is running".into());
         }
@@ -191,14 +231,34 @@ impl Book {
         drop(jobs);
         let book = Arc::clone(self);
         let kept = key.clone();
+        let running = scope.clone();
         let started = std::thread::Builder::new()
             .name("fleet-claude-challenge".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(start)));
-                let state = match result {
-                    Ok(Ok(callback)) => State::Done(callback),
-                    Ok(Err(why)) => State::Failed(super::one_line(&why, 320)),
-                    Err(_) => State::Failed("challenge worker panicked".into()),
+            .spawn(scope.wrap(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if running.cancelled() {
+                        return Err("account work admissions are paused".into());
+                    }
+                    run(start, &running)
+                }));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if let Err(secondary) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                        {
+                            std::mem::forget(secondary);
+                        }
+                        Err("challenge worker panicked".into())
+                    }
+                };
+                let state = if running.cancelled() {
+                    State::Unavailable
+                } else {
+                    match result {
+                        Ok(callback) => State::Done(callback),
+                        Err(why) => State::Failed(super::one_line(&why, 320)),
+                    }
                 };
                 if let Some(job) = book
                     .jobs
@@ -209,7 +269,7 @@ impl Book {
                     job.at = Instant::now();
                     job.state = state;
                 }
-            });
+            }));
         if let Err(error) = started {
             self.jobs
                 .lock()
@@ -238,30 +298,33 @@ fn encode(nonce: &str, state: State) -> String {
         State::Done(callback) => json!({"schema":1,"request":nonce,"state":"done",
             "callback":callback}),
         State::Failed(error) => json!({"schema":1,"request":nonce,"state":"failed","error":error}),
+        State::Unavailable => {
+            json!({"schema":1,"request":nonce,"state":"unavailable","error":"account work admissions are paused"})
+        }
     };
     format!("OK 1\n{value}\n")
 }
 
 #[cfg(unix)]
-fn run(start: Start) -> Result<String, String> {
-    super::challenge_window::authorize(&start.authorize_url, start.email.as_deref(), WITHIN)
+fn run(start: Start, scope: &super::account_work::Scope) -> Result<String, String> {
+    super::challenge_window::authorize(&start.authorize_url, start.email.as_deref(), WITHIN, scope)
 }
 
 #[cfg(not(unix))]
-fn run(_start: Start) -> Result<String, String> {
+fn run(_start: Start, _scope: &super::account_work::Scope) -> Result<String, String> {
     Err("central Claude challenges require a serving window on macOS or Linux".into())
 }
 
 /// Serve a challenge on this window. The caller has already passed the local-owner or native
 /// fleet-drive gate; node-only service processes never reach this entry.
-pub fn serve(caller: &str, rest: &str) -> String {
+pub fn serve_scoped(lifetime: &super::account_work::Lifetime, caller: &str, rest: &str) -> String {
     static BOOK: OnceLock<Arc<Book>> = OnceLock::new();
     let answer = (|| {
         let request = Request::parse(rest)?;
         let nonce = request.nonce().to_owned();
         let book = BOOK.get_or_init(|| Arc::new(Book::default()));
         let state = match request {
-            Request::Start(start) => book.start(caller, start, run)?,
+            Request::Start(start) => book.start(lifetime, caller, start, run)?,
             Request::Poll(nonce) => book.poll(caller, &nonce)?,
         };
         Ok::<_, String>(encode(&nonce, state))
@@ -278,6 +341,7 @@ fn decode(nonce: &str, text: &str) -> Result<State, String> {
     }
     match value["state"].as_str() {
         Some("working") => Ok(State::Working),
+        Some("unavailable") => Ok(State::Unavailable),
         Some("failed") => Ok(State::Failed(
             value["error"]
                 .as_str()
@@ -306,7 +370,7 @@ fn request_with(
     within: Duration,
     mut call: impl FnMut(&str, Duration) -> Result<String, String>,
     mut pause: impl FnMut(Duration),
-) -> Result<String, String> {
+) -> Result<String, RequestError> {
     let deadline = Instant::now() + within;
     let decode_reply = |reply: &str| {
         decode(&start.nonce, reply).map_err(|error| {
@@ -331,23 +395,24 @@ fn request_with(
     loop {
         match state {
             State::Done(callback) => return Ok(callback),
-            State::Failed(error) => return Err(error),
+            State::Failed(error) => return Err(RequestError::Failed(error)),
+            State::Unavailable => return Err(RequestError::Unavailable),
             State::Working => {}
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(format!(
+            return Err(RequestError::Unconfirmed(format!(
                 "challenge completion unconfirmed (request {}); poll the same request",
                 start.nonce
-            ));
+            )));
         }
         pause(left.min(POLL));
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(format!(
+            return Err(RequestError::Unconfirmed(format!(
                 "challenge completion unconfirmed (request {}); poll the same request",
                 start.nonce
-            ));
+            )));
         }
         state = decode_reply(
             &call(
@@ -365,7 +430,7 @@ fn request_with(
 }
 
 #[cfg(all(unix, not(test)))]
-fn request(host: &str, authorize_url: &str, email: Option<&str>) -> Result<String, String> {
+fn request(host: &str, authorize_url: &str, email: Option<&str>) -> Result<String, RequestError> {
     use ring::rand::{SecureRandom as _, SystemRandom};
     let mut random = [0; 16];
     SystemRandom::new()
@@ -402,26 +467,26 @@ fn request(host: &str, authorize_url: &str, email: Option<&str>) -> Result<Strin
 
 /// Route a blocked Claude OAuth flow to the fleet issuer's serving window.
 #[cfg(all(unix, not(test)))]
-pub fn request_central(authorize_url: &str, email: Option<&str>) -> Result<String, String> {
-    let state = aterm_types::dirs::state_dir().ok_or("no fleet state directory")?;
-    let peers = aterm_net::fleet_member::read_peers(&state)
-        .map_err(|_| "fleet peers are unavailable".to_owned())?;
+pub fn request_central(authorize_url: &str, email: Option<&str>) -> Result<String, RequestError> {
+    let state = aterm_types::dirs::state_dir().ok_or(RequestError::Unavailable)?;
+    let peers =
+        aterm_net::fleet_member::read_peers(&state).map_err(|_| RequestError::Unavailable)?;
     let issuer = peers
         .iter()
         .find(|peer| peer.via == aterm_net::fleet_member::Via::Issuer)
-        .ok_or("no fleet issuer is configured")?;
+        .ok_or(RequestError::Unavailable)?;
     request(&issuer.host, authorize_url, email)
 }
 
 #[cfg(all(unix, test))]
 thread_local! {
-    static CENTRAL_RESULT: std::cell::RefCell<Option<Result<String, String>>> =
+    static CENTRAL_RESULT: std::cell::RefCell<Option<Result<String, RequestError>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the previous inert central result when dropped.
 #[cfg(all(unix, test))]
-pub struct CentralResultGuard(Option<Result<String, String>>);
+pub struct CentralResultGuard(Option<Result<String, RequestError>>);
 
 #[cfg(all(unix, test))]
 impl Drop for CentralResultGuard {
@@ -432,13 +497,13 @@ impl Drop for CentralResultGuard {
 
 /// Substitute one thread-local central result; no test reaches the live fleet without this.
 #[cfg(all(unix, test))]
-pub fn set_central_result_for_tests(result: Result<String, String>) -> CentralResultGuard {
+pub fn set_central_result_for_tests(result: Result<String, RequestError>) -> CentralResultGuard {
     CentralResultGuard(CENTRAL_RESULT.with(|slot| slot.borrow_mut().replace(result)))
 }
 
 /// Return the thread's substituted result, or an inert refusal by default.
 #[cfg(all(unix, test))]
-pub fn request_central(_authorize_url: &str, _email: Option<&str>) -> Result<String, String> {
+pub fn request_central(_authorize_url: &str, _email: Option<&str>) -> Result<String, RequestError> {
     CENTRAL_RESULT.with(|slot| {
         slot.borrow()
             .clone()
@@ -448,8 +513,8 @@ pub fn request_central(_authorize_url: &str, _email: Option<&str>) -> Result<Str
 
 /// Report that no visible central browser is available on this platform.
 #[cfg(not(unix))]
-pub fn request_central(_authorize_url: &str, _email: Option<&str>) -> Result<String, String> {
-    Err("central Claude challenges are unavailable on this platform".into())
+pub fn request_central(_authorize_url: &str, _email: Option<&str>) -> Result<String, RequestError> {
+    Err(RequestError::Unavailable)
 }
 
 #[cfg(test)]
@@ -498,35 +563,117 @@ mod tests {
     }
 
     #[test]
+    fn paused_services_reject_new_work_but_retain_the_exact_running_request() {
+        let book = Arc::new(Book::default());
+        let lifetime = super::super::account_work::Lifetime::default();
+        let (ready, began) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        assert!(matches!(
+            book.start(&lifetime, "a", start(), move |_, scope| {
+                ready.send(()).unwrap();
+                finish.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                assert!(scope.cancelled());
+                Ok(CALLBACK.into())
+            }),
+            Ok(State::Working)
+        ));
+        began.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let pause = lifetime.pause().unwrap();
+        let pause = pause
+            .try_wait()
+            .expect_err("the detached worker retains its scope");
+        assert!(matches!(
+            book.start(&lifetime, "a", start(), |_, _| panic!("duplicate work")),
+            Ok(State::Working)
+        ));
+        assert!(matches!(
+            book.start(
+                &lifetime,
+                "a",
+                Start {
+                    nonce: OTHER.into(),
+                    ..start()
+                },
+                |_, _| panic!("paused work")
+            ),
+            Ok(State::Unavailable)
+        ));
+        assert!(
+            book.poll("a", OTHER).is_err(),
+            "a refused start creates no job"
+        );
+        release.send(()).unwrap();
+        let mut pause = Some(pause);
+        let drained = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || match pause.take().unwrap().try_wait() {
+                Ok(drained) => Some(drained),
+                Err(pending) => {
+                    pause = Some(pending);
+                    None
+                }
+            },
+        )
+        .expect("the cancelled service retired its actual worker");
+        assert!(
+            matches!(book.poll("a", ID), Ok(State::Unavailable)),
+            "cancelled work cannot return a callback"
+        );
+        assert_eq!(
+            decode(
+                ID,
+                &json!({"schema":1,"request":ID,"state":"unavailable"}).to_string()
+            )
+            .map(|state| matches!(state, State::Unavailable)),
+            Ok(true)
+        );
+        assert_eq!(
+            request_with(
+                &start(),
+                Duration::from_secs(1),
+                |_, _| Ok(json!({"schema":1,"request":ID,"state":"unavailable"}).to_string()),
+                |_| {}
+            ),
+            Err(RequestError::Unavailable)
+        );
+        assert!(drained.resume().is_ok());
+    }
+
+    #[test]
     fn duplicates_share_one_flow_and_callers_cannot_read_each_others_results() {
         let book = Arc::new(Book::default());
+        let lifetime = super::super::account_work::Lifetime::default();
         let (release, wait) = std::sync::mpsc::channel();
         assert!(matches!(
-            book.start("a", start(), move |_| {
+            book.start(&lifetime, "a", start(), move |_, _| {
                 wait.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
                 Ok(CALLBACK.into())
             }),
             Ok(State::Working)
         ));
         assert!(matches!(
-            book.start("a", start(), |_| panic!("duplicate execution")),
+            book.start(&lifetime, "a", start(), |_, _| panic!(
+                "duplicate execution"
+            )),
             Ok(State::Working)
         ));
         let mut changed = start();
         changed.authorize_url.push_str("&client_id=other");
         assert!(
-            book.start("a", changed, |_| panic!("changed flow"))
+            book.start(&lifetime, "a", changed, |_, _| panic!("changed flow"))
                 .is_err()
         );
         assert!(book.poll("b", ID).is_err());
         assert!(
             book.start(
+                &lifetime,
                 "b",
                 Start {
                     nonce: OTHER.into(),
                     ..start()
                 },
-                |_| { panic!("parallel execution") }
+                |_, _| { panic!("parallel execution") }
             )
             .is_err()
         );

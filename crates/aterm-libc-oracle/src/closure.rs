@@ -151,8 +151,8 @@ fn render_fn_pointer(pointer: &Value) -> String {
     format!("{safety}{abi}fn({}){output}", args.join(", "))
 }
 
-/// Every identifier in rendered source that could name a crate item.
-fn named(source: &str, into: &mut BTreeSet<String>) {
+/// Calls `f` on every identifier in rendered source that could name a crate item.
+fn for_each_named(source: &str, mut f: impl FnMut(&str)) {
     let bytes = source.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -167,9 +167,17 @@ fn named(source: &str, into: &mut BTreeSet<String>) {
         }
         let word = &source[begin..i];
         if !BUILTIN.contains(&word) && !KEYWORDS.contains(&word) && !PRIMS.contains(&word) {
-            into.insert(word.to_string());
+            f(word);
         }
     }
+}
+
+/// Every identifier in rendered source that could name a crate item.
+#[cfg(test)]
+fn named(source: &str, into: &mut BTreeSet<String>) {
+    for_each_named(source, |word| {
+        into.insert(word.to_string());
+    });
 }
 
 /// The rendered types one item's signature mentions.
@@ -216,27 +224,28 @@ fn signature_types<'d>(doc: &'d Doc, entry: &Entry<'d>) -> Result<Vec<&'d Value>
 /// When a reached item lacks its `inner` object.
 pub fn closure(doc: &Doc, public: &Public<'_>, names: &[String]) -> Result<BTreeSet<String>> {
     let mut have: BTreeSet<String> = names.iter().cloned().collect();
-    loop {
-        let mut reached = BTreeSet::new();
-        for name in &have {
+    let mut frontier: Vec<String> = have.iter().cloned().collect();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for name in &frontier {
             let Some(by_namespace) = public.get(name.as_str()) else {
                 continue;
             };
             for entry in by_namespace.values() {
                 for ty in signature_types(doc, entry)? {
-                    named(&render(ty), &mut reached);
+                    for_each_named(&render(ty), |word| {
+                        if public.contains_key(word) && !have.contains(word) {
+                            let owned = word.to_string();
+                            have.insert(owned.clone());
+                            next.push(owned);
+                        }
+                    });
                 }
             }
         }
-        let new: Vec<String> = reached
-            .into_iter()
-            .filter(|name| public.contains_key(name.as_str()) && !have.contains(name))
-            .collect();
-        if new.is_empty() {
-            return Ok(have);
-        }
-        have.extend(new);
+        frontier = next;
     }
+    Ok(have)
 }
 
 #[cfg(test)]

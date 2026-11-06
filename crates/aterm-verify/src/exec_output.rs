@@ -124,7 +124,7 @@ impl OwnedChild {
             #[cfg(unix)]
             if super::group::stopping() {
                 return Err(io::Error::other(
-                    "the run was interrupted before this child started",
+                    super::halted().unwrap_or("the run was interrupted before this child started"),
                 ));
             }
             if scope.closed() {

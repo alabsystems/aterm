@@ -49,7 +49,8 @@ fn imports() -> String {
         .split_whitespace()
         .filter_map(|n| n.strip_prefix('_'))
         .collect();
-    let mut text = String::from("unsafe extern \"C\" {\n");
+    let mut text = String::with_capacity(192 + names.len() * 88);
+    text.push_str("unsafe extern \"C\" {\n");
     for (i, name) in names.iter().enumerate() {
         let _ = writeln!(text, "    #[link_name = {name:?}]\n    static I{i}: u8;");
     }

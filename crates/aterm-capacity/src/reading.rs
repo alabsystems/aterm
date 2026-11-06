@@ -290,7 +290,8 @@ impl Procs {
             }
             return out;
         }
-        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
+        let mut parent: HashMap<u32, u32> = HashMap::with_capacity(self.procs.len());
+        parent.extend(self.procs.iter().map(|p| (p.pid, p.ppid)));
         let mut at = pid;
         while let Some(&up) = parent.get(&at) {
             if up == at || up == pid || out.contains(&up) {
@@ -332,9 +333,10 @@ impl Procs {
     /// tree never holds another claimant's, so no process is credited to two claims.
     #[must_use]
     pub fn trees(&self, roots: &[u32]) -> HashMap<u32, TreeUse> {
-        let parent: HashMap<u32, u32> = self.procs.iter().map(|p| (p.pid, p.ppid)).collect();
-        let mut out: HashMap<u32, TreeUse> =
-            roots.iter().map(|r| (*r, TreeUse::default())).collect();
+        let mut parent: HashMap<u32, u32> = HashMap::with_capacity(self.procs.len());
+        parent.extend(self.procs.iter().map(|p| (p.pid, p.ppid)));
+        let mut out: HashMap<u32, TreeUse> = HashMap::with_capacity(roots.len());
+        out.extend(roots.iter().map(|r| (*r, TreeUse::default())));
         for p in &self.procs {
             let mut at = p.pid;
             let mut steps = 0usize;
@@ -361,6 +363,11 @@ impl Procs {
 
 /// What the ledger reads of the machine: the live one ([`Live`]) or a fixed one ([`Fixed`]), so no test reaches a platform reader.
 pub trait Machine {
+    /// Whether this admission belongs to a live release. Injected machines are inert,
+    /// so tests of isolated ledgers never inherit the verifier's scheduling priority.
+    fn release_run(&self) -> bool {
+        false
+    }
     /// The machine now, its volume the one holding `path` (`None`: no volume).
     fn read(&self, path: Option<&Path>) -> Reading;
 
@@ -417,6 +424,9 @@ thread_local! {
 pub struct Live;
 
 impl Machine for Live {
+    fn release_run(&self) -> bool {
+        std::env::var_os(crate::RELEASE_RUN_ENV).is_some_and(|v| !v.is_empty())
+    }
     fn cpu_point(&self) -> Option<crate::CpuPoint> {
         let ticks = aterm_sysprobe::Probe::new().core_ticks()?;
         Some(crate::CpuPoint {

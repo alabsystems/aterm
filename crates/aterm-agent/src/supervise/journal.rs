@@ -957,11 +957,17 @@ pub fn unix_ms() -> i64 {
     aterm_time::unix_millis().map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX))
 }
 
-/// The open journal of one loop (or none).
+#[derive(Debug)]
+enum JournalTarget {
+    Off,
+    Named(PathBuf),
+    Append(PathBuf),
+}
+
+/// The journal of one loop (or none), reopened under its path lock for each append.
 #[derive(Debug)]
 pub struct Journal {
-    path: Option<PathBuf>,
-    file: Option<std::fs::File>,
+    target: JournalTarget,
     sid: Option<String>,
     /// The one warning was said.
     warned: bool,
@@ -971,8 +977,7 @@ impl Journal {
     /// No journal: [`Self::record`] does nothing.
     pub const fn off() -> Self {
         Self {
-            path: None,
-            file: None,
+            target: JournalTarget::Off,
             sid: None,
             warned: false,
         }
@@ -983,7 +988,7 @@ impl Journal {
     pub fn named(path: Option<&Path>, sid: Option<&str>) -> Self {
         let mut j = Self::off();
         if let Some(path) = path {
-            j.path = Some(path.to_path_buf());
+            j.target = JournalTarget::Named(path.to_path_buf());
             j.sid = sid.map(str::to_string);
         }
         j
@@ -995,30 +1000,20 @@ impl Journal {
         let Some(path) = path else {
             return j;
         };
-        j.path = Some(path.to_path_buf());
+        j.target = JournalTarget::Append(path.to_path_buf());
         j.sid = sid.map(str::to_string);
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        }
-        match o.open(path).and_then(|f| {
-            if f.metadata()?.is_file() {
-                Ok(f)
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "not a regular file",
-                ))
-            }
-        }) {
-            Ok(f) => j.file = Some(f),
-            Err(e) => j.failed(&e, "cannot open it", warn),
+        let opened = aterm_uds::line_log::ensure(path);
+        if let Err(e) = opened {
+            j.failed(&e, "cannot open it", warn);
         }
         j
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match &self.target {
+            JournalTarget::Off => None,
+            JournalTarget::Named(path) | JournalTarget::Append(path) => Some(path),
+        }
     }
 
     /// Appends the record of `line` ([`JournalRecord::of_line`]), stamped `t_ms`. A test build
@@ -1061,38 +1056,31 @@ impl Journal {
     ) -> Option<String> {
         #[cfg(test)]
         super::ledger::assert_marked(line);
-        self.path.as_ref()?;
+        self.path()?;
         let mut rec = JournalRecord::of_line(t_ms, self.sid.as_deref(), line, None);
         rec.mark = mark;
         rec.ended = ended;
         let mut text = rec.to_json();
-        text.push('\n');
-        let res = match self.file.as_mut() {
-            Some(f) => f.write_all(text.as_bytes()).and_then(|()| f.flush()),
-            None => return Some(text),
-        };
-        if let Err(e) = res {
+        if let JournalTarget::Append(path) = &self.target
+            && let Err(e) = aterm_uds::line_log::append(path, &text)
+        {
             self.failed(&e, "cannot append to it", warn);
         }
+        text.push('\n');
         Some(text)
     }
 
     /// Whether a journal was given (a file named, opened or not).
     #[must_use]
     pub const fn is_on(&self) -> bool {
-        self.path.is_some()
+        !matches!(self.target, JournalTarget::Off)
     }
 
     /// Append one line that is already a JSON object.
     pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) -> bool {
-        let res = match self.file.as_mut() {
-            Some(f) => {
-                let mut row = String::with_capacity(json.len() + 1);
-                row.push_str(json);
-                row.push('\n');
-                f.write_all(row.as_bytes()).and_then(|()| f.flush())
-            }
-            None => return false,
+        let res = match &self.target {
+            JournalTarget::Append(path) => aterm_uds::line_log::append(path, json),
+            JournalTarget::Off | JournalTarget::Named(_) => return false,
         };
         if let Err(e) = res {
             self.failed(&e, "cannot append to it", warn);
@@ -1106,8 +1094,7 @@ impl Journal {
     fn failed(&mut self, e: &std::io::Error, what: &str, warn: &mut dyn Write) {
         if crate::harness::disk::poke::is_out_of_space(e) {
             let path = self
-                .path
-                .as_deref()
+                .path()
                 .map_or_else(String::new, |p| p.display().to_string());
             crate::harness::disk::poke::poke(crate::harness::disk::poke::Cause::Write(format!(
                 "journal {path}: {e}"
@@ -1121,8 +1108,7 @@ impl Journal {
             return;
         }
         let path = self
-            .path
-            .as_deref()
+            .path()
             .map_or_else(String::new, |p| p.display().to_string());
         let _ = writeln!(
             warn,
@@ -1159,6 +1145,131 @@ pub fn read_journal(path: &Path) -> Result<(Vec<JournalRecord>, usize), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appends_preserve_interrupted_bytes_and_start_separate_records() {
+        for prefix in [b"".as_slice(), b"{}\n", b"{}", b"{\"broken\":", b"\xff"] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let path = tmp.path().join("journal.jsonl");
+            std::fs::write(&path, prefix).unwrap();
+            let mut warn = Vec::new();
+            let mut journal = Journal::open(Some(&path), None, &mut warn);
+            assert!(journal.append_raw("{\"id\":1}", &mut warn));
+            let recorded = journal.record(2, "TIMEOUT", &mut warn).unwrap();
+            let mut expected = prefix.to_vec();
+            if !prefix.is_empty() && !prefix.ends_with(b"\n") {
+                expected.push(b'\n');
+            }
+            expected.extend_from_slice(b"{\"id\":1}\n");
+            expected.extend_from_slice(recorded.as_bytes());
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert!(warn.is_empty());
+
+            // A later interrupted append is checked too, not just the constructor's tail.
+            std::fs::write(&path, b"{\"later\":").unwrap();
+            assert!(journal.append_raw("{\"id\":3}", &mut warn));
+            assert_eq!(std::fs::read(&path).unwrap(), b"{\"later\":\n{\"id\":3}\n");
+        }
+    }
+
+    #[test]
+    fn a_contended_journal_keeps_its_bytes_and_can_retry_after_unlock() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let path = tmp.path().join("journal.jsonl");
+        let mut warn = Vec::new();
+        let mut journal = Journal::open(Some(&path), None, &mut warn);
+        let held = aterm_uds::line_log::lock(&path).unwrap();
+        assert!(!journal.append_raw("{\"id\":1}", &mut warn));
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        assert!(!warn.is_empty());
+        drop(held);
+        assert!(journal.append_raw("{\"id\":2}", &mut warn));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"id\":2}\n");
+    }
+
+    #[test]
+    fn a_journal_recovers_after_its_initial_open_failed() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("missing");
+        let path = parent.join("journal.jsonl");
+        let mut journal = Journal::open(Some(&path), None, &mut Vec::new());
+        assert!(!journal.append_raw("{}", &mut Vec::new()));
+        std::fs::create_dir(&parent).unwrap();
+        assert!(journal.append_raw("{}", &mut Vec::new()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}\n");
+
+        let named_path = parent.join("named.jsonl");
+        let mut named = Journal::named(Some(&named_path), None);
+        assert!(named.record(1, "TIMEOUT", &mut Vec::new()).is_some());
+        assert!(!named.append_raw("{}", &mut Vec::new()));
+        assert!(!named_path.exists());
+        assert!(!named_path.with_file_name("named.jsonl.lock").exists());
+    }
+
+    #[test]
+    fn independent_journal_writers_keep_every_acknowledged_row() {
+        use std::sync::Barrier;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let path = tmp.path().join("journal.jsonl");
+        std::fs::write(&path, b"{\"interrupted\":").unwrap();
+        let start = Barrier::new(4);
+        let mut accepted = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|id| {
+                    let path = &path;
+                    let start = &start;
+                    scope.spawn(move || {
+                        let mut journal = Journal::open(Some(path), None, &mut Vec::new());
+                        start.wait();
+                        journal
+                            .append_raw(&format!("{{\"id\":{id}}}"), &mut Vec::new())
+                            .then_some(id)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        let mut recorded: Vec<_> = bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|line| aterm_json::from_slice::<aterm_json::Value>(line).ok())
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect();
+        accepted.sort_unstable();
+        recorded.sort_unstable();
+        assert!(!accepted.is_empty());
+        assert_eq!(recorded, accepted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_reopens_refuse_replaced_links_and_live_sockets() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let tmp = aterm_tempfile::Builder::new()
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("j");
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let mut journal = Journal::open(Some(&path), None, &mut Vec::new());
+        std::fs::remove_file(&path).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(!journal.append_raw("{}", &mut Vec::new()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(!journal.append_raw("{}", &mut Vec::new()));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(path.with_file_name("j.lock")).unwrap();
+        symlink(&target, path.with_file_name("j.lock")).unwrap();
+        assert!(!journal.append_raw("{}", &mut Vec::new()));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
 
     /// Every kind of line the loops print, read into its kind, phase, `seq=`
     /// and free-text tail: one row per arm of the reader.
@@ -1606,8 +1717,7 @@ mod tests {
                 .any(|w| w.contains(tag))
         };
         let denied = format!("journal-denied-{}", std::process::id());
-        let mut j = Journal::off();
-        j.path = Some(PathBuf::from(&denied));
+        let mut j = Journal::named(Some(Path::new(&denied)), None);
         let mut warn = Vec::new();
         j.failed(
             &Error::from(ErrorKind::PermissionDenied),
@@ -1618,8 +1728,7 @@ mod tests {
         assert!(!warn.is_empty(), "said");
         for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
             let full = format!("journal-full-{kind:?}-{}", std::process::id());
-            let mut j = Journal::off();
-            j.path = Some(PathBuf::from(&full));
+            let mut j = Journal::named(Some(Path::new(&full)), None);
             j.failed(&Error::from(kind), "cannot append to it", &mut Vec::new());
             assert!(named(&full), "{kind:?} pokes the watch");
         }

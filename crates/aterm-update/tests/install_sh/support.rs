@@ -324,7 +324,10 @@ impl Scratch {
 /// on stderr. A run cut off (a hang detector, or install.sh's own bound) may have left macOS still
 /// checking a program's first start in it, and macOS 27.0.1's syspolicyd crashes when the file it
 /// is checking at a first exec is removed, stranding every later exec until a restart
-/// (install.sh's `showed_it_ran`): a program that has not shown it ran stays where it is.
+/// (install.sh's `showed_it_ran`): a program that has not shown it ran stays where it is. Only a
+/// failing test keeps its scratch, so a test that lays a program install.sh's bound may cut off
+/// with no change to what it checks fails unless the program wrote a line as it ran
+/// (`each_showed_it_ran` in ownership.rs).
 impl Drop for Scratch {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
@@ -538,6 +541,18 @@ impl Rec {
     }
 }
 
+/// Shell code after which install.sh's `bounded` cuts off each run of `$HELD_EXE` at once,
+/// unrun: it ends 124 with nothing written, as the bound ends a first exec macOS's check still
+/// holds (`showed_it_ran`). Every other run goes through the real `bounded`.
+pub const HELD: &str = r#"eval "unheld_$(declare -f bounded)"
+bounded() {
+	local arg
+	for arg in "$@"; do
+		[[ "$arg" != "${HELD_EXE:?}" ]] || return 124
+	done
+	unheld_bounded "$@"
+}"#;
+
 /// A batch of library calls into install.sh, run in one bash.
 pub struct Lib {
     script: PathBuf,
@@ -572,6 +587,12 @@ impl Lib {
     pub fn step(&mut self, code: impl Into<String>) -> &mut Self {
         self.items.push(Item::Step(code.into()));
         self
+    }
+
+    /// From this point each run of `exe` install.sh's `bounded` makes is cut off at once, unrun
+    /// ([`HELD`]).
+    pub fn hold(&mut self, exe: &Path) -> &mut Self {
+        self.env("HELD_EXE", s(exe)).step(HELD)
     }
 
     /// Shell code run at this point in the batch's own shell (globals it sets persist).

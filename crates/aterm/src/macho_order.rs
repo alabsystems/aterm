@@ -49,11 +49,11 @@ pub(crate) enum SymbolTier {
 }
 
 /// Extracted `(tier, crate_name, module_name, sub_tier)` locality key for a symbol.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LocalityKey {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LocalityKey<'a> {
     pub tier: SymbolTier,
-    pub crate_name: String,
-    pub module_name: String,
+    pub crate_name: &'a str,
+    pub module_name: &'a str,
     /// `0` for forward-execution items, `1` for `drop_glue` / `Drop::drop` so teardown
     /// code sits immediately at the tail of its own `(crate, module)` rather than
     /// splitting forward paths or faulting a distant segment.
@@ -586,7 +586,7 @@ pub(crate) fn extract_executable_faulted_symbols(
 
     for i in 0..sect_syms.len() {
         let (sect, start, name) = sect_syms[i];
-        if !should_order_symbol_name(name) {
+        if !should_order_symbol_name(name) || hits.contains(name) {
             continue;
         }
         let sect_end = text_sects[sect as usize].map_or(start.saturating_add(4), |(_, end)| end);
@@ -633,30 +633,31 @@ pub(crate) fn build_order_list_from_slices(inputs: &[&[u8]]) -> Vec<String> {
     order_raw_symbols(raw)
 }
 
-fn order_raw_symbols(raw: Vec<RawSym>) -> Vec<String> {
-    let mut keyed: Vec<(LocalityKey, u32, u64, String)> = raw
-        .into_iter()
-        .map(|sym| {
-            let key = classify_symbol(&sym.name);
-            (key, sym.file_order, sym.addr, sym.name)
-        })
+fn order_raw_symbols(mut raw: Vec<RawSym>) -> Vec<String> {
+    let mut keyed: Vec<(LocalityKey<'_>, u32, u64, usize)> = raw
+        .iter()
+        .enumerate()
+        .map(|(idx, sym)| (classify_symbol(&sym.name), sym.file_order, sym.addr, idx))
         .collect();
 
-    keyed.sort_by(|a, b| {
+    keyed.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| raw[a.3].name.cmp(&raw[b.3].name))
     });
 
-    let mut seen = HashSet::with_capacity(keyed.len());
-    let mut ordered = Vec::with_capacity(keyed.len());
-    for (_, _, _, name) in keyed {
-        if seen.insert(name.clone()) {
-            ordered.push(name);
-        }
-    }
-    ordered
+    let mut seen: HashSet<&str> = HashSet::with_capacity(keyed.len());
+    let keep_indices: Vec<usize> = keyed
+        .into_iter()
+        .filter_map(|(_, _, _, idx)| seen.insert(raw[idx].name.as_str()).then_some(idx))
+        .collect();
+    drop(seen);
+
+    keep_indices
+        .into_iter()
+        .map(|idx| std::mem::take(&mut raw[idx].name))
+        .collect()
 }
 
 fn extract_container_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym>) {
@@ -918,12 +919,12 @@ fn read_u64_be(bytes: &[u8], off: usize) -> Option<u64> {
 /// Classifies a Mach-O symbol into `(tier, crate_name, module_name, sub_tier)` using
 /// structural Rust v0 / Itanium mangling grammar with no crate or module registry.
 #[must_use]
-pub(crate) fn classify_symbol(sym: &str) -> LocalityKey {
+pub(crate) fn classify_symbol(sym: &str) -> LocalityKey<'_> {
     if sym == "_main" || sym == "main" {
         return LocalityKey {
             tier: SymbolTier::Runtime,
-            crate_name: String::new(),
-            module_name: String::new(),
+            crate_name: "",
+            module_name: "",
             sub_tier: 0,
         };
     }
@@ -970,8 +971,8 @@ pub(crate) fn classify_symbol(sym: &str) -> LocalityKey {
         } else {
             SymbolTier::Runtime
         },
-        crate_name: c_group.to_string(),
-        module_name: String::new(),
+        crate_name: c_group,
+        module_name: "",
         sub_tier,
     }
 }
@@ -1022,7 +1023,7 @@ fn is_stdlib_crate(crate_name: &str) -> bool {
     )
 }
 
-fn extract_v0_locality(sym: &str) -> Option<(String, String, bool)> {
+fn extract_v0_locality(sym: &str) -> Option<(&str, &str, bool)> {
     let v0_body = sym.strip_prefix("__R").or_else(|| sym.strip_prefix("_R"))?;
     let bytes = v0_body.as_bytes();
     let mut fallback_std: Option<(&str, &str)> = None;
@@ -1043,7 +1044,7 @@ fn extract_v0_locality(sym: &str) -> Option<(String, String, bool)> {
             };
 
             if !is_stdlib_crate(crate_name) {
-                return Some((crate_name.to_string(), module_name.to_string(), true));
+                return Some((crate_name, module_name, true));
             }
             if fallback_std.is_none() {
                 fallback_std = Some((crate_name, module_name));
@@ -1052,7 +1053,7 @@ fn extract_v0_locality(sym: &str) -> Option<(String, String, bool)> {
         i += 1;
     }
 
-    fallback_std.map(|(c, m)| (c.to_string(), m.to_string(), false))
+    fallback_std.map(|(c, m)| (c, m, false))
 }
 
 fn parse_v0_crate_at(s: &str, c_pos: usize) -> Option<(&str, &str)> {
@@ -1119,7 +1120,7 @@ fn is_module_like_ident(ident: &str) -> bool {
         .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
-fn extract_itanium_locality(sym: &str) -> Option<(String, String, bool)> {
+fn extract_itanium_locality(sym: &str) -> Option<(&str, &str, bool)> {
     let mut rest = sym
         .strip_prefix("__ZN")
         .or_else(|| sym.strip_prefix("_ZN"))?;
@@ -1127,10 +1128,10 @@ fn extract_itanium_locality(sym: &str) -> Option<(String, String, bool)> {
     rest = after0;
     let mod1 = parse_itanium_seg(rest)
         .filter(|(m, _)| is_module_like_ident(m))
-        .map(|(m, _)| m.to_string())
-        .unwrap_or_default();
+        .map(|(m, _)| m)
+        .unwrap_or("");
     let is_domain = !is_stdlib_crate(seg0);
-    Some((seg0.to_string(), mod1, is_domain))
+    Some((seg0, mod1, is_domain))
 }
 
 fn parse_itanium_seg(s: &str) -> Option<(&str, &str)> {
@@ -1272,8 +1273,8 @@ mod tests {
             live_mod,
             LocalityKey {
                 tier: SymbolTier::Live,
-                crate_name: "aterm_gui".into(),
-                module_name: "rewind_worker".into(),
+                crate_name: "aterm_gui",
+                module_name: "rewind_worker",
                 sub_tier: 0,
             }
         );
@@ -1285,8 +1286,8 @@ mod tests {
             root_method,
             LocalityKey {
                 tier: SymbolTier::Live,
-                crate_name: "aterm_gui".into(),
-                module_name: String::new(),
+                crate_name: "aterm_gui",
+                module_name: "",
                 sub_tier: 0,
             }
         );
@@ -1298,8 +1299,8 @@ mod tests {
             generic_vec,
             LocalityKey {
                 tier: SymbolTier::Live,
-                crate_name: "aterm_db".into(),
-                module_name: String::new(),
+                crate_name: "aterm_db",
+                module_name: "",
                 sub_tier: 0,
             }
         );
@@ -1311,8 +1312,8 @@ mod tests {
             thread_entry,
             LocalityKey {
                 tier: SymbolTier::Live,
-                crate_name: "aterm_gui".into(),
-                module_name: "rewind_worker".into(),
+                crate_name: "aterm_gui",
+                module_name: "rewind_worker",
                 sub_tier: 0,
             }
         );
@@ -1324,8 +1325,8 @@ mod tests {
             drop_sym,
             LocalityKey {
                 tier: SymbolTier::Live,
-                crate_name: "aterm_gui".into(),
-                module_name: "app_config".into(),
+                crate_name: "aterm_gui",
+                module_name: "app_config",
                 sub_tier: 1,
             }
         );

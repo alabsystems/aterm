@@ -51,17 +51,18 @@ fn credentialed(inv: &Invocation) -> bool {
     inv.global.as_profile.is_some()
         || matches!(class, Some(Class::Write | Class::Destructive))
         || path == ["release", "download"]
-        || (path == ["api"]
-            && matches!(
-                api_method(inv).as_str(),
-                "POST" | "PATCH" | "PUT" | "DELETE"
-            ))
+        || (path == ["api"] && {
+            let method = api_method(inv);
+            method.eq_ignore_ascii_case("POST")
+                || method.eq_ignore_ascii_case("PATCH")
+                || method.eq_ignore_ascii_case("PUT")
+                || method.eq_ignore_ascii_case("DELETE")
+        })
 }
 
-/// The method `cmd_api` sends: `--method` (which `-X` sets), ASCII-uppercased, `GET` when
-/// absent.
-fn api_method(inv: &Invocation) -> String {
-    inv.flag("--method").unwrap_or("GET").to_ascii_uppercase()
+/// The method `cmd_api` sends: `--method` (which `-X` sets), `GET` when absent.
+fn api_method(inv: &Invocation) -> &str {
+    inv.flag("--method").unwrap_or("GET")
 }
 
 /// A one-shot write recorded against github.com (plan §14, body 5): `release create`,
@@ -75,7 +76,7 @@ fn one_shot(inv: &Invocation) -> bool {
             | ["release", "ensure"]
             | ["ref", "create"]
             | ["ref", "update-atomic"]
-    ) || (path == ["api"] && api_method(inv) == "POST")
+    ) || (path == ["api"] && api_method(inv).eq_ignore_ascii_case("POST"))
 }
 
 /// Configures `ctx` for `--record` or `--replay` before the verb runs.
@@ -110,8 +111,13 @@ pub(crate) fn begin_with(
                 Some(taped) => taped,
                 None => read_tape(replay)?,
             };
-            let typed: Vec<String> = argv.iter().map(|arg| Redactor::shapes(arg)).collect();
-            if header.argv != typed {
+            if header.argv.len() != argv.len()
+                || header
+                    .argv
+                    .iter()
+                    .zip(argv)
+                    .any(|(expected, arg)| *expected != Redactor::shapes(arg))
+            {
                 return Err(Error::replay(
                     Replay::Argv,
                     format!(

@@ -6,6 +6,7 @@
 use crate::model::{Mode, Read};
 use crate::port::{Cmd, Scratch, System};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -325,6 +326,7 @@ pub fn seal(
         key_path,
         how,
         scratch.path(),
+        None,
     );
     wires?
         .pop()
@@ -338,15 +340,16 @@ pub fn fresh_scratch<'s>(sys: &'s dyn System, what: &str) -> Result<Scratch<'s>,
     Scratch::new(sys, what).map_err(|e| format!("envelope scratch: {e}"))
 }
 
-/// Sign every body in `bodies` with ONE `ssh-keygen -Y sign` run, writing the scratch bodies and signatures in `scratch` (a directory only this user may write).
+/// Sign every body in `bodies` with ONE `ssh-keygen -Y sign` run, writing the scratch bodies and signatures in `scratch` (a directory only this user may write). A [`Signing::Agent`] run reaches the agent at `agent_sock` (the caller's `SSH_AUTH_SOCK`; this process's environment is not read).
 /// # Errors
-/// One line when the scratch directory is not private or `ssh-keygen` does not sign.
+/// One line when the scratch directory is not private, an agent run has no `agent_sock`, or `ssh-keygen` does not sign.
 pub fn seal_batch(
     sys: &dyn System,
     bodies: &[Envelope],
     key: &Path,
     how: Signing,
     scratch: &Path,
+    agent_sock: Option<&OsStr>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if bodies.is_empty() {
         return Ok(Vec::new());
@@ -392,7 +395,7 @@ pub fn seal_batch(
     let signed = match how {
         Signing::Unattended | Signing::Agent => {
             if how == Signing::Agent {
-                let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
+                let Some(sock) = agent_sock.filter(|sock| !sock.is_empty()) else {
                     cleanup(&files);
                     return Err("envelope: no ssh-agent: SSH_AUTH_SOCK is not set".into());
                 };
@@ -527,7 +530,7 @@ pub fn open_in(
     let _ = sys.remove(&body_file);
     let (principal, key_id) = verified?;
     let envelope = parse_body(body)?;
-    if uuid.is_empty() || envelope.host != uuid {
+    if uuid.is_empty() || !envelope.host.eq_ignore_ascii_case(uuid) {
         return Err(Refusal::WrongHost {
             named: envelope.host,
         });
@@ -1001,6 +1004,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             Path::new("/k/signing"),
             Signing::Unattended,
             Path::new("/s"),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("incorrect passphrase"), "{err}");
@@ -1043,20 +1047,56 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             ),
             Ran::exit(1, ""),
         );
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&handed);
+        fake.simulate(move |_, cmd| {
+            seen.lock().unwrap().push(cmd.env.clone());
+            None
+        });
         let err = seal_batch(
             &fake,
             &[envelope("U", 1, 10)],
             Path::new("/k/signing"),
             Signing::Agent,
             Path::new("/s"),
+            Some(OsStr::new("/private/walk-agent.sock")),
         )
         .unwrap_err();
-        if std::env::var_os("SSH_AUTH_SOCK").is_some() {
-            assert!(err.contains("did not sign: exit 1"), "{err}");
-        } else {
-            assert!(err.contains("no ssh-agent"), "{err}");
-        }
+        assert!(err.contains("did not sign: exit 1"), "{err}");
+        assert_eq!(
+            *handed.lock().unwrap(),
+            [vec![(
+                "SSH_AUTH_SOCK".to_owned(),
+                "/private/walk-agent.sock".to_owned()
+            )]]
+        );
         assert!(!fake.calls().iter().any(|c| c.starts_with("tty ")));
+    }
+
+    /// An agent run with no socket named is refused before `ssh-keygen` runs, whatever this
+    /// process's own `SSH_AUTH_SOCK` says. NEGATIVE CONTROL: the run handed a socket, above,
+    /// reaches `ssh-keygen` with exactly it.
+    #[test]
+    fn an_agent_run_with_no_socket_named_is_refused_before_signing() {
+        for none in [None, Some(OsStr::new(""))] {
+            let fake = Fake::root();
+            private(&fake, "/s");
+            let err = seal_batch(
+                &fake,
+                &[envelope("U", 1, 10)],
+                Path::new("/k/signing"),
+                Signing::Agent,
+                Path::new("/s"),
+                none,
+            )
+            .unwrap_err();
+            assert!(err.contains("no ssh-agent"), "{none:?}: {err}");
+            assert!(
+                !fake.calls().iter().any(|c| c.contains("ssh-keygen")),
+                "{:?}",
+                fake.calls()
+            );
+        }
     }
 
     /// A throwaway controller: signing and recovery keys (recovery with a passphrase), an
@@ -1119,6 +1159,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
                 &self.key(key),
                 Signing::Unattended,
                 &self.scratch(),
+                None,
             )
             .unwrap();
             w.pop().unwrap()
@@ -1197,6 +1238,27 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
         assert!(matches!(err, Refusal::BadSignature(_)), "{err}");
     }
 
+    /// A host's UUID is hex, which `is_uuid` reads in either case: an envelope for the
+    /// lower-case spelling opens on a host that reads its own in upper case. NEGATIVE CONTROL:
+    /// another UUID is still the wrong host.
+    #[test]
+    fn an_envelope_for_the_host_s_uuid_in_another_case_opens() {
+        let keys = Keys::new();
+        let now = Live::new().now();
+        let lower = "0a1b2c3d-0000-4000-8000-00000000abcd";
+        let wire = keys.seal(&envelope(lower, 1, now), "signing");
+        let opened = keys
+            .open(&wire, "0A1B2C3D-0000-4000-8000-00000000ABCD", 0)
+            .unwrap();
+        assert_eq!(opened.envelope.host, lower);
+        assert_eq!(
+            keys.open(&wire, "0A1B2C3D-0000-4000-8000-00000000ABCE", 0),
+            Err(Refusal::WrongHost {
+                named: lower.into()
+            })
+        );
+    }
+
     #[test]
     fn a_signature_in_another_namespace_is_refused() {
         let keys = Keys::new();
@@ -1253,6 +1315,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             &keys.key("signing"),
             Signing::Unattended,
             &keys.scratch(),
+            None,
         )
         .unwrap();
         for (i, wire) in wires.iter().enumerate() {
@@ -1280,6 +1343,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             Path::new("/k/signing"),
             Signing::Unattended,
             Path::new("/s"),
+            None,
         )
         .expect_err("seal_batch must refuse expires < issued");
         assert!(seal_err.contains("before issued"), "{seal_err}");

@@ -147,7 +147,7 @@ pub(super) fn run_with(
         deadline,
         |token, expected, wait| read(token, expected, wait).map(drop),
         fresh,
-        "pending-native-google-direct-renewal",
+        ("pending-native-google-direct-renewal", None),
     )?;
     let mut verified = staged
         .verify_with_retry(deadline, &mut read, std::thread::sleep, Instant::now)

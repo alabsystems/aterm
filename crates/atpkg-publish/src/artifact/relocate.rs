@@ -37,6 +37,14 @@ pub trait Backend {
     fn is_native_object(&self, path: &Path) -> bool;
     /// Read the object's id / needed / rpaths.
     fn read_refs(&self, path: &Path) -> Result<ObjectRefs, String>;
+    /// The ELF interpreter, absent for shared libraries, static binaries and other formats.
+    fn interpreter(&self, _path: &Path) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    /// Rewrite an ELF interpreter to the target system's dynamic loader.
+    fn set_interpreter(&self, _path: &Path, _loader: &str) -> Result<(), String> {
+        Err("this relocation backend cannot rewrite an ELF interpreter".into())
+    }
     /// Rewrite the object's own install-name/soname to the portable form.
     fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String>;
     /// Repoint an absolute machine-local dependency to the portable form.
@@ -725,6 +733,66 @@ pub mod elf {
         *m == [0x7f, b'E', b'L', b'F']
     }
 
+    /// Read a supported ELF64 little-endian image's PT_INTERP without invoking its loader.
+    ///
+    /// # Errors
+    /// Malformed headers, an unsupported encoding, or an invalid interpreter string.
+    pub fn interpreter(bytes: &[u8]) -> Result<Option<String>, String> {
+        let invalid = || "invalid ELF program headers or interpreter".to_string();
+        if bytes.get(..6) != Some(b"\x7fELF\x02\x01") {
+            return Err("the GNU package requires a little-endian ELF64 object".into());
+        }
+        let word = |at: usize| {
+            bytes
+                .get(at..at.checked_add(8)?)
+                .and_then(|part| <[u8; 8]>::try_from(part).ok())
+                .map(u64::from_le_bytes)
+                .and_then(|n| usize::try_from(n).ok())
+        };
+        let half = |at: usize| {
+            bytes
+                .get(at..at + 2)
+                .and_then(|part| <[u8; 2]>::try_from(part).ok())
+                .map(u16::from_le_bytes)
+                .map(usize::from)
+        };
+        let offset = word(32).ok_or_else(invalid)?;
+        let stride = half(54).ok_or_else(invalid)?;
+        let count = half(56).ok_or_else(invalid)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        if stride < 56
+            || offset
+                .checked_add(stride.checked_mul(count).ok_or_else(invalid)?)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Err(invalid());
+        }
+        let mut interpreter = None;
+        for i in 0..count {
+            let at = offset + stride * i;
+            if bytes.get(at..at + 4) != Some(&3_u32.to_le_bytes()) {
+                continue;
+            }
+            if interpreter.is_some() {
+                return Err(invalid());
+            }
+            let start = word(at + 8).ok_or_else(invalid)?;
+            let size = word(at + 32).ok_or_else(invalid)?;
+            let raw = bytes
+                .get(start..start.checked_add(size).ok_or_else(invalid)?)
+                .and_then(|part| part.strip_suffix(&[0]))
+                .ok_or_else(invalid)?;
+            let text = std::str::from_utf8(raw).map_err(|_| invalid())?;
+            if text.is_empty() || text.bytes().any(|b| b.is_ascii_control()) {
+                return Err(invalid());
+            }
+            interpreter = Some(text.to_string());
+        }
+        Ok(interpreter)
+    }
+
     /// Split a `patchelf --print-rpath` value (`:`-separated) into entries.
     #[cfg(any(target_os = "linux", test))]
     pub fn parse_rpath(value: &str) -> Vec<String> {
@@ -805,6 +873,14 @@ pub mod elf {
             let rpaths = parse_rpath(&patchelf_out(&["--print-rpath"], path)?);
             Ok(ObjectRefs { id, needed, rpaths })
         }
+        fn interpreter(&self, path: &Path) -> Result<Option<String>, String> {
+            let bytes = crate::identity::read_regular_bytes(path, 64 * 1024 * 1024)
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            interpreter(&bytes)
+        }
+        fn set_interpreter(&self, path: &Path, loader: &str) -> Result<(), String> {
+            patchelf(&["--set-interpreter", loader], path)
+        }
         fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String> {
             patchelf(&["--set-soname", basename], path)
         }
@@ -833,6 +909,31 @@ pub mod elf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elf_interpreter_reads_only_bounded_program_headers() {
+        let loader = b"@@HOMEBREW_PREFIX@@/lib/ld.so\0";
+        let mut bytes = vec![0; 120];
+        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[72..80].copy_from_slice(&120_u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&(loader.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(loader);
+        assert_eq!(
+            elf::interpreter(&bytes).unwrap().as_deref(),
+            Some("@@HOMEBREW_PREFIX@@/lib/ld.so")
+        );
+        assert!(elf::interpreter(&bytes[..119]).is_err());
+        *bytes.last_mut().unwrap() = b'x';
+        assert!(elf::interpreter(&bytes).is_err());
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(elf::interpreter(&bytes).unwrap(), None);
+        bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(elf::interpreter(&bytes).is_err());
+    }
 
     #[test]
     fn machine_local_classification_covers_both_oses() {

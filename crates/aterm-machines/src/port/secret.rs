@@ -4,6 +4,7 @@
 //! In-memory password buffer fed via pipe ([`Secret`], [`no_core_dumps`]).
 //! Used by [`super::System::run_fed`] and returns [`std::io::ErrorKind::Interrupted`] on signals.
 
+use aterm_uds::secret::scrub;
 use std::io;
 
 /// The longest password a [`Secret`] holds, in bytes.
@@ -57,11 +58,16 @@ impl Secret {
     /// # Errors
     /// The read's error, or [`io::ErrorKind::InvalidInput`] for a line longer than [`SECRET_MAX`].
     pub fn read_line(input: &mut dyn io::Read) -> io::Result<Option<Self>> {
+        Self::read_line_through(input, &mut [0_u8; 1])
+    }
+
+    /// [`Self::read_line`], each byte read into `byte` and scrubbed from it once kept, so
+    /// `byte` holds no byte of the line when this returns (a newline at most).
+    fn read_line_through(input: &mut dyn io::Read, byte: &mut [u8; 1]) -> io::Result<Option<Self>> {
         let mut secret = Self::empty();
         let mut any = false;
         loop {
-            let mut byte = [0_u8; 1];
-            let n = match input.read(&mut byte) {
+            let n = match input.read(byte) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none() => {
                     continue;
@@ -76,10 +82,11 @@ impl Secret {
                 break;
             }
             let Some(slot) = secret.bytes.get_mut(secret.len) else {
+                scrub(byte);
                 return Err(too_long());
             };
             *slot = byte[0];
-            scrub(&mut byte);
+            scrub(byte);
             secret.len += 1;
         }
         if secret.bytes().last() == Some(&b'\r') {
@@ -111,16 +118,6 @@ fn too_long() -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("longer than {SECRET_MAX} bytes"),
     )
-}
-
-/// Overwrite `buf` with zeroes in a way the optimizer may not delete.
-fn scrub(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        // SAFETY: `b` is a live, uniquely borrowed `u8` from a mutable slice: a one-byte volatile
-        // write to it is in bounds and unaliased.
-        unsafe { std::ptr::write_volatile(b, 0) };
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Keep `buf` out of swap, best effort (the result is ignored: `RLIMIT_MEMLOCK` may refuse).
@@ -477,5 +474,24 @@ mod tests {
         assert!(Secret::new(&[b'x'; SECRET_MAX + 1]).is_err());
         let mut long: &[u8] = &[b'x'; SECRET_MAX + 1];
         assert!(Secret::read_line(&mut long).is_err());
+    }
+
+    /// The byte past the longest line is scrubbed from the read buffer before the refusal, as
+    /// every kept byte is. NEGATIVE CONTROL: a line that fits is read whole through the same
+    /// buffer, which holds none of it afterwards.
+    #[test]
+    fn an_over_long_line_leaves_none_of_its_bytes_in_the_read_buffer() {
+        let mut long = [b'x'; SECRET_MAX + 1];
+        long[SECRET_MAX] = b'y';
+        let mut byte = [0_u8; 1];
+        let refused = Secret::read_line_through(&mut &long[..], &mut byte).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(byte, [0]);
+        let mut fits: &[u8] = &[b'x'; SECRET_MAX];
+        let secret = Secret::read_line_through(&mut fits, &mut byte)
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret.bytes(), &[b'x'; SECRET_MAX]);
+        assert_eq!(byte, [0]);
     }
 }

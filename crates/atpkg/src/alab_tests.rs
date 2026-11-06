@@ -1178,12 +1178,12 @@ fn pack_archive_recording(build: u64, exe: &[u8], record: Option<&[u8]>) -> Vec<
 
 /// The bytes every darwin test pack runs: a copy of an Apple binary signed AD HOC, as
 /// `alab/package.sh` signs codex-alab, which `codesign --verify --strict` passes; elsewhere
-/// any bytes (no platform gate there).
+/// complete, unexecuted ELF metadata.
 pub(crate) fn signed_exe() -> Vec<u8> {
     if cfg!(target_os = "macos") {
         codesigned(&["--force", "--sign", "-"])
     } else {
-        b"\x7fELF-test".to_vec()
+        crate::testdir::elf_fixture()
     }
 }
 

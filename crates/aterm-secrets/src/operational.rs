@@ -28,7 +28,9 @@ fn service_observation(state: crate::Result<service::State>) -> Value {
     })
 }
 
-fn membership(status: &client::Status) -> Value {
+/// The membership `status` reads, as JSON: a Mac its vault let go is `dropped` where no act took
+/// it out (`client::dropped`), `revoked` otherwise.
+fn membership(paths: &Paths, status: &client::Status) -> Value {
     use client::Membership;
     match &status.membership {
         Membership::Unconfigured => json!({"state": "unconfigured"}),
@@ -38,7 +40,14 @@ fn membership(status: &client::Status) -> Value {
         Membership::In { seq, heard } => json!({
             "state": "in", "sequence": seq, "local_processing_marker": heard,
         }),
-        Membership::Revoked { seq } => json!({"state": "revoked", "sequence": seq}),
+        Membership::Revoked { seq } => {
+            let state = if client::dropped(paths) {
+                "dropped"
+            } else {
+                "revoked"
+            };
+            json!({"state": state, "sequence": seq})
+        }
         Membership::Plain => json!({"state": "plain"}),
     }
 }
@@ -69,7 +78,7 @@ pub fn metadata(paths: &Paths) -> Value {
             "host": status.config.as_ref().map(|c| &c.host),
             "configured_signer": status.config.as_ref().and_then(|c| c.signer.as_ref()).map(|key| crate::b64::encode_padded(key)),
             "join_code": status.machine.as_ref().map(|(_, code)| code),
-            "membership": membership(&status),
+            "membership": membership(paths, &status),
             "materialized_names": status.names,
         })
     });

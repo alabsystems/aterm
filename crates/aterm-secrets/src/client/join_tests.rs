@@ -2955,6 +2955,7 @@ fn deaf() -> Hearing<'static> {
         bell: &NOBODY,
         routes: false,
         ask: &ask_nobody,
+        members: std::sync::Mutex::new(MembersAsked::default()),
         hold: &hold_nothing,
         away: &|| false,
     }
@@ -3035,6 +3036,7 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
                     bell: &NOBODY,
                     routes: false,
                     ask: &ask,
+                    members: std::sync::Mutex::new(MembersAsked::default()),
                     hold: &hold_nothing,
                     away: &|| false,
                 },
@@ -3057,6 +3059,126 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
         "{:?}",
         logged.lock().expect("log")
     );
+}
+
+/// A route event reaches members while the vault's actual long poll remains held,
+/// even after the ordinary member requests backed off to fifteen minutes.
+#[test]
+fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (route, routes) = std::sync::mpsc::channel();
+    let (handled, handling) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let _stops = StopsOnDrop(&stop);
+        let me = &mb;
+        let asks = &asks;
+        let stop = &stop;
+        let subscriber = scope.spawn(move || {
+            crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+            let ask = |_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst));
+            let hearing = Hearing {
+                members: std::sync::Mutex::new(MembersAsked {
+                    at: Some(Instant::now()),
+                    asks: 6,
+                    ..MembersAsked::default()
+                }),
+                ask: &ask,
+                ..deaf()
+            };
+            let mut consumed = false;
+            member_routes::while_hearing(
+                me,
+                &hearing.members,
+                &ask,
+                &|_| {},
+                move |most| {
+                    crate::envelope::TEST_RETIRED
+                        .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                    if std::mem::take(&mut consumed) {
+                        handled.send(()).expect("route handled");
+                    }
+                    consumed = routes.recv_timeout(most).is_ok();
+                    consumed
+                },
+                || {
+                    subscriber_loop_until(
+                        me,
+                        &|_| {},
+                        &|| stop.load(Ordering::SeqCst),
+                        &Converging {
+                            start: &|_| None,
+                            routes: &crate::server::route_sources,
+                        },
+                        &hearing,
+                    )
+                },
+            )
+        });
+        until("the subscriber's long-poll is held", || {
+            server.waiting() == 1
+        });
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            0,
+            "ordinary requests backed off"
+        );
+        route.send(()).expect("route change");
+        handling.recv_timeout(HANG_DETECTOR).expect("route handled");
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        assert_eq!(server.waiting(), 1, "the vault poll did not have to finish");
+        stop.store(true, Ordering::SeqCst);
+        server.stop();
+        subscriber
+            .join()
+            .expect("subscriber ended")
+            .expect("cleanly");
+    });
+}
+
+#[test]
+fn member_route_wakes_preserve_sharing_holds_and_revocation() {
+    for off in [true, false] {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+        let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+        if off {
+            let config = mb.home.join(".config/aterm");
+            std::fs::create_dir_all(&config).expect("config directory");
+            std::fs::write(config.join("aterm.toml"), "[swarm]\nenabled = false\n")
+                .expect("sharing hold");
+        } else {
+            let mut state = load_state(&mb).expect("state");
+            state.membership = Stored::Revoked;
+            save_state(&mb, &state).expect("revoked");
+        }
+        let members = std::sync::Mutex::new(MembersAsked::default());
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let (route, routes) = std::sync::mpsc::channel();
+        let (handled, handling) = std::sync::mpsc::channel();
+        route.send(()).expect("route queued");
+        let mut consumed = false;
+        member_routes::while_hearing(
+            &mb,
+            &members,
+            &|_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst)),
+            &|_| {},
+            move |most| {
+                crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                if std::mem::take(&mut consumed) {
+                    handled.send(()).expect("route handled");
+                }
+                consumed = routes.recv_timeout(most).is_ok();
+                consumed
+            },
+            || handling.recv_timeout(HANG_DETECTOR).expect("route handled"),
+        );
+        assert_eq!(asks.load(Ordering::SeqCst), 0, "off={off}");
+        server.stop();
+    }
 }
 
 /// When a waiting Mac's subscriber asks ALab's members: at once as it starts waiting for the ALab
@@ -3224,6 +3346,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
                     bell: &NOBODY,
                     routes: false,
                     ask: &ask,
+                    members: std::sync::Mutex::new(MembersAsked::default()),
                     hold: &hold,
                     away: &|| false,
                 },
@@ -3474,6 +3597,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
                     bell: &bell,
                     routes: false,
                     ask: &ask_nobody,
+                    members: std::sync::Mutex::new(MembersAsked::default()),
                     hold: &hold_nothing,
                     away: &|| false,
                 },
@@ -3545,6 +3669,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
                     bell: &bell,
                     routes: false,
                     ask: &ask_nobody,
+                    members: std::sync::Mutex::new(MembersAsked::default()),
                     hold: &hold_nothing,
                     away: &|| false,
                 },
@@ -3644,6 +3769,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
                     bell: &bell,
                     routes: false,
                     ask: &ask_nobody,
+                    members: std::sync::Mutex::new(MembersAsked::default()),
                     hold: &hold_nothing,
                     away: &|| false,
                 },

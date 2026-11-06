@@ -127,7 +127,7 @@ pub struct Profile {
     pub incremental: bool,
     /// Why it is in use right now, or `None` — a build lock someone holds.
     pub in_use: Option<String>,
-    /// Bytes deleting its `incremental/` would release: the blocks of each file there that is its last name, on the profile's device.
+    /// File allocation in its `incremental/` whose last name would be removed, on the profile's device.
     pub bytes: u64,
     /// `true` when that walk stopped at its bound: the figure is a floor.
     pub bytes_partial: bool,
@@ -168,22 +168,26 @@ impl TargetDir {
     /// The profiles a reclaim would take: idle past `threshold_days` at `now`, holding an `incremental/`, and not in use.
     #[must_use]
     pub fn candidates(&self, now: i64, threshold_days: i64) -> Vec<&Profile> {
-        self.profiles
-            .iter()
-            .filter(|p| {
-                p.incremental && p.in_use.is_none() && idle(p.last_used, now, threshold_days)
-            })
-            .collect()
+        self.candidate_profiles(now, threshold_days).collect()
     }
 
-    /// Bytes a reclaim would release — the candidates' `incremental/` — and whether the figure is a floor.
+    /// Counted file allocation in the candidates' `incremental/` caches, and whether it is a floor.
     #[must_use]
     pub fn reclaimable(&self, now: i64, threshold_days: i64) -> (u64, bool) {
-        self.candidates(now, threshold_days)
-            .iter()
+        self.candidate_profiles(now, threshold_days)
             .fold((0u64, false), |(b, partial), p| {
-                (b.saturating_add(p.bytes), partial || p.bytes_partial)
+                let (bytes, overflow) = b.overflowing_add(p.bytes);
+                (
+                    if overflow { u64::MAX } else { bytes },
+                    partial || p.bytes_partial || overflow,
+                )
             })
+    }
+
+    fn candidate_profiles(&self, now: i64, threshold_days: i64) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(move |p| {
+            p.incremental && p.in_use.is_none() && idle(p.last_used, now, threshold_days)
+        })
     }
 
     /// The profiles the pressure pass may take ([`reclaim_lru`]), each unwritten for at least
@@ -1846,6 +1850,24 @@ mod fd {
     }
 
     #[cfg(unix)]
+    fn stat_entry(
+        parent: &OwnedFd,
+        name: &OsStr,
+        here: &Path,
+        out: &mut Deleted,
+    ) -> Option<dirfd::Stat> {
+        match dirfd::fstatat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => Some(st),
+            Err(Errno::NOENT) => None,
+            Err(e) => {
+                out.kept
+                    .push(format!("{}: {}", here.display(), io::Error::from(e)));
+                None
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn remove_tree_at(
         parent: &OwnedFd,
         child: &Child,
@@ -1859,24 +1881,41 @@ mod fd {
         if !pass.permit((parent, at), &here, out) {
             return;
         }
-        let dir = match dirfd::openat(parent, name, dir_flags(), Mode::empty()) {
-            Ok(fd) => Some(fd),
-            Err(Errno::NOENT) => return,
-            Err(e) if [libc::ENOTDIR, libc::ELOOP].contains(&e.0) => None,
-            Err(e) => {
-                return out
-                    .kept
-                    .push(format!("{}: {}", here.display(), io::Error::from(e)));
-            }
+        let Some(st) = stat_entry(parent, name, &here, out) else {
+            return;
         };
+        let kind = dirfd::FileType::from_raw_mode(st.st_mode);
         aterm_uds::progress::tick();
-        let Some(fd) = dir else {
-            let freed = open_file(parent, name)
-                .and_then(|f| f.metadata().ok())
-                .map_or(0, |m| super::released(&m));
+        if !kind.is_dir() {
             if !pass.permit((parent, at), &here, out) {
                 return;
             }
+            // Policy checks may perform I/O. Read the name again afterward and keep replacements.
+            let Some(current) = stat_entry(parent, name, &here, out) else {
+                return;
+            };
+            let current_kind = dirfd::FileType::from_raw_mode(current.st_mode);
+            if !current_kind.is_file() && !current_kind.is_symlink() {
+                pass.revoked = true;
+                out.kept.push(format!(
+                    "{} is not a regular file or symbolic link and was kept",
+                    here.display()
+                ));
+                return;
+            }
+            if current.st_dev != st.st_dev || current.st_ino != st.st_ino {
+                pass.revoked = true;
+                out.kept.push(format!(
+                    "{} changed while its removal was permitted and was kept",
+                    here.display()
+                ));
+                return;
+            }
+            let freed = if current_kind.is_file() && current.st_nlink == 1 {
+                current.st_blocks.saturating_mul(512)
+            } else {
+                0
+            };
             match dirfd::unlinkat(parent, name, AtFlags::empty()) {
                 Ok(()) => out.bytes = out.bytes.saturating_add(freed),
                 Err(Errno::NOENT) => {}
@@ -1885,6 +1924,15 @@ mod fd {
                     .push(format!("{}: {}", here.display(), io::Error::from(e))),
             }
             return;
+        }
+        let fd = match dirfd::openat(parent, name, dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return,
+            Err(e) => {
+                return out
+                    .kept
+                    .push(format!("{}: {}", here.display(), io::Error::from(e)));
+            }
         };
         if !pass.permit((&fd, &here), &here, out) {
             return;
@@ -2151,6 +2199,21 @@ mod fd {
                 self.entries = self.entries.saturating_add(1);
                 if self.entries > self.budget.entries {
                     return Err("its managed-custody scan reached the entry bound".into());
+                }
+                #[cfg(unix)]
+                {
+                    let st = dirfd::fstatat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|e| format!("{}: {e}", path.join(name).display()))?;
+                    let kind = dirfd::FileType::from_raw_mode(st.st_mode);
+                    if kind.is_file() || kind.is_symlink() {
+                        continue;
+                    }
+                    if !kind.is_dir() {
+                        return Err(format!(
+                            "{} is a special filesystem entry, so its cache is kept",
+                            path.join(name).display()
+                        ));
+                    }
                 }
                 let child = match dirfd::openat(fd, name, dir_flags(), Mode::empty()) {
                     Ok(child) => child,

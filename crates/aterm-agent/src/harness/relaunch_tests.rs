@@ -5556,6 +5556,23 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         !agent_resumed(&o, &settled),
         "control: RESUMED_BY_ANOTHER leaves relaunched_at == 0"
     );
+    save(
+        &o,
+        ID,
+        &St {
+            phase: upgrade::Phase::Failed("no-resume".to_string()),
+            cause: CAUSE_ASKED.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 4100,
+            resumed_pid: 4200,
+            relaunched_at: new_began,
+            ..St::default()
+        },
+    );
+    assert!(
+        agent_resumed(&o, &settled),
+        "control: a stopped record whose resumed process lives on still names it"
+    );
 
     // Codex, Muse, and Agy resumed snapshots + start mismatch negative control.
     save(
@@ -5644,7 +5661,101 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         started_ms: 0,
         block: None,
     });
-    assert!(agent_resumed(&o, &agy), "Agy resume");
+    let held = |now: Option<Option<&'static str>>| {
+        move |_: &Path, pid: u32| {
+            assert_eq!(pid, 7200, "the snapshot's own process is read");
+            now.map(|c| c.map(str::to_owned))
+        }
+    };
+    assert!(
+        agent_resumed_with(&o, &agy, &held(Some(Some(ID)))),
+        "Agy resume"
+    );
+    assert!(
+        agent_resumed_with(&o, &agy, &held(None)),
+        "control: unreadable files fall back to the snapshot's conversation"
+    );
+    assert!(
+        !agent_resumed_with(&o, &agy, &held(Some(Some(OTHER_ID)))),
+        "the conversation the agy holds now moved off the record's since its snapshot"
+    );
+
+    save(
+        &o,
+        "agy-rec",
+        &St {
+            phase: upgrade::Phase::Failed(super::super::upgrade_drive::STARTED_FRESH.to_string()),
+            agent: upgrade::Agent::Agy,
+            cause: CAUSE_EXIT.to_string(),
+            tab: "s-resumed".to_string(),
+            pid: 7100,
+            relaunched_pid: 7200,
+            relaunched_start: START_NEW.to_string(),
+            relaunched_at: new_began,
+            thread: ID.to_string(),
+            ..St::default()
+        },
+    );
+    let mut lockless = agy.clone();
+    lockless.session = None;
+    assert!(
+        !agent_resumed_with(&o, &lockless, &held(Some(None))),
+        "a relaunch the lane found started fresh is no resume"
+    );
+
+    // What `agent_resumed` itself reads, the live process table: this test process stands in for
+    // the resumed agy, its snapshot captured on the record's conversation, holding one presence
+    // lock open. NEGATIVE CONTROL: with `agent_resumed` reading no files (`&|_, _| None`), or
+    // `upgrade_agy_drive::conversation_held` reading no lock, the moved one still resumes it.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use super::super::upgrade_agy::{PRESENCE, presence_lock};
+        const C1: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
+        const C2: &str = "5f2b9c3e-7d41-4a8e-9b2c-1e3d5f7a9b0c";
+        let me = std::process::id();
+        let config = dir.join("agy-live");
+        std::fs::create_dir_all(config.join(PRESENCE)).expect("presence");
+        let config = std::fs::canonicalize(&config).expect("the config, as the kernel names it");
+        save(
+            &o,
+            "agy-live",
+            &St {
+                phase: upgrade::Phase::Done,
+                agent: upgrade::Agent::Agy,
+                cause: CAUSE_ASKED.to_string(),
+                tab: "s-resumed".to_string(),
+                pid: 7100,
+                relaunched_pid: me,
+                resumed_pid: me,
+                relaunched_start: START_NEW.to_string(),
+                relaunched_at: new_began,
+                done_at: new_began + 1,
+                thread: C1.to_string(),
+                ..St::default()
+            },
+        );
+        let mut live = claude_snap(me, START_NEW, &["agy", "--conversation", C1], Some(C1));
+        live.run = AgentRun::Agy(AgyRun {
+            config: config.clone(),
+            env: Vec::new(),
+            lock: Some(presence_lock(&config, C1)),
+            crash: None,
+            started_ms: 0,
+            block: None,
+        });
+        let hold = |c: &str| std::fs::File::create(presence_lock(&config, c)).expect("the lock");
+        let on_c1 = hold(C1);
+        assert!(
+            agent_resumed(&o, &live),
+            "control: the agy holds the record's conversation now"
+        );
+        drop(on_c1);
+        let _on_c2 = hold(C2);
+        assert!(
+            !agent_resumed(&o, &live),
+            "the agy holds another conversation's lock now, its snapshot the record's"
+        );
+    }
 }
 
 /// A LAUNCH WHOSE OWN ARGUMENTS RESUME A CONVERSATION IS A RESUMED AGENT TO THE LOOP

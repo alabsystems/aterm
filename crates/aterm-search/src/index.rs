@@ -14,7 +14,7 @@ use crate::bitmap::SparseBitmap;
 
 use super::bloom::BloomFilter;
 use super::iterators::{
-    CandidateSource, SearchMatchIterator, SearchMatchReverseIterator, next_literal_match,
+    CandidateSource, SearchMatchIterator, SearchMatchReverseIterator, literal_occurrence,
 };
 #[cfg(test)]
 use super::types::SearchResult;
@@ -24,7 +24,6 @@ use crate::grapheme::{
     ColumnMap, LowerByteMap, LowerNeed, MapSource, lower_fold, lower_fold_char, lower_fold_into,
     lower_need,
 };
-use crate::literal::AsciiCaseInsensitiveMatches;
 
 /// Default maximum number of lines kept in the search index cache before oldest-quarter eviction.
 pub const DEFAULT_MAX_CACHED_LINES: usize = 100_000;
@@ -50,6 +49,7 @@ thread_local! {
     static SEARCH_FROM_LINE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CASE_INSENSITIVE_CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CASE_INSENSITIVE_LOWERED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CASE_INSENSITIVE_MATCH_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LAST_UNIQUE_POSTING_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -147,14 +147,53 @@ fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
 pub(crate) struct CaseInsensitiveMatcher {
     lower_query: String,
     lower_buf: String,
+    /// Query classification stays fixed while the matcher visits its candidate rows.
+    ascii_query: bool,
+}
+
+/// A match visit's completion and raw occurrence facts, including zero-column spans.
+pub(crate) struct MatchVisit {
+    pub(crate) completed: bool,
+    pub(crate) had_occurrence: bool,
+}
+
+fn visit_occurrences(
+    line_num: usize,
+    query_len: usize,
+    col_map: &ColumnMap,
+    byte_map: Option<&LowerByteMap>,
+    positions: impl Iterator<Item = usize>,
+    mut visit: impl FnMut(SearchMatch) -> bool,
+) -> MatchVisit {
+    let mut result = MatchVisit {
+        completed: true,
+        had_occurrence: false,
+    };
+    for abs_pos in positions {
+        #[cfg(test)]
+        CASE_INSENSITIVE_MATCH_VISITS.with(|count| count.set(count.get() + 1));
+        result.had_occurrence = true;
+        let match_end = abs_pos.saturating_add(query_len);
+        let orig_start = byte_map.map_or(abs_pos, |map| map.map_to_original(abs_pos));
+        let orig_end = byte_map.map_or(match_end, |map| map.map_to_original(match_end));
+        let (start_col, end_col) = col_map.span(orig_start, orig_end);
+        if start_col != end_col && !visit(SearchMatch::new(line_num, start_col, end_col)) {
+            result.completed = false;
+            break;
+        }
+    }
+    result
 }
 
 impl CaseInsensitiveMatcher {
     #[inline]
     pub(crate) fn new(query: &str) -> Self {
+        let lower_query = lower_fold(query);
+        let ascii_query = lower_query.is_ascii();
         Self {
-            lower_query: lower_fold(query),
+            lower_query,
             lower_buf: String::new(),
+            ascii_query,
         }
     }
 
@@ -163,95 +202,81 @@ impl CaseInsensitiveMatcher {
         self.lower_query.is_empty()
     }
 
-    /// Visit matches in ascending byte/column order.
+    /// Visit matches in the selected byte/column order, reporting textual occurrences even when
+    /// their zero-column spans are omitted from the visitor.
     #[inline]
-    pub(crate) fn visit_matches(
+    pub(crate) fn visit_matches<const REV: bool>(
         &mut self,
         line_num: usize,
         text: &str,
         col_map: &ColumnMap,
-        mut visit: impl FnMut(SearchMatch) -> bool,
-    ) -> bool {
+        visit: impl FnMut(SearchMatch) -> bool,
+    ) -> MatchVisit {
+        self.visit_matches_anchored::<REV>(line_num, text, col_map, None, visit)
+    }
+
+    /// Restrict ASCII identity rows to a point anchor; other maps retain column filtering.
+    #[inline]
+    pub(crate) fn visit_matches_anchored<const REV: bool>(
+        &mut self,
+        line_num: usize,
+        text: &str,
+        col_map: &ColumnMap,
+        anchor: Option<(usize, bool)>,
+        visit: impl FnMut(SearchMatch) -> bool,
+    ) -> MatchVisit {
+        let empty = MatchVisit {
+            completed: true,
+            had_occurrence: false,
+        };
         if self.lower_query.is_empty() {
-            return true;
+            return empty;
         }
 
-        let ascii = text.is_ascii() && self.lower_query.is_ascii();
-        if ascii && self.lower_query.len() <= 2 {
-            for abs_pos in AsciiCaseInsensitiveMatches::new(text, &self.lower_query) {
-                let Some(match_end) = abs_pos.checked_add(self.lower_query.len()) else {
-                    break;
-                };
-                let (start_col, end_col) = col_map.span(abs_pos, match_end);
-                if start_col != end_col && !visit(SearchMatch::new(line_num, start_col, end_col)) {
-                    return false;
-                }
+        if col_map.is_ascii() {
+            if !self.ascii_query {
+                return empty;
             }
-            return true;
+            let searcher = crate::bytesearch::Searcher::new_ascii(self.lower_query.as_bytes());
+            let window = anchor
+                .and_then(|(col, inclusive)| {
+                    col_map.identity_match_window::<REV>(
+                        text.len(),
+                        col,
+                        inclusive,
+                        self.lower_query.len(),
+                    )
+                })
+                .unwrap_or(0..text.len());
+            let offset = window.start;
+            return visit_occurrences(
+                line_num,
+                self.lower_query.len(),
+                col_map,
+                None,
+                searcher
+                    .matches_in::<REV>(&text.as_bytes()[window])
+                    .map(|at| offset.saturating_add(at)),
+                visit,
+            );
         }
 
         #[cfg(test)]
         count_case_insensitive_lowered_line();
 
         self.lower_buf.clear();
-        if ascii {
-            self.lower_buf.extend(
-                text.bytes()
-                    .map(|byte| char::from(byte.to_ascii_lowercase())),
-            );
-        } else {
-            self.lower_buf
-                .extend(text.chars().flat_map(lower_fold_char));
-        }
-        let byte_map = (!ascii).then(|| LowerByteMap::new(text));
-        let mut start = 0;
-        while let Some(tail) = self.lower_buf.get(start..) {
-            let Some(pos) = tail.find(&self.lower_query) else {
-                break;
-            };
-            let Some(abs_pos) = start.checked_add(pos) else {
-                break;
-            };
-            let Some(match_end) = abs_pos.checked_add(self.lower_query.len()) else {
-                break;
-            };
-            let orig_start = byte_map
-                .as_ref()
-                .map_or(abs_pos, |map| map.map_to_original(abs_pos));
-            let orig_end = byte_map
-                .as_ref()
-                .map_or(match_end, |map| map.map_to_original(match_end));
-            let (start_col, end_col) = col_map.span(orig_start, orig_end);
-            if start_col != end_col && !visit(SearchMatch::new(line_num, start_col, end_col)) {
-                return false;
-            }
-            let step = self
-                .lower_buf
-                .get(abs_pos..)
-                .and_then(|s| s.chars().next())
-                .map_or(1, char::len_utf8);
-            let Some(next_start) = abs_pos.checked_add(step) else {
-                break;
-            };
-            start = next_start;
-        }
-        true
-    }
-
-    /// Whether `text` contains the folded query at all, including occurrences whose span resolves to zero display columns, which [`visit_matches`](Self::visit_matches) drops.
-    pub(crate) fn has_occurrence(&mut self, text: &str) -> bool {
-        if self.lower_query.is_empty() {
-            return false;
-        }
-        if text.is_ascii() && self.lower_query.is_ascii() {
-            return AsciiCaseInsensitiveMatches::new(text, &self.lower_query)
-                .next()
-                .is_some();
-        }
-        self.lower_buf.clear();
         self.lower_buf
             .extend(text.chars().flat_map(lower_fold_char));
-        self.lower_buf.contains(self.lower_query.as_str())
+        let byte_map = LowerByteMap::new(text);
+        let searcher = crate::bytesearch::Searcher::new(self.lower_query.as_bytes());
+        visit_occurrences(
+            line_num,
+            self.lower_query.len(),
+            col_map,
+            Some(&byte_map),
+            searcher.matches_in::<REV>(self.lower_buf.as_bytes()),
+            visit,
+        )
     }
 }
 
@@ -303,6 +328,12 @@ impl SearchIndex {
             c.set(0);
             value
         })
+    }
+
+    /// Take the count of raw folded occurrences considered by the visitor.
+    #[cfg(test)]
+    pub(crate) fn take_case_insensitive_match_visits() -> usize {
+        CASE_INSENSITIVE_MATCH_VISITS.with(|count| count.replace(0))
     }
 
     #[cfg(test)]
@@ -431,9 +462,10 @@ impl SearchIndex {
 
         if self.lines.get(&line_num).is_some_and(|old| old == text_ref) {
             if let Some(cells) = cells {
-                let column_map = column_map();
-                if self.column_maps.get(&line_num) != Some(&column_map) {
-                    self.column_maps.insert(line_num, column_map);
+                if let Some(map) = self.column_maps.get_mut(&line_num) {
+                    map.refresh_cells(text_ref, cells);
+                } else {
+                    self.column_maps.insert(line_num, column_map());
                 }
                 self.set_truncated(line_num, cells.is_truncated());
             }
@@ -541,7 +573,7 @@ impl SearchIndex {
         u32::try_from(line.saturating_sub(self.key_base)).unwrap_or(u32::MAX)
     }
 
-    fn line_range(&self, first: usize, end: usize) -> CandidateSource {
+    fn line_range(&self, first: usize, end: usize) -> CandidateSource<'_> {
         let keys = self.posting_key(first)..self.posting_key(end);
         match self.held_keys_if_sparse(&keys) {
             Some(held) => CandidateSource::listed(self.key_base, held),
@@ -549,7 +581,7 @@ impl SearchIndex {
         }
     }
 
-    fn line_range_rev(&self, first: usize, end: usize) -> CandidateSource {
+    fn line_range_rev(&self, first: usize, end: usize) -> CandidateSource<'_> {
         let keys = self.posting_key(first)..self.posting_key(end);
         match self.held_keys_if_sparse(&keys) {
             Some(held) => CandidateSource::listed_rev(self.key_base, held),
@@ -578,15 +610,19 @@ impl SearchIndex {
         Some(held)
     }
 
-    fn postings_forward(&self, postings: Vec<&SparseBitmap>, from_line: usize) -> CandidateSource {
+    fn postings_forward<'a>(
+        &self,
+        postings: Vec<&'a SparseBitmap>,
+        from_line: usize,
+    ) -> CandidateSource<'a> {
         CandidateSource::from_postings_forward(self.key_base, postings, self.posting_key(from_line))
     }
 
-    fn postings_backward(
+    fn postings_backward<'a>(
         &self,
-        postings: Vec<&SparseBitmap>,
+        postings: Vec<&'a SparseBitmap>,
         before_line: usize,
-    ) -> CandidateSource {
+    ) -> CandidateSource<'a> {
         CandidateSource::from_postings_backward(
             self.key_base,
             postings,
@@ -764,19 +800,25 @@ impl SearchIndex {
         }
 
         let mut line_nums: Vec<usize> = self.lines.keys().copied().collect();
-        line_nums.sort_unstable();
 
         let evict_count = if to_evict < line_nums.len() {
             to_evict
         } else {
             line_nums.len()
         };
+        // Only the oldest partition and the first retained row matter; ordering
+        // either partition would sort rows whose relative order is never used.
+        let next_retained = if evict_count < line_nums.len() {
+            let (_, first_retained, _) = line_nums.select_nth_unstable(evict_count);
+            Some(*first_retained)
+        } else {
+            None
+        };
         for &line in line_nums.iter().take(evict_count) {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
 
-        let next_retained = line_nums.get(evict_count).copied();
         self.lowest_retained_line = next_retained.unwrap_or(self.next_line);
         self.first_cached_line = next_retained.unwrap_or(usize::MAX);
         self.eviction_occurred = true;
@@ -843,19 +885,55 @@ impl SearchIndex {
     }
 
     fn posting_lists(&self, query: &str) -> Option<Vec<&SparseBitmap>> {
-        let mut posting_lists = Vec::new();
-        for window in query.as_bytes().windows(3) {
-            let trigram: [u8; 3] = [window[0], window[1], window[2]];
-            posting_lists.push(self.trigrams.get(&trigram)?);
+        // Small queries need only a sorted reference vector. Once distinct
+        // postings exceed this bounded insertion cost, hash membership keeps
+        // long, high-diversity queries from doing quadratic shifts.
+        const SORTED_LIMIT: usize = 32;
+        let mut posting_lists: Vec<&SparseBitmap> = Vec::new();
+        if query.len() <= SORTED_LIMIT + 2 {
+            // Materializing at most 32 references is bounded scratch and keeps
+            // the ordinary short-query sort on its compact fast path.
+            for window in query.as_bytes().windows(3) {
+                let trigram = [window[0], window[1], window[2]];
+                posting_lists.push(self.trigrams.get(&trigram)?);
+            }
+            posting_lists.sort_unstable_by_key(|bitmap| std::ptr::from_ref(*bitmap));
+            posting_lists.dedup_by(|left, right| std::ptr::eq(*left, *right));
+        } else {
+            let mut seen: Option<FxHashSet<*const SparseBitmap>> = None;
+            for window in query.as_bytes().windows(3) {
+                let trigram: [u8; 3] = [window[0], window[1], window[2]];
+                let bitmap = self.trigrams.get(&trigram)?;
+                let key = std::ptr::from_ref(bitmap);
+                if let Some(seen) = &mut seen {
+                    if seen.insert(key) {
+                        posting_lists.push(bitmap);
+                    }
+                } else if let Err(at) =
+                    posting_lists.binary_search_by_key(&key, |bitmap| std::ptr::from_ref(*bitmap))
+                {
+                    posting_lists.insert(at, bitmap);
+                    if posting_lists.len() == SORTED_LIMIT {
+                        seen = Some(
+                            posting_lists
+                                .iter()
+                                .map(|bitmap| std::ptr::from_ref(*bitmap))
+                                .collect(),
+                        );
+                    }
+                }
+            }
         }
-        posting_lists.sort_unstable_by_key(|bitmap| std::ptr::from_ref(*bitmap));
-        posting_lists.dedup_by(|left, right| std::ptr::eq(*left, *right));
         #[cfg(test)]
         LAST_UNIQUE_POSTING_LISTS.with(|count| count.set(posting_lists.len()));
         Some(posting_lists)
     }
 
-    fn literal_candidates_forward(&self, lower_query: &str, from_line: usize) -> CandidateSource {
+    fn literal_candidates_forward(
+        &self,
+        lower_query: &str,
+        from_line: usize,
+    ) -> CandidateSource<'_> {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::empty();
         }
@@ -877,7 +955,7 @@ impl SearchIndex {
         &self,
         lower_query: &str,
         before_line: usize,
-    ) -> CandidateSource {
+    ) -> CandidateSource<'_> {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::empty();
         }
@@ -1011,18 +1089,15 @@ impl SearchIndex {
             return;
         }
         let distance = first_retained_line.saturating_sub(old_first);
-        let stale: Vec<usize> = if distance <= self.lines.len().saturating_mul(2) {
-            (old_first..first_retained_line).collect()
+        if distance <= self.lines.len().saturating_mul(2) {
+            for line in old_first..first_retained_line {
+                self.lines.remove(&line);
+                self.column_maps.remove(&line);
+            }
         } else {
-            self.lines
-                .keys()
-                .copied()
-                .filter(|line| *line < first_retained_line)
-                .collect()
-        };
-        for line in stale {
-            self.lines.remove(&line);
-            self.column_maps.remove(&line);
+            self.lines.retain(|line, _| *line >= first_retained_line);
+            self.column_maps
+                .retain(|line, _| *line >= first_retained_line);
         }
         self.drop_truncated_below(first_retained_line);
         let watermark = self.posting_key(first_retained_line);
@@ -1363,24 +1438,39 @@ impl SearchIndex {
                     }
                 }
                 SearchDirection::Backward => {
-                    let mut line_matches = Vec::new();
+                    let base = matches.len();
+                    let remaining = MAX_SEARCH_MATCHES.saturating_sub(base);
+                    if remaining == 0 {
+                        break 'lines;
+                    }
+                    let mut next_replace = 0;
                     for cap in scan.by_ref() {
                         if cap.start() == cap.end() {
                             continue;
                         }
                         let (start_col, end_col) = col_map.span(cap.start(), cap.end());
                         if start_col != end_col {
-                            line_matches.push(SearchMatch::new(line_num, start_col, end_col));
+                            let found = SearchMatch::new(line_num, start_col, end_col);
+                            if matches.len() < MAX_SEARCH_MATCHES {
+                                matches.push(found);
+                            } else {
+                                matches[base + next_replace] = found;
+                                next_replace += 1;
+                                if next_replace == remaining {
+                                    next_replace = 0;
+                                }
+                            }
                         }
                     }
                     if scan.step_limit_exceeded() && !self.truncated_lines.contains(&line_num) {
                         cut_short = cut_short.saturating_add(1);
                     }
-                    for found in line_matches.into_iter().rev() {
-                        matches.push(found);
-                        if matches.len() >= MAX_SEARCH_MATCHES {
-                            break 'lines;
-                        }
+                    // The row's suffix is a ring in the final result buffer.
+                    // Restore encounter order before reversing this row.
+                    matches[base..].rotate_left(next_replace);
+                    matches[base..].reverse();
+                    if matches.len() >= MAX_SEARCH_MATCHES {
+                        break 'lines;
                     }
                 }
             }
@@ -1415,11 +1505,11 @@ impl SearchIndex {
                             &fallback
                         }
                     };
-                    let completed = matcher.visit_matches(line_num, text, col_map, |found| {
+                    let visit = matcher.visit_matches::<false>(line_num, text, col_map, |found| {
                         matches.push(found);
                         matches.len() < MAX_SEARCH_MATCHES
                     });
-                    if !completed {
+                    if !visit.completed {
                         break;
                     }
                 }
@@ -1441,20 +1531,11 @@ impl SearchIndex {
                             &fallback
                         }
                     };
-                    let remaining = MAX_SEARCH_MATCHES.saturating_sub(matches.len());
-                    if remaining == 0 {
-                        break;
-                    }
-                    let mut line_matches = std::collections::VecDeque::new();
-                    matcher.visit_matches(line_num, text, col_map, |found| {
-                        if line_matches.len() == remaining {
-                            line_matches.pop_front();
-                        }
-                        line_matches.push_back(found);
-                        true
+                    let visit = matcher.visit_matches::<true>(line_num, text, col_map, |found| {
+                        matches.push(found);
+                        matches.len() < MAX_SEARCH_MATCHES
                     });
-                    matches.extend(line_matches.into_iter().rev());
-                    if matches.len() >= MAX_SEARCH_MATCHES {
+                    if !visit.completed {
                         break;
                     }
                 }
@@ -1510,11 +1591,11 @@ impl SearchIndex {
             };
         }
 
-        enum Candidates<I: Iterator<Item = usize>> {
-            Engine(CandidateSource),
+        enum Candidates<'a, I: Iterator<Item = usize>> {
+            Engine(CandidateSource<'a>),
             Frame(I),
         }
-        impl<I: Iterator<Item = usize>> Candidates<I> {
+        impl<I: Iterator<Item = usize>> Candidates<'_, I> {
             fn next(&mut self) -> Option<usize> {
                 match self {
                     Candidates::Engine(source) => source.next_candidate(),
@@ -1559,15 +1640,15 @@ impl SearchIndex {
                     &fallback
                 }
             };
-            let mut line_matched = false;
             match matcher.as_mut() {
                 None => {
-                    let mut from_byte = 0usize;
-                    while let Some((found, resume)) =
-                        next_literal_match(line_num, text, &searcher, col_map, from_byte)
-                    {
-                        from_byte = resume;
-                        line_matched = true;
+                    let mut had_occurrence = false;
+                    for at in searcher.matches_in::<false>(text.as_bytes()) {
+                        let found = literal_occurrence(line_num, at, query.len(), col_map);
+                        had_occurrence = true;
+                        if found.start_col == found.end_col {
+                            continue;
+                        }
                         matches.push(found);
                         if matches.len() >= MAX_SEARCH_MATCHES {
                             occurrence_lines.push_offset(self.posting_key(line_num));
@@ -1575,20 +1656,19 @@ impl SearchIndex {
                             break 'lines;
                         }
                     }
-                    if line_matched || searcher.find_in(text.as_bytes()).is_some() {
+                    if had_occurrence {
                         occurrence_lines.push_offset(self.posting_key(line_num));
                     }
                 }
                 Some(matcher) => {
-                    let completed = matcher.visit_matches(line_num, text, col_map, |found| {
-                        line_matched = true;
+                    let visit = matcher.visit_matches::<false>(line_num, text, col_map, |found| {
                         matches.push(found);
                         matches.len() < MAX_SEARCH_MATCHES
                     });
-                    if line_matched || matcher.has_occurrence(text) {
+                    if visit.had_occurrence {
                         occurrence_lines.push_offset(self.posting_key(line_num));
                     }
-                    if !completed {
+                    if !visit.completed {
                         capped = true;
                         break 'lines;
                     }
@@ -1797,21 +1877,27 @@ impl SearchIndex {
                 }
             };
             let mut found = None;
-            matcher.visit_matches(line_num, text, col_map, |candidate| {
-                if candidate.line > anchor_line
-                    || (candidate.line == anchor_line
-                        && if inclusive {
-                            candidate.start_col >= anchor_col
-                        } else {
-                            candidate.start_col > anchor_col
-                        })
-                {
-                    found = Some(candidate);
-                    false
-                } else {
-                    true
-                }
-            });
+            matcher.visit_matches_anchored::<false>(
+                line_num,
+                text,
+                col_map,
+                (line_num == anchor_line).then_some((anchor_col, inclusive)),
+                |candidate| {
+                    if candidate.line > anchor_line
+                        || (candidate.line == anchor_line
+                            && if inclusive {
+                                candidate.start_col >= anchor_col
+                            } else {
+                                candidate.start_col > anchor_col
+                            })
+                    {
+                        found = Some(candidate);
+                        false
+                    } else {
+                        true
+                    }
+                },
+            );
             if found.is_some() {
                 return found;
             }
@@ -1847,6 +1933,9 @@ impl SearchIndex {
         while let Some(line_num) = candidates.next_candidate() {
             #[cfg(test)]
             count_case_insensitive_candidate_visit();
+            if line_num == anchor_line && anchor_col == 0 && !inclusive {
+                continue;
+            }
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };
@@ -1859,21 +1948,27 @@ impl SearchIndex {
                 }
             };
             let mut found = None;
-            matcher.visit_matches(line_num, text, col_map, |candidate| {
-                if candidate.line < anchor_line
-                    || (candidate.line == anchor_line
-                        && if inclusive {
-                            candidate.start_col <= anchor_col
-                        } else {
-                            candidate.start_col < anchor_col
-                        })
-                {
-                    found = Some(candidate);
-                    true
-                } else {
-                    false
-                }
-            });
+            matcher.visit_matches_anchored::<true>(
+                line_num,
+                text,
+                col_map,
+                (line_num == anchor_line).then_some((anchor_col, inclusive)),
+                |candidate| {
+                    if candidate.line < anchor_line
+                        || (candidate.line == anchor_line
+                            && if inclusive {
+                                candidate.start_col <= anchor_col
+                            } else {
+                                candidate.start_col < anchor_col
+                            })
+                    {
+                        found = Some(candidate);
+                        false
+                    } else {
+                        true
+                    }
+                },
+            );
             if found.is_some() {
                 return found;
             }

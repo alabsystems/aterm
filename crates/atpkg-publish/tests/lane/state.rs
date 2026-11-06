@@ -180,6 +180,22 @@ fn a_held_lock_is_busy_and_a_holder_past_twelve_hours_has_stalled() {
     assert!(matches!(s.try_lock().expect("lock"), Lock::Held(_)));
 }
 
+/// The day is the civil date's whole year, month and day. NEGATIVE CONTROL: the epoch, a day in
+/// 2026, and the last instant of 9999 read as their dates.
+#[test]
+fn a_utc_day_names_its_whole_year() {
+    assert_eq!(report::utc_day(0), "19700101");
+    assert_eq!(
+        report::utc_day(-1),
+        "19700101",
+        "before the epoch reads as its day"
+    );
+    assert_eq!(report::utc_day(1_792_022_399), "20261014");
+    assert_eq!(report::utc_day(253_402_300_799), "99991231");
+    assert_eq!(report::utc_day(253_402_300_800), "100000101");
+    assert_eq!(report::utc_day(i64::MAX), "2922770265961204");
+}
+
 #[test]
 fn a_notice_is_recorded_once_a_utc_day() {
     let tmp = scratch("state-notify");
@@ -198,6 +214,19 @@ fn a_notice_is_recorded_once_a_utc_day() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(files, [format!("notified-{}", report::utc_day(NOW + day))]);
+    report::record_once(&seen, "t", tmp.path(), NOW + day, false, "carriage\r");
+    report::record_once(&seen, "t", tmp.path(), NOW + day + 60, false, "carriage\r");
+    assert_eq!(
+        seen.entries().len(),
+        4,
+        "a message ending in CR is still recorded at most once a UTC day"
+    );
+    report::record_once(&seen, "t", tmp.path(), NOW + day, false, "carriage");
+    assert_eq!(
+        seen.entries().len(),
+        5,
+        "NEGATIVE CONTROL: without the CR it is another"
+    );
 
     let transcript = Transcript::memory("publication");
     report::record_once(

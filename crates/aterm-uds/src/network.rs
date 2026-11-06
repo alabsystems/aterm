@@ -868,6 +868,15 @@ mod tests {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub struct RouteChanges(std::os::fd::OwnedFd);
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl std::os::fd::AsFd for RouteChanges {
+    /// Borrow readiness so a network owner can wait on route changes and its
+    /// sockets together. [`RouteChanges::wait`] still filters and drains events.
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+}
+
 /// The netlink groups [`RouteChanges`] joins (`linux/rtnetlink.h`): links, and IPv4 and IPv6
 /// addresses and routes; never neighbours, whose cache churns with LAN traffic.
 #[cfg(target_os = "linux")]

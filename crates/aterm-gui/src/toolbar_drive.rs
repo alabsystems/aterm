@@ -845,7 +845,7 @@ mod macos {
                 "the desk's glance counts 1 need you, 6 landing, 1 resting, 5 landed and 3 shells (got {counts:?})"
             ),
         );
-        let want = crate::status_item::here_line(h);
+        let want = crate::status_item::here_line(h, glance.machine.as_deref());
         let Some(item) = crate::status_item::install(proxy, &glance) else {
             cx.check(false, "the status bar gave the drive no item".to_owned());
             return;

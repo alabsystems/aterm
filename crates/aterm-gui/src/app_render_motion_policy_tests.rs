@@ -1004,3 +1004,40 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         MotionPolicy::Reduced
     );
 }
+
+#[cfg(a11y_tree)]
+#[test]
+fn a_load_flip_at_a_present_keeps_the_page_for_a_client() {
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    app.first_present_done = true;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.windows.get_mut(&wid).unwrap().a11y_active = true;
+    assert!(app.prepare_native_input_scratch(wid));
+    let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
+    let presented_stamp = app.windows[&wid]
+        .native_ui_compiled
+        .as_ref()
+        .map(|frame| frame.stamp);
+    app.perf_run = PERF_HYSTERESIS_FRAMES - 1;
+    app.finalize_successful_present(
+        wid,
+        crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+        Duration::from_secs(1).as_nanos() as u64,
+        None,
+        super::SuccessfulPresentRoute::Native {
+            view,
+            presented_stamp,
+        },
+        route,
+        super::HostVisualState::default(),
+        None,
+        &plan,
+    );
+    assert!(app.perf_reduced, "this present flipped the load policy");
+    assert!(
+        app.windows[&wid].native_a11y_published.is_some(),
+        "a screen reader keeps the page through the flip"
+    );
+}

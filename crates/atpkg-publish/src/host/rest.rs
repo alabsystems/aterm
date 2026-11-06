@@ -413,11 +413,17 @@ impl RestHost {
         self.git_output(args).map(|_| ())
     }
 
+    /// `git <args…>` with this host's auth, within [`super::agh::LANE_GIT_BUDGET`], the bound a
+    /// lane's clone or fetch through agh has ([`crate::git::output_within`]).
     fn git_output(&self, args: &[OsString]) -> Result<std::process::Output, HostError> {
-        let out = self
-            .git_command(args)?
-            .output()
-            .map_err(|e| HostError::Unreachable(format!("spawn git: {e}")))?;
+        let out =
+            crate::git::output_within(&mut self.git_command(args)?, super::agh::LANE_GIT_BUDGET)
+                .map_err(|e| match e {
+                    aterm_uds::deadline::CompleteOutputError::Run(
+                        aterm_uds::deadline::RunError::Spawn(e),
+                    ) => HostError::Unreachable(format!("spawn git: {e}")),
+                    other => HostError::Unreachable(format!("git: {other}")),
+                })?;
         if out.status.success() {
             return Ok(out);
         }

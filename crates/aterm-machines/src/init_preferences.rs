@@ -9,7 +9,7 @@ use crate::items::defaults::{self, Target};
 use crate::items::{Activation, Ctx, Item, keyboard, widgets};
 use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::Entries;
-use crate::port::{Cmd, System};
+use crate::port::{Cmd, KeyboardMapChange, KeyboardPrefix, System};
 use aterm_types::macos_setup::{Selection, Setting};
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +21,7 @@ const FINDER: &str = "com.apple.finder";
 const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
 const HIDUTIL: &str = aterm_uds::os_path!("hidutil");
+const NATIVE_MAPPING: &str = "HIDKeyboardModifierMappingPairs";
 const DOCK_APPS: [(&str, &str, &str); 3] = [
     ("/Applications/aterm.app", "com.aterm.aterm", "aterm"),
     (
@@ -236,6 +237,210 @@ pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
     Ok(items)
 }
 
+/// Development acceptance of the production native setter on an already-Control keyboard.
+/// Adds only native Caps→Left Control, requiring an empty native table and exactly the same
+/// user Caps→Left Control rule. Both before/after cohorts and all unrelated tables are checked.
+///
+/// # Errors
+/// Console identity, the exact service or before-image differs, the backend refuses, or its
+/// fresh service records do not verify the one intended addition.
+#[cfg(any(test, debug_assertions))]
+pub fn accept_native_caps_control(vendor: u32, product: u32, registry: u64) -> Result<(), String> {
+    let sys = crate::port::Live::new();
+    let ctx = crate::init::initial_setup_context(&sys)?;
+    let [user] = ctx.users.as_slice() else {
+        return Err("one console user is required".into());
+    };
+    let item = AttachedKeyboard {
+        model: keyboard::Model { vendor, product },
+        user: user.clone(),
+        reading: LastReading::default(),
+    };
+    let before = item.mappings(&sys)?;
+    let targets: Vec<_> = before
+        .iter()
+        .filter(|map| map.registry == registry)
+        .collect();
+    if targets.len() != 1 {
+        return Err("the exact keyboard service is absent or ambiguous".into());
+    }
+    let target = targets[0];
+    let control = vec![(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+    if !target.native.is_empty() || target.user != control {
+        return Err("native acceptance requires empty native mappings and existing user Caps→Left Control; nothing changed".into());
+    }
+    let change = KeyboardMapChange {
+        registry,
+        before_prefix: target.prefix.clone(),
+        before_native: target.native.clone(),
+        before_user: target.user.clone(),
+        native: Some(control.clone()),
+        user: None,
+    };
+    item.set_mappings(&sys, &[change])?;
+    let after = item.mappings(&sys)?;
+    if after.len() != before.len() {
+        return Err("the keyboard service cohort changed during acceptance".into());
+    }
+    for old in before {
+        let now: Vec<_> = after
+            .iter()
+            .filter(|map| map.registry == old.registry)
+            .collect();
+        if now.len() != 1
+            || now[0].prefix != old.prefix
+            || now[0].user != old.user
+            || now[0].native
+                != if old.registry == registry {
+                    control.clone()
+                } else {
+                    old.native
+                }
+        {
+            return Err(
+                "native acceptance did not verify; an unrelated table or service changed".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Activate the accepted Caps setting on only newly observed services, retaining a device's
+/// explicit saved or live Caps choice. This never writes persistent preferences.
+pub(crate) fn attachment_items(
+    ctx: &Ctx,
+    registries: &[u64],
+) -> Result<Vec<Box<dyn Item>>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("input activation requires exactly one local user".into());
+    };
+    let mut models: Vec<_> = ctx
+        .facts
+        .keyboards
+        .iter()
+        .map(|keyboard| keyboard::Model {
+            vendor: keyboard.vendor,
+            product: keyboard.product,
+        })
+        .collect();
+    models.sort();
+    models.dedup();
+    Ok(models
+        .into_iter()
+        .map(|model| {
+            Box::new(Attachment {
+                inner: AttachedKeyboard {
+                    model,
+                    user: user.clone(),
+                    reading: LastReading::default(),
+                },
+                registries: registries.to_vec(),
+            }) as Box<dyn Item>
+        })
+        .collect())
+}
+
+struct Attachment {
+    inner: AttachedKeyboard,
+    registries: Vec<u64>,
+}
+
+impl Attachment {
+    fn maps(&self, sys: &dyn System) -> Result<Option<Vec<HidMapping>>, String> {
+        let maps = self.inner.mappings_for(sys, Some(&self.registries))?;
+        if maps.is_empty() {
+            return Ok(None);
+        }
+        let target = Target::host("-g", &self.inner.model.key(), &self.inner.user);
+        let accepted = match target.read(sys) {
+            Read::Absent => true,
+            Read::Unusable(why) => return Err(why),
+            Read::Value(PValue::Array(pairs)) => {
+                let mut mapping = Vec::new();
+                for pair in pairs {
+                    let (Some(PValue::Int(source)), Some(PValue::Int(destination))) =
+                        (unique_field(&pair, SRC), unique_field(&pair, DST))
+                    else {
+                        return Err("unrecognized saved keyboard mapping; left untouched".into());
+                    };
+                    mapping.push((*source, *destination));
+                }
+                unique_sources(&mapping)?;
+                mapping
+                    .iter()
+                    .find(|(source, _)| *source == keyboard::CAPS_LOCK)
+                    .map_or(!mapping.is_empty(), |(_, destination)| {
+                        matches!(
+                            *destination,
+                            keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+                        )
+                    })
+            }
+            Read::Value(_) => {
+                return Err("unrecognized saved keyboard mapping; left untouched".into());
+            }
+        };
+        if !accepted {
+            return Ok(None);
+        }
+        let maps: Vec<_> = maps
+            .into_iter()
+            .filter(|map| {
+                matches!(
+                    map.caps_lock(),
+                    keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+                ) || !map
+                    .native
+                    .iter()
+                    .chain(&map.user)
+                    .any(|(source, _)| *source == keyboard::CAPS_LOCK)
+            })
+            .collect();
+        Ok((!maps.is_empty()).then_some(maps))
+    }
+}
+
+impl Item for Attachment {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn family(&self) -> &'static str {
+        self.inner.family()
+    }
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        match self
+            .maps(sys)
+            .and_then(|maps| maps.map(|maps| merged_mapping(&maps)).transpose())
+        {
+            Err(why) => Probe::Unusable { why },
+            Ok(None) => Probe::NotApplicable {
+                why: "no new default keyboard service; explicit choices left untouched".into(),
+            },
+            Ok(Some(None)) => Probe::Ok {
+                now: "Caps Lock acts as Control on new keyboard services".into(),
+            },
+            Ok(Some(Some(_))) => Probe::Change {
+                from: "new keyboard service".into(),
+                to: "Caps Lock acts as Control".into(),
+            },
+        }
+    }
+    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        if sys.euid() != self.inner.user.uid {
+            return Err("keyboard activation must run as the target console user; existing remaps left untouched".into());
+        }
+        if let Some(maps) = self.maps(sys)?
+            && let Some(changes) = merged_mapping(&maps)?
+        {
+            self.inner.set_mappings(sys, &changes)?;
+        }
+        Ok(())
+    }
+}
+
 fn run(sys: &dyn System, cmd: &Cmd) -> Result<String, String> {
     let ran = sys
         .run(cmd)
@@ -260,15 +465,20 @@ impl AttachedKeyboard {
             .args([
                 "property",
                 "--matching",
-                &format!(
-                    "{{\"PrimaryUsagePage\":1,\"PrimaryUsage\":6,\"VendorID\":{},\"ProductID\":{}}}",
-                    self.model.vendor, self.model.product
-                ),
+                &crate::port::keyboard_usage::matching_model(self.model.vendor, self.model.product),
             ])
             .as_user(&self.user)
     }
 
-    fn mappings(&self, sys: &dyn System) -> Result<Vec<Vec<(i64, i64)>>, String> {
+    fn mappings(&self, sys: &dyn System) -> Result<Vec<HidMapping>, String> {
+        self.mappings_for(sys, None)
+    }
+
+    fn mappings_for(
+        &self,
+        sys: &dyn System,
+        registries: Option<&[u64]>,
+    ) -> Result<Vec<HidMapping>, String> {
         let command = self.command().args(["--get", "UserKeyMapping"]);
         let ran = sys
             .run_complete_stdout(&command)
@@ -276,18 +486,35 @@ impl AttachedKeyboard {
         if !ran.success() {
             return Err(format!("{}: {}", command.display(), ran.describe()));
         }
-        parse_hid_mappings(&ran.out())
+        let mut matched = parse_hid_mappings(&ran.out())?;
+        if let Some(registries) = registries {
+            matched.retain(|(registry, _)| registries.contains(registry));
+        }
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+        let command = Cmd::new(HIDUTIL)
+            .args(["dump", "services", "-f", "xml"])
+            .as_user(&self.user);
+        let ran = sys
+            .run_complete_stdout(&command)
+            .map_err(|e| e.to_string())?;
+        if !ran.success() {
+            return Err(format!("{}: {}", command.display(), ran.describe()));
+        }
+        live_hid_mappings(&ran.out(), &matched)
     }
 
-    fn set_mappings(&self, sys: &dyn System, mappings: &[(i64, i64)]) -> Result<(), String> {
-        let values: Vec<aterm_json::Value> = mappings
-            .iter()
-            .map(|(src, dst)| aterm_json::json!({SRC: src, DST: dst}))
-            .collect();
-        let value = aterm_json::to_string(&aterm_json::json!({"UserKeyMapping": values}))
-            .map_err(|e| e.to_string())?;
-        run(sys, &self.command().args(["--set", &value]))?;
-        Ok(())
+    fn set_mappings(&self, sys: &dyn System, mappings: &[KeyboardMapChange]) -> Result<(), String> {
+        // hidutil uses a Simple client, whose permitted properties exclude the native
+        // modifier table. The Passive property backend can update it without privileges,
+        // events or permission requests, and checks the exact services again before writing.
+        sys.set_keyboard_maps(
+            self.user.uid,
+            self.model.vendor,
+            self.model.product,
+            mappings,
+        )
     }
 }
 
@@ -323,12 +550,11 @@ impl Item for AttachedKeyboard {
                 now: "Caps Lock acts as Control on every attached service".into(),
             },
             Ok(Some(_)) => {
-                // No service maps Caps Lock at all: the key still does Caps Lock,
-                // the one reading System State names (`init_observe`).
+                // Every service leaves the physical key doing Caps Lock, including when
+                // the two mapping tables compose back to Caps (`init_observe`).
                 self.reading.set(
                     maps.iter()
-                        .flatten()
-                        .all(|(source, _)| *source != keyboard::CAPS_LOCK)
+                        .all(|map| map.caps_lock() == keyboard::CAPS_LOCK)
                         .then_some(Reading::CapsLock),
                 );
                 Probe::Change {
@@ -344,6 +570,9 @@ impl Item for AttachedKeyboard {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        if sys.euid() != self.user.uid {
+            return Err("keyboard activation must run as the target console user; existing remaps left untouched".into());
+        }
         let maps = self.mappings(sys)?;
         if let Some(want) = merged_mapping(&maps)? {
             self.set_mappings(sys, &want)?;
@@ -352,51 +581,108 @@ impl Item for AttachedKeyboard {
     }
 }
 
-fn merged_mapping(maps: &[Vec<(i64, i64)>]) -> Result<Option<Vec<(i64, i64)>>, String> {
+type KeyMapping = Vec<(i64, i64)>;
+
+#[derive(Debug)]
+struct HidMapping {
+    registry: u64,
+    prefix: KeyboardPrefix,
+    native: KeyMapping,
+    user: KeyMapping,
+}
+
+impl HidMapping {
+    fn caps_lock(&self) -> i64 {
+        self.output(keyboard::CAPS_LOCK)
+    }
+
+    fn output(&self, key: i64) -> i64 {
+        let mapped = |map: &KeyMapping, key| {
+            map.iter()
+                .find_map(|(source, destination)| (*source == key).then_some(*destination))
+                .unwrap_or(key)
+        };
+        // KeyboardPrefix proves every earlier Fn/modifier/NumLock layer passes Caps
+        // through and no other key can enter Caps. The remaining native and user tables
+        // each perform one lookup. Reading only the user table can falsely claim Control.
+        mapped(&self.user, mapped(&self.native, key))
+    }
+}
+
+fn merged_mapping(maps: &[HidMapping]) -> Result<Option<Vec<KeyboardMapChange>>, String> {
     if maps.is_empty() {
         return Err(
             "the attached keyboard has no HID service; reconnect it and run aterm init again"
                 .into(),
         );
     }
-    let correct = |map: &Vec<(i64, i64)>| {
-        let caps: Vec<_> = map
-            .iter()
-            .filter(|(s, _)| *s == keyboard::CAPS_LOCK)
-            .collect();
-        !caps.is_empty()
-            && caps
+    let control = |key| matches!(key, keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL);
+    let mut changes = Vec::new();
+    for map in maps {
+        if control(map.caps_lock()) {
+            continue;
+        }
+        let user_maps = |key| {
+            map.user
                 .iter()
-                .all(|(_, d)| matches!(*d, keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL))
-    };
-    if maps.iter().all(correct) {
-        return Ok(None);
-    }
-    let mut want = common_other_mappings(maps)?;
-    want.push((keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL));
-    Ok(Some(want))
-}
-
-fn common_other_mappings(maps: &[Vec<(i64, i64)>]) -> Result<Vec<(i64, i64)>, String> {
-    let Some(first) = maps.first() else {
-        return Err("the attached keyboard has no HID service; left untouched".into());
-    };
-    let others = |map: &Vec<(i64, i64)>| {
-        map.iter()
+                .find_map(|(source, destination)| (*source == key).then_some(*destination))
+                .unwrap_or(key)
+        };
+        // Changing only native Caps preserves every other physical key's effective output,
+        // even when a native Command→Caps feeds a user Caps mapping. Prefer an existing
+        // user-table preimage of Control to adding a rule another physical key could enter.
+        let preimage = [
+            keyboard::LEFT_CONTROL,
+            keyboard::RIGHT_CONTROL,
+            keyboard::CAPS_LOCK,
+        ]
+        .into_iter()
+        .chain(map.user.iter().map(|(source, _)| *source))
+        .find(|key| control(user_maps(*key)));
+        let mut user = None;
+        let destination = if let Some(preimage) = preimage {
+            preimage
+        } else {
+            if map.native.iter().any(|(source, destination)| {
+                *source != keyboard::CAPS_LOCK && *destination == keyboard::CAPS_LOCK
+            }) {
+                return Err("existing modifier remaps conflict with Caps Lock as Control; unrelated keys left untouched".into());
+            }
+            let mut wanted: KeyMapping = map
+                .user
+                .iter()
+                .copied()
+                .filter(|(source, _)| *source != keyboard::CAPS_LOCK)
+                .collect();
+            wanted.push((keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL));
+            user = Some(wanted);
+            keyboard::CAPS_LOCK
+        };
+        let mut native: KeyMapping = map
+            .native
+            .iter()
             .copied()
-            .filter(|(s, _)| *s != keyboard::CAPS_LOCK)
-            .collect::<Vec<_>>()
-    };
-    let want = others(first);
-    if maps.iter().skip(1).any(|map| others(map) != want) {
-        return Err("keyboard services have different unrelated remaps; left untouched".into());
+            .filter(|(source, _)| *source != keyboard::CAPS_LOCK)
+            .collect();
+        if destination != keyboard::CAPS_LOCK {
+            native.push((keyboard::CAPS_LOCK, destination));
+        }
+        changes.push(KeyboardMapChange {
+            registry: map.registry,
+            before_prefix: map.prefix.clone(),
+            before_native: map.native.clone(),
+            before_user: map.user.clone(),
+            native: (native != map.native).then_some(native),
+            user,
+        });
     }
-    Ok(want)
+    Ok((!changes.is_empty()).then_some(changes))
 }
 
-fn parse_hid_mappings(text: &str) -> Result<Vec<Vec<(i64, i64)>>, String> {
+fn parse_hid_mappings(text: &str) -> Result<Vec<(u64, KeyMapping)>, String> {
     let mut values = Vec::new();
     let mut current = String::new();
+    let mut registry = None;
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if line.starts_with("RegistryID") {
             continue;
@@ -407,9 +693,13 @@ fn parse_hid_mappings(text: &str) -> Result<Vec<Vec<(i64, i64)>>, String> {
             && let Some(rest) = rest.trim().strip_prefix("UserKeyMapping")
         {
             if !current.is_empty() {
-                values.push(parse_mapping(&current)?);
+                values.push((
+                    registry.ok_or("missing keyboard service identity")?,
+                    parse_mapping(&current)?,
+                ));
                 current.clear();
             }
+            registry = Some(u64::from_str_radix(id, 16).map_err(|e| e.to_string())?);
             current.push_str(rest.trim());
         } else {
             current.push(' ');
@@ -417,9 +707,96 @@ fn parse_hid_mappings(text: &str) -> Result<Vec<Vec<(i64, i64)>>, String> {
         }
     }
     if !current.trim().is_empty() {
-        values.push(parse_mapping(&current)?);
+        values.push((
+            registry.ok_or("missing keyboard service identity")?,
+            parse_mapping(&current)?,
+        ));
+    }
+    let mut ids: Vec<_> = values.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != values.len() {
+        return Err("duplicate keyboard service identity; existing remaps left untouched".into());
     }
     Ok(values)
+}
+
+fn live_hid_mappings(text: &str, matched: &[(u64, KeyMapping)]) -> Result<Vec<HidMapping>, String> {
+    let invalid =
+        || "unrecognized live keyboard filter state; existing remaps left untouched".to_owned();
+    let dump = crate::plist::parse(text.as_bytes()).map_err(|_| invalid())?;
+    let PValue::Array(services) = unique_field(&dump, "ServiceRecords").ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    matched
+        .iter()
+        .map(|(registry, user)| {
+            let mut matching_services = services.iter().filter(|service| {
+                matches!(unique_field(service, "IORegistryEntryID"), Some(PValue::Int(id)) if u64::try_from(*id).ok() == Some(*registry))
+            });
+            let service = matching_services.next().ok_or_else(invalid)?;
+            if matching_services.next().is_some() {
+                return Err(invalid());
+            }
+            if !crate::port::keyboard_usage::is_keyboard_service(service) {
+                return Err(invalid());
+            }
+            let PValue::Array(filters) = unique_field(service, "ServiceFilterDebug").ok_or_else(invalid)? else {
+                return Err(invalid());
+            };
+            let mut filters = filters.iter().filter_map(|filter| {
+                let plugin = unique_field(filter, "plugin")?;
+                matches!(unique_field(plugin, "Class"), Some(PValue::Str(class)) if class == "IOHIDKeyboardFilter").then_some(plugin)
+            });
+            let filter = filters.next().ok_or_else(invalid)?;
+            if filters.next().is_some() {
+                return Err(invalid());
+            }
+            let read = |key: &str| -> Result<KeyMapping, String> {
+                let PValue::Array(pairs) = unique_field(filter, key).ok_or_else(invalid)? else {
+                    return Err(invalid());
+                };
+                let mappings = pairs.iter().map(|pair| {
+                    match (unique_field(pair, "Src"), unique_field(pair, "Dst")) {
+                        (Some(PValue::Int(source)), Some(PValue::Int(destination))) => Ok((*source, *destination)),
+                        _ => Err(invalid()),
+                    }
+                }).collect::<Result<KeyMapping, String>>()?;
+                unique_sources(&mappings)?;
+                Ok(mappings)
+            };
+            let native = read(NATIVE_MAPPING)?;
+            let observed = read("UserKeyMapping")?;
+            let prefix = KeyboardPrefix::read(filter)?;
+            let mut observed_sorted = observed.clone();
+            observed_sorted.sort_unstable();
+            let mut matched_sorted = user.clone();
+            matched_sorted.sort_unstable();
+            if observed_sorted != matched_sorted {
+                return Err("keyboard mappings changed while reading; existing remaps left untouched".into());
+            }
+            Ok(HidMapping { registry: *registry, prefix, native, user: observed })
+        })
+        .collect()
+}
+
+fn unique_field<'a>(value: &'a PValue, key: &str) -> Option<&'a PValue> {
+    let PValue::Dict(fields) = value else {
+        return None;
+    };
+    let mut values = fields.iter().filter(|(name, _)| name == key);
+    let value = &values.next()?.1;
+    values.next().is_none().then_some(value)
+}
+
+fn unique_sources(mappings: &KeyMapping) -> Result<(), String> {
+    let mut sources: Vec<_> = mappings.iter().map(|(source, _)| *source).collect();
+    sources.sort_unstable();
+    sources.dedup();
+    if sources.len() != mappings.len() {
+        return Err("duplicate keyboard mapping source; existing remaps left untouched".into());
+    }
+    Ok(())
 }
 
 fn parse_mapping(value: &str) -> Result<Vec<(i64, i64)>, String> {
@@ -483,6 +860,7 @@ fn parse_mapping(value: &str) -> Result<Vec<(i64, i64)>, String> {
             return Err(invalid());
         }
     }
+    unique_sources(&mappings)?;
     Ok(mappings)
 }
 
@@ -1478,24 +1856,487 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hidutil_table_preserves_every_unrelated_mapping_and_updates_conflicting_caps() {
+    fn hidutil_table_keeps_services_distinct_and_preserves_their_existing_user_rules() {
         let table = "RegistryID Key Value\n100000001 UserKeyMapping (\n{ HIDKeyboardModifierMappingDst = 30064771297; HIDKeyboardModifierMappingSrc = 30064771303; },\n{ HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771241; }\n)\n100000002 UserKeyMapping (null)\n";
-        let maps = parse_hid_mappings(table).unwrap();
+        let maps: Vec<_> = parse_hid_mappings(table)
+            .unwrap()
+            .into_iter()
+            .map(|(registry, user)| HidMapping {
+                registry,
+                prefix: KeyboardPrefix::default(),
+                native: Vec::new(),
+                user,
+            })
+            .collect();
         assert_eq!(maps.len(), 2);
-        assert!(
-            merged_mapping(&maps).is_err(),
-            "different services must never overwrite one another"
-        );
-        let want = merged_mapping(&maps[..1]).unwrap().unwrap();
-        assert_eq!(
-            want,
-            [
-                (30064771303, 30064771297),
-                (keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)
-            ]
-        );
-        assert_eq!(merged_mapping(&[want]).unwrap(), None);
+        let changes = merged_mapping(&maps).unwrap().unwrap();
+        assert_eq!(changes.len(), 2);
+        for (before, change) in maps.into_iter().zip(changes) {
+            assert_eq!(change.registry, before.registry);
+            assert_eq!(change.before_user, before.user);
+            assert_eq!(change.user, None);
+            let after = after_change(before, change);
+            assert_eq!(after.caps_lock(), keyboard::LEFT_CONTROL);
+            assert_eq!(merged_mapping(&[after]).unwrap(), None);
+        }
         assert!(parse_hid_mappings("100000001 UserKeyMapping (garbage)").is_err());
+    }
+
+    fn after_change(before: HidMapping, change: KeyboardMapChange) -> HidMapping {
+        HidMapping {
+            registry: before.registry,
+            prefix: before.prefix,
+            native: change.native.unwrap_or(before.native),
+            user: change.user.unwrap_or(before.user),
+        }
+    }
+
+    type HidDumpRow<'a> = (u64, &'a [(i64, i64)], &'a [(i64, i64)]);
+
+    fn hid_dump(maps: &[HidDumpRow<'_>]) -> String {
+        hid_dump_with_prefix(maps, &crate::port::keyboard_prefix::tests::fields())
+    }
+
+    fn hid_dump_with_prefix(maps: &[HidDumpRow<'_>], prefix: &[(String, PValue)]) -> String {
+        let pairs = |map: &[(i64, i64)]| {
+            PValue::Array(
+                map.iter()
+                    .map(|(source, destination)| {
+                        PValue::Dict(vec![
+                            ("Src".into(), PValue::Int(*source)),
+                            ("Dst".into(), PValue::Int(*destination)),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        crate::plist::document(&PValue::Dict(vec![(
+            "ServiceRecords".into(),
+            PValue::Array(
+                maps.iter()
+                    .map(|(registry, native, user)| {
+                        PValue::Dict(vec![
+                            (
+                                "IORegistryEntryID".into(),
+                                PValue::Int(i64::try_from(*registry).unwrap()),
+                            ),
+                            ("PrimaryUsagePage".into(), PValue::Int(1)),
+                            ("PrimaryUsage".into(), PValue::Int(6)),
+                            (
+                                "ServiceFilterDebug".into(),
+                                PValue::Array(vec![PValue::Dict(vec![(
+                                    "plugin".into(),
+                                    PValue::Dict(
+                                        [
+                                            (
+                                                "Class".into(),
+                                                PValue::Str("IOHIDKeyboardFilter".into()),
+                                            ),
+                                            (NATIVE_MAPPING.into(), pairs(native)),
+                                            ("UserKeyMapping".into(), pairs(user)),
+                                        ]
+                                        .into_iter()
+                                        .chain(prefix.iter().cloned())
+                                        .collect(),
+                                    ),
+                                )])]),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )]))
+    }
+
+    fn hid_dump_command(who: &User) -> Cmd {
+        Cmd::new(HIDUTIL)
+            .args(["dump", "services", "-f", "xml"])
+            .as_user(who)
+    }
+
+    fn attachment(who: &User, vendor: u32, product: u32) -> Attachment {
+        Attachment {
+            inner: AttachedKeyboard {
+                model: keyboard::Model { vendor, product },
+                user: who.clone(),
+                reading: LastReading::default(),
+            },
+            registries: vec![2],
+        }
+    }
+
+    fn hid_user_row(registry: u64, pairs: &[(i64, i64)]) -> String {
+        let map = if pairs.is_empty() {
+            "(null)".into()
+        } else {
+            format!(
+                "( {} )",
+                pairs
+                    .iter()
+                    .map(|(src, dst)| format!("{{ {SRC} = {src}; {DST} = {dst}; }}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        format!("RegistryID Key Value\n{registry:x} UserKeyMapping {map}\n")
+    }
+
+    #[test]
+    fn automatic_attachment_targets_only_new_services_and_preserves_unrelated_remaps() {
+        let who = user("alice", 501);
+        let item = attachment(&who, 65534, 169);
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let option = 0x7_0000_00e2;
+        let command = 0x7_0000_00e3;
+        let native = [(option, command)];
+        let user_map = [(keyboard::LEFT_CONTROL, option)];
+        sys.on(
+            &item
+                .inner
+                .command()
+                .args(["--get", "UserKeyMapping"])
+                .display(),
+            Ran::ok(&hid_user_row(2, &user_map)),
+        );
+        sys.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&composite_keyboard_dump(
+                &[
+                    (1, &[(keyboard::CAPS_LOCK, option)], &[]),
+                    (2, &native, &user_map),
+                ],
+                true,
+            )),
+        );
+        sys.on(
+            &Target::host("-g", &item.inner.model.key(), &who)
+                .export_cmd()
+                .display(),
+            export("<dict/>"),
+        );
+        let context = ctx(std::slice::from_ref(&who));
+        assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+        item.apply(&sys, &context).unwrap();
+        let changes = sys.keyboard_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].registry, 2);
+        assert_eq!(changes[0].user, None);
+        assert_eq!(
+            changes[0].native,
+            Some(vec![
+                (option, command),
+                (keyboard::CAPS_LOCK, keyboard::RIGHT_CONTROL)
+            ])
+        );
+        let other = attachment(&who, 1452, 999);
+        sys.on(
+            &other
+                .inner
+                .command()
+                .args(["--get", "UserKeyMapping"])
+                .display(),
+            Ran::ok("RegistryID Key Value\n3 UserKeyMapping (null)\n"),
+        );
+        let before = sys.calls().len();
+        assert!(matches!(
+            other.probe(&sys, &context),
+            Probe::NotApplicable { .. }
+        ));
+        assert_eq!(
+            sys.calls().len(),
+            before + 1,
+            "another model reads no preference or live filter when it owns no new service"
+        );
+        assert_eq!(sys.keyboard_changes().len(), 1);
+    }
+
+    #[test]
+    fn automatic_attachments_preserve_explicit_saved_and_live_caps_choices() {
+        let who = user("alice", 501);
+        let option = 0x7_0000_00e2;
+        let caps = keyboard::CAPS_LOCK;
+        let as_value = |map: &[(i64, i64)]| {
+            PValue::Array(
+                map.iter()
+                    .map(|(src, dst)| {
+                        PValue::Dict(vec![
+                            (SRC.into(), PValue::Int(*src)),
+                            (DST.into(), PValue::Int(*dst)),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        for (saved, native, user_map) in [
+            (Some(as_value(&[])), vec![], vec![]),
+            (Some(as_value(&[(caps, caps)])), vec![], vec![]),
+            (Some(as_value(&[(caps, option)])), vec![], vec![]),
+            (None, vec![(caps, caps)], vec![]),
+            (None, vec![], vec![(caps, caps)]),
+            (None, vec![(caps, option)], vec![]),
+        ] {
+            let item = attachment(&who, 65534, 169);
+            let mut sys = Fake::root();
+            sys.euid = who.uid;
+            let entries =
+                saved.map_or_else(Vec::new, |value| vec![(item.inner.model.key(), value)]);
+            let domain = crate::plist::document(&PValue::Dict(entries));
+            sys.on(
+                &Target::host("-g", &item.inner.model.key(), &who)
+                    .export_cmd()
+                    .display(),
+                Ran::ok(&domain),
+            );
+            sys.on(
+                &item
+                    .inner
+                    .command()
+                    .args(["--get", "UserKeyMapping"])
+                    .display(),
+                Ran::ok(&hid_user_row(2, &user_map)),
+            );
+            sys.on(
+                &hid_dump_command(&who).display(),
+                Ran::ok(&composite_keyboard_dump(
+                    &[(1, &[], &[]), (2, &native, &user_map)],
+                    true,
+                )),
+            );
+            let context = ctx(std::slice::from_ref(&who));
+            assert!(matches!(
+                item.probe(&sys, &context),
+                Probe::NotApplicable { .. }
+            ));
+            item.apply(&sys, &context).unwrap();
+            assert!(sys.keyboard_changes().is_empty());
+        }
+    }
+
+    fn composite_keyboard_dump(maps: &[HidDumpRow<'_>], keyboard_usage: bool) -> String {
+        let mut value = crate::plist::parse(hid_dump(maps).as_bytes()).unwrap();
+        let PValue::Dict(fields) = &mut value else {
+            unreachable!()
+        };
+        let (_, PValue::Array(services)) = &mut fields[0] else {
+            unreachable!()
+        };
+        let PValue::Dict(service) = &mut services[1] else {
+            unreachable!()
+        };
+        *service
+            .iter_mut()
+            .find(|(key, _)| key == "PrimaryUsage")
+            .unwrap() = ("PrimaryUsage".into(), PValue::Int(2));
+        let pair = |usage| {
+            PValue::Dict(vec![
+                ("DeviceUsagePage".into(), PValue::Int(1)),
+                ("DeviceUsage".into(), PValue::Int(usage)),
+            ])
+        };
+        let mut pairs = vec![pair(2)];
+        if keyboard_usage {
+            pairs.push(pair(6));
+        }
+        service.push(("DeviceUsagePairs".into(), PValue::Array(pairs)));
+        crate::plist::document(&value)
+    }
+
+    #[test]
+    fn a_composite_mouse_collection_carrying_keyboard_events_is_repaired_and_verified() {
+        let who = user("alice", 501);
+        let item = AttachedKeyboard {
+            model: keyboard::Model {
+                vendor: 65534,
+                product: 169,
+            },
+            user: who.clone(),
+            reading: LastReading::default(),
+        };
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+        let get = item.command().args(["--get", "UserKeyMapping"]).display();
+        for _ in 0..4 {
+            sys.on(&get, Ran::ok("RegistryID Key Value\n1 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n2 UserKeyMapping (null)\n"));
+        }
+        sys.on(
+            &get,
+            Ran::ok("RegistryID Key Value\n2 UserKeyMapping (null)\n2 UserKeyMapping (null)\n"),
+        );
+        let dump = hid_dump_command(&who).display();
+        for fixture in [
+            composite_keyboard_dump(&[(1, &[], &mapped), (2, &[], &[])], true),
+            composite_keyboard_dump(&[(1, &[], &mapped), (2, &[], &[])], true),
+            composite_keyboard_dump(&[(1, &[], &mapped), (2, &mapped, &[])], true),
+            composite_keyboard_dump(&[(1, &[], &mapped), (2, &mapped, &[])], false),
+        ] {
+            sys.on(&dump, Ran::ok(&fixture));
+        }
+        let context = ctx(&[who]);
+        assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+        item.apply(&sys, &context).unwrap();
+        let changes = sys.keyboard_changes();
+        assert_eq!(
+            changes.len(),
+            1,
+            "the already-correct primary interface is preserved"
+        );
+        assert_eq!(changes[0].registry, 2);
+        assert_eq!(changes[0].native, Some(mapped.to_vec()));
+        assert_eq!(changes[0].user, None);
+        assert!(matches!(item.probe(&sys, &context), Probe::Ok { .. }));
+        assert!(
+            matches!(item.probe(&sys, &context), Probe::Unusable { .. }),
+            "a true mouse cannot become a keyboard write target"
+        );
+        assert!(
+            matches!(item.probe(&sys, &context), Probe::Unusable { .. }),
+            "an OR matcher returning a service twice cannot trigger duplicate writes"
+        );
+        assert_eq!(sys.keyboard_changes().len(), 1);
+    }
+
+    #[test]
+    fn effective_caps_uses_native_then_user_mapping_and_activation_keeps_other_keys() {
+        let caps = keyboard::CAPS_LOCK;
+        let control = keyboard::LEFT_CONTROL;
+        let option = 0x7_0000_00E2;
+        let native = HidMapping {
+            registry: 1,
+            prefix: KeyboardPrefix::default(),
+            native: vec![(caps, control)],
+            user: Vec::new(),
+        };
+        assert_eq!(native.caps_lock(), control);
+        assert_eq!(
+            merged_mapping(&[native]).unwrap(),
+            None,
+            "native Control needs no user mapping"
+        );
+
+        for (native, user) in [
+            (
+                vec![(caps, option), (option, keyboard::RIGHT_CONTROL)],
+                vec![(caps, control)],
+            ),
+            (
+                vec![(caps, control), (option, keyboard::RIGHT_CONTROL)],
+                vec![(caps, control), (control, option)],
+            ),
+        ] {
+            let before = HidMapping {
+                registry: 1,
+                prefix: KeyboardPrefix::default(),
+                native,
+                user,
+            };
+            let other_keys = [control, keyboard::RIGHT_CONTROL, option, 0x7_0000_00E3];
+            let other_outputs = other_keys.map(|key| before.output(key));
+            assert_eq!(
+                before.caps_lock(),
+                option,
+                "a user Caps entry cannot bypass the earlier native lookup"
+            );
+            let mut change = merged_mapping(std::slice::from_ref(&before))
+                .unwrap()
+                .unwrap();
+            let change = change.remove(0);
+            assert_eq!(change.user, None);
+            assert_eq!(change.before_user, before.user);
+            let after = after_change(before, change);
+            assert!(matches!(
+                after.caps_lock(),
+                keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+            ));
+            assert!(after.native.contains(&(option, keyboard::RIGHT_CONTROL)));
+            assert_eq!(other_keys.map(|key| after.output(key)), other_outputs);
+            assert_eq!(merged_mapping(&[after]).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn activation_preserves_other_physical_keys_that_enter_the_user_caps_mapping() {
+        let caps = keyboard::CAPS_LOCK;
+        let left = keyboard::LEFT_CONTROL;
+        let right = keyboard::RIGHT_CONTROL;
+        let option = 0x7_0000_00E2;
+        let command = 0x7_0000_00E3;
+        let before = HidMapping {
+            registry: 1,
+            prefix: KeyboardPrefix::default(),
+            native: vec![(caps, option), (command, caps)],
+            user: vec![(left, option)],
+        };
+        let command_before = before.output(command);
+        let mut changes = merged_mapping(std::slice::from_ref(&before))
+            .unwrap()
+            .unwrap();
+        let change = changes.remove(0);
+        assert_eq!(
+            change.user, None,
+            "adding user Caps would also change physical Command"
+        );
+        let after = after_change(before, change);
+        assert_eq!(after.caps_lock(), right);
+        assert_eq!(after.output(command), command_before);
+        assert!(after.native.contains(&(command, caps)));
+        assert!(!after.user.iter().any(|(source, _)| *source == caps));
+
+        let blocked = HidMapping {
+            registry: 2,
+            prefix: KeyboardPrefix::default(),
+            native: vec![(caps, option), (command, caps)],
+            user: vec![(left, option), (right, option)],
+        };
+        assert!(
+            merged_mapping(&[blocked]).is_err(),
+            "no safe Control preimage can be invented"
+        );
+
+        let safe = HidMapping {
+            registry: 3,
+            prefix: KeyboardPrefix::default(),
+            native: vec![(caps, option), (command, option)],
+            user: vec![(left, option), (right, option)],
+        };
+        let command_before = safe.output(command);
+        let mut changes = merged_mapping(std::slice::from_ref(&safe))
+            .unwrap()
+            .unwrap();
+        let after = after_change(safe, changes.remove(0));
+        assert_eq!(after.caps_lock(), left);
+        assert_eq!(after.output(command), command_before);
+        assert!(after.native.contains(&(command, option)));
+        assert_eq!(
+            after.user.iter().find(|(source, _)| *source == left),
+            Some(&(left, option))
+        );
+    }
+
+    #[test]
+    fn filter_state_is_bound_by_service_identity_and_never_guessed_from_row_order() {
+        let caps = keyboard::CAPS_LOCK;
+        let control = keyboard::LEFT_CONTROL;
+        let user = vec![(caps, control)];
+        let matched = vec![(1, user.clone()), (2, user.clone())];
+        let native = vec![(caps, 0x7_0000_00E2)];
+        let dump = hid_dump(&[(2, &native, &user), (1, &[], &user)]);
+        let observed = live_hid_mappings(&dump, &matched).unwrap();
+        assert_eq!(observed[0].caps_lock(), control);
+        assert_eq!(observed[1].caps_lock(), 0x7_0000_00E2);
+        for incomplete in [
+            hid_dump(&[(1, &[], &user)]),
+            hid_dump(&[(1, &[], &user), (1, &[], &user), (2, &native, &user)]),
+            hid_dump(&[(1, &[], &user), (2, &native, &[])]),
+            dump.replace("IOHIDKeyboardFilter", "UnknownFilter"),
+            dump.replace("HIDKeyboardModifierMappingPairs", "UnknownMapping"),
+            dump.replace("<key>Dst</key>", "<key>Unknown</key>"),
+        ] {
+            assert!(live_hid_mappings(&incomplete, &matched).is_err());
+        }
+        assert!(parse_hid_mappings("1 UserKeyMapping (null)\n1 UserKeyMapping (null)").is_err());
+        assert!(parse_hid_mappings("garbage\n1 UserKeyMapping (null)").is_err());
     }
 
     #[test]
@@ -1509,21 +2350,179 @@ pub(crate) mod tests {
             user: who.clone(),
             reading: LastReading::default(),
         };
-        let sys = Fake::root();
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
         let get = item.command().args(["--get", "UserKeyMapping"]).display();
         sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping (null)\n100021604 UserKeyMapping (null)\n"));
-        let set = item.command().args(["--set", "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingDst\":30064771296,\"HIDKeyboardModifierMappingSrc\":30064771129}]}"]).display();
-        sys.on(&set, Ran::ok(""));
+        let dump = hid_dump_command(&who).display();
+        sys.on(
+            &dump,
+            Ran::ok(&hid_dump(&[
+                (0x10002160e, &[], &[]),
+                (0x100021604, &[], &[]),
+            ])),
+        );
         let c = ctx(&[who]);
         assert!(matches!(item.probe(&sys, &c), Probe::Change { .. }));
         // No service maps Caps Lock yet: System State reads the key as Caps Lock.
         assert_eq!(item.detail(&sys, &c), Some(Reading::CapsLock.token()));
         item.apply(&sys, &c).unwrap();
-        assert!(sys.calls().contains(&set));
-        sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingDst = 30064771296; HIDKeyboardModifierMappingSrc = 30064771129; } )\n"));
+        let changes = sys.keyboard_changes();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.registry)
+                .collect::<Vec<_>>(),
+            [0x10002160e, 0x100021604]
+        );
+        assert!(changes.iter().all(|change| change.user.is_none()));
+        let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+        sys.on(
+            &dump,
+            Ran::ok(&hid_dump(&[
+                (0x100021604, &mapped, &[]),
+                (0x10002160e, &mapped, &[]),
+            ])),
+        );
         let _ = item.mappings(&sys).unwrap();
         assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
         assert_eq!(item.detail(&sys, &c), None);
+    }
+
+    #[test]
+    fn a_successful_set_cannot_verify_caps_while_the_native_table_still_redirects_it() {
+        let who = user("alice", 501);
+        let item = AttachedKeyboard {
+            model: keyboard::Model {
+                vendor: 1452,
+                product: 598,
+            },
+            user: who.clone(),
+            reading: LastReading::default(),
+        };
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let mapped = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+        let native = [(keyboard::CAPS_LOCK, 0x7_0000_00E2)];
+        sys.on(&item.command().args(["--get", "UserKeyMapping"]).display(), Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"));
+        sys.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&hid_dump(&[(0x100021604, &native, &mapped)])),
+        );
+        let rows = crate::engine::run(
+            &[Box::new(item)],
+            crate::model::Mode::Apply,
+            &sys,
+            &ctx(&[who]),
+            &mut crate::engine::NoJournal,
+        );
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Failed);
+        assert_eq!(sys.keyboard_changes().len(), 1);
+        assert_eq!(sys.keyboard_changes()[0].registry, 0x100021604);
+    }
+
+    #[test]
+    fn upstream_caps_remaps_are_never_reported_ready_or_rewritten_as_native_caps() {
+        let who = user("alice", 501);
+        let item = AttachedKeyboard {
+            model: keyboard::Model {
+                vendor: 1452,
+                product: 598,
+            },
+            user: who.clone(),
+            reading: LastReading::default(),
+        };
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        sys.on(
+            &item.command().args(["--get", "UserKeyMapping"]).display(),
+            Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping (null)\n"),
+        );
+        let native = [(keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL)];
+        let mut prefix = crate::port::keyboard_prefix::tests::fields();
+        let fn_map = &mut prefix
+            .iter_mut()
+            .find(|(name, _)| name == "FnFunctionUsageMap")
+            .unwrap()
+            .1;
+        *fn_map =
+            crate::port::keyboard_prefix::tests::pairs(&[(keyboard::CAPS_LOCK, 0x7_0000_00e2)]);
+        // With FnKeyMode=0 and no Fn held, Apple applies Caps→Option before the native
+        // table. A native Caps→Control entry therefore does not establish physical Control.
+        sys.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&hid_dump_with_prefix(
+                &[(0x100021604, &native, &[])],
+                &prefix,
+            )),
+        );
+        let context = ctx(std::slice::from_ref(&who));
+        assert!(matches!(item.probe(&sys, &context), Probe::Unusable { .. }));
+        assert!(item.apply(&sys, &context).is_err());
+        assert!(sys.keyboard_changes().is_empty());
+
+        *prefix
+            .iter_mut()
+            .find(|(name, _)| name == "FnFunctionUsageMap")
+            .unwrap() = (
+            "FnFunctionUsageMap".into(),
+            crate::port::keyboard_prefix::tests::pairs(&[
+                (0x7_0000_003a, 0xc_0000_006f),
+                (keyboard::CAPS_LOCK, keyboard::CAPS_LOCK),
+            ]),
+        );
+        let mut ordinary = Fake::root();
+        ordinary.euid = who.uid;
+        ordinary.on(
+            &item.command().args(["--get", "UserKeyMapping"]).display(),
+            Ran::ok("RegistryID Key Value\n100021604 UserKeyMapping (null)\n"),
+        );
+        ordinary.on(
+            &hid_dump_command(&who).display(),
+            Ran::ok(&hid_dump_with_prefix(
+                &[(0x100021604, &native, &[])],
+                &prefix,
+            )),
+        );
+        assert!(
+            matches!(item.probe(&ordinary, &context), Probe::Ok { .. }),
+            "ordinary function maps and identity Caps remain usable"
+        );
+
+        let historical = crate::port::keyboard_prefix::tests::historical_fields();
+        let old_dump = hid_dump_with_prefix(&[(0x100021604, &[], &[])], &historical);
+        let old_maps = live_hid_mappings(&old_dump, &[(0x100021604, Vec::new())]).unwrap();
+        let mut changes = merged_mapping(&old_maps).unwrap().unwrap();
+        assert_eq!(
+            changes.len(),
+            1,
+            "complete historical state still permits setup"
+        );
+        assert_eq!(changes[0].before_prefix, old_maps[0].prefix);
+        assert_eq!(
+            after_change(old_maps.into_iter().next().unwrap(), changes.remove(0)).caps_lock(),
+            keyboard::LEFT_CONTROL
+        );
+    }
+
+    #[test]
+    fn activation_for_another_user_never_reaches_the_native_writer() {
+        let who = user("alice", 501);
+        let item = AttachedKeyboard {
+            model: keyboard::Model {
+                vendor: 1452,
+                product: 598,
+            },
+            user: who.clone(),
+            reading: LastReading::default(),
+        };
+        for actor in [0, 502] {
+            let mut sys = Fake::root();
+            sys.euid = actor;
+            assert!(item.apply(&sys, &ctx(std::slice::from_ref(&who))).is_err());
+            assert!(sys.keyboard_changes().is_empty());
+            assert!(sys.calls().is_empty());
+        }
     }
 
     #[test]
@@ -1553,6 +2552,7 @@ pub(crate) mod tests {
         );
         assert_eq!(rows[0].outcome, crate::model::Outcome::Unknown);
         assert!(sys.calls().iter().all(|call| !call.contains("--set")));
+        assert!(sys.keyboard_changes().is_empty());
     }
 
     #[test]

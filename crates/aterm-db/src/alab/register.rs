@@ -423,7 +423,7 @@ fn goes_by(row: &Row, label: &str) -> bool {
         || row
             .fields
             .get("aliases")
-            .is_some_and(|field| field.members().contains(label))
+            .is_some_and(|field| field.has_member(label))
 }
 
 /// The machines live enrollments other than this one are bound to.

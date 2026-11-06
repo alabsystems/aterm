@@ -422,6 +422,7 @@ pub(crate) fn routes_of(from: &Mac, peers: Vec<Peer>, net: &Arc<Net>, wide: bool
     let net = Arc::clone(net);
     Routes::start(RoutesConfig {
         me: me.clone(),
+        key,
         source: Arc::new(Adopt {
             broker: Arc::clone(&from.broker),
             key,

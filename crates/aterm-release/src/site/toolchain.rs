@@ -141,6 +141,7 @@ pub fn mac_pins(index: &Value) -> Result<[BTreeMap<String, u64>; 2], Unknown> {
 /// invalid.
 pub fn levels(index: &Value, manifest: &dyn Fn(&str) -> Option<String>) -> Result<Levels, Unknown> {
     let mut levels = [Coverage::Absent; 2];
+    let mut parsed_manifests: BTreeMap<String, Value> = BTreeMap::new();
     for (slot, pins) in mac_pins(index)?.iter().enumerate() {
         let triple = triple(MAC_ARCHES[slot]);
         if pins.is_empty() {
@@ -151,11 +152,17 @@ pub fn levels(index: &Value, manifest: &dyn Fn(&str) -> Option<String>) -> Resul
         let mut serving = 0;
         for (program, build) in pins {
             let name = manifest_name(program, *build);
-            let text = manifest(&name).ok_or_else(|| Unknown::Missing {
-                manifest: name.clone(),
-                triple: triple.clone(),
-            })?;
-            let m = parse(&text, &name)?;
+            let m = if let Some(cached) = parsed_manifests.get(&name) {
+                cached
+            } else {
+                let text = manifest(&name).ok_or_else(|| Unknown::Missing {
+                    manifest: name.clone(),
+                    triple: triple.clone(),
+                })?;
+                let m = parse(&text, &name)?;
+                parsed_manifests.insert(name.clone(), m);
+                &parsed_manifests[&name]
+            };
             let names = m.get("program").and_then(Value::as_str) == Some(program.as_str());
             let builds = matches!(m.get("build_number"), Some(Value::Integer(n)) if *n >= 0 && n.unsigned_abs() == *build);
             if !names || !builds {

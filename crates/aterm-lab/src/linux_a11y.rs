@@ -1625,8 +1625,15 @@ impl OrcaRun<'_, '_> {
                     .sh(&guest::wait_file(&format!("{seat}/ready"), HANG_SECS))
                     .ok()
                 {
+                    // Stopped first, as the baseline's seat is: this wait and the seat's own hang
+                    // detector are one minute each, so a line naming a stalled peer lands as this
+                    // wait ends.
+                    let _ = up.sh(&["touch".into(), format!("{seat}/stop")]);
+                    let _ = up.sh(&guest::wait_unit_gone(&unit.name, 60));
+                    let said = up.sh(&guest::unit_journal(&unit.name));
                     return Err(format!(
-                        "the seat's keyboard never had the window's focus ({HANG_SECS} s)"
+                        "the seat's keyboard never had the window's focus ({HANG_SECS} s): {}",
+                        crate::util::one_line(&said.text, 300)
                     ));
                 }
             }

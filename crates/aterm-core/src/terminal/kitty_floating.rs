@@ -5,6 +5,7 @@
 //! Kitty placements relative to a virtual placement ("floating" placements).
 
 use std::num::NonZeroU32;
+use std::ops::Range;
 
 use aterm_grid::{Grid, MAX_IMAGE_LAYERS};
 
@@ -92,6 +93,16 @@ pub(super) fn parent_exists(transient: &TransientState, parent: KittyFloatParent
     }
 }
 
+/// The cells `0..span` of a footprint starting at screen coordinate `origin` whose coordinates
+/// `origin + i` fall inside `0..limit`: empty when none do.
+#[inline]
+pub(super) fn visible_cell_range(origin: i32, span: u16, limit: u16) -> Range<u16> {
+    let (origin, span_wide) = (i64::from(origin), i64::from(span));
+    let clamp = |at: i64| u16::try_from(at.clamp(0, span_wide)).unwrap_or(span);
+    let start = clamp(-origin);
+    start..clamp(i64::from(limit) - origin).max(start)
+}
+
 /// Every on-screen cell of the floating placements, placement by placement
 /// in `kitty_floating` order. Empty — and free — while there are none.
 pub(super) fn floating_tiles(grid: &Grid, transient: &TransientState) -> Vec<FloatingTile> {
@@ -101,20 +112,15 @@ pub(super) fn floating_tiles(grid: &Grid, transient: &TransientState) -> Vec<Flo
         let Some((top, left)) = origin else {
             continue;
         };
-        for cell_row in 0..floating.image.rows {
+        let cols = visible_cell_range(left, floating.image.cols, grid.cols());
+        for cell_row in visible_cell_range(top, floating.image.rows, grid.rows()) {
             let Ok(row) = u16::try_from(top.saturating_add(i32::from(cell_row))) else {
                 continue;
             };
-            if row >= grid.rows() {
-                break;
-            }
-            for cell_col in 0..floating.image.cols {
+            for cell_col in cols.clone() {
                 let Ok(col) = u16::try_from(left.saturating_add(i32::from(cell_col))) else {
                     continue;
                 };
-                if col >= grid.cols() {
-                    break;
-                }
                 tiles.push(FloatingTile {
                     row,
                     col,
@@ -194,4 +200,37 @@ fn origin(
         top.saturating_add(floating.dy),
         left.saturating_add(floating.dx),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_cell_range;
+
+    #[test]
+    fn a_footprint_walks_only_its_on_screen_cells() {
+        assert_eq!(visible_cell_range(0, 10, 80), 0..10, "wholly on screen");
+        assert_eq!(visible_cell_range(-5, 10, 80), 5..10, "off the left edge");
+        assert_eq!(visible_cell_range(75, 10, 80), 0..5, "off the right edge");
+        assert_eq!(visible_cell_range(-3, 10, 4), 3..7, "past both edges");
+        for (origin, span, limit) in [
+            (100, 10, 80),
+            (80, 10, 80),
+            (-10, 10, 80),
+            (i32::MIN, u16::MAX, 80),
+            (i32::MAX, u16::MAX, 80),
+            (70_000, u16::MAX, 80),
+            (0, 0, 80),
+            (0, 10, 0),
+        ] {
+            assert!(
+                visible_cell_range(origin, span, limit).is_empty(),
+                "({origin}, {span}, {limit})"
+            );
+        }
+        assert_eq!(
+            visible_cell_range(-65_534, u16::MAX, 24),
+            65_534..u16::MAX,
+            "the last cell of the widest footprint"
+        );
+    }
 }

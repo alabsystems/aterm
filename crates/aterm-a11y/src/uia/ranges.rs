@@ -102,7 +102,9 @@ impl Provider {
             ))
         })?;
         let values = selection
-            .map(|(start, len)| TextRange::spanning(key, start, start + len).query(&IID_IUnknown))
+            .map(|(start, len)| {
+                TextRange::spanning(key, start, start.saturating_add(len)).query(&IID_IUnknown)
+            })
             .transpose()?
             .into_iter()
             .collect::<Vec<_>>();
@@ -292,16 +294,15 @@ impl TextRange {
         })
     }
 
-    /// The attribute's value; `None` only when UI Automation answered its
-    /// not-supported request with nothing, which leaves the caller's VARIANT
-    /// unwritten, as before.
-    pub(super) fn get_attribute_value(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<Option<Variant>> {
+    /// The attribute's value, or `VT_EMPTY` when UI Automation answered its
+    /// not-supported request with nothing.
+    pub(super) fn get_attribute_value(&self, id: UIA_TEXTATTRIBUTE_ID) -> Result<Variant> {
         self.read(|node, _, _, _| match id {
-            UIA_IsReadOnlyAttributeId => Ok(Some(Variant::bool(
+            UIA_IsReadOnlyAttributeId => Ok(Variant::bool(
                 !node.data().supports_action(Action::ReplaceSelectedText)
                     && !node.data().supports_action(Action::SetValue),
-            ))),
-            UIA_IsHiddenAttributeId => Ok(Some(Variant::bool(node.is_offscreen()))),
+            )),
+            UIA_IsHiddenAttributeId => Ok(Variant::bool(node.is_offscreen())),
             _ => {
                 let mut out = std::ptr::null_mut();
                 // SAFETY: `out` receives UI Automation's owned sentinel.
@@ -310,7 +311,7 @@ impl TextRange {
                     return Err(hr);
                 }
                 // SAFETY: a successful call hands over the reference `out` holds.
-                Ok(unsafe { Com::from_raw(out) }.map(Variant::unknown))
+                Ok(unsafe { Com::from_raw(out) }.map_or_else(Variant::empty, Variant::unknown))
             }
         })
     }

@@ -218,7 +218,7 @@ fn one_hundred_eighty_sessions_render_within_the_budget() {
     assert!(
         tight.ends_with(&format!(
             "  +{more} idle shells\n{}",
-            left_out_line(more, 0, false)
+            left_out_line(more, 0, 0, false)
         )),
         "{tight}"
     );
@@ -272,7 +272,7 @@ fn eighteen_instances_degrade_honestly_to_fit() {
     let whole = firsts.iter().filter(|w| w.len() == 2).count();
     assert_eq!(marked(&text), 180 - whole, "{text}");
     assert!(
-        text.ends_with(&left_out_line(0, 180 - whole, false)),
+        text.ends_with(&left_out_line(0, 180 - whole, 0, false)),
         "{text}"
     );
 
@@ -284,7 +284,7 @@ fn eighteen_instances_degrade_honestly_to_fit() {
     let more = folded(&small);
     assert_eq!(shown + more, 180, "every session shown or counted");
     assert!(
-        small.ends_with(&left_out_line(more, shown, false)),
+        small.ends_with(&left_out_line(more, shown, 0, false)),
         "{small}"
     );
 
@@ -404,8 +404,167 @@ fn thirty_lab_macs_keep_each_machines_most_pressing_words() {
         .count();
     assert_eq!(marked(&text), 90 - whole, "{text}");
     assert!(
-        text.ends_with(&left_out_line(more, 90 - whole, true)),
+        text.ends_with(&left_out_line(more, 90 - whole, 0, true)),
         "{text}"
+    );
+}
+
+/// Thirty Macs that each say where their home is, twenty-four of them asking: the home lines fold,
+/// counted on the closing line, after the shells and before any machine's most pressing agent
+/// loses a word (sessions-as-subagents §3; one-mesh E2's `lab fleet-sim` found the last machine's
+/// most pressing agent short once DX-2's home lines joined every header). NEGATIVE CONTROL: with
+/// the home lines ranked with the header ([`HOME_WITH_HEADER`]), as before they could fold, every
+/// home line shows and a machine's most pressing agent loses its words.
+#[test]
+fn thirty_macs_home_lines_fold_before_an_agent_loses_its_words() {
+    let asking = |h: usize| h % 5 != 4;
+    let replies: Vec<HostReply> = (0..30)
+        .map(|h| {
+            let rows = vec![
+                if asking(h) {
+                    lab_agent(h, 1, "prompt", "4000")
+                } else {
+                    lab_agent(h, 1, "busy", "125000")
+                },
+                lab_agent(h, 2, "idle", "7200000"),
+                lab_agent(h, 3, "idle", "18000000"),
+                lab_shell(h, 4, true),
+                lab_shell(h, 5, false),
+            ];
+            let mut lines = vec![format!(
+                "instance pid={} host=Lab-Mac-{h:02}.local version=0.155.0 sessions=5 \
+                 level=content cut=0 at_ms=1793129880000 home=/Users//lab-{h:02} \
+                 home_free_mb=111616 repos=0 repos_at=1793129874000 repos_cut=0",
+                2000 + h
+            )];
+            lines.extend(rows);
+            HostReply {
+                label: format!("Lab-Mac-{h:02}.local"),
+                remote: true,
+                unproven: false,
+                node: None,
+                answer: parse_reply(&lines),
+            }
+        })
+        .collect();
+    // The machines whose most pressing agent lost words: an asking one keeps both, another its
+    // last words.
+    let short = |text: &str| -> Vec<usize> {
+        (0..30)
+            .filter(|&h| {
+                let words = words_of(text, &format!("s-{h:04x}{:016x}", 1));
+                if asking(h) {
+                    words.len() != 2
+                } else {
+                    !words.iter().any(|l| l.starts_with("    said: "))
+                }
+            })
+            .collect()
+    };
+    let homes = |text: &str| text.lines().filter(|l| l.starts_with("  home ")).count();
+
+    let text = render_text(&replies, DEFAULT_BUDGET, None);
+    assert!(chars(&text) <= DEFAULT_BUDGET, "{}", chars(&text));
+    assert_line_caps(&text);
+    assert_eq!(short(&text), Vec::<usize>::new(), "{text}");
+    assert_eq!(
+        folded(&text) + text.lines().filter(|l| l.starts_with("s-")).count(),
+        150
+    );
+    let shown = homes(&text);
+    assert!(shown < 30, "the home lines fold: {text}");
+    assert!(
+        text.lines()
+            .last()
+            .is_some_and(|l| l.contains(&format!(", {} homes; ", 30 - shown))),
+        "the closing line counts them: {text}"
+    );
+
+    HOME_WITH_HEADER.with(|on| on.set(true));
+    let before = render_text(&replies, DEFAULT_BUDGET, None);
+    HOME_WITH_HEADER.with(|on| on.set(false));
+    assert_eq!(homes(&before), 30, "the control shows every home: {before}");
+    assert!(
+        !short(&before).is_empty(),
+        "the control: with every home line shown a most pressing agent loses words: {before}"
+    );
+}
+
+/// Ten Macs whose homes each list sixteen checkouts, under a budget their home lines overrun:
+/// each home line is a unit of its own, so the read leaves less than a line unused, every home
+/// line shows before any checkout line, and the closing line counts the homes it cut (one-mesh
+/// E2's review). NEGATIVE CONTROL: with each home one unit ([`HOME_WHOLE`]), the first home that
+/// does not fit strands its room, more than a line of it.
+#[test]
+fn checkout_lines_fold_a_line_at_a_time() {
+    let repo = |h: usize, n: usize| {
+        wire_row(&[
+            ("name", &format!("repo-{n:02}")),
+            ("path", &format!("/Users//lab-{h:02}/repo-{n:02}")),
+            ("head", "0123456789abcdef0123456789abcdef01234567"),
+            ("branch", "main"),
+            ("main", "origin/main"),
+            ("behind", "0"),
+            ("fetched_at", "1793129800000"),
+            ("dirty", "0"),
+        ])
+        .replacen("session", "repo", 1)
+    };
+    let replies: Vec<HostReply> = (0..10)
+        .map(|h| {
+            let mut lines = vec![format!(
+                "instance pid={} host=Lab-Mac-{h:02}.local version=0.155.0 sessions=1 \
+                 level=content cut=0 at_ms=1793129880000 home=/Users//lab-{h:02} \
+                 home_free_mb=111616 repos=16 repos_at=1793129874000 repos_cut=0",
+                2000 + h
+            )];
+            lines.push(lab_agent(h, 1, "busy", "125000"));
+            lines.extend((0..16).map(|n| repo(h, n)));
+            HostReply {
+                label: format!("Lab-Mac-{h:02}.local"),
+                remote: true,
+                unproven: false,
+                node: None,
+                answer: parse_reply(&lines),
+            }
+        })
+        .collect();
+    let heads = |text: &str| text.lines().filter(|l| l.starts_with("  home ")).count();
+    let rows = |text: &str| text.lines().filter(|l| l.starts_with("    repo-")).count();
+    // Every line at the excerpt width the fill uses; a budget half its checkout lines short of
+    // that leaves the fill to choose.
+    let blocks = blocks_of(&replies, None);
+    let all = render(&blocks, &Shown::all(&blocks, Class::Agent, EXCERPT_CHARS));
+    assert_eq!((heads(&all), rows(&all)), (10, 160), "{all}");
+    let row_room: usize = all
+        .lines()
+        .filter(|l| l.starts_with("    repo-"))
+        .map(|l| chars(l) + 1)
+        .sum();
+    let budget = chars(&all) - row_room / 2;
+
+    let text = render_text(&replies, budget, None);
+    assert!(chars(&text) <= budget, "{}", chars(&text));
+    assert_line_caps(&text);
+    assert!(
+        (1..160).contains(&rows(&text)),
+        "some checkout lines show and some fold: {text}"
+    );
+    assert_eq!(heads(&text), 10, "every home line shows first: {text}");
+    assert!(
+        budget - chars(&text) <= LINE_CHARS,
+        "less than a line unused: {} of {budget}: {text}",
+        budget - chars(&text)
+    );
+    assert!(text.ends_with(" homes; --fleet with --budget, --sid <s> or --json for more\n"));
+
+    HOME_WHOLE.with(|on| on.set(true));
+    let whole = render_text(&replies, budget, None);
+    HOME_WHOLE.with(|on| on.set(false));
+    assert!(
+        budget - chars(&whole) > LINE_CHARS,
+        "the control: one unit per home strands its room: {} of {budget} unused: {whole}",
+        budget - chars(&whole)
     );
 }
 
@@ -1371,7 +1530,7 @@ fn an_agent_idle_for_hours_keeps_its_excerpts_until_the_budget_is_tight() {
         )),
         "{tight}"
     );
-    assert!(tight.ends_with(&left_out_line(0, 1, false)), "{tight}");
+    assert!(tight.ends_with(&left_out_line(0, 1, 0, false)), "{tight}");
 }
 
 fn narrowest(replies: &[HostReply]) -> String {
@@ -1527,7 +1686,7 @@ fn excerpts_narrow_alike_then_go_least_needed_first() {
             .iter()
             .all(|l| chars(l) <= EXCERPT_CHARS)
     );
-    assert!(tight.ends_with(&left_out_line(0, 1, false)), "{tight}");
+    assert!(tight.ends_with(&left_out_line(0, 1, 0, false)), "{tight}");
 }
 
 #[test]
@@ -1758,7 +1917,7 @@ fn one_machine_reads_in_full() {
     assert!(
         budgeted.ends_with(&format!(
             "\n  +{more} idle shells\n{}",
-            left_out_line(more, 0, false)
+            left_out_line(more, 0, 0, false)
         )),
         "{budgeted}"
     );

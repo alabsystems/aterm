@@ -88,7 +88,8 @@ use super::{Body, Entrant, Founder, Kind, MemberId, Record, RecordId};
 use crate::age::Recipient;
 use crate::commons::binding::Binding;
 use aterm_digest::Sha256;
-#[cfg(test)]
+use aterm_mesh_core::revocation::{Remove, Row, Table};
+#[cfg(any(test, debug_assertions))]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -221,6 +222,31 @@ thread_local! {
     pub(super) static WEIGHINGS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of [`Membership::seat_removed`]: while set, the removal predicate
+    /// loses its actor disjunct, as a copy that dropped it would, so a superseded seat whose
+    /// recipient and node key are now another seat's reads as in. A test sets it for its thread;
+    /// a lab instance turns it on for its whole process with `seat-without-actor` in
+    /// `ATERM_TEST_NEGATIVE_CONTROL` ([`seat_without_actor`]).
+    pub(super) static SEAT_WITHOUT_ACTOR: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether [`SEAT_WITHOUT_ACTOR`] is on: set on this thread, or named for this process
+/// (`seat-without-actor`, [`aterm_types::negative_control::on`]); never in a release build, which
+/// has neither switch.
+fn seat_without_actor() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        SEAT_WITHOUT_ACTOR.with(Cell::get)
+            || aterm_types::negative_control::on("seat-without-actor")
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
 /// One member, as the log says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
@@ -302,12 +328,24 @@ pub enum NodeStanding {
     Unknown,
 }
 
+/// A seat row that revokes its recipient, as P1's causal gate reads it
+/// ([`Membership::revoking_rows`], `aterm_mesh_core::revocation::gate_row`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RevokingRow {
+    /// The `Remove`s (an accepted quorum's shares included) that took the row out.
+    pub removes: BTreeSet<RecordId>,
+    /// Whether a seat row that is not out binds the recipient (a co-holder admitted beside the
+    /// `Remove`s): an epoch's gate then needs every one of them in its causal past, not one.
+    pub recipient_live: bool,
+}
+
 /// Membership as one log says it ([`super::Log::membership`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Membership {
     members: BTreeMap<MemberId, Member>,
     removed: BTreeMap<MemberId, Removal>,
     removed_recipients: BTreeSet<Recipient>,
+    revoking_rows: BTreeSet<RevokingRow>,
     removed_labels: BTreeSet<String>,
     claimed_labels: BTreeSet<String>,
     quorums: Vec<Quorum>,
@@ -344,10 +382,22 @@ impl Membership {
     pub const fn removed(&self) -> &BTreeMap<MemberId, Removal> {
         &self.removed
     }
-    /// Every age recipient a founder seat or binding `Admit` binds to a Mac now out
-    /// ([`Membership::removed`]) that no current member ([`Membership::members`]) holds.
+    /// Every age recipient P1 revokes ([`aterm_mesh_core::revocation`]): one a seat row binds
+    /// (a founder seat or a binding `Admit`, superseded seats and the seats of Macs now out
+    /// included) that an effective `Remove` took out, unless a row of the same recipient that no
+    /// `Remove` took out entered with every `Remove` that took it in its causal past. A current
+    /// member that holds such a recipient (a co-holder admitted beside the `Remove`) does not
+    /// keep it.
     pub const fn removed_recipients(&self) -> &BTreeSet<Recipient> {
         &self.removed_recipients
+    }
+    /// The seat rows that revoke their recipient, as P1's causal gate reads them: a newest
+    /// epoch is due a rotation, and no writer seals under it, unless for each row every `Remove`
+    /// that took it lies in the epoch's causal past, or one does and no live row binds the
+    /// recipient (`Log::head_due`). The gate reads no `Wrap`: another Mac may have handed the
+    /// epoch to the recipient beside the `Remove`.
+    pub const fn revoking_rows(&self) -> &BTreeSet<RevokingRow> {
+        &self.revoking_rows
     }
     /// Every label a founder seat or binding `Admit` binds to a Mac now out
     /// ([`Membership::removed`]) that no current member ([`Membership::members`]) holds.
@@ -390,6 +440,88 @@ impl Membership {
             .node_key
             .is_some_and(|nk| nk != [0; 32] && matches!(self.node(&nk), NodeStanding::Removed(_)))
             || matches!(self.node(member.binding.writer()), NodeStanding::Removed(_))
+    }
+    /// Whether `recipient` belongs to a Mac that was removed and not restored: it is one of
+    /// [`Self::removed_recipients`], or a member or waiting founder holds it and every one that
+    /// does holds a node key (a member, or its writer key) a Mac now out bound.
+    #[must_use]
+    pub fn recipient_removed(&self, recipient: &Recipient) -> bool {
+        if self.removed_recipients.contains(recipient) {
+            return true;
+        }
+        let mut any_for_recipient = false;
+        for m in self.members.values() {
+            if m.binding.recipient() == *recipient {
+                any_for_recipient = true;
+                if !self.member_node_removed(m) {
+                    return false;
+                }
+            }
+        }
+        for f in &self.unproved {
+            if f.recipient == *recipient {
+                any_for_recipient = true;
+                let node_removed = f.node_key.is_some_and(|nk| {
+                    nk != [0; 32] && matches!(self.node(&nk), NodeStanding::Removed(_))
+                });
+                if !node_removed {
+                    return false;
+                }
+            }
+        }
+        any_for_recipient
+    }
+    /// Whether a member that shares `binding`'s actor or recipient holds a node key a Mac now out
+    /// bound ([`NodeStanding::Removed`]); the zero key binds nothing. The `kin` verdict of
+    /// [`Self::seat_removed`].
+    #[must_use]
+    pub fn kin_removed(&self, binding: &Binding) -> bool {
+        let (actor, recipient) = (binding.actor(), binding.recipient());
+        self.members.iter().any(|(m_actor, m)| {
+            (*m_actor == actor || m.binding.recipient() == recipient)
+                && m.node_key.is_some_and(|nk| {
+                    nk != [0; 32] && matches!(self.nodes.get(&nk), Some(NodeStanding::Removed(_)))
+                })
+        })
+    }
+    /// Whether this membership takes the Mac of `binding` out: the one removal predicate (P4's
+    /// binding 4, `docs/design/one-mesh-proofs/P4-handshake.md`) every peer check and enrollment
+    /// judges a seat by. Four verdicts, joined by [`aterm_db_core::seat_out`]: an effective
+    /// `Remove` of its actor ([`Self::removal`]), its recipient bound to a Mac now out
+    /// ([`Self::recipient_removed`]), its writer key a removed Mac's ([`Self::node`]), and a seat
+    /// sharing its actor or recipient that holds a node key a removed Mac bound
+    /// ([`Self::kin_removed`]). Any one takes the seat out: the actor alone takes out a seat a
+    /// later `Admit` superseded, whose recipient and node key are now the new seat's.
+    #[must_use]
+    pub fn seat_removed(&self, binding: &Binding) -> bool {
+        aterm_db_core::seat_out(
+            self.removal(&binding.actor()).is_some() && !seat_without_actor(),
+            self.recipient_removed(&binding.recipient()),
+            matches!(self.node(binding.writer()), NodeStanding::Removed(_)),
+            self.kin_removed(binding),
+        )
+    }
+    /// A membership made of its parts, as no log need give it, for the tests that judge a
+    /// predicate over generated memberships ([`Self::seat_removed`]); the parts not named are
+    /// empty.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_parts(
+        members: BTreeMap<MemberId, Member>,
+        removed: BTreeMap<MemberId, Removal>,
+        removed_recipients: BTreeSet<Recipient>,
+        unproved: Vec<Founder>,
+        nodes: BTreeMap<[u8; 32], NodeStanding>,
+    ) -> Self {
+        Self {
+            members,
+            removed,
+            removed_recipients,
+            unproved,
+            nodes,
+            ..Self::default()
+        }
     }
     /// Every node key whose standing is not [`NodeStanding::Unknown`], by key.
     pub const fn nodes(&self) -> &BTreeMap<[u8; 32], NodeStanding> {
@@ -1355,27 +1487,19 @@ impl<'a> Graph<'a> {
         let bound_seats: Vec<(usize, Seat<'a>)> = self
             .bound_seats_with_entry(&effects.out, &authorized, &effects.void, &standing)
             .collect();
-        let mut removed_recipients = BTreeSet::new();
+        let (removed_recipients, revoking_rows) = self.revocation(
+            &bound_seats,
+            &standing,
+            candidates,
+            accepted,
+            &superseded_by,
+        );
         let mut claimed_labels: BTreeSet<String> =
             self.listed().iter().map(|f| f.label.clone()).collect();
-        for &(seat_entry, seat) in &bound_seats {
+        for &(_, seat) in &bound_seats {
             let member = seat.member();
             if members.contains_key(&member) || removed.contains_key(&member) {
                 claimed_labels.insert(seat.label.to_owned());
-            }
-            if removed.contains_key(&member) && !superseded_by.contains_key(&member) {
-                let recipient = seat.binding.recipient();
-                let has_newer_recipient_seat =
-                    members.iter().any(|(active_actor, m)| {
-                        m.binding.recipient() == recipient
-                            && standing
-                                .members
-                                .get(active_actor)
-                                .is_some_and(|&active_entry| active_entry > seat_entry)
-                    }) || unproved.iter().any(|f| f.recipient == recipient);
-                if !has_newer_recipient_seat {
-                    removed_recipients.insert(recipient);
-                }
             }
         }
         let nodes = self.nodes(
@@ -1429,25 +1553,11 @@ impl<'a> Graph<'a> {
                 }
             }
         }
-        // A seat a later `Admit` superseded (its node key, writer key or recipient moved to a new
-        // seat) is still a removed Mac's for the epochs: where no current member and no waiting
-        // founder holds its recipient, that recipient counts as removed, so a newest epoch that
-        // still wraps it is due a rotation (`Log::rekey_dues`) until one is minted without it.
-        // Read only here, after the node index and the labels above: the moved node key and the
-        // label stay the new seat's (one-mesh A15; A8's churn run found the old seat of a Mac
-        // back by `allow --again` still wrapped by every newest `[everyone]` epoch).
-        for removed_actor in superseded_by.keys() {
-            if let Some(&recipient) = seat_recipients.get(removed_actor)
-                && !members.values().any(|m| m.binding.recipient() == recipient)
-                && !unproved.iter().any(|f| f.recipient == recipient)
-            {
-                removed_recipients.insert(recipient);
-            }
-        }
         Membership {
             members,
             removed,
             removed_recipients,
+            revoking_rows,
             removed_labels,
             claimed_labels,
             quorums,
@@ -1721,6 +1831,106 @@ impl<'a> Graph<'a> {
                 Some((key, standing))
             })
             .collect()
+    }
+
+    /// P1's revocation ([`aterm_mesh_core::revocation`]) of this view: every bound seat row
+    /// (`bound_seats`, founders and binding `Admit`s, the seats of Macs now out and superseded
+    /// seats included), every effective `Remove`, and each share of an accepted quorum, which
+    /// takes every row of its member whenever it entered (out for good, [`Graph::standing`]),
+    /// under the causal order. Returns the recipients it revokes and the rows that revoke them,
+    /// with the `Remove`s that took each and whether a live row binds its recipient (the gate's
+    /// premises). Node-key removals stay a separate layer (`Log::removed_recipients`).
+    fn revocation(
+        &self,
+        bound_seats: &[(usize, Seat<'a>)],
+        standing: &Standing,
+        candidates: &[Candidate],
+        accepted: &[usize],
+        superseded_by: &BTreeMap<MemberId, MemberId>,
+    ) -> (BTreeSet<Recipient>, BTreeSet<RevokingRow>) {
+        #[cfg(any(test, debug_assertions))]
+        let (skips_superseded, arrival_order) = (
+            aterm_types::negative_control::on("revocation-skips-superseded"),
+            aterm_types::negative_control::on("revocation-arrival-order"),
+        );
+        #[cfg(not(any(test, debug_assertions)))]
+        let (skips_superseded, arrival_order) = (false, false);
+        let mut actors: BTreeMap<MemberId, usize> = BTreeMap::new();
+        let mut recipients: BTreeMap<Recipient, usize> = BTreeMap::new();
+        let mut by_index: Vec<Recipient> = Vec::new();
+        let mut actor = |member: MemberId| {
+            let next = actors.len();
+            *actors.entry(member).or_insert(next)
+        };
+        let mut rows = Vec::with_capacity(bound_seats.len());
+        for &(entry, seat) in bound_seats {
+            // NEGATIVE CONTROL `revocation-skips-superseded`: the rule before A15, under which a
+            // seat a later `Admit` superseded revoked nothing.
+            if skips_superseded && superseded_by.contains_key(&seat.member()) {
+                continue;
+            }
+            let recipient = seat.binding.recipient();
+            let next = recipients.len();
+            let dense = *recipients.entry(recipient).or_insert_with(|| {
+                by_index.push(recipient);
+                next
+            });
+            rows.push(Row {
+                actor: actor(seat.member()),
+                recipient: dense,
+                entry,
+            });
+        }
+        let shares: BTreeSet<usize> = accepted
+            .iter()
+            .flat_map(|&q| candidates[q].shares.iter().copied())
+            .collect();
+        let mut removes = Vec::new();
+        for &q in accepted {
+            let Candidate { member, shares, .. } = &candidates[q];
+            for &record in shares {
+                removes.push(Remove {
+                    actor: actor(*member),
+                    record,
+                    live: true,
+                    quorum: true,
+                });
+            }
+        }
+        for (member, records) in &standing.removes {
+            for &record in records.iter().filter(|r| !shares.contains(r)) {
+                removes.push(Remove {
+                    actor: actor(*member),
+                    record,
+                    live: true,
+                    quorum: false,
+                });
+            }
+        }
+        // NEGATIVE CONTROL `revocation-arrival-order`: read the records' arrival order (their
+        // index in this Mac's slice) as the causal order, as the rule before PF1 compared seats.
+        let before = |a: usize, b: usize| {
+            if arrival_order {
+                a < b
+            } else {
+                self.before(a, b)
+            }
+        };
+        let table = Table::new(&rows, &removes, before);
+        let mut revoked = BTreeSet::new();
+        let mut revoking = BTreeSet::new();
+        for i in table.revoking_rows() {
+            let recipient = rows[i].recipient;
+            revoked.insert(by_index[recipient]);
+            revoking.insert(RevokingRow {
+                removes: (0..removes.len())
+                    .filter(|&j| table.takes(j, i))
+                    .map(|j| *self.records[removes[j].record].id())
+                    .collect(),
+                recipient_live: table.bound_live(recipient),
+            });
+        }
+        (revoked, revoking)
     }
 
     /// Every seat the genesis or a binding `Admit` ([`Self::admit_binds`]) binds.

@@ -564,9 +564,20 @@ pub fn run_io(
             // No import has run where no source row is: what `check` reads is the Macs' own rows.
             let imported = !view.project(&registry::SOURCE).rows.is_empty();
             // Two phone rows whose sealed numbers open to one number, by key only.
-            let duplicates = handle
-                .view_sealed(|view, sealer| Ok(duplicate_numbers(&view.project(&PHONE), sealer)))
-                .unwrap_or_default();
+            let phones = view.project(&PHONE);
+            let live_numbers = phones
+                .rows
+                .values()
+                .filter(|row| row.live() && row.get("number").and_then(Value::as_str).is_some())
+                .take(2)
+                .count();
+            let duplicates = if live_numbers >= 2 {
+                handle
+                    .view_sealed(|_, sealer| Ok(duplicate_numbers(&phones, sealer)))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let (mut lab, generic) = checks::lab(&view.cells);
             lab.extend(checks::facts(
                 view.owned
@@ -707,8 +718,16 @@ fn sheet(kind: SheetKind, explicit: Option<&Path>, default: PathBuf) -> Result<O
             Some((file, tab)) => (file, Some(tab)),
             None => (path.to_path_buf(), None),
         },
-        None if default.is_file() => (default, None),
-        None => return Ok(None),
+        None => {
+            let Some(bytes) = crate::import::read_bounded_if_file(&default)? else {
+                return Ok(None);
+            };
+            let name = default
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
+            return Sheet::parse(kind, name, &bytes).map(Some);
+        }
     };
     let name = path
         .file_name()
@@ -1081,26 +1100,31 @@ pub(super) const FRESH_MS: u64 = 15 * 60 * 1000;
 /// service's latest repair round with each peer it knows (`peers`, `None` for a peer with no
 /// round retained) (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §8 step 2). Only a round within
 /// [`FRESH_MS`] of `now_ms` speaks, over the registry's `table` (any table where this Mac cannot
-/// name it) or over this Mac's `catalog`. One over the registry that received records, deferred
-/// some or failed exchanging them says the lab holds what this Mac has not heard yet; one that
-/// exchanged and brought nothing says that peer holds nothing more. The caller passes `catalog`
-/// only where this Mac's catalog holds no declaration of the registry by another Mac: only an
-/// import declares it, and a Mac that holds the registry holds its declaration, so a round over
-/// the catalog that exchanged and brought nothing says that peer holds none of the registry,
-/// while one that deferred or failed exchanging the catalog may have held a declaration back, and
-/// one that brought records said nothing this read has weighed. Repair visits only tables some
-/// Mac holds, so before the lab's first import no round over the registry ever comes: without
-/// the catalog's word that import would wait for good wherever a peer is known. Where no peer's
-/// round speaks at all, whether the lab holds the registry is unknown: an import now could write
-/// concurrent candidates over every row and mint a second key for every phone, so it waits too.
-/// `None` where no peer is known or a round that speaks found nothing to bring.
+/// name it) or over this Mac's `catalog`. The guard waits only on what a peer reported: a round
+/// over the registry that received records (a failed round's count is a lower bound) or deferred
+/// some says the lab holds what this Mac has not heard yet; one that exchanged and brought nothing
+/// says that peer holds nothing more. The caller passes `catalog` only where this Mac's catalog
+/// holds no declaration of the registry by another Mac: only an import declares it, it does so
+/// before it writes a row, and a declaration rides the catalog, which every exchange relays, so a
+/// Mac that holds rows is heard of through any peer it exchanged with. A round over the catalog
+/// that exchanged and brought nothing says that peer holds no declaration this Mac lacks; one that
+/// deferred catalog records may have held one back; one that brought records said nothing this
+/// read has weighed. A failed round is no word: in a lab of dozens of Macs some peer's round
+/// fails on every pass (unreachable, an old build, a busy disk), so waiting on any failure is a
+/// livelock, and what that peer holds reaches this Mac through the peers that exchange. Repair
+/// visits only tables some Mac holds, so before the lab's first import no round over the registry
+/// ever comes: without the catalog's word that import would wait for good wherever a peer is
+/// known. Where no peer's round speaks at all, whether the lab holds the registry is unknown: an
+/// import now could write concurrent candidates over every row and mint a second key for every
+/// phone, so it waits too. `None` where no peer is known or a round that speaks found nothing to
+/// bring.
 pub(super) fn empty_view_wait<'r>(
     table: Option<[u8; 32]>,
     catalog: Option<[u8; 32]>,
     peers: impl IntoIterator<Item = Option<&'r aterm_types::network_state::RepairObservation>>,
     now_ms: u64,
 ) -> Option<&'static str> {
-    use aterm_types::network_state::{RepairOutcome, RepairStage};
+    use aterm_types::network_state::RepairOutcome;
     let mut known = false;
     let mut drained = false;
     for round in peers {
@@ -1112,8 +1136,6 @@ pub(super) fn empty_view_wait<'r>(
         };
         let deferred =
             round.outcome == RepairOutcome::Deferred || round.deferred.is_some_and(|n| n > 0);
-        let failed =
-            round.outcome == RepairOutcome::Failed && round.stage == Some(RepairStage::Application);
         let exchanged = matches!(
             round.outcome,
             RepairOutcome::Exchanged | RepairOutcome::NoCommonTable
@@ -1134,21 +1156,11 @@ pub(super) fn empty_view_wait<'r>(
                     "a peer's repair round deferred registry records: the lab holds what this Mac has not heard",
                 );
             }
-            if failed {
-                return Some(
-                    "a peer's repair round failed while exchanging the registry: the lab may hold it",
-                );
-            }
             drained |= exchanged;
         } else if catalog.is_some() && round.table == catalog {
             if deferred {
                 return Some(
                     "a peer's repair round deferred catalog records: one may declare the registry",
-                );
-            }
-            if failed {
-                return Some(
-                    "a peer's repair round failed while exchanging the catalog: it may declare the registry",
                 );
             }
             drained |= exchanged && !received;
@@ -1187,7 +1199,7 @@ fn empty_view_catalog(paths: &Paths, ops: usize) -> Result<Option<[u8; 32]>> {
     if ops > 0 {
         return Ok(None);
     }
-    match Registry::at(paths.clone()).catalog_word() {
+    match Registry::at(paths.clone()).catalog_word(std::time::Instant::now() + IMPORT_PASS) {
         Ok(Some((_, true))) => Err(Error::new(
             "this Mac holds none of the registry yet and another Mac declared it here, so the lab \
              holds it; import once its repair round brings it",
@@ -1701,7 +1713,7 @@ fn prefer(paths: &Paths, args: &Args, on: bool, now_ms: u64) -> Result<Value> {
                     || row
                         .fields
                         .get("aliases")
-                        .is_some_and(|field| field.members().contains(label))
+                        .is_some_and(|field| field.has_member(label))
             })
         })?;
         let account = named_row(
@@ -1932,14 +1944,15 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
             .to_vec(),
     ];
     for item in &plan.planned {
-        let column = item.column.split('.').next().unwrap_or_default();
-        let ty = REGISTRY
-            .collection(item.collection)
-            .and_then(|c| c.column(column))
-            .map_or(Ty::Json(0), |c| c.ty);
-        let shown = match (&ty, item.column.contains('.')) {
-            (_, true) => item.column.split('.').nth(1).unwrap_or_default().to_owned(),
-            (ty, false) => grid::show(ty, &item.x, reveal),
+        let shown = match item.column.split_once('.') {
+            Some((_, elem)) => elem.to_owned(),
+            None => {
+                let ty = REGISTRY
+                    .collection(item.collection)
+                    .and_then(|c| c.column(&item.column))
+                    .map_or(Ty::Json(0), |c| c.ty);
+                grid::show(&ty, &item.x, reveal)
+            }
         };
         let step = match item.step {
             Step::Write => "write",

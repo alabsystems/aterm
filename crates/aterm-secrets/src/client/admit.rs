@@ -7,7 +7,8 @@
 //! its pin trusts, holding epochs) and this Mac holds a seat in it and the keys of every epoch a
 //! new Mac needs, a person's Allow and the phrase let the new Mac in with no admin:
 //!
-//! - [`hand_over`] signs the new Mac's `Admit` (its label the next free `m<N>`, C11) and a `Wrap`
+//! - [`hand_over`] signs the new Mac's `Admit` (its label the next free `m<N>`, C11; a founder the
+//!   genesis lists and no Mac proved keeps its own, `unproved_founder_label`) and a `Wrap`
 //!   of every `[everyone]` and Commons epoch that still seals a current entry, keeps them in this
 //!   Mac's records, and hands the whole record store in the bundle
 //!   ([`members::bundle::Handed::Log`]). The caller posts the records to every server it reaches
@@ -141,6 +142,57 @@ pub(super) fn labels_taken(
         }
     }
     (taken, counted)
+}
+
+/// The label of the founder the genesis lists under the age recipient `recipient` with neither a
+/// binding nor a node key, which no Mac proved yet ([`membership_log::Membership::unproved`]),
+/// where `member`, the Mac that holds that recipient, can take it bare: no `Admit` of the log
+/// claimed that label, a current member's, a removed Mac's or a voided one alike, and none
+/// claimed a label for `member`. Genesis labels are unique, so an `Admit` is the only other claim
+/// the evaluator counts: another Mac's claim of the label would seat the founder beside it as
+/// `m6-3fa2`, and an earlier claim of `member`'s own, even one a removal's cutoff or a quorum
+/// voided, would name it, since a Mac takes the label of its first claim. There the Mac takes
+/// the next free label, as before (one-mesh E2, f184). `None` too for a founder label that is no
+/// bare `m<N>`, which no `Admit` may carry.
+fn unproved_founder_label(
+    log: &Log,
+    membership: &membership_log::Membership,
+    member: &membership_log::MemberId,
+    recipient: &crate::age::Recipient,
+) -> Option<String> {
+    let founder = membership
+        .unproved()
+        .iter()
+        .find(|f| f.node_key.is_none() && f.recipient == *recipient)
+        .filter(|f| membership_log::is_label(&f.label))?;
+    let claimed = log.records().any(|record| {
+        matches!(
+            record.body(),
+            membership_log::Body::Admit { entrant, .. }
+                if entrant.label == founder.label || entrant.member() == *member
+        )
+    });
+    (!claimed).then(|| founder.label.clone())
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// NEGATIVE CONTROL (one-mesh E2, f184): while set on a thread, a person's Allow there
+    /// ([`log_path`]) seats a founder no Mac proved under the next free label, as every build
+    /// before E2 did (the lab's founder `x`, labelled `m6`, was seated as `m9`). A whole process
+    /// (a lab's desk) turns it on with the negative control `allow-next-label`
+    /// (`aterm_types::negative_control::on`).
+    static ALLOW_NEXT_LABEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a person's Allow seats an unproved founder under the next free label
+/// ([`ALLOW_NEXT_LABEL`]); never in a release build.
+fn allow_takes_next_label() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    return ALLOW_NEXT_LABEL.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("allow-next-label");
+    #[cfg(not(any(test, debug_assertions)))]
+    false
 }
 
 /// Why the log keeps the Mac `request` names out of an Allow, read by the member that opened
@@ -486,7 +538,8 @@ pub(super) fn held_log(
 }
 
 /// Let the Mac `request` names in through the membership log, as the member at `paths`, after a
-/// person's Allow and the phrase: sign its `Admit` under the next free label and a `Wrap` of
+/// person's Allow and the phrase: sign its `Admit` under the next free label (a founder the
+/// genesis lists and no Mac proved keeps its own, `unproved_founder_label`) and a `Wrap` of
 /// every `[everyone]` and Commons epoch that still seals a current entry, and keep them in this
 /// Mac's records. A Mac the log already lets in gets only the `Wrap`s it lacks, under its first
 /// `Admit`. [`ByLog::KeptOut`] where the log removed the Mac or left it out on purpose
@@ -602,6 +655,23 @@ pub(super) fn log_path(
     let member = request.binding().actor();
     let recipient = request.binding().recipient();
     let membership = log.membership();
+    // A founder the genesis lists under this Mac's recipient with no node key, which no Mac
+    // proved, keeps the label the genesis gave it, as its proof from the home ALab LAN keeps it
+    // (`readmit::decide`): the person's Allow vouches for the Mac that holds the recipient
+    // (one-mesh E2, f184). Not a label a roster denies, which would read the seat as removed.
+    let founder_label = match unproved_founder_label(&log, &membership, &member, &recipient)
+        .filter(|_| !allow_takes_next_label())
+    {
+        Some(label)
+            if log_entries::local_swarm_roster_for_log_held(paths, &log, lock)?
+                .is_some_and(|r| r.is_label_denied(&label))
+                || log_entries::roster_from_doc_or_opened(None, Some(&opened), Some(&log))
+                    .is_some_and(|r| r.is_label_denied(&label)) =>
+        {
+            None
+        }
+        founder => founder,
+    };
     let signed = device.with_seed(|seed| -> crate::Result<(RecordId, String, Vec<Record>)> {
         let signer = Signer {
             actor: &actor,
@@ -672,7 +742,7 @@ pub(super) fn log_path(
                     })
             });
         let (taken, counted) = labels_taken(&opened.by_audience);
-        let label = match restored {
+        let label = match restored.or_else(|| founder_label.clone()) {
             Some(label) => label,
             None => log
                 .next_label(name, &taken, &counted)
@@ -702,6 +772,17 @@ pub(super) fn log_path(
                  nothing was kept",
             )));
         }
+    }
+    // A founder given its genesis label must be seated under it bare, as readmit's founder
+    // proof must be: where the evaluator reads another claim of it and suffixes the seat, nothing
+    // is kept.
+    if founder_label.as_deref() == Some(label.as_str())
+        && log.membership().get(&member).map(|m| m.label.as_str()) != Some(label.as_str())
+    {
+        return Ok(ByLog::KeptOut(format!(
+            "the membership log would not seat this Mac as {label}, the label its genesis gave \
+             it, so nothing was kept",
+        )));
     }
     if !signed.is_empty() {
         store.ingest(&encode_records(&signed))?;
@@ -1838,6 +1919,194 @@ mod tests {
         assert!(
             err.contains("the member that signed this Admit is revoked in the vault"),
             "{err}"
+        );
+    }
+
+    /// The Commons request of the Mac at `home` (its identity made there if it has none) to the
+    /// network and authority of the genesis `member` holds.
+    fn request_of(member: &Paths, home: &Paths) -> Request {
+        machine_identity(home).expect("identity");
+        let store = load_records(member).expect("records");
+        let log = store.log().expect("a log");
+        let membership_log::Body::Genesis { root, .. } = log.genesis().body() else {
+            panic!("a genesis");
+        };
+        Device::open(home)
+            .expect("device")
+            .expect("an identity")
+            .request(root.network, root.authority)
+            .expect("request")
+    }
+
+    /// `m22`'s file vault, its genesis listing `names` (each in `[machines]`, none enrolled in
+    /// Commons) as founders with neither a binding nor a node key, as the lab's `swarm e2e` lists
+    /// `s`, `x` and `y`: `m22`, the bound founder that allows, and each founder's request and the
+    /// label its genesis gives it.
+    fn unproved_founders(
+        root: &std::path::Path,
+        names: &[&str],
+    ) -> (Paths, Vec<(Request, String)>) {
+        let vault = root.join("alab.vault");
+        let m22 = Paths::for_home(&root.join("m22"));
+        test_create_unbound(
+            &m22,
+            vault.to_str().expect("a UTF-8 path"),
+            None,
+            Some("m22"),
+        )
+        .expect("create");
+        admin_keys::legacy::publish_legacy(&m22, &admin_open(&m22).expect("admin"));
+        admin_commons_init(&m22).expect("commons init");
+        let homes: Vec<Paths> = names
+            .iter()
+            .map(|n| Paths::for_home(&root.join(n)))
+            .collect();
+        let recipients: Vec<String> = homes
+            .iter()
+            .map(|home| {
+                machine_identity(home)
+                    .expect("identity")
+                    .recipient()
+                    .to_bech32()
+            })
+            .collect();
+        let admin = admin_open(&m22).expect("admin");
+        let mut doc = admin.doc.clone();
+        for (name, recipient) in names.iter().zip(&recipients) {
+            doc.add_machine(name, recipient).expect("add machine");
+        }
+        doc.set_entry(&Audience::Everyone, "shared", b"v1")
+            .expect("entry");
+        admin_publish_approved(&m22, &admin, &doc, &recipients).expect("approve");
+        seed_vault_genesis(&m22, &root.join("genesis.bin")).expect("seed the genesis");
+        let membership = load_records(&m22)
+            .expect("records")
+            .log()
+            .expect("a log")
+            .membership();
+        let founders = homes
+            .iter()
+            .map(|home| {
+                let request = request_of(&m22, home);
+                let label = membership
+                    .unproved()
+                    .iter()
+                    .find(|f| f.recipient == request.binding().recipient() && f.node_key.is_none())
+                    .expect("the genesis lists it unproved, with no node key")
+                    .label
+                    .clone();
+                (request, label)
+            })
+            .collect();
+        (m22, founders)
+    }
+
+    /// A person's Allow on `m22` of the Mac `request` names, asking as `name` with no node key,
+    /// as [`hand_over`] runs it for a new Mac that reads the log: the label it was let in under.
+    fn allow(m22: &Paths, request: &Request, name: &str) -> String {
+        let by_log = log_path(
+            m22,
+            request,
+            [0; 32],
+            name,
+            aterm_time::unix_millis().expect("a clock"),
+            (
+                Some(Reader::BoundedLog(
+                    crate::crossing::RecordsBound::uncrossed(),
+                )),
+                false,
+                (Book::default(), false),
+            ),
+            None,
+        )
+        .expect("the Allow runs");
+        let ByLog::Admitted(admission) = by_log else {
+            panic!("m22 did not let {name} in through the log: {by_log:?}");
+        };
+        admission.label
+    }
+
+    /// One-mesh E2 (f184): a person's Allow of a founder the genesis lists with its recipient and
+    /// neither a binding nor a node key seats it under the label its genesis gave it, as its proof
+    /// from the home ALab LAN does (`readmit::decide`'s `Founder`), not under the next free one
+    /// (the lab's founder `x`, labelled `m6`, was seated as `m9`). Where an `Admit` claimed that
+    /// label first (`z`, which m22 admits under `y`'s), the Allow takes the next free label,
+    /// which the evaluator seats bare, and `z` keeps its own.
+    ///
+    /// NEGATIVE CONTROL: [`ALLOW_NEXT_LABEL`] on, as the test runs it around `w`'s Allow on every
+    /// pass (its `CONTROL` assert): the founder takes the next free label, and set around `x`'s
+    /// Allow the first assert fails. With `unproved_founder_label`'s claim scan cut, `y` takes
+    /// `z`'s label, the evaluator would seat it suffixed, and the Allow keeps nothing.
+    #[test]
+    fn a_persons_allow_seats_an_unproved_founder_under_its_genesis_label() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let (m22, founders) = unproved_founders(root.path(), &["w", "x", "y"]);
+        let [(w, w_label), (x, x_label), (y, y_label)] = &founders[..] else {
+            panic!("three founders");
+        };
+        let membership = || {
+            load_records(&m22)
+                .expect("records")
+                .log()
+                .expect("a log")
+                .membership()
+        };
+
+        ALLOW_NEXT_LABEL.with(|on| on.set(true));
+        let old = allow(&m22, w, "w");
+        ALLOW_NEXT_LABEL.with(|on| on.set(false));
+        assert_ne!(
+            &old, w_label,
+            "CONTROL: the rule before f184 takes the next free label"
+        );
+
+        assert_eq!(
+            &allow(&m22, x, "x"),
+            x_label,
+            "x keeps the label its genesis gave it"
+        );
+        let seated = membership();
+        assert_eq!(
+            seated.label(&x.binding().actor()),
+            Some(x_label.as_str()),
+            "x is seated under it bare"
+        );
+        assert!(
+            seated
+                .unproved()
+                .iter()
+                .all(|f| f.recipient != x.binding().recipient()),
+            "x is proved"
+        );
+
+        // z, a Mac no genesis lists, claims y's label first.
+        let z = request_of(&m22, &Paths::for_home(&root.path().join("z")));
+        log_entries::admit_member_in_log(
+            &m22,
+            Entrant {
+                request: z.clone(),
+                node_key: [0; 32],
+                name: "z".to_owned(),
+                label: y_label.clone(),
+            },
+            membership_log::Evidence::Phrase,
+        )
+        .expect("m22 admits z under y's label");
+        let label = allow(&m22, y, "y");
+        assert_ne!(
+            &label, y_label,
+            "a label an Admit claimed is not the founder's to take"
+        );
+        let seated = membership();
+        assert_eq!(
+            seated.label(&y.binding().actor()),
+            Some(label.as_str()),
+            "y is seated bare"
+        );
+        assert_eq!(
+            seated.label(&z.binding().actor()),
+            Some(y_label.as_str()),
+            "z keeps its label"
         );
     }
 }

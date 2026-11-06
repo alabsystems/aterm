@@ -728,18 +728,13 @@ unsafe extern "system" fn get_attribute_value(
     id: UIA_TEXTATTRIBUTE_ID,
     out: *mut VARIANT,
 ) -> HRESULT {
-    if out.is_null() {
-        return aterm_win32::Win32::Foundation::E_POINTER;
-    }
     // SAFETY: the slot contract (module docs).
-    match unsafe { text_range(this) }.get_attribute_value(id) {
-        Ok(Some(value)) => {
-            // SAFETY: the caller's writable slot; the VARIANT moves to it.
-            unsafe { out.write(value.into_raw()) };
-            S_OK
-        }
-        Ok(None) => S_OK,
-        Err(hr) => hr,
+    unsafe {
+        put(out, || {
+            text_range(this)
+                .get_attribute_value(id)
+                .map(Variant::into_raw)
+        })
     }
 }
 

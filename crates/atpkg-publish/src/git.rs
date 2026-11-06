@@ -4,20 +4,52 @@
 //! Git queries on a checkout through [`aterm_uds::spawnfd::command`].
 
 use std::path::Path;
+use std::process::Output;
+use std::time::{Duration, Instant};
+
+use aterm_uds::deadline::{CompleteOutputError, MAX_COMPLETE_STDOUT_BYTES, RunError};
 
 use crate::error::{Error, Result};
 
-/// `git -C <dir> <args…>`'s trimmed stdout.
+/// How long a local git query or checkout ([`run`]) may take before it is taken for hung and
+/// killed: ten minutes, where a checkout of a compiler's tree on a loaded machine takes one or two.
+pub const LOCAL_GIT_BOUND: Duration = Duration::from_mins(10);
+
+/// Runs a git `cmd` to its end within `within`, its stdout whole: more than
+/// [`MAX_COMPLETE_STDOUT_BYTES`] is refused, never a kept tail read as the whole (a first-parent
+/// `rev-list` prints its newest commits first, which a tail drops), and a git that has not ended
+/// by then is killed with its process group.
 /// # Errors
-/// A could-not-run when git cannot be started, or a refusal when git fails.
+/// A spawn refusal ([`RunError::Spawn`]), the deadline, or a stdout that is not whole.
+pub(crate) fn output_within(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    within: Duration,
+) -> std::result::Result<Output, CompleteOutputError> {
+    aterm_uds::deadline::output_until_complete_stdout_with_limit(
+        cmd,
+        Instant::now() + within,
+        MAX_COMPLETE_STDOUT_BYTES,
+    )
+}
+
+/// `git -C <dir> <args…>`'s trimmed stdout, within [`LOCAL_GIT_BOUND`] ([`output_within`]).
+/// # Errors
+/// A could-not-run when git cannot be started, does not end in time or prints more than a whole
+/// stdout can hold, or a refusal when git fails.
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-        .arg("-C")
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| Error::io("spawn git", &e))?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let out = output_within(&mut cmd, LOCAL_GIT_BOUND).map_err(|e| match e {
+        CompleteOutputError::Run(RunError::Spawn(e)) => Error::io("spawn git", &e),
+        other => Error::cannot_run(format!(
+            "`git -C {} {}`: {other}",
+            dir.display(),
+            args.join(" ")
+        )),
+    })?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {

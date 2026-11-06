@@ -532,9 +532,14 @@ fn duration(text: &str) -> Option<Elapsed> {
         [(h, b'h'), (m, b'm'), (s, b's')] if (1..24).contains(h) && *m < 60 && *s < 60 => {
             (((h * 60 + m) * 60 + s) * 1000, 1000)
         }
-        [(d, b'd'), (h, b'h'), (m, b'm')] if *d > 0 && *h < 24 && *m < 60 => {
-            (((d * 24 + h) * 60 + m) * 60_000, 60_000)
-        }
+        [(d, b'd'), (h, b'h'), (m, b'm')] if *d > 0 && *h < 24 && *m < 60 => (
+            d.checked_mul(24)?
+                .checked_add(*h)?
+                .checked_mul(60)?
+                .checked_add(*m)?
+                .checked_mul(60_000)?,
+            60_000,
+        ),
         _ => return None,
     };
     Some(Elapsed::Clock { ms, res_ms })
@@ -564,7 +569,13 @@ fn bar_elapsed(text: &str) -> Option<Elapsed> {
         (b'h', b'm') if (1..24).contains(&major) && minor < 60 => {
             ((major * 60 + minor) * 60_000, 60_000)
         }
-        (b'd', b'h') if major > 0 && minor < 24 => ((major * 24 + minor) * 3_600_000, 3_600_000),
+        (b'd', b'h') if major > 0 && minor < 24 => (
+            major
+                .checked_mul(24)?
+                .checked_add(minor)?
+                .checked_mul(3_600_000)?,
+            3_600_000,
+        ),
         _ => return None,
     };
     Some(Elapsed::Clock { ms, res_ms })
@@ -613,7 +624,10 @@ fn tokens(text: &str) -> Option<(Tokens, bool)> {
             b't' => 1_000_000_000_000,
             _ => return None,
         };
-        (whole * unit + tenth * (unit / 10), unit / 10)
+        (
+            whole.checked_mul(unit)?.checked_add(tenth * (unit / 10))?,
+            unit / 10,
+        )
     };
     Some((
         Tokens {

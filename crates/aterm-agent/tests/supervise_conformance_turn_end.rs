@@ -165,6 +165,7 @@ fn reading(
         rules: None,
         pending_input,
         interrupted: false,
+        fault: None,
         restartable: true,
         relaunch_off: false,
         resume: None,

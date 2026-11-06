@@ -98,6 +98,36 @@ fn publish_public_pair(f: &Fixture, roster: &[u8], signature: &[u8]) {
 }
 
 #[test]
+fn authenticated_local_default_policy_preserves_always_managed_and_anchor_boundaries() {
+    let f = Fixture::new();
+    assert!(!f.read_token().unwrap().unanchored_default());
+    f.publish(|doc| {
+        doc.set_entry_with(
+            &Audience::Everyone,
+            "token",
+            b"inert-authentic-token",
+            true,
+            None,
+        )
+        .unwrap();
+    });
+    assert!(f.read_token().unwrap().unanchored_default());
+    f.publish(|doc| {
+        doc.set_entry_with(&Audience::Everyone, "other", b"inert-other", true, None)
+            .unwrap();
+        doc.set_entry_with(
+            &Audience::Everyone,
+            "token",
+            b"inert-authentic-token",
+            true,
+            Some("other"),
+        )
+        .unwrap();
+    });
+    assert!(!f.read_token().unwrap().unanchored_default());
+}
+
+#[test]
 fn public_roster_reads_current_pair_without_adopting_stale_files() {
     let f = Fixture::new();
     for name in PUBLIC_ROSTER_NAMES {

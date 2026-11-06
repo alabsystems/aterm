@@ -177,16 +177,19 @@ pub fn entry() -> Option<std::process::ExitCode> {
         Err(ReadError::Unavailable)
     };
     Some(std::process::ExitCode::from(match answer {
-        Ok(Some(bytes)) => {
-            use std::io::Write as _;
-            match std::io::stdout().lock().write_all(bytes.as_slice()) {
-                Ok(()) => 0,
-                Err(_) => code(ReadError::Unavailable),
-            }
-        }
+        Ok(Some(bytes)) => emit(&mut std::io::stdout().lock(), bytes.as_slice()),
         Ok(None) => 10,
         Err(error) => code(error),
     }))
+}
+
+/// Hand the child's answer to its parent on `out`, flushed: the child's exit status, success
+/// only once every byte has left the buffer, so a write the parent never got cannot exit `0`.
+fn emit(out: &mut dyn std::io::Write, bytes: &[u8]) -> u8 {
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Ok(()) => 0,
+        Err(_) => code(ReadError::Unavailable),
+    }
 }
 
 /// Exercise the real child against only `synthetic.keychain-db` in a private stage.

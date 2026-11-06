@@ -345,6 +345,7 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
         ("1m 0s", 60_000, 1000),
         ("10h 9m 42s", 36_582_000, 1000),
         ("1d 0h 0m", 86_400_000, 60_000),
+        ("2d 3h 4m", 183_840_000, 60_000),
     ] {
         assert_eq!(duration(text), Some(clock(ms, res)), "{text}");
     }
@@ -360,6 +361,7 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
         "s",
         "",
         "1m  5s",
+        "300000000000d 0h 0m",
     ] {
         assert_eq!(duration(text), None, "{text}");
     }
@@ -373,7 +375,14 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
         assert_eq!(bar_elapsed(text), Some(clock(ms, res)), "{text}");
     }
     for text in [
-        "4m 28s", "4m8s", "60m00s", "0m05s", "24h00m", "2d24h", "4h10s",
+        "4m 28s",
+        "4m8s",
+        "60m00s",
+        "0m05s",
+        "24h00m",
+        "2d24h",
+        "4h10s",
+        "300000000000d00h",
     ] {
         assert_eq!(bar_elapsed(text), None, "{text}");
     }
@@ -383,6 +392,7 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
         ("↑ 613.6k tokens", 613_600, 100, true),
         ("↓ 1.0m", 1_000_000, 100_000, false),
         ("↓ 2.5b tokens", 2_500_000_000, 100_000_000, true),
+        ("↓ 12.3k tokens", 12_300, 100, true),
     ] {
         let (t, w) = tokens(text).unwrap_or_else(|| panic!("{text}"));
         assert_eq!((t.count, t.quantum, w), (count, quantum, worded), "{text}");
@@ -394,9 +404,23 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
         "1.0k tokens",
         "↓1.0k",
         "↓ tokens",
+        "↓ 99999999.0t tokens",
+        "↓ 999999999999.0b tokens",
     ] {
         assert_eq!(tokens(text), None, "{text}");
     }
+    for row in [
+        "  ◯ a  Working   300000000000d 0h 0m · ↓ 1.0k tokens",
+        "  ◯ sweep  ▰▰▰▰▰▰▰▰  300000000000d00h · ↓ 1.0k tokens",
+    ] {
+        assert_eq!(
+            parse_row(row, one_cell).and_then(|r| r.elapsed),
+            None,
+            "{row:?}"
+        );
+    }
+    let row = "  ◯ a  Working   4s · ↓ 99999999.0t tokens";
+    assert_eq!(parse_row(row, one_cell).and_then(|r| r.tokens), None);
     assert_eq!(queued("2 queued"), Some(2));
     assert_eq!(queued("2 queue"), None);
     assert_eq!(progress("3/4"), Some(Progress { done: 3, total: 4 }));

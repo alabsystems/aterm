@@ -3,6 +3,7 @@
 
 //! Rust build intermediates out of Spotlight (macOS).
 
+use crate::platform::rename_noreplace;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -261,30 +262,6 @@ fn stages_in(holder: &Path, base: &OsStr) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
-}
-
-/// Rename `from` to `to` only where nothing stands at `to` (`renameat` with `RENAME_EXCL` on
-/// macOS, `RENAME_NOREPLACE` on Linux): `AlreadyExists` otherwise, and nothing is replaced.
-#[cfg(unix)]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    aterm_dirfd::renameat_with(
-        aterm_dirfd::CWD,
-        from,
-        aterm_dirfd::CWD,
-        to,
-        aterm_dirfd::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
-}
-
-/// Off Unix, a rename to a name nothing stood at when looked at (a folder is never renamed over
-/// another there).
-#[cfg(not(unix))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(to).is_ok() {
-        return Err(std::io::ErrorKind::AlreadyExists.into());
-    }
-    std::fs::rename(from, to)
 }
 
 /// The locks cargo holds in a profile for a whole build; [`reclaim`] skips a build
@@ -674,10 +651,11 @@ pub enum Unused {
     Tooling { idle: Duration, after: Duration },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
     GivenUp,
-    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and `units` an old compiler built, each unwritten for `after` ([`ReclaimAfter::stale`]) or more.
+    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders, `units` an old compiler built, and `superseded` units its last passing release run did not use beside another build of their package and kind that it did ([`stale::USED`]), each unwritten for `after` ([`ReclaimAfter::stale`]) or more.
     Stale {
         incremental: usize,
         units: usize,
+        superseded: usize,
         after: Duration,
     },
 }
@@ -1157,7 +1135,7 @@ impl Sweep<'_, '_> {
             return false;
         };
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-        let (mut incremental, mut units) = (0, 0);
+        let (mut incremental, mut units, mut superseded) = (0, 0, 0);
         for one in &doomed {
             if !(self.permitted)() || !registered::retention::allows_tree(leaf) {
                 break;
@@ -1173,12 +1151,14 @@ impl Sweep<'_, '_> {
                 match one.part {
                     stale::Part::Incremental => incremental += 1,
                     stale::Part::Unit => units += 1,
+                    stale::Part::Superseded => superseded += 1,
                 }
             }
         }
         let why = Unused::Stale {
             incremental,
             units,
+            superseded,
             after: self.after.stale,
         };
         // A rename acts by name: a keep published at the leaf as its parts moved would lose
@@ -1911,6 +1891,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 why: Unused::Stale {
                     incremental: count(stale::Part::Incremental),
                     units: count(stale::Part::Unit),
+                    superseded: count(stale::Part::Superseded),
                     after: after.stale,
                 },
                 paths: doomed.into_iter().flat_map(|d| d.paths).collect(),

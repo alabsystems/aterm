@@ -29,8 +29,8 @@ pub(crate) const CALLER: &str = "atpkg-publish";
 
 /// How long a lane's clone or fetch through agh's isolated git may take: four hours, the
 /// Linux unit's `TimeoutStartSec`, in place of agh's ten-minute `GIT_BUDGET`. A lane clone of a
-/// large repository over a slow link outlasts ten minutes, and `RestHost`'s git has no limit;
-/// a release-tier grant still lives at most `GRANT_MAX`.
+/// large repository over a slow link outlasts ten minutes, and `RestHost`'s git has this same
+/// limit; a release-tier grant still lives at most `GRANT_MAX`.
 pub const LANE_GIT_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// A release host over one agh client.

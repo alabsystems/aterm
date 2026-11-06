@@ -219,6 +219,7 @@ pub struct UnverifiedGoogleGrant {
     account: String,
     revision: Option<[u8; 32]>,
     recovery: Option<recovery::Journal>,
+    work: Option<super::account_work::Scope>,
 }
 
 /// A native grant accepted by Google's canonical account endpoint. The native profile
@@ -495,6 +496,14 @@ fn wipe_native_json(value: aterm_json::Value) {
 }
 
 impl UnverifiedGoogleGrant {
+    fn retain_work(&mut self, work: Option<super::account_work::Scope>) {
+        if self.work.is_none() {
+            self.work = work;
+        }
+        if let Some(session) = self.native.session.as_mut() {
+            session.retain_work(self.work.clone());
+        }
+    }
     /// Prove the exact native token's Google account before making it usable.
     /// Temporary endpoint failures get at most three requests, each at most 30 seconds,
     /// with one- and two-second delays inside the caller's original deadline. The native
@@ -620,11 +629,29 @@ impl UnverifiedGoogleGrant {
     }
     /// Check again before verification/publication; a changed binding cannot publish a login.
     pub fn check_binding(&self) -> Result<(), GoogleLoginError> {
-        if binding_current(&self.state, &self.account, self.revision) {
-            Ok(())
-        } else {
-            Err(GoogleLoginError::Configuration)
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err(GoogleLoginError::Configuration);
         }
+        self.check_binding_authority()?;
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            Err(GoogleLoginError::Configuration)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_binding_authority(&self) -> Result<(), GoogleLoginError> {
+        binding_current(&self.state, &self.account, self.revision)
+            .then_some(())
+            .ok_or(GoogleLoginError::Configuration)
     }
 }
 
@@ -744,6 +771,7 @@ pub fn check_google_published(
             account: account.into(),
             revision: registry.binding_revision("agy", account),
             recovery: None,
+            work: None,
         },
     };
     published.check_current()?;
@@ -783,10 +811,32 @@ pub fn run_google_staged(
     staging: StagedGoogleLogin<'_>,
     deadline: Instant,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
-    if staging.recovery.is_some() {
-        return recovery::run(program, state, home, account, staging, deadline);
+    run_google_staged_scoped(program, state, home, account, staging, deadline, None)
+}
+
+/// Run staged authorization while retaining its automatic operation lifetime.
+pub fn run_google_staged_scoped(
+    program: &Path,
+    state: &Path,
+    home: &Path,
+    account: &str,
+    staging: StagedGoogleLogin<'_>,
+    deadline: Instant,
+    work: Option<super::account_work::Scope>,
+) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
+    if work
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Err(GoogleLoginError::Configuration);
     }
-    run_google_at(program, state, home, account, Some(staging), deadline)
+    if staging.recovery.is_some() {
+        return recovery::run_scoped(program, state, home, account, staging, deadline, work);
+    }
+    let result =
+        run_google_at_scoped(program, state, home, account, Some(staging), deadline, work)?;
+    result.check_binding()?;
+    Ok(result)
 }
 
 fn run_google_at(
@@ -796,6 +846,18 @@ fn run_google_at(
     account: &str,
     staging: Option<StagedGoogleLogin<'_>>,
     deadline: Instant,
+) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
+    run_google_at_scoped(program, state, home, account, staging, deadline, None)
+}
+
+fn run_google_at_scoped(
+    program: &Path,
+    state: &Path,
+    home: &Path,
+    account: &str,
+    staging: Option<StagedGoogleLogin<'_>>,
+    deadline: Instant,
+    work: Option<super::account_work::Scope>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     remaining(deadline).map_err(GoogleLoginError::Native)?;
     if !state.is_absolute() || !home.is_absolute() {
@@ -835,7 +897,12 @@ fn run_google_at(
         None
     };
     let revision = registry.binding_revision("agy", account);
-    let current = || binding_current(state, account, revision);
+    let current = || {
+        !work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+            && binding_current(state, account, revision)
+    };
     let mut approval_error = None;
     let recovery = staged.then_some(StagedRecovery {
         expected_email: binding.expected_email(),
@@ -850,6 +917,7 @@ fn run_google_at(
         |request, deadline| {
             let mailbox = super::headless_oauth::discover_mailbox_config(Some(home), Some(state));
             let context = super::google_direct::Context {
+                work: work.clone(),
                 identity,
                 home,
                 state,
@@ -875,8 +943,9 @@ fn run_google_at(
         account: account.into(),
         revision,
         recovery: None,
+        work,
     };
-    result.check_binding()?;
+    result.check_binding_authority()?;
     Ok(result)
 }
 
@@ -1324,6 +1393,7 @@ pub(super) fn publication_fixture(
             account: account.into(),
             revision: registry(state).unwrap().binding_revision("agy", account),
             recovery: None,
+            work: None,
         },
         profile: super::google_profile::GoogleProfile {
             email: email.into(),
@@ -1776,6 +1846,7 @@ mod tests {
                 account: "one".into(),
                 revision,
                 recovery: None,
+                work: None,
             },
             profile: super::super::google_profile::GoogleProfile {
                 email: "person@example.com".into(),

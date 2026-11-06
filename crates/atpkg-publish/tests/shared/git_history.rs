@@ -5,7 +5,10 @@
 
 use std::path::Path;
 
-use atpkg_publish::{git::rev_count, testkit};
+use atpkg_publish::{
+    git::{rev_count, run},
+    testkit,
+};
 
 fn git(at: &Path, args: &[&str]) -> String {
     let output = testkit::git()
@@ -114,4 +117,24 @@ fn shallow_history_cannot_mint_a_truncated_publication_number() {
         rev_count(&shallow, "HEAD").expect("fetched complete history"),
         3
     );
+}
+
+/// A git query's stdout is read whole or refused, never cut to a kept tail: a blob of
+/// exactly the whole-stdout limit reads back whole (NEGATIVE CONTROL), one byte more is refused.
+#[test]
+fn a_git_query_reads_its_stdout_whole_or_refuses_it() {
+    let directory = super::scratch("git-stdout-whole");
+    let at = directory.path();
+    git(at, &["init", "--quiet", "--initial-branch=main"]);
+    let blob = |len: usize| {
+        let file = at.join("blob");
+        std::fs::write(&file, vec![b'a'; len]).expect("write the blob");
+        git(at, &["hash-object", "-w", "blob"])
+    };
+    let limit = aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES;
+    let whole = run(at, &["cat-file", "blob", &blob(limit)]).expect("a stdout at the limit");
+    assert_eq!(whole.len(), limit, "the stdout is whole");
+    let refusal = run(at, &["cat-file", "blob", &blob(limit + 1)])
+        .expect_err("a stdout past the limit is refused");
+    assert!(refusal.to_string().contains("exceeds"), "{refusal}");
 }

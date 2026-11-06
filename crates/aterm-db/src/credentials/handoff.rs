@@ -73,10 +73,11 @@ impl Round<'_> {
             descriptor,
             |session, store, scope| {
                 session.may_write()?;
-                session.peer_writer(self.peer)?;
+                let peer_binding = session.peer_writer(self.peer)?;
                 let context = context(&facts, session, scope, now)?;
                 let log = Log::read_with(session, store, scope, decode)?;
-                let book = Book::read(&log, &context);
+                let eligible = log.eligible();
+                let book = Book::from_eligible(&eligible, &context);
                 let thread = book
                     .threads
                     .get(&request)
@@ -90,26 +91,27 @@ impl Round<'_> {
                 if !context.policy.allows(&thread.want) {
                     return Err(Error::new("credential policy refuses this contribution"));
                 }
-                let offered = log.eligible().into_iter().any(|(operation, command)| {
-                    operation.header.id == offer
-                        && operation.header.actor == holder
-                        && !book.inert.iter().any(|(id, _)| *id == offer)
-                        && record_of(&command).is_ok_and(|record| {
-                            record.kind == "offer"
-                                && ids(&record.key).is_ok_and(|key| key == request)
-                        })
-                });
+                let offered = !book.inert.iter().any(|(id, _)| *id == offer)
+                    && eligible.iter().any(|&(operation, command)| {
+                        operation.header.id == offer
+                            && operation.header.actor == holder
+                            && record_of(command).is_ok_and(|record| {
+                                record.kind == "offer"
+                                    && ids(&record.key).is_ok_and(|key| key == request)
+                            })
+                    });
                 if !offered {
                     return Err(Error::new("the exact holder Offer is unavailable"));
                 }
                 delivery::destination(session, thread)?;
-                let custodian = if holder == self.local {
-                    self.peer
+                let local_binding = session.peer_writer(self.local)?;
+                let (custodian_binding, holder_binding) = if holder == self.local {
+                    (&peer_binding, &local_binding)
                 } else {
-                    self.local
+                    (&local_binding, &peer_binding)
                 };
-                let recipient = session.peer_writer(custodian)?.recipient();
-                let writer = *session.peer_writer(holder)?.writer();
+                let recipient = custodian_binding.recipient();
+                let writer = *holder_binding.writer();
                 let sight = facts
                     .sight
                     .as_ref()
@@ -137,10 +139,11 @@ impl Round<'_> {
                 session.peer_writer(self.peer)?;
                 let context = context(&facts, session, scope, now)?;
                 let log = Log::read_with(session, store, scope, decode)?;
-                let book = Book::read(&log, &context);
+                let eligible = log.eligible();
+                let book = Book::from_eligible(&eligible, &context);
                 let inert_ids: BTreeSet<Digest> = book.inert.iter().map(|(id, _)| *id).collect();
-                let mut offers = Vec::new();
-                for (operation, command) in log.eligible() {
+                let mut best: Option<(Digest, [u8; 16])> = None;
+                for (operation, command) in eligible {
                     if operation.header.actor != self.peer
                         || self.owner.offered_before(&operation.header.id)
                         || inert_ids.contains(&operation.header.id)
@@ -150,23 +153,21 @@ impl Round<'_> {
                     {
                         continue;
                     }
-                    let record = record_of(&command)?;
+                    let record = record_of(command)?;
                     let request = ids(&record.key)?;
                     if book.threads.get(&request).is_some_and(|thread| {
                         !thread.ended()
                             && thread.published.is_none()
                             && context.policy.allows(&thread.want)
-                            && !admin
-                                .doc
-                                .entries()
-                                .iter()
-                                .any(|entry| thread.want.entries().first() == Some(&entry.name))
+                            && thread.want.entries().first().is_none_or(|first| {
+                                !admin.doc.entries().iter().any(|entry| entry.name == *first)
+                            })
                     }) {
-                        offers.push((operation.header.id, request));
+                        let candidate = (operation.header.id, request);
+                        best = Some(best.map_or(candidate, |cur| cur.min(candidate)));
                     }
                 }
-                offers.sort_unstable();
-                Ok(offers.first().map(|(offer, request)| (*request, *offer)))
+                Ok(best.map(|(offer, request)| (request, offer)))
             },
         )
         .map(Option::flatten)

@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 12, "0.12");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 13, "0.13");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -1072,8 +1072,18 @@ fn is_fault(message: &str) -> bool {
     .any(|f| message.starts_with(f))
 }
 
+/// Muse Code's own notice that it stopped the last turn (`◆ A configuration problem stopped this
+/// turn. Fix it in /settings.`), its lines joined: no reply and no wall, and only a person clears
+/// what it names.
+#[must_use]
+pub fn stopped_turn(rows: &[String]) -> Option<String> {
+    ended(rows)
+        .map(|(_, lines)| lines.join(" "))
+        .filter(|message| is_fault(message))
+}
+
 fn faulted(rows: &[String]) -> bool {
-    ended(rows).is_some_and(|(_, lines)| is_fault(&lines.join(" ")))
+    stopped_turn(rows).is_some()
 }
 
 /// Returns whether the last turn was interrupted by the user (`◆ Interrupted`).

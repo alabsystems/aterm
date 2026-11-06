@@ -1768,6 +1768,14 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return CloseOutcome::Stay; // stale/unknown id → no-op
         }
+        if self.exits_app_when_closing(wid)
+            && !self.accounts_drained_before(crate::app_account_work::Continuation::Window(
+                wid,
+                Some(crate::session_store::current_close_attribution()),
+            ))
+        {
+            return CloseOutcome::Stay;
+        }
         #[cfg(target_os = "macos")]
         self.withdraw_askpass_window(wid);
         let deferred_attribution = self
@@ -1909,9 +1917,13 @@ impl App {
         }
         match self.prepare_window_native_shutdown(wid, crate::native_app::CloseScope::Window) {
             Ok(true) => {}
-            Ok(false) => return CloseOutcome::Stay,
+            Ok(false) => {
+                self.disarm_account_window_close(wid);
+                return CloseOutcome::Stay;
+            }
             Err(error) => {
                 aterm_log::warn!("window native close barrier: {error}");
+                self.disarm_account_window_close(wid);
                 return CloseOutcome::Stay;
             }
         }
@@ -1920,6 +1932,7 @@ impl App {
             Ok(false) => return CloseOutcome::Stay,
             Err(error) => {
                 aterm_log::warn!("window document close barrier: {error}");
+                self.disarm_account_window_close(wid);
                 return CloseOutcome::Stay;
             }
         }
@@ -2400,6 +2413,7 @@ impl App {
         }
         if !proceed {
             pending.replay.cancel();
+            self.resume_drained_accounts();
             // The attribution `present_close_banner` stashed was for a replay that
             // will not run; a later close must not inherit this gesture's name.
             if let Some(ws) = self.windows.get_mut(&pending.wid) {
@@ -2587,6 +2601,7 @@ impl App {
                 busy,
                 crate::close_confirm::CloseReplay::Quit,
             ) {
+                self.resume_drained_accounts();
                 return;
             }
         }
@@ -2605,30 +2620,39 @@ impl App {
                 aterm_log::info!(
                     "quit waits: a tab holds unsaved work, and its Review and Discard are on it"
                 );
+                self.resume_drained_accounts();
                 return QuitBarrier::Refused;
             }
             Err(error) => {
                 aterm_log::warn!("quit native close barrier: {error}");
+                self.resume_drained_accounts();
                 return QuitBarrier::Refused;
             }
         }
         match self.prepare_quit_document_shutdown() {
-            Ok(true) => QuitBarrier::Ready,
+            Ok(true) => {
+                if self.accounts_drained_before(crate::app_account_work::Continuation::Quit) {
+                    QuitBarrier::Ready
+                } else {
+                    QuitBarrier::Saving
+                }
+            }
             Ok(false) if !self.quit_document_shutdown_blocked() => QuitBarrier::Saving,
             Ok(false) => {
                 self.cancel_failed_quit_document_shutdown();
+                self.resume_drained_accounts();
                 QuitBarrier::Refused
             }
             Err(error) => {
                 aterm_log::warn!("quit document close barrier: {error}");
                 self.cancel_failed_quit_document_shutdown();
+                self.resume_drained_accounts();
                 QuitBarrier::Refused
             }
         }
     }
 
     /// A Quit whose barriers were ready when it deferred behind an update handoff.
-    #[cfg(unix)]
     pub(crate) fn replay_clean_quit_ready(&mut self) -> bool {
         match self.quit_barriers() {
             QuitBarrier::Ready => {
@@ -2758,13 +2782,17 @@ impl App {
                 if !waiting {
                     let _ = crate::menu::cancel_native_termination(generation);
                 }
+                self.resume_drained_accounts();
                 return false;
             }
         }
 
         match self.quit_barriers() {
             QuitBarrier::Ready => {}
-            QuitBarrier::Saving => return false,
+            QuitBarrier::Saving => {
+                self.account_quit_generation(generation);
+                return false;
+            }
             QuitBarrier::Refused => {
                 let _ = crate::menu::cancel_native_termination(generation);
                 return false;
@@ -2788,13 +2816,16 @@ impl App {
             ) {
                 return;
             }
-            let _ = crate::menu::complete_current_native_termination();
-            let _ = self.video_abort_app_shutdown();
-            el.exit();
+            if self.replay_clean_quit_ready() {
+                el.exit();
+            }
             return;
         }
         for window in windows {
-            if matches!(self.close_window_logical(window), CloseOutcome::Exit) {
+            if matches!(
+                self.close_window_through_barriers(window),
+                CloseOutcome::Exit
+            ) {
                 el.exit();
                 return;
             }

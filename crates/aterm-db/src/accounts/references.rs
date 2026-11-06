@@ -131,23 +131,24 @@ impl<'a> Graph<'a> {
 
     /// Follow only declared links. The result is a mailbox claim for detecting
     /// contradictions, even if a linked record is broken. It is never a route.
-    fn email(
+    fn email<'v>(
         &mut self,
         object: &Key,
         field: &str,
-        id: &str,
-        mut initial: Option<&'a Value>,
+        id: &'v str,
+        mut initial: Option<&'v Value>,
     ) -> Option<String> {
-        let mut next = Some(id.to_owned());
+        let mut next = Some(id);
         let mut seen = BTreeSet::new();
         let mut mailboxes = BTreeSet::new();
         while let Some(id) = next.take() {
-            let target = ("email-addresses".into(), id.clone());
-            if !seen.insert(id.clone()) {
+            if !seen.insert(id) {
+                let target = ("email-addresses".into(), id.to_owned());
                 self.issue(object, field, "alias-cycle", Some(target));
                 break;
             }
             if seen.len() > MAX_ALIAS_DEPTH {
+                let target = ("email-addresses".into(), id.to_owned());
                 self.limits.insert("alias-depth");
                 self.issue(object, field, "alias-depth-exceeded", Some(target));
                 break;
@@ -155,6 +156,7 @@ impl<'a> Graph<'a> {
             let value = if let Some(value) = initial.take() {
                 value
             } else {
+                let target = ("email-addresses".into(), id.to_owned());
                 let Some(value) = self.get(object, field, &target) else {
                     break;
                 };
@@ -165,10 +167,7 @@ impl<'a> Graph<'a> {
                 let _ = self.get(object, field, &target);
                 mailboxes.insert(mailbox.to_owned());
             }
-            next = value
-                .get("alias_of")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            next = value.get("alias_of").and_then(Value::as_str);
         }
         if mailboxes.len() > 1 {
             self.issue(object, field, "alias-mailbox-conflict", None);
@@ -280,7 +279,7 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn object(&mut self, key: &Key, value: &'a Value) {
+    fn object(&mut self, key: &'a Key, value: &'a Value) {
         match key.0.as_str() {
             "email-addresses" => {
                 let _ = self.email(key, "delivery", &key.1, Some(value));
@@ -439,7 +438,7 @@ pub(super) fn inspect_with_links(snapshot: &Snapshot) -> (Value, Links) {
         steps: 0,
         links: Links::new(),
     };
-    let mut addresses = BTreeMap::<String, Vec<Key>>::new();
+    let mut addresses = BTreeMap::<&str, Vec<&Key>>::new();
     let mut inspected = 0;
     for (key, cell) in &snapshot.cells {
         if graph.steps == MAX_STEPS {
@@ -461,10 +460,7 @@ pub(super) fn inspect_with_links(snapshot: &Snapshot) -> (Value, Links) {
         if key.0 == "email-addresses"
             && let Some(address) = value.get("address").and_then(Value::as_str)
         {
-            addresses
-                .entry(address.into())
-                .or_default()
-                .push(key.clone());
+            addresses.entry(address).or_default().push(key);
         }
         graph.object(key, value);
     }

@@ -71,8 +71,8 @@ fn presence_runs_while_the_mesh_is_held() {
 
 /// What a row reads: this build, this Mac's fleet addresses at the port the latest generation
 /// bound, and the membership log the job holds (with no vault, the record store it was given);
-/// with neither, no membership digest. The lab tables have no store in the node job yet, and with
-/// no mesh hosting `bus.log` no topics are held.
+/// with neither, no membership digest. The lab tables and the held topics are the mesh's: with no
+/// mesh, neither is read.
 #[test]
 fn a_row_reads_this_build_the_bound_port_and_the_records_held() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -87,7 +87,10 @@ fn a_row_reads_this_build_the_bound_port_and_the_records_held() {
     assert_eq!(facts.build, Build::running());
     assert!(facts.addresses.iter().all(|at| at.port() == 48_123));
     assert_eq!(facts.membership, None, "no vault and no record store");
-    assert_eq!(facts.tables, None);
+    assert_eq!(
+        facts.tables, None,
+        "no mesh, so no egress has read the tables"
+    );
     assert_eq!(
         facts.topics,
         Vec::<String>::new(),

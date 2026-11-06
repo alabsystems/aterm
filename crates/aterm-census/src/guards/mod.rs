@@ -381,7 +381,7 @@ impl Corpus {
     }
 
     /// Which files are test code that nothing ships ([`rules::TestCode::read`]), read once for
-    /// every guard: a guard asks it whether a file ships, never a path test of its own.
+    /// every guard that leaves test code out.
     fn test_code(&self) -> &rules::TestCode {
         self.test_code.get_or_init(|| rules::TestCode::read(self))
     }
@@ -409,35 +409,6 @@ impl Corpus {
             .binary_search_by(|f| f.rel.as_str().cmp(rel))
             .ok()
             .map(|i| &self.files[i])
-    }
-
-    /// The files under `prefix` that compile only under `test`: each file a test-gated `mod`
-    /// declaration names (`#[cfg(all(test, unix))] #[path = "x.rs"] mod x;`), and every module
-    /// such a file declares, unless a shipped line also loads it.
-    pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
-        let prefixes = [prefix];
-        let loads: Vec<(&str, &[Load])> = self
-            .under(&prefixes)
-            .map(|f| (f.rel.as_str(), f.loads()))
-            .collect();
-        let mut out = BTreeSet::new();
-        loop {
-            let before = out.len();
-            for (rel, loads) in &loads {
-                let whole = out.contains(*rel);
-                for load in loads.iter().filter(|l| whole || l.gated) {
-                    for child in load.files.iter().filter(|c| self.get(c).is_some()) {
-                        out.insert(child.clone());
-                    }
-                }
-            }
-            if out.len() == before {
-                break;
-            }
-        }
-        let shipped = self.shipped_loads(&prefixes, &|rel| out.contains(rel));
-        out.retain(|file| !shipped.contains(file));
-        out
     }
 
     /// The files a shipped line of a shipped file under `prefixes` loads
@@ -517,9 +488,6 @@ pub(crate) struct Load {
     /// Outside the shipped lines: inside an item whose `cfg` proves it
     /// test-only.
     pub(crate) gated: bool,
-    /// A `mod` at the file's top level: not one in an inline module or a
-    /// block, and not an `include!`.
-    pub(crate) top: bool,
 }
 
 /// A directory no walk enters: `.git`, build output (`target`, `target-*`,
@@ -861,9 +829,8 @@ impl SourceFile {
         } else {
             format!("{dir}/{}", self.name().trim_end_matches(".rs"))
         };
-        let depth = depths_at(code, decls.iter().map(|d| d.0));
         let mut out = Vec::new();
-        for ((at, name, paths), depth) in decls.iter().zip(depth) {
+        for (at, name, paths) in &decls {
             let chain: Vec<&str> = inline
                 .iter()
                 .filter(|&&(open, close, _)| open < *at && *at < close)
@@ -890,7 +857,6 @@ impl SourceFile {
                 files,
                 kind,
                 gated: gated(*at),
-                top: depth == 0,
             });
         }
         include_loads(code, text, dir, manifest_dir, &gated, &mut out);
@@ -936,7 +902,6 @@ fn include_loads(
                     files: vec![joined(mdir, suffix.trim_start_matches('/'))],
                     kind: LoadKind::Include,
                     gated: gated(at),
-                    top: false,
                 });
             }
             continue;
@@ -956,7 +921,6 @@ fn include_loads(
             files: vec![joined(dir, path)],
             kind: LoadKind::Include,
             gated: gated(at),
-            top: false,
         });
     }
 }
@@ -1039,25 +1003,6 @@ fn brace_close(code: &str, open: usize) -> Option<usize> {
         }
     }
     None
-}
-
-/// The brace depth at each of `positions` (ascending) in a CODE view.
-fn depths_at(code: &str, positions: impl Iterator<Item = usize>) -> Vec<i64> {
-    let b = code.as_bytes();
-    let (mut depth, mut from) = (0i64, 0usize);
-    positions
-        .map(|at| {
-            for &c in &b[from..at] {
-                match c {
-                    b'{' => depth += 1,
-                    b'}' => depth -= 1,
-                    _ => {}
-                }
-            }
-            from = at;
-            depth
-        })
-        .collect()
 }
 
 /// `path` under the directory `dir`, `..` and `.` resolved.
@@ -1203,11 +1148,23 @@ pub(crate) mod tests {
         assert_eq!(found[0].rule, "boom");
     }
 
-    /// A file is test-only when its parent declares it under a test `cfg`,
+    /// The files of `corpus` that are test code nothing ships ([`rules::TestCode::holds`]).
+    fn held(corpus: &Corpus) -> Vec<String> {
+        let test_code = corpus.test_code();
+        let held: BTreeSet<String> = corpus
+            .files
+            .iter()
+            .filter(|f| test_code.holds(&f.rel))
+            .map(|f| f.rel.clone())
+            .collect();
+        held.into_iter().collect()
+    }
+
+    /// A file is test code when its parent declares it under a test `cfg`,
     /// by its own name, its `mod.rs` or a `#[path]`, or when a test-only file
     /// declares it.
     #[test]
-    fn a_module_its_parent_gates_on_test_is_test_only() {
+    fn a_module_its_parent_gates_on_test_is_test_code() {
         let corpus = Corpus::of(&[
             (
                 "crates/x/src/lib.rs",
@@ -1225,9 +1182,8 @@ pub(crate) mod tests {
             ("crates/x/src/plain/tests.rs", ""),
             ("crates/x/src/plain/inner.rs", ""),
         ]);
-        let found: Vec<String> = corpus.test_only("crates/x/").into_iter().collect();
         assert_eq!(
-            found,
+            held(&corpus),
             [
                 "crates/x/src/a.rs",
                 "crates/x/src/a/b/mod.rs",
@@ -1238,9 +1194,9 @@ pub(crate) mod tests {
     }
 
     /// A file a shipped line also loads ships, and so does what it declares; a file only a
-    /// test-only file loads stays test-only. Each load resolves as rustc resolves it: an
-    /// attribute on the `mod`'s own line, a `cfg_attr` path, an inline module's directory, an
-    /// `include!` literal.
+    /// test-only file loads stays test code, and so does one a test-only inline module
+    /// `include!`s. Each load resolves as rustc resolves it: an attribute on the `mod`'s own
+    /// line, a `cfg_attr` path, an inline module's directory, an `include!` literal.
     #[test]
     fn a_test_module_a_shipped_line_also_loads_ships() {
         let corpus = Corpus::of(&[
@@ -1260,9 +1216,8 @@ pub(crate) mod tests {
             ("crates/x/src/inc.rs", ""),
             ("crates/x/src/c_inc.rs", ""),
         ]);
-        let found: Vec<String> = corpus.test_only("crates/x/").into_iter().collect();
         assert_eq!(
-            found,
+            held(&corpus),
             [
                 "crates/x/src/a.rs",
                 "crates/x/src/a/a_child.rs",
@@ -1270,10 +1225,10 @@ pub(crate) mod tests {
             ]
         );
         let lib = corpus.get("crates/x/src/lib.rs").map(SourceFile::loads);
-        let loads: Vec<(Vec<String>, bool, bool)> = lib
+        let loads: Vec<(Vec<String>, bool)> = lib
             .unwrap_or_default()
             .iter()
-            .map(|l| (l.files.clone(), l.gated, l.top))
+            .map(|l| (l.files.clone(), l.gated))
             .collect();
         let s = |p: &str| p.to_string();
         assert_eq!(
@@ -1281,26 +1236,23 @@ pub(crate) mod tests {
             [
                 (
                     vec![s("crates/x/src/a.rs"), s("crates/x/src/a/mod.rs")],
-                    true,
                     true
                 ),
                 (
                     vec![s("crates/x/src/b.rs"), s("crates/x/src/b/mod.rs")],
-                    true,
                     true
                 ),
-                (vec![s("crates/x/src/b.rs")], false, true),
-                (vec![s("crates/x/src/outer/o.rs")], false, false),
+                (vec![s("crates/x/src/b.rs")], false),
+                (vec![s("crates/x/src/outer/o.rs")], false),
                 (
                     vec![
                         s("crates/x/src/outer/plain.rs"),
                         s("crates/x/src/outer/plain/mod.rs")
                     ],
-                    false,
                     false
                 ),
-                (vec![s("crates/x/src/inc.rs")], false, false),
-                (vec![s("crates/x/src/c_inc.rs")], true, false),
+                (vec![s("crates/x/src/inc.rs")], false),
+                (vec![s("crates/x/src/c_inc.rs")], true),
             ]
         );
     }

@@ -128,6 +128,9 @@ enum FailureKind {
     Repair(aterm_types::network_state::RepairCause),
     #[cfg(unix)]
     EnrollmentPending,
+    /// A record names a writer grant or a roster this Mac's membership view does not hold yet.
+    #[cfg(unix)]
+    AwaitingMembership,
 }
 
 impl fmt::Debug for Error {
@@ -150,7 +153,9 @@ impl Error {
             FailureKind::Repair(cause) => cause,
             FailureKind::Busy | FailureKind::SnapshotChanged => RepairCause::NotReady,
             #[cfg(unix)]
-            FailureKind::EnrollmentPending => RepairCause::NotReady,
+            FailureKind::EnrollmentPending | FailureKind::AwaitingMembership => {
+                RepairCause::NotReady
+            }
             FailureKind::Other => RepairCause::Other,
         }
     }
@@ -174,6 +179,31 @@ impl Error {
     #[cfg(unix)]
     pub(crate) fn is_enrollment_pending(&self) -> bool {
         matches!(self.1, FailureKind::EnrollmentPending)
+    }
+    /// A record whose writer grant or roster is not in this Mac's membership view yet: it may
+    /// authenticate after a membership change. Inside `untyped_membership` on this thread
+    /// (tests), it is an untyped refusal, as before the classification existed.
+    #[cfg(unix)]
+    pub(crate) fn awaiting_membership(reason: &str) -> Self {
+        #[cfg(test)]
+        if UNTYPED_MEMBERSHIP.with(std::cell::Cell::get) {
+            return Self::new(reason);
+        }
+        Self(reason.into(), FailureKind::AwaitingMembership)
+    }
+    /// Whether a record waits for this Mac's membership view: its writer is not a seat it knows
+    /// at the record's epoch, or its roster is one this Mac has not seen. A later membership
+    /// change can admit it; nothing about the record itself is refused.
+    #[must_use]
+    pub fn is_awaiting_membership(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self.1, FailureKind::AwaitingMembership)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
     /// Whether local contention or a newer snapshot requires a fresh observation.
     pub(crate) fn is_busy(&self) -> bool {
@@ -223,6 +253,25 @@ impl From<aterm_secrets::Error> for Error {
         Self(value.to_string(), kind)
     }
 }
+#[cfg(all(unix, test))]
+std::thread_local! {
+    static UNTYPED_MEMBERSHIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `run` with [`Error::awaiting_membership`] untyped on this thread: the negative control of
+/// a test that a waiting record is told apart from a refused one.
+#[cfg(all(unix, test))]
+pub(crate) fn untyped_membership<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNTYPED_MEMBERSHIP.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(UNTYPED_MEMBERSHIP.with(|slot| slot.replace(true)));
+    run()
+}
+
 /// Database boundary result.
 pub type Result<T> = std::result::Result<T, Error>;
 

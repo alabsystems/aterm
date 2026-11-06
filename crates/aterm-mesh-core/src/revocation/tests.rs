@@ -52,16 +52,19 @@ type View<'a> = Table<'a, &'a dyn Fn(usize, usize) -> bool>;
 /// A reading of whether a recipient is revoked: the decision's, or a mutant's.
 type Revoked = fn(&View<'_>, usize) -> bool;
 
-/// What one answer sheet reads of a view: the island's `revoked`, `current` and `revokes`.
+/// What one answer sheet reads of a view: the island's `revoked`, `current`, `gate` and
+/// `revokes`.
 struct Reading {
     revoked: Revoked,
     current: fn(&View<'_>, usize) -> bool,
+    gate: fn(&View<'_>, usize) -> bool,
     revokes: fn(&View<'_>, usize) -> bool,
 }
 
 const DECISION: Reading = Reading {
     revoked: |t, r| t.revoked(r),
     current: |t, r| t.current(r),
+    gate: |t, e| t.gate(e),
     revokes: |t, i| t.revokes(i),
 };
 
@@ -76,8 +79,8 @@ fn grid_byte(k: usize, reading: &Reading) -> u8 {
         (reading.revoked)(&t, 1),
         (reading.current)(&t, 0),
         (reading.current)(&t, 1),
-        t.gate(4),
-        t.gate(7),
+        (reading.gate)(&t, 4),
+        (reading.gate)(&t, 7),
         (reading.revokes)(&t, 0),
         (reading.revokes)(&t, 1),
     ];
@@ -163,18 +166,46 @@ fn revoked_index_order(t: &View<'_>, r: usize) -> bool {
     })
 }
 
+/// PF1's first gate: every `Remove` that took a revoking row lies in the epoch's past, whether
+/// or not a live row binds its recipient.
+fn gate_every_taker(t: &View<'_>, e: usize) -> bool {
+    (0..t.rows().len()).all(|i| !t.revokes(i) || t.takers_before(i, e))
+}
+
 #[test]
 fn the_grid_sees_every_replaced_rule() {
     let island = island_sheet().expect("the island states its answer sheet");
-    for (name, revoked) in [
-        ("pre-A15 superseded skip", revoked_pre_a15 as Revoked),
-        ("any holder keeps it", revoked_any_holder),
-        ("index order", revoked_index_order),
-    ] {
-        let mutant = Reading {
-            revoked,
-            ..DECISION
-        };
+    let mutants = [
+        (
+            "pre-A15 superseded skip",
+            Reading {
+                revoked: revoked_pre_a15,
+                ..DECISION
+            },
+        ),
+        (
+            "any holder keeps it",
+            Reading {
+                revoked: revoked_any_holder,
+                ..DECISION
+            },
+        ),
+        (
+            "index order",
+            Reading {
+                revoked: revoked_index_order,
+                ..DECISION
+            },
+        ),
+        (
+            "every-taker gate",
+            Reading {
+                gate: gate_every_taker,
+                ..DECISION
+            },
+        ),
+    ];
+    for (name, mutant) in mutants {
         assert_ne!(
             sheet(&mutant),
             island,
@@ -287,6 +318,20 @@ fn a_quorum_removal_is_out_for_good_and_a_void_lifts_a_removal() {
     }];
     let lifted = table(&rows[..1], &void, total);
     assert!(!lifted.revoked(0) && lifted.current(0));
+}
+
+#[test]
+fn one_concurrent_remove_of_a_recipient_no_live_row_binds_leaves_the_gate_open() {
+    // The island's `twice`: one row (entry 0), taken by two `Remove`s (records 1 and 2); the
+    // epoch (record 3) has record 1 in its past and is concurrent with record 2.
+    let rows = [row(0, 0, 0)];
+    let removes = [remove(0, 1), remove(0, 2)];
+    let racing: &dyn Fn(usize, usize) -> bool = &|a, b| a < b && !(a == 2 && b == 3);
+    let t = table(&rows, &removes, racing);
+    assert!(t.revoked(0) && !t.bound_live(0));
+    assert!(t.gate(3), "every Mac holding the epoch holds record 1");
+    assert!(!gate_every_taker(&t, 3), "PF1's first gate called it due");
+    assert!(!t.gate(0), "an epoch before both Removes is due");
 }
 
 #[test]

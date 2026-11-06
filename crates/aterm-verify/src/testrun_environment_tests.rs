@@ -47,15 +47,32 @@ fn failed(binary: &Binary, chatter: &str, failures: &[(&str, &str)]) -> Run {
         output,
         code: Some(101),
         spawn_error: None,
+        usage: None,
     }
 }
 
 fn event(binary: &Binary, run: &Run) -> aterm_json::Value {
-    let line = binary_event(
+    let (event, sample) = event_and_sample(binary, run, true);
+    if let Some(sample) = sample {
+        assert_eq!(event["outcome"].as_str(), Some(sample.outcome.as_str()));
+    }
+    event
+}
+
+/// The event of `run`, at a width of 3, with the fields every event has, and the history sample
+/// it keeps, if it keeps one, with the figures the event has.
+fn event_and_sample(
+    binary: &Binary,
+    run: &Run,
+    started: bool,
+) -> (aterm_json::Value, Option<crate::test_history::Sample>) {
+    let (_, line, sample) = binary_event(
         binary,
         run,
+        started,
         Duration::from_millis(1250),
         Duration::from_millis(8500),
+        3,
     );
     let event: aterm_json::Value =
         aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
@@ -65,7 +82,120 @@ fn event(binary: &Binary, run: &Run) -> aterm_json::Value {
     assert_eq!(event["exit_code"].as_i64(), run.code.map(i64::from));
     assert_eq!(event["waiting_s"].as_f64(), Some(1.25));
     assert_eq!(event["execution_s"].as_f64(), Some(8.5));
-    event
+    assert_eq!(event["width"].as_u64(), Some(3));
+    if let Some(sample) = &sample {
+        assert_eq!(sample.width, 3);
+        assert_eq!(event["tests"].as_u64(), sample.tests);
+        assert_eq!(sample.wall_ms, 8500);
+    }
+    (event, sample)
+}
+
+/// The event and the sample of a binary `run` that measured it.
+fn measured_sample(binary: &Binary, run: &Run) -> (aterm_json::Value, crate::test_history::Sample) {
+    let (event, sample) = event_and_sample(binary, run, true);
+    (
+        event,
+        sample.expect("a run that measured its binary keeps a sample"),
+    )
+}
+
+/// A BINARY'S HISTORY KEEPS ONLY THE RUNS THAT MEASURED IT: one the run's ceiling left no time
+/// to start ([`not_started`]), one something outside it ended (an interrupt that came before it
+/// started, a stuck holder: `spawn_error`) and one that ended as an interrupt was ending the run
+/// keep no sample, each with its event as before; one the ceiling ended mid-run keeps its
+/// sample, a lower bound with its wall and its test count. NEGATIVE CONTROL: the unstarted run
+/// counted as started, and the interrupted one once the run is no longer ending, each keep one.
+#[test]
+fn only_a_run_that_measured_its_binary_keeps_a_sample() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let binary = binary();
+    let never = not_started(&binary, Duration::from_secs(30));
+    let (event, sample) = event_and_sample(&binary, &never, false);
+    assert_eq!(event["outcome"].as_str(), Some("FAIL"));
+    assert!(sample.is_none(), "{sample:?}");
+    assert!(event_and_sample(&binary, &never, true).1.is_some());
+
+    for why in [
+        "the run was interrupted before this child started",
+        "this child waited for admission or a lock behind a holder that has made no progress",
+    ] {
+        let mut ended = failed(&binary, "", &[("broke", "assertion failed")]);
+        ended.code = None;
+        ended.spawn_error = Some(why.to_owned());
+        let (event, sample) = event_and_sample(&binary, &ended, true);
+        assert_eq!(event["outcome"].as_str(), Some("NOT RUN"));
+        assert!(sample.is_none(), "{why}: {sample:?}");
+    }
+
+    let ceiling = Run {
+        ok: false,
+        output: format!(
+            "{}\n\nrunning 3 tests\ntest slow ... ok\n{} — killed at the ceiling\n",
+            binary.header,
+            crate::findings::CEILING_KILL
+        ),
+        code: None,
+        spawn_error: None,
+        usage: None,
+    };
+    let (event, sample) = measured_sample(&binary, &ceiling);
+    assert_eq!(event["outcome"].as_str(), Some("FAIL"));
+    assert_eq!((sample.wall_ms, sample.tests), (8500, Some(3)));
+
+    let mut passed = failed(&binary, "", &[]);
+    passed.ok = true;
+    passed.code = Some(0);
+    let end = Arc::new(AtomicBool::new(true));
+    crate::exec::ends::when(Arc::clone(&end), Arc::new(AtomicBool::new(false)));
+    let (event, sample) = event_and_sample(&binary, &passed, true);
+    assert_eq!(event["outcome"].as_str(), Some("ok"));
+    assert!(sample.is_none(), "{sample:?}");
+    end.store(false, Ordering::SeqCst);
+    assert_eq!(measured_sample(&binary, &passed).1.outcome, "ok");
+}
+
+/// A finished binary's event carries what its tree used, the width it ran at and the tests
+/// libtest said it runs, and its history sample the same figures: 2.5 CPU-s, 0.75 s starved and
+/// 1 GiB held become 2500 ms, 750 ms and 1 GiB. With no reading of its tree (every platform but
+/// macOS), each usage field is `null` and its sample keeps none, never 0; with no opening line,
+/// no test count. NEGATIVE CONTROL: the read run's numbers are not the unread run's nulls.
+#[test]
+fn a_binarys_event_and_sample_carry_its_usage_width_and_tests() {
+    let binary = binary();
+    let mut run = failed(&binary, "", &[("broke", "assertion failed")]);
+    let (unread, sample) = measured_sample(&binary, &run);
+    for field in ["cpu_s", "starved_s", "peak_bytes"] {
+        assert!(unread[field].is_null(), "{field}: {unread}");
+    }
+    assert_eq!(unread["tests"].as_u64(), Some(2));
+    assert_eq!(
+        (sample.cpu_ms, sample.starved_ms, sample.peak_bytes),
+        (None, None, None)
+    );
+    run.usage = Some(crate::exec::TreeUsage {
+        cpu: Duration::from_millis(2500),
+        runnable: Duration::from_secs(3),
+        starved: Duration::from_millis(750),
+        waited: Duration::ZERO,
+        wall: Duration::from_millis(8500),
+        peak_bytes: 1 << 30,
+        processes: 4,
+    });
+    let (read, sample) = measured_sample(&binary, &run);
+    assert_eq!(read["cpu_s"].as_f64(), Some(2.5));
+    assert_eq!(read["starved_s"].as_f64(), Some(0.75));
+    assert_eq!(read["peak_bytes"].as_u64(), Some(1 << 30));
+    assert_eq!(
+        (sample.cpu_ms, sample.starved_ms, sample.peak_bytes),
+        (Some(2500), Some(750), Some(1 << 30))
+    );
+    assert_eq!(sample.outcome, "FAIL");
+    run.output = "thread 'main' panicked before its harness\n".to_owned();
+    let (none, sample) = measured_sample(&binary, &run);
+    assert!(none["tests"].is_null() && sample.tests.is_none());
 }
 
 fn assert_combined_parity(binary: &Binary, run: &Run, event: &aterm_json::Value) {
@@ -193,6 +323,7 @@ fn an_enospc_abort_retains_the_actual_missing_exit_code() {
         ),
         code: None,
         spawn_error: None,
+        usage: None,
     };
     let event = event(&binary, &run);
     assert_eq!(event["outcome"].as_str(), Some("NOT RUN"));

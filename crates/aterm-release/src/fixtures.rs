@@ -189,8 +189,8 @@ pub fn stage(
         let prefix = format!("{}-", pins.tag());
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                crate::gates::clear_path(&entry.path())
-                    .map_err(|e| io("cannot clear", &entry.path(), e))?;
+                let path = entry.path();
+                crate::gates::clear_path(&path).map_err(|e| io("cannot clear", &path, e))?;
             }
         }
     }
@@ -872,10 +872,7 @@ pub fn land(
             });
         }
         let why = push.stderr_utf8().trim().to_string();
-        let lost_race = why.contains("non-fast-forward")
-            || why.contains("fetch first")
-            || why.contains("[rejected]");
-        if !lost_race {
+        if !crate::ledger::lost_race(&why) {
             return Err(Error::new(format!(
                 "handoff fixtures: git push origin main failed (not a fast-forward rejection, \
                  so retrying cannot help): {why}"

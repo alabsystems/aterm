@@ -39,6 +39,7 @@ mod hook;
 
 mod interrupt;
 mod ledger;
+mod line;
 
 mod machines;
 mod manifest_out;
@@ -49,6 +50,7 @@ mod provision;
 mod publish;
 
 mod release;
+mod release_disk;
 mod release_keychain;
 mod release_status;
 mod release_steps;

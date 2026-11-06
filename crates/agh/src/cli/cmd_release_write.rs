@@ -806,10 +806,14 @@ fn expected_assets(
             ))
         };
         let (name, hex) = value.split_once('=').ok_or_else(bad)?;
-        if name.is_empty() || !aterm_codec::hex::is_lower(hex, 64) {
+        let mut bytes = [0u8; 32];
+        if name.is_empty()
+            || !aterm_codec::hex::is_lower(hex, 64)
+            || !aterm_codec::hex::decode_into(hex.as_bytes(), &mut bytes)
+        {
             return Err(bad());
         }
-        let digest = Sha256Digest::parse(&format!("sha256:{hex}")).ok_or_else(bad)?;
+        let digest = Sha256Digest::from_bytes(bytes);
         if assets.insert(name.to_string(), digest).is_some() {
             return Err(inv.usage(format!("--expect-asset {name} given twice")));
         }

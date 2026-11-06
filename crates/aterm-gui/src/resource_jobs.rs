@@ -157,12 +157,17 @@ pub(crate) fn command(ctx: &crate::SessionCtx, owner: bool, rest: &str) -> Strin
             let supported =
                 key(std::process::id()).is_some() && boot().is_some() && runner.is_some();
             format!(
-                "OK resources version=1 available={} self_register=peer-pid-start group_signals=exec-inherit runner={} ai={} session={}\n",
+                "OK resources version=1 available={} self_register=peer-pid-start group_signals=exec-inherit cpu=shared-kernel-leases runner={} ai={} session={}\n",
                 u8::from(supported),
                 aterm_codec::pct::encode(runner.unwrap_or("-")),
                 program(ctx),
                 ctx.self_id.as_str()
             )
+        }
+        Some("cpu") if words.next().is_none() => {
+            let dir = aterm_capacity::ledger::user_dir();
+            let cpu = aterm_capacity::CpuObservation::read(dir.as_deref());
+            format!("OK resources-cpu version=1\n{}\n", cpu.json())
         }
         Some("register") => {
             if !owner {
@@ -234,7 +239,7 @@ fn confirmed_peer(root: ProcessKey, expected: Option<u64>, now: Option<ProcessKe
 }
 
 fn usage() -> String {
-    "ERR usage: resources [capabilities|register start=<kernel-start> [ai=<word>] job=<percent-encoded-label>]\n".into()
+    "ERR usage: resources [capabilities|cpu|register start=<kernel-start> [ai=<word>] job=<percent-encoded-label>]\n".into()
 }
 
 fn list(session: &str) -> String {
@@ -626,6 +631,16 @@ mod tests {
                     .any(|part| part == format!("ai={expected}"))
             );
         }
+    }
+
+    #[test]
+    fn cpu_control_reports_the_shared_observation_without_claiming_a_lease() {
+        let session = crate::stub_session(0);
+        let reply = command(&session.ctx, true, "cpu");
+        let payload = reply.strip_prefix("OK resources-cpu version=1\n").unwrap();
+        let json: aterm_json::Value = aterm_json::from_str(payload).unwrap();
+        assert!(json.get("state").is_some());
+        assert!(command(&session.ctx, true, "cpu extra").starts_with("ERR usage:"));
     }
 
     fn claimed_session() -> crate::Session {

@@ -261,9 +261,18 @@ impl std::fmt::Debug for EntrySnapshot {
 pub struct VerifiedEntry {
     value: SecretBytes,
     snapshot: EntrySnapshot,
+    unanchored_default: bool,
 }
 
 impl VerifiedEntry {
+    /// Whether the authenticated entry only fills an unanchored local gap. A local edit of
+    /// such a configuration becomes the machine's own on the next ordinary vault sync;
+    /// an always-managed entry or an anchor does not grant that setup policy.
+    #[must_use]
+    pub const fn unanchored_default(&self) -> bool {
+        self.unanchored_default
+    }
+
     /// The authenticated bytes, borrowed without changing the observation.
     #[must_use]
     pub const fn value(&self) -> &SecretBytes {
@@ -839,6 +848,7 @@ fn read_entry_with_version_held(
     Ok(Some((
         VerifiedEntry {
             value,
+            unanchored_default: entry.if_absent && entry.anchor.is_none(),
             snapshot: EntrySnapshot {
                 mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
                 config,

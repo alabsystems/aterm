@@ -1074,6 +1074,21 @@ impl SessionLog {
                 let f = with(f, Key::Moved, Some(Val::U(1)));
                 (Kind::MailSeen, aterm_slog::Actor::Aterm, f)
             }
+            // Carried by aterm itself, by a fleet drive, with no bridge between (§11 C6). Its key
+            // names it, as the reply the session reads by `inbox fleet` does; its `fN` is the
+            // other Mac's.
+            F::FleetMailOut {
+                id: _,
+                kind,
+                to,
+                idem,
+            } => {
+                let f = word(Fields::new(), Key::Dir, "out");
+                let f = word(f, Key::MailKind, kind);
+                let f = text(f, Key::To, to);
+                let f = text(f, Key::Idem, idem);
+                (Kind::Mail, aterm_slog::Actor::Aterm, f)
+            }
             F::MailIn {
                 kind,
                 from,
@@ -1128,7 +1143,7 @@ impl SessionLog {
                 moved,
             } => {
                 let f = with(Fields::new(), Key::Inbox, Some(Val::U(inbox)));
-                let f = with(f, Key::Off, Some(Val::U(off)));
+                let f = with(f, Key::Off, off.map(Val::U));
                 let f = with(f, Key::Floor, floor.map(Val::U));
                 let f = with(f, Key::Seen, Some(Val::U(seen)));
                 let f = with(f, Key::Moved, Some(Val::U(u64::from(moved))));

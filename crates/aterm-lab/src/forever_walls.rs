@@ -308,8 +308,11 @@ fn switch_land_within_ms() -> i64 {
     next_step_ms(1, false) + PERSISTENCE_GRACE_MS + 60_000
 }
 
-fn switch_land_due(seen: &Seen, prompt_ms: i64) -> (i64, String) {
-    match named_backoff(seen, prompt_ms) {
+/// When W5's second agent's land act at `land` (none yet: the watch's end) is due past its prompt
+/// at `prompt_ms`: the back-off named before it and [`PERSISTENCE_GRACE_MS`], else within
+/// [`switch_land_within_ms`]; and what timed it, in the verdict's words.
+fn switch_land_due(seen: &Seen, (prompt_ms, land): (i64, i64)) -> (i64, String) {
+    match named_backoff(seen, (prompt_ms, land)) {
         Some((due, line)) => (due + PERSISTENCE_GRACE_MS, crate::util::one_line(line, 120)),
         None => (
             prompt_ms + switch_land_within_ms(),
@@ -414,8 +417,10 @@ pub(super) fn judge_wall_switch(
     if let Some(g) = going_in(&on, sw.exited_ms, held_until, t0) {
         return Verdict::Fail(format!("{said}; TYPED before {}'s land act: {g}", sw.to));
     }
-    let (due, backoff) = switch_land_due(seen, sw.prompt_ms);
-    if let Some((_, line)) = named_backoff(seen, sw.prompt_ms).filter(|(_, l)| !own_streak(l)) {
+    let (due, backoff) = switch_land_due(seen, (sw.prompt_ms, held_until));
+    if let Some((_, line)) =
+        named_backoff(seen, (sw.prompt_ms, held_until)).filter(|(_, l)| !own_streak(l))
+    {
         return Verdict::Fail(format!(
             "{said}; {program}'s STREAK CARRIED into {}: its first point named {}",
             sw.to,
@@ -737,19 +742,34 @@ fn gone_past(
 }
 
 /// How long after what went on past W8's wall Cruise's own act may come where the loop named no
-/// back-off for it: the ladder's step for `streak`, the short turns in a row the act the wall cut
-/// was typed on, which nothing past the wall adds to ([`sysmsg::streak_kept`]; the ladder's cap
-/// where that is unread), [`PERSISTENCE_GRACE_MS`], and a minute for the reply.
+/// back-off for it: the ladder's step for `streak` ([`waited_on`]; the ladder's cap where no streak
+/// was read, the longest step any streak names), [`PERSISTENCE_GRACE_MS`], and a minute for the
+/// reply.
 fn cruise_after_wall_ms(streak: Option<u32>) -> i64 {
     next_step_ms(streak.unwrap_or(u32::MAX), false) + PERSISTENCE_GRACE_MS + 60_000
 }
 
-/// The first short-turn back-off journaled after `tg`: its due (unix ms) and its line.
-pub(super) fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
+/// The short turns in a row the loop's wait before Cruise's act past W8's wall follows, where it
+/// named no back-off for it: those the last point record past the going on `tg` and before that
+/// act `next` names (the ladder's step after a point is its own streak's), else those of the point
+/// the act that met the wall at `t1` was typed on, which nothing past the wall adds to
+/// ([`sysmsg::streak_kept`]); `None` where neither was read.
+fn waited_on(seen: &Seen, t1: i64, (tg, next): (i64, i64)) -> Option<u32> {
+    sysmsg::last_point_in(seen, (tg, next.saturating_sub(1)))
+        .or_else(|| sysmsg::typed_on(seen, t1))
+        .map(|(_, n)| n)
+}
+
+/// The first short-turn back-off journaled past `from` and before `before`, the act it would time:
+/// its due (unix ms) and its line. One journaled after that act times a later act, not that one.
+pub(super) fn named_backoff(seen: &Seen, (from, before): (i64, i64)) -> Option<(i64, &str)> {
     seen.journal
         .iter()
         .filter(|(t, l)| {
-            *t > tg && l.starts_with("WAITING ") && l.contains(" short turn(s) in a row: ")
+            *t > from
+                && *t < before
+                && l.starts_with("WAITING ")
+                && l.contains(" short turn(s) in a row: ")
         })
         .find_map(|(_, l)| {
             let (_, rest) = l.split_once(" until=")?;
@@ -782,8 +802,8 @@ pub(super) fn cruise_went_on(seen: &Seen) -> Option<i64> {
 /// on, the short streak stands at the one the act the wall cut was typed on: the cut act, the
 /// vendor's own continuation that delivers it and the loop's resume add nothing
 /// ([`sysmsg::streak_kept`], v6 §14.17.5.7). Cruise's act after it comes by the due of the
-/// back-off the loop named there and [`PERSISTENCE_GRACE_MS`] (none named: within
-/// [`cruise_after_wall_ms`]).
+/// back-off the loop named there before that act ([`named_backoff`]) and [`PERSISTENCE_GRACE_MS`]
+/// (none named: within [`cruise_after_wall_ms`]).
 pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict {
     let Some((raised, reset_s)) = seen.cover.wall else {
         return Verdict::Unobserved(
@@ -864,7 +884,7 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
         .find(|(t, l)| *t > tg && act_rule(l) != Some(turn_end::RULE_LIMIT_RESUME))
         .map(|(t, l)| (*t, act_rule(l).unwrap_or("?")));
     let next = cruise.map_or(i64::MAX, |(tc, _)| tc);
-    // A want it could not read is decided last, so it never hides another's fault.
+    // A want it could not read is decided last, so every fault the records decide comes first.
     let (said, unread) = match sysmsg::streak_kept(seen, t1, (tg, "the going on", next), t0) {
         Ok(kept) => (format!("{said}{kept}"), None),
         Err(sysmsg::LandOn::Fault(why)) => {
@@ -872,13 +892,18 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
         }
         Err(sysmsg::LandOn::Unwatched(why)) => (said, Some(why)),
     };
-    let backoff = named_backoff(seen, tg);
+    let backoff = named_backoff(seen, (tg, next));
+    let waited = waited_on(seen, t1, (tg, next));
     let deadline = backoff.map_or_else(
-        || tg + cruise_after_wall_ms(sysmsg::typed_on(seen, t1).map(|(_, n)| n)),
+        || tg + cruise_after_wall_ms(waited),
         |(due, _)| due + PERSISTENCE_GRACE_MS,
     );
     let named = backoff.map_or_else(
-        || "no back-off named".to_string(),
+        || match waited {
+            Some(n) => format!("no back-off named; {n} short turn(s)' step"),
+            None => "no back-off named and no streak read, so only the ladder's cap bounds it"
+                .to_string(),
+        },
         |(due, l)| {
             format!(
                 "the back-off it named due +{} ({})",

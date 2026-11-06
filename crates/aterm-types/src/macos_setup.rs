@@ -1273,8 +1273,8 @@ pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long macOS's Local Network question counts as up once aterm raised it. macOS reports
 /// neither the alert nor its answer, so this is a bound, not a reading: the Commons runtime that
-/// asks by itself holds the dialog slot this long from its first LAN use (past
-/// [`lan_first_use::STEP_WAIT`], as a door pass's question is held, below). System State's Local
+/// asks by itself holds the dialog slot this long from its first LAN use,
+/// as a door pass's question is held below. System State's Local
 /// Network step holds its own alert until the answer is heard, until the window list, after
 /// showing a new window of the alert's owner, shows no window of that owner left, on screen or
 /// off, at a read with the person at the Mac (macOS 26 and 27), or until the person has been at
@@ -1301,30 +1301,18 @@ pub mod lan_first_use {
 
     static HANDED: OnceLock<u64> = OnceLock::new();
 
-    /// How long a use of the LAN waits for System State's Local Network step, from the first time
-    /// a use in this process found the step still to come ([`waits_for_step`]); `aterm-gui`'s
-    /// permission walk waits as long for it (`permission_walk::LOCAL_NETWORK_WAIT`). The step asks
-    /// only while System State is the visible view of a focused window, so a window whose System
-    /// State stays behind a terminal tab would otherwise hold every first LAN use for good: past
-    /// this, a use goes through this process's door ([`install_door`]), and macOS asks its own
-    /// question once. Where a door is installed (a window) only time with a person at the Mac
-    /// counts toward it ([`PRESENT_GAP`]): macOS lets no LAN traffic through before a person
-    /// answers its question, so a use held while nobody is there loses nothing. A process with no
-    /// door (the node job) counts the wall clock, and past this its uses go.
-    pub const STEP_WAIT: Duration = Duration::from_secs(60);
-
-    /// The most of the time between two looks that counts toward [`STEP_WAIT`] where a door is
-    /// installed, and only with a person read present at both looks: a look reads a person
-    /// present for an input within the last minute, so a longer gap may hide an absence.
+    /// The question's hold counts at most a minute between presence reads.
+    #[cfg(any(test, not(target_family = "wasm")))]
     const PRESENT_GAP: Duration = Duration::from_secs(60);
 
-    /// The time counted toward [`STEP_WAIT`] in this process, and the last look that counted it.
+    /// Time with an already visible question. This never delays the initial request.
+    #[cfg(any(test, not(target_family = "wasm")))]
     struct Waited {
         counted: Duration,
-        /// When the last look was, and whether it read a person present.
         last: Option<(Instant, bool)>,
     }
 
+    #[cfg(any(test, not(target_family = "wasm")))]
     impl Waited {
         const fn new() -> Self {
             Self {
@@ -1333,37 +1321,25 @@ pub mod lan_first_use {
             }
         }
 
-        /// Count the time since the last look at `now`, `present` being whether this look reads
-        /// a person at the Mac: the whole of it where `gap` is `None` (no presence is read), else
-        /// at most `gap` of it, and only with the person present at both looks. The total.
         fn count(&mut self, now: Instant, present: bool, gap: Option<Duration>) -> Duration {
-            self.counted = self.peek(now, present, gap);
+            if let Some((at, true)) = self.last
+                && present
+            {
+                let since = now.saturating_duration_since(at);
+                self.counted = self
+                    .counted
+                    .saturating_add(gap.map_or(since, |gap| since.min(gap)));
+            }
             self.last = Some((now, present));
             self.counted
         }
-
-        /// What [`Self::count`] would total at `now`, counting nothing.
-        fn peek(&self, now: Instant, present: bool, gap: Option<Duration>) -> Duration {
-            match self.last {
-                Some((at, true)) if present => {
-                    let since = now.saturating_duration_since(at);
-                    self.counted
-                        .saturating_add(gap.map_or(since, |gap| since.min(gap)))
-                }
-                _ => self.counted,
-            }
-        }
     }
-
-    /// What this process's uses counted toward [`STEP_WAIT`] ([`waits_for_step`]).
-    static WAITED: Mutex<Waited> = Mutex::new(Waited::new());
 
     /// A reader of something this process sees now, from any thread.
     type Reader = Box<dyn Fn() -> bool + Send + Sync>;
     type DoorReaders<'a> = (&'a dyn Fn() -> bool, &'a dyn Fn() -> bool);
 
-    /// The door a window's first LAN uses go through once they waited [`STEP_WAIT`] for System
-    /// State's step ([`install_door`]).
+    /// The door a window's first eligible LAN use goes through ([`install_door`]).
     struct InstalledDoor {
         /// A person is at this Mac now: input within the last minute and the screen unlocked.
         present: Reader,
@@ -1375,7 +1351,7 @@ pub mod lan_first_use {
     static DOOR: OnceLock<InstalledDoor> = OnceLock::new();
 
     /// The watch a window keeps on macOS's Local Network question a use raises through its door,
-    /// or the Commons gate's first LAN use raises by itself past [`STEP_WAIT`]
+    /// or the Commons gate's first eligible LAN use raises itself
     /// ([`install_question_watch`]): it ends the door's hold of that question once it sees the
     /// question answered. Function pointers, so the door's code reaches no window list itself.
     #[derive(Clone, Copy)]
@@ -1422,8 +1398,8 @@ pub mod lan_first_use {
     static OPENED: OnceLock<fn()> = OnceLock::new();
 
     /// The hold on the dialog slot the door took for the question a use raised
-    /// ([`hold_door_slot`]), or the Commons gate's first LAN use raised by itself past
-    /// [`STEP_WAIT`] ([`Asking`]): [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time, or
+    /// ([`hold_door_slot`]), or the Commons gate's first eligible LAN use raised
+    /// ([`Asking`]): [`super::LOCAL_NETWORK_QUESTION_HOLD`] of the person's time, or
     /// less once the question's watch sees it answered or the re-probe hears its answer
     /// ([`answer_heard`]) ([`hold_question`]), during which the use whose door pass took it may
     /// hold it through its own LAN use ([`take_door_slot`]) and give it back.
@@ -1550,17 +1526,15 @@ pub mod lan_first_use {
         /// Nothing holds a use for the step: it handed the LAN over, a use asked through the
         /// door, or the step is not to come.
         Open,
-        /// The step is still to come and the wait for it holds a use for at least this much more
-        /// of the person's time ([`STEP_WAIT`]).
-        Waits(Duration),
-        /// The wait for the step ran out: a use goes through the door at the person's next quiet
-        /// moment with this process's dialog slot free ([`install_door`]).
-        Spent,
+        /// The step is still to come and presence, quiet or the dialog slot holds the use.
+        Waiting,
+        /// A first use may request the process's dialog slot now ([`install_door`]).
+        Ready,
     }
 
     /// Register what runs the moment this process's LAN stops being held for System State's
     /// step: the step hands it over ([`hand_over`]), a use first asks through the door
-    /// ([`note_asked`]), or a look finds the wait for the step ran out ([`waits_for_step`]). The
+    /// ([`note_asked`]). The
     /// setup worker registers its wake, so a Secrets join parked on the step goes on then. The
     /// first registration wins.
     pub fn on_open(opened: fn()) {
@@ -1596,13 +1570,12 @@ pub mod lan_first_use {
         let _ = STEP_TO_COME.set(Box::new(reader));
     }
 
-    /// Install this process's door, through which its first LAN uses go once they waited
-    /// [`STEP_WAIT`] for System State's step ([`may_use`]): `present` reads a person at this Mac
-    /// (input within the last minute, the screen unlocked), which is also the only time the wait
-    /// counts, and `quiet` the window's quiet moment (an aterm window has keyboard focus and no
-    /// key went to aterm for the steps' key rest). Past the wait a use goes only with both true
+    /// Install this process's door for its first eligible LAN use ([`may_use`]):
+    /// `present` reads a person at this Mac (input within the last minute, screen unlocked),
+    /// and `quiet` the window's quiet moment (an aterm window has keyboard focus and no
+    /// key went to aterm for the steps' key rest). A use goes only with both true
     /// and this process's dialog slot free, which it takes for the question's hold; the Commons
-    /// gate goes through the same door ([`waits_for_step`]), and once one use asked, every other
+    /// gate goes through the same door ([`ready_for_question`]), and once one use asked, every other
     /// follows its answer ([`asked`]). A window that runs first-run setup installs it. The first
     /// door installed wins.
     pub fn install_door(
@@ -1617,7 +1590,7 @@ pub mod lan_first_use {
 
     /// Install this process's watch of macOS's Local Network question a use raises through its
     /// door ([`install_door`]), or the Commons gate's first LAN use raises by itself past
-    /// [`STEP_WAIT`] ([`asking`]): such a use starts it, with this process's dialog slot taken into
+    /// its first eligible use ([`asking`]): such a use starts it, with this process's dialog slot taken into
     /// the door's hold and before the use's ask is noted or the use made, and waits for its first
     /// read ([`QuestionWatch::start`]); the door's hold of the question then ends once the watch
     /// sees it answered, and stops the watch when it ends otherwise ([`hold_question`]). A window
@@ -1704,7 +1677,7 @@ pub mod lan_first_use {
     }
 
     /// Note that a LAN use of this process went through the door ([`install_door`]): the Commons
-    /// gate that asked by itself past [`STEP_WAIT`], or a use [`may_use`] let through. The first
+    /// gate that asked on its first eligible use, or a use [`may_use`] let through. The first
     /// note tells [`on_open`].
     pub fn note_asked() {
         if !ASKED.swap(true, Ordering::AcqRel) {
@@ -1733,12 +1706,12 @@ pub mod lan_first_use {
     /// Whether an automatic use of the LAN by this process (a probe, a sweep, a browse, a join)
     /// may go now without putting macOS's Local Network question on screen out of turn: sharing
     /// is on ([`install_sharing`]), and the step handed the LAN over, a use already asked through
-    /// the door ([`asked`]), the installed reader says the step is not still to come, or the uses
-    /// waited [`STEP_WAIT`] for it ([`waits_for_step`]) and this use goes through the door: where
+    /// the door ([`asked`]), the installed reader says the step is not still to come, or this use
+    /// goes through the door at its first eligible moment: where
     /// a door is installed (a window), a person present in the window's quiet moment and this
     /// process's dialog slot free, which the use takes for the question's hold. In a process that
     /// installed no reader (a command, a window that runs no first-run setup) nothing waits on a
-    /// step; in one with a reader and no door (the node job) a use goes once the wait ran out.
+    /// step; in one with a reader and no door (the node job) the first use goes immediately.
     /// Ask it right before the use, and only for a use that is due: a pass through the door
     /// spends the door on that use.
     #[must_use]
@@ -1768,7 +1741,7 @@ pub mod lan_first_use {
             STEP_TO_COME
                 .get()
                 .map(|reader| &**reader as &dyn Fn() -> bool),
-            waits_for_step,
+            |to_come| to_come && !ready_for_question(),
             || {
                 through_the_door().is_some_and(|through| {
                     pass = through;
@@ -1783,85 +1756,40 @@ pub mod lan_first_use {
         }
     }
 
-    /// Where this process's LAN stands for a use held for System State's step, read without
-    /// counting a look or taking a slot: open where nothing holds a use for the step, else what
-    /// is left of [`STEP_WAIT`] counted at this moment, or spent. The setup worker's park reads it
-    /// for a Secrets join that waits on the step: a change is a new fact, and what is left arms
-    /// its one timer, at the earliest moment the wait could run out.
+    /// Where this process's first LAN use stands, without taking a dialog slot.
+    /// Readiness changes are facts for a parked Secrets join; no countdown holds the use.
     #[must_use]
     pub fn door() -> Door {
         if handed().is_some() || asked() || STEP_TO_COME.get().is_none_or(|to_come| !to_come()) {
             return Door::Open;
         }
-        let present = DOOR.get().is_none_or(|door| (door.present)());
-        let counted = WAITED.lock().unwrap_or_else(PoisonError::into_inner).peek(
-            Instant::now(),
-            present,
-            DOOR.get().map(|_| PRESENT_GAP),
-        );
-        door_of(counted)
+        if ready_for_question() && !super::macos_dialog_up() {
+            Door::Ready
+        } else {
+            Door::Waiting
+        }
     }
 
-    /// [`Door`] of what the uses counted toward [`STEP_WAIT`] (pure), the step still to come.
-    fn door_of(counted: Duration) -> Door {
-        STEP_WAIT
-            .checked_sub(counted)
-            .filter(|left| !left.is_zero())
-            .map_or(Door::Spent, Door::Waits)
-    }
-
-    /// Whether a use that finds System State's Local Network step still to come (`to_come`)
-    /// waits for it now: within [`STEP_WAIT`] counted from the first time a use in this process
-    /// found it so, which the first such call notes, counting only time with a person present
-    /// where a door is installed; past it, while the door's person or quiet moment is missing
-    /// ([`install_door`]). A use that finds the step not to come waits for nothing and notes
-    /// nothing. The Commons runtime's gate waits by this too, so it goes through the same door.
-    /// The look that spends the wait tells [`on_open`].
+    /// Whether a first use may request the dialog slot now: a window needs the
+    /// installed door's person and quiet moment; a background job installs no door.
+    /// The slot itself is still taken immediately before the actual network use.
     #[must_use]
-    pub fn waits_for_step(to_come: bool) -> bool {
-        let door = DOOR.get().map(|door| {
+    pub fn ready_for_question() -> bool {
+        ready_with(DOOR.get().map(|door| {
             (
                 &*door.present as &dyn Fn() -> bool,
                 &*door.quiet as &dyn Fn() -> bool,
             )
-        });
-        let mut waited = WAITED.lock().unwrap_or_else(PoisonError::into_inner);
-        let before = waited.counted;
-        let waits = waits_with(to_come, &mut waited, Instant::now(), door);
-        let spent = spent_now(before, waited.counted);
-        drop(waited);
-        if spent {
-            tell_open();
-        }
-        waits
+        }))
     }
 
-    /// Whether a look that counted `before` → `after` toward [`STEP_WAIT`] is the one that spent
-    /// it (pure).
-    fn spent_now(before: Duration, after: Duration) -> bool {
-        before < STEP_WAIT && after >= STEP_WAIT
-    }
-
-    /// [`waits_for_step`] at `now`, with `waited` what the uses counted so far and `door` the
-    /// installed door's readers of a person present and of the window's quiet moment (pure but
-    /// for counting).
-    fn waits_with(
-        to_come: bool,
-        waited: &mut Waited,
-        now: Instant,
-        door: Option<DoorReaders<'_>>,
-    ) -> bool {
-        if !to_come {
-            return false;
-        }
-        let present = door.is_none_or(|(present, _)| present());
-        let counted = waited.count(now, present, door.map(|_| PRESENT_GAP));
-        counted < STEP_WAIT || door.is_some_and(|(_, quiet)| !present || !quiet())
+    fn ready_with(door: Option<DoorReaders<'_>>) -> bool {
+        door.is_none_or(|(present, quiet)| present() && quiet())
     }
 
     /// [`may_use`] of what it read (pure but for `waits` and `door`): `sharing`, whether the LAN
     /// was handed over or a use already asked (`handed`), the reader, if one was installed,
-    /// `waits`, whether a step still to come holds the use now ([`waits_for_step`]), and `door`,
+    /// `waits`, whether the door's present and quiet conditions hold the use, and `door`,
     /// whether the use, past that wait, goes through the door ([`through_the_door`]); each asked
     /// only where the one before it leaves the use waiting.
     fn may_use_with(
@@ -1875,7 +1803,7 @@ pub mod lan_first_use {
             && (handed || step_to_come.is_none_or(|to_come| !to_come() || (!waits(true) && door())))
     }
 
-    /// Whether a use past [`STEP_WAIT`] goes through this process's door, and with which pass:
+    /// Whether a first eligible use goes through this process's door, and with which pass:
     /// with no door installed, at once and with none; with one, only where this process's dialog
     /// slot is free, which it takes for the question's hold, the question's watch started
     /// ([`install_question_watch`]) and its first read in before the ask is noted
@@ -2162,7 +2090,7 @@ pub mod lan_first_use {
     }
 
     /// The question the Commons gate's first LAN use is about to raise by itself once this
-    /// process's uses waited [`STEP_WAIT`] for System State's step ([`asking`]): the dialog slot
+    /// process's first eligible use requested it ([`asking`]): the dialog slot
     /// the gate took, in the door's hold, with the question's watch started where this process
     /// installed one. Once the use was made, [`Self::asked`] holds the question as a door pass's
     /// is held; dropped before that (the use reached no LAN socket, or none came within the gate's
@@ -2172,7 +2100,7 @@ pub mod lan_first_use {
     pub struct Asking(Question<DoorHold>);
 
     /// The Commons gate's first LAN use is about to raise macOS's Local Network question by
-    /// itself past [`STEP_WAIT`], under this process's dialog `slot`, which the gate took: take
+    /// itself at its first eligible use, under this process's dialog `slot`, which the gate took: take
     /// the slot into the door's hold and start the question's watch ([`install_question_watch`]),
     /// as a use through the door does ([`through_the_door`]). With a watch installed, this returns
     /// once its first read is in, or at most the watch's own wait for it, past which the use asks
@@ -2329,45 +2257,6 @@ pub mod lan_first_use {
             ));
         }
 
-        /// The park of a Secrets join waiting on System State's step reads where the LAN stands
-        /// without counting a look: what is left of the wait arms its one timer, and the look
-        /// that spends the wait is the one that tells the setup worker.
-        #[test]
-        fn the_door_reads_what_is_left_of_the_wait_and_tells_its_spending_once() {
-            assert_eq!(
-                super::door_of(Duration::ZERO),
-                super::Door::Waits(super::STEP_WAIT)
-            );
-            assert_eq!(
-                super::door_of(Duration::from_millis(59_500)),
-                super::Door::Waits(Duration::from_millis(500))
-            );
-            assert_eq!(super::door_of(super::STEP_WAIT), super::Door::Spent);
-            assert_eq!(super::door_of(Duration::from_secs(600)), super::Door::Spent);
-            let second = Duration::from_secs(1);
-            assert!(super::spent_now(
-                super::STEP_WAIT - second,
-                super::STEP_WAIT
-            ));
-            assert!(!super::spent_now(
-                super::STEP_WAIT,
-                super::STEP_WAIT + second
-            ));
-            assert!(!super::spent_now(second, second * 2));
-            let t0 = Instant::now();
-            let mut waited = Waited::new();
-            waited.count(t0, true, None);
-            assert_eq!(
-                waited.peek(t0 + Duration::from_secs(10), true, None),
-                Duration::from_secs(10)
-            );
-            assert_eq!(waited.counted, Duration::ZERO, "a peek counts nothing");
-            assert_eq!(
-                waited.peek(t0 + Duration::from_secs(10), false, None),
-                Duration::ZERO
-            );
-        }
-
         /// A use with the door's slot `free` or held by another macOS question: whether it went
         /// through, and whether it noted the ask.
         fn door(free: bool) -> (bool, bool) {
@@ -2418,44 +2307,22 @@ pub mod lan_first_use {
             );
         }
 
-        /// System State open behind a terminal tab never reads frontmost, so its Local Network
-        /// step never asks and never hands the LAN over: in a process with no door (the node
-        /// job), Commons and the `_alab._tcp` browse wait for it [`super::STEP_WAIT`] from the
-        /// first wait at most, on the wall clock, and then go, macOS asking its own question once.
-        /// A use that finds no step to come notes no wait.
+        /// A background job has no window door: the first eligible use requests
+        /// macOS access immediately, even with System State behind a terminal tab.
         #[test]
-        fn the_local_network_step_behind_a_terminal_tab_never_holds_the_lan_for_good() {
-            let mut waited = Waited::new();
-            let t0 = Instant::now();
-            let at = |seconds: u64| t0 + Duration::from_secs(seconds);
-            assert!(
-                !super::waits_with(false, &mut waited, t0, None),
-                "no step to come"
-            );
-            assert!(waited.last.is_none(), "and no wait noted");
+        fn the_first_background_lan_use_has_no_artificial_wait() {
             let to_come = || true;
-            let open = || true;
-            let mut may_use = |seconds: u64| {
-                super::may_use_with(
-                    true,
-                    false,
-                    Some(&to_come),
-                    |to_come| super::waits_with(to_come, &mut waited, at(seconds), None),
-                    open,
-                )
-            };
-            assert!(!may_use(5), "the first use waits for the step");
-            assert!(
-                !may_use(64),
-                "a later use waits only for what is left of the first's wait"
-            );
-            assert!(may_use(65), "the step's wait ran out from the first wait");
-            for minute in 2..=120 {
-                assert!(may_use(5 + 60 * minute), "two hours behind a terminal tab");
-            }
+            assert!(super::ready_with(None));
+            assert!(super::may_use_with(
+                true,
+                false,
+                Some(&to_come),
+                |_| !super::ready_with(None),
+                || true,
+            ));
         }
 
-        /// Past [`super::STEP_WAIT`] a window's LAN use (the `_alab._tcp` browse, the
+        /// A window's first eligible LAN use (the `_alab._tcp` browse, the
         /// Secrets stage's join, Tab Control's sweep, the fleet's heartbeat, facts push and
         /// glance) goes only through the door the Commons gate goes through: never while another
         /// macOS question of this process holds its dialog slot (the walk's System Settings page,
@@ -2486,88 +2353,24 @@ pub mod lan_first_use {
             );
         }
 
-        /// Past [`super::STEP_WAIT`] a window's use waits for a person at the Mac in the window's
+        /// A window's first use waits for a person at the Mac in the window's
         /// quiet moment (keys at rest), as the Commons gate's look does: macOS's question comes up
         /// with the person there and no key on its way into it.
         #[test]
-        fn a_lan_use_past_the_step_wait_waits_for_a_person_in_a_quiet_moment() {
-            let t0 = Instant::now();
-            let at = |seconds: u64| t0 + Duration::from_secs(seconds);
+        fn a_first_lan_use_needs_a_person_in_a_quiet_moment() {
             for (present, quiet, waits) in [
                 (true, true, false),
                 (true, false, true),
                 (false, true, true),
                 (false, false, true),
             ] {
-                let mut waited = Waited::new();
-                let here = || true;
-                let still = || true;
-                assert!(super::waits_with(
-                    true,
-                    &mut waited,
-                    at(0),
-                    Some((&here, &still))
-                ));
-                assert!(super::waits_with(
-                    true,
-                    &mut waited,
-                    at(30),
-                    Some((&here, &still))
-                ));
                 let (now_present, now_quiet) = (move || present, move || quiet);
                 assert_eq!(
-                    super::waits_with(true, &mut waited, at(60), Some((&now_present, &now_quiet))),
-                    waits,
+                    super::ready_with(Some((&now_present, &now_quiet))),
+                    !waits,
                     "present {present}, quiet {quiet}"
                 );
             }
-        }
-
-        /// In a window only the time a person is at the Mac counts toward
-        /// [`super::STEP_WAIT`]: hours away from it (or with its screen locked) count nothing, a
-        /// gap longer than a minute counts a minute at most, and the wait runs out only after a
-        /// minute with the person there.
-        #[test]
-        fn away_time_does_not_count_toward_the_step_wait() {
-            let t0 = Instant::now();
-            let at = |seconds: u64| t0 + Duration::from_secs(seconds);
-            let mut waited = Waited::new();
-            let away = || false;
-            let here = || true;
-            let quiet = || true;
-            for seconds in (0..=7_200).step_by(10) {
-                assert!(
-                    super::waits_with(true, &mut waited, at(seconds), Some((&away, &quiet))),
-                    "nobody at the Mac for two hours: still waiting at {seconds} s"
-                );
-            }
-            assert_eq!(waited.counted, Duration::ZERO, "away time counts nothing");
-            assert!(super::waits_with(
-                true,
-                &mut waited,
-                at(7_210),
-                Some((&here, &quiet))
-            ));
-            assert!(super::waits_with(
-                true,
-                &mut waited,
-                at(7_215),
-                Some((&here, &quiet))
-            ));
-            assert_eq!(
-                waited.counted,
-                Duration::from_secs(5),
-                "the person's time counts"
-            );
-            assert!(
-                !super::waits_with(true, &mut waited, at(7_815), Some((&here, &quiet))),
-                "a minute with the person there: through the door"
-            );
-            assert_eq!(
-                waited.counted,
-                Duration::from_secs(65),
-                "a gap of ten minutes counts a minute at most"
-            );
         }
 
         /// One use goes through the door and asks; the others follow its answer, taking no slot

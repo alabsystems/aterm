@@ -221,7 +221,8 @@ In Low Data Mode the row waits calmly
 and the tab opens by itself once the mode is off; an account
 that is not one of the Mac's administrators is told so, with no Install…. While Apple's own
 installer window for them is open, however long ago it opened and whether or not you pressed
-Install there, System State asks you to finish there, and `aterm init` leaves them to it and
+Install there, System State asks you to finish there, its Go to installer bringing that window
+to the front (it starts no install and asks for nothing), and `aterm init` leaves them to it and
 asks no password: finish in that window, or quit it so aterm can install them. Where Apple's
 catalog offers them none, the authorized install keeps retrying the catalog. Closing an
 existing Apple installer window without installing them ends that wait at once. `aterm init` asks for your
@@ -562,6 +563,10 @@ GOTCHAS
              originating tab and aterm.\n\n\
              In resources output, `cpu_cores` is a live sampled rate from observed processes'\n\
              CPU time (`sample=complete` means current process readings were available).\n\
+             `aterm ctl @self resources cpu` reads the native Targo/Trust shared CPU lease\n\
+             pool: held and available slots, plus reported holder identities. These are\n\
+             kernel lease observations, not measured utilization or an allocation grant.\n\
+             An absent, initializing or unreadable pool reports no available count.\n\n\
              Query support via `aterm ctl @self resources capabilities`. A started command is\n\
              never retried; job labels should name the task, not secret argv.\n",
         ),
@@ -1517,6 +1522,16 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   stuck_break_note [true]         at a break of the agent's background work,
                                   type the first two facts as one line of aterm's own,
                                   as often (Cruise or Land, with `facts` on)
+  occupancy_source.<name> [none]  a source an owner rule watches: `kind = "git-ref"`
+                                  (`repo` or `url`, `remote`, `ref`, `path`, `every`)
+                                  or `kind = "atpkg"` (`program`, `every`)
+  occupancy_rule [[]]             the owner's rules, `[[harness.occupancy_rule]]`:
+                                  `name`, `when` (one source and machine or session
+                                  terms), `scope.jobs_cwd`, `modes`, `urgent`, `mode`
+                                  (`"live"` or `"dry-run"`) and `text`; told only under
+                                  `occupancy = "prompt"`. Both tables are read from the
+                                  root `[harness]` table alone (a copy below another
+                                  header grants nothing), and are written by hand
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
   `muse`) stops supervising that agent alone; for `claude` and `codex` it also turns
@@ -3445,20 +3460,22 @@ fn permission_states() -> ([&'static str; 3], Option<String>) {
             runs_elsewhere(subject.as_deref(), theirs.as_deref())
         })
         .map(|app| app.display_name);
+    // Full Disk Access and the Developer Tools list beside the debugger probe, each read in this
+    // thread where no other starts.
     let states = std::thread::scope(|scope| {
-        let fda = scope.spawn(|| {
+        let fda = crate::beside::start(scope, "aterm-manual-fda", || {
             elsewhere
                 .is_none()
                 .then(|| aterm_containment::probe_fda(gate()).state)
         });
-        let devtools = scope.spawn(|| {
+        let devtools = crate::beside::start(scope, "aterm-manual-devtools", || {
             let id = subject.as_deref().unwrap_or_default();
             consent::probe_devtool_list(gate(), id).listing
         });
         let debugger = consent::probe_debugger(gate()).mode;
         permission_words(
-            fda.join().unwrap_or(Some(FdaState::Unknown)),
-            devtools.join().unwrap_or(DevToolListing::Unknown),
+            fda.answer_or(|_| Some(FdaState::Unknown)),
+            devtools.answer_or(|_| DevToolListing::Unknown),
             debugger,
         )
     });

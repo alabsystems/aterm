@@ -54,6 +54,127 @@ pub(crate) struct SparseBitmap {
     count: u32,
 }
 
+/// Borrowed double-ended cursor over compressed posting values.
+pub(crate) struct PostingCursor<'a> {
+    bytes: &'a [u8],
+    first: u32,
+    last: u32,
+    remaining: u32,
+}
+
+impl PostingCursor<'_> {
+    /// Read the next endpoint without decoding a gap.
+    pub(crate) fn peek(&self, backward: bool) -> Option<u32> {
+        (self.remaining != 0).then_some(if backward { self.last } else { self.first })
+    }
+
+    /// Skip an encoded prefix in one pass, without constructing one iterator item per row.
+    pub(crate) fn seek_forward(&mut self, boundary: u32) {
+        if self.remaining == 0 || self.first >= boundary {
+            return;
+        }
+        if self.last < boundary {
+            self.remaining = 0;
+            return;
+        }
+        let mut gap = 0u32;
+        let mut shift = 0;
+        for (i, &byte) in self.bytes.iter().enumerate() {
+            gap |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 != 0 {
+                shift += 7;
+                continue;
+            }
+            self.first = self.first.wrapping_add(gap);
+            self.remaining -= 1;
+            if self.first >= boundary {
+                self.bytes = self.bytes.get(i + 1..).unwrap_or_default();
+                return;
+            }
+            gap = 0;
+            shift = 0;
+        }
+    }
+
+    /// Skip values at or above an exclusive upper bound in one reverse byte walk.
+    pub(crate) fn seek_backward(&mut self, boundary: u32) {
+        if self.remaining == 0 || self.last < boundary {
+            return;
+        }
+        if self.first >= boundary {
+            self.remaining = 0;
+            return;
+        }
+        let mut gap = 0u32;
+        for (i, &byte) in self.bytes.iter().enumerate().rev() {
+            gap = (gap << 7) | u32::from(byte & 0x7f);
+            if i != 0 && self.bytes.get(i - 1).is_some_and(|b| b & 0x80 != 0) {
+                continue;
+            }
+            self.last = self.last.wrapping_sub(gap);
+            self.remaining -= 1;
+            if self.last < boundary {
+                self.bytes = self.bytes.get(..i).unwrap_or_default();
+                return;
+            }
+            gap = 0;
+        }
+    }
+}
+
+impl Iterator for PostingCursor<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let value = self.first;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            let mut gap = 0u32;
+            let mut shift = 0;
+            loop {
+                let (&byte, rest) = self.bytes.split_first()?;
+                self.bytes = rest;
+                gap |= u32::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            self.first = self.first.wrapping_add(gap);
+        }
+        Some(value)
+    }
+}
+
+impl DoubleEndedIterator for PostingCursor<'_> {
+    fn next_back(&mut self) -> Option<u32> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let value = self.last;
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            let end = self.bytes.len().checked_sub(1)?;
+            let start = self
+                .bytes
+                .get(..end)?
+                .iter()
+                .rposition(|b| b & 0x80 == 0)
+                .map_or(0, |i| i + 1);
+            let mut gap = 0u32;
+            for (i, &byte) in self.bytes.get(start..)?.iter().enumerate() {
+                gap |= u32::from(byte & 0x7f) << (i * 7);
+            }
+            self.bytes = self.bytes.get(..start)?;
+            self.last = self.last.wrapping_sub(gap);
+        }
+        Some(value)
+    }
+}
+
 /// Iterator over values in a `SparseBitmap`, consuming it. Ascending order.
 #[cfg(test)]
 pub(crate) type SparseBitmapIntoIter = std::vec::IntoIter<u32>;
@@ -74,7 +195,88 @@ fn push_varint(buf: &mut Vec<u8>, mut value: u32) {
     buf.push(value as u8);
 }
 
+fn read_varint(bytes: &[u8]) -> Option<(u32, usize)> {
+    let mut value = 0u32;
+    for (i, &byte) in bytes.iter().take(5).enumerate() {
+        value |= u32::from(byte & 0x7f) << (i * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// The encoded gap bracketing a key (`previous < key <= next`).
+struct Gap {
+    previous: u32,
+    next: u32,
+    start: usize,
+    end: usize,
+}
+
 impl SparseBitmap {
+    /// Locate the gap for a key strictly between the endpoints, starting at the nearer numeric
+    /// endpoint and retaining byte positions instead of expanded IDs.
+    fn gap_at(&self, value: u32) -> Option<Gap> {
+        let mut cursor = self.cursor();
+        if value.wrapping_sub(self.first) <= self.last.wrapping_sub(value) {
+            cursor.seek_forward(value);
+            let next = cursor.peek(false)?;
+            let end = self.deltas.len().checked_sub(cursor.bytes.len())?;
+            let start = self
+                .deltas
+                .get(..end.checked_sub(1)?)?
+                .iter()
+                .rposition(|b| b & 0x80 == 0)
+                .map_or(0, |i| i + 1);
+            let (gap, _) = read_varint(self.deltas.get(start..end)?)?;
+            Some(Gap {
+                previous: next.wrapping_sub(gap),
+                next,
+                start,
+                end,
+            })
+        } else {
+            cursor.seek_backward(value);
+            let previous = cursor.peek(true)?;
+            let start = (self.head as usize).checked_add(cursor.bytes.len())?;
+            let (gap, len) = read_varint(self.deltas.get(start..)?)?;
+            Some(Gap {
+                previous,
+                next: previous.wrapping_add(gap),
+                start,
+                end: start.checked_add(len)?,
+            })
+        }
+    }
+
+    /// Replace one or two adjacent gaps using bounded stack scratch.
+    fn replace_gaps(&mut self, start: usize, end: usize, gaps: &[u32]) {
+        let mut encoded = [0u8; 10];
+        let mut len = 0;
+        for &gap in gaps {
+            let mut value = gap;
+            while value >= 0x80 {
+                encoded[len] = (value as u8) | 0x80;
+                len += 1;
+                value >>= 7;
+            }
+            encoded[len] = value as u8;
+            len += 1;
+        }
+        self.deltas
+            .splice(start..end, encoded[..len].iter().copied());
+    }
+
+    /// Walk live postings without expanding their encoded storage.
+    pub(crate) fn cursor(&self) -> PostingCursor<'_> {
+        PostingCursor {
+            bytes: self.deltas.get(self.head as usize..).unwrap_or_default(),
+            first: self.first,
+            last: self.last,
+            remaining: self.count,
+        }
+    }
     /// Create a new empty bitmap.
     #[must_use]
     #[cfg(test)]
@@ -158,15 +360,25 @@ impl SparseBitmap {
         if value == self.last || value == self.first {
             return false;
         }
-        let mut values = self.to_vec();
-        match values.binary_search(&value) {
-            Ok(_) => false,
-            Err(pos) => {
-                values.insert(pos, value);
-                self.rebuild_from_sorted(&values);
-                true
+        if value < self.first {
+            let head = self.head as usize;
+            self.replace_gaps(head, head, &[self.first - value]);
+            self.first = value;
+        } else {
+            let Some(gap) = self.gap_at(value) else {
+                return false;
+            };
+            if gap.next == value {
+                return false;
             }
+            self.replace_gaps(
+                gap.start,
+                gap.end,
+                &[value - gap.previous, gap.next - value],
+            );
         }
+        self.count = self.count.saturating_add(1);
+        true
     }
 
     /// Removes `value`, returning `true` if present.
@@ -179,15 +391,24 @@ impl SparseBitmap {
             self.remove_last();
             return true;
         }
-        let mut values = self.to_vec();
-        match values.binary_search(&value) {
-            Ok(pos) => {
-                values.remove(pos);
-                self.rebuild_from_sorted(&values);
-                true
-            }
-            Err(_) => false,
+        if value == self.first {
+            self.drop_below(value.saturating_add(1));
+            return true;
         }
+        let Some(gap) = self.gap_at(value) else {
+            return false;
+        };
+        if gap.next != value {
+            return false;
+        }
+        let Some((next_gap, len)) = self.deltas.get(gap.end..).and_then(read_varint) else {
+            return false;
+        };
+        let successor = value.wrapping_add(next_gap);
+        self.replace_gaps(gap.start, gap.end + len, &[successor - gap.previous]);
+        self.count = self.count.saturating_sub(1);
+        self.compact_prefix();
+        true
     }
 
     fn remove_last(&mut self) {
@@ -345,6 +566,115 @@ impl BitAndAssign<&SparseBitmap> for SparseBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_mutations_match_a_set_without_expanding_postings() {
+        use aterm_spec::rng::XorShift;
+        use std::collections::BTreeSet;
+
+        let boundaries = [
+            0,
+            1,
+            126,
+            127,
+            128,
+            129,
+            16_383,
+            16_384,
+            16_385,
+            (1 << 21) - 1,
+            1 << 21,
+            (1 << 28) - 1,
+            1 << 28,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        let mut rng = XorShift::new(0xDA17_AED1_7E00_0001);
+        let mut bitmap = SparseBitmap::new();
+        let mut reference = BTreeSet::new();
+        for step in 0..8192 {
+            let mut value = if step % 2 == 0 {
+                *rng.pick(&boundaries)
+            } else {
+                u32::try_from(rng.index(1 << 20))
+                    .unwrap()
+                    .saturating_mul(4093)
+            };
+            if step % 5 == 3 && !reference.is_empty() {
+                value = *reference.iter().nth(rng.index(reference.len())).unwrap();
+            }
+            let before = decodes();
+            if step % 5 < 3 {
+                assert_eq!(bitmap.insert(value), reference.insert(value));
+                assert!(!bitmap.insert(value), "an interior duplicate is a no-op");
+            } else {
+                assert_eq!(bitmap.remove(value), reference.remove(&value));
+                assert!(!bitmap.remove(value), "an absent key is a no-op");
+            }
+            if step % 127 == 0 {
+                let watermark = *rng.pick(&boundaries);
+                bitmap.drop_below(watermark);
+                reference.retain(|&v| v >= watermark);
+            }
+            assert_eq!(
+                decodes(),
+                before,
+                "mutating a compressed list never expands it"
+            );
+            assert_encoding(&bitmap, &reference.iter().copied().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn borrowed_cursor_matches_both_ends_after_eviction() {
+        let values = [0, 1, 127, 128, 16_383, 16_384, 1 << 28, u32::MAX];
+        for watermark in values {
+            let mut bitmap = SparseBitmap::from_sorted(&values);
+            bitmap.drop_below(watermark);
+            let expected = bitmap.to_vec();
+            for boundary in values.into_iter().flat_map(|v| [v, v.saturating_add(1)]) {
+                let mut cursor = bitmap.cursor();
+                cursor.seek_forward(boundary);
+                assert_eq!(
+                    cursor.collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .copied()
+                        .filter(|&v| v >= boundary)
+                        .collect::<Vec<_>>()
+                );
+                let mut cursor = bitmap.cursor();
+                cursor.seek_backward(boundary);
+                assert_eq!(
+                    cursor.rev().collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .rev()
+                        .copied()
+                        .filter(|&v| v < boundary)
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(bitmap.cursor().collect::<Vec<_>>(), expected);
+            assert_eq!(
+                bitmap.cursor().rev().collect::<Vec<_>>(),
+                expected.iter().rev().copied().collect::<Vec<_>>()
+            );
+            for split in 0..=expected.len() {
+                let mut cursor = bitmap.cursor();
+                for &value in &expected[..split] {
+                    assert_eq!(cursor.next(), Some(value));
+                }
+                for &value in expected[split..].iter().rev() {
+                    assert_eq!(cursor.next_back(), Some(value));
+                }
+                assert_eq!(cursor.next(), None);
+                assert_eq!(cursor.next_back(), None);
+            }
+        }
+        assert_eq!(SparseBitmap::default().cursor().next(), None);
+        assert_eq!(SparseBitmap::default().cursor().next_back(), None);
+    }
 
     fn assert_encoding(bm: &SparseBitmap, expected: &[u32]) {
         assert_eq!(bm.to_vec(), expected);

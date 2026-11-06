@@ -10,6 +10,20 @@ use aterm_tempfile::TempDir;
 
 use crate::store::Layout;
 
+/// Complete static ELF metadata for byte-only fixtures; no machine code is executed.
+pub(crate) fn elf_fixture() -> Vec<u8> {
+    let mut bytes = vec![0; 64];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    let machine =
+        aterm_toolchain::gnu_runtime::machine_for_arch(std::env::consts::ARCH).unwrap_or(0);
+    bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    bytes
+}
+
 /// A scratch directory: dereferences to its path, removed on drop.
 #[derive(Debug)]
 pub(crate) struct Dir {

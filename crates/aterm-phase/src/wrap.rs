@@ -51,9 +51,71 @@ fn wraps_with(
     lead + cells(above) + 1 + word + slack > room
 }
 
-/// The room a line drawn from column `col` of a pane `width` cells wide has in a box as wide as the pane less `col` on each side: a footer's, a banner's, a `⎿` notice's (whose box ends at the pane's edge: the rule reads such a row full a little early).
+/// The room a line drawn from column `col` of a pane `width` cells wide has in a box as wide as the pane less `col` on each side: a footer's, a dialog's, the chrome intro's. A row of Claude Code's transcript is drawn in a box that ends at the pane's edge, its room [`transcript_room`].
 pub(crate) const fn room(col: usize, width: usize) -> usize {
     width.saturating_sub(col.saturating_mul(2))
+}
+
+/// The room the text of a row of Claude Code's transcript, drawn from column `col` of a pane `width` cells wide (beside the side panel, as wide as the rule's column), has: its box ends at the pane's edge. Measured across the captured Claude Code screens, for each layout the transcript draws:
+/// - a `⎿` row's text (the gutter under a call, a prompt or a message), from column 5 (4 under `⎿ `): drawn to the pane's edge (the usage limit notice at 26 and 34 columns, a tool's output at 40, a question's answer at 120), and a next word that would end one cell past the edge opens the next row (the limit notice's `session limit ·` over `resets` at 26, a tool's output at 40 and 60, the auto-continue countdown at 144);
+/// - a `⏺` reply's text, from column 2: drawn to the pane's edge in 27 reply paragraphs (the lab stub's replies at 12 to 50 columns, its tick rows at 34, 80 and 144, replies at 80, 146 and 150 and beside the 2.1.316 rule at 81; the sweep's other 33 `⏺` paragraphs at the edge are one-row call heads and notices), and a next word that would end one or two cells past it opens the next row (in replies at 12 to 146 columns);
+/// - a `✻` status line, from column 2: 15 drawn to the pane's edge (14 done rows at 12 to 34 columns and a spinner's word split at 10), the 13 done rows whose next word would end one cell past it wrapped there (at 12 to 34 columns), and under the 2.1.310 no-response retry at 60 the vendor's hint opens a row of its own though its first word fits on the retry row.
+///
+/// Ink wraps there with no slack, the lead an exactly full row leaves counted ([`transcript_line_end`], which reads a `⎿` block's lines and a done row's status line in it, `phase::line_end_in`). The readers of a column-2 row that may be a vendor `⏺` notice's (its text wrapped in the pane less ten, `NOTICE_MARGIN`) or a dialog's (in [`room`]) keep [`room`]: [`line_start`] outside a `⎿` block and `turn::wraps_onto`. So does the status line of a wait or of a spinner whose parenthesis wraps, whose wrap no capture measures. One captured `⎿` paragraph wraps narrower: 2.1.316's `Message queued for delivery …` beside the side panel, at no more than 71 cells of the rule's 81, so in this room its rows read as lines of their own.
+pub(crate) const fn transcript_room(col: usize, width: usize) -> usize {
+    width.saturating_sub(col)
+}
+
+/// The last row of the line row `first` opens in the transcript's box ([`transcript_room`]), its text there `head` (trimmed) from column `col`, in a pane `width` cells wide: each row after it, short of row `until`, that Ink wrapped onto the row above it there, as Ink wraps it — the row above had no room for the row's first word and its space ([`continues_exactly`], no slack), its [`lead`] after an exactly full row counted. A row that would have fit on the row above is a line of its own.
+pub(crate) fn transcript_line_end(
+    rows: &[String],
+    first: usize,
+    head: &str,
+    col: usize,
+    width: usize,
+    until: usize,
+) -> usize {
+    let until = until.min(rows.len());
+    let room = transcript_room(col, width);
+    let (mut end, mut above, mut lead) = (first, head, 0);
+    while let Some(next) = end.checked_add(1)
+        && next < until
+        && continues_exactly(above, lead, col, &rows[next], room)
+    {
+        lead = self::lead(lead + cells(above), room);
+        end = next;
+        above = crate::text::trim(&rows[end]);
+    }
+    end
+}
+
+/// The `⎿` row whose block row `i` stands in ([`crate::phase::gutter_open`]) and the column that row's text is drawn from, where row `i` is the `⎿` row itself or a row of the block's text under it at that column: every line of a `⎿` block is drawn in one box, the transcript's, which ends at the pane's edge (the sweep [`transcript_room`] cites measured the rows under a `⎿` row at its text column with that row's). A row of the block drawn further in (a tool's own indent) is neither.
+pub(crate) fn gutter_of(rows: &[String], i: usize) -> Option<(usize, usize)> {
+    let open = crate::phase::gutter_open(rows, i)?;
+    let row = rows[open].as_str();
+    let after = crate::text::trim_start(row).strip_prefix('⎿')?;
+    let col = leading_spaces(row) + 1 + leading_spaces(after);
+    (open == i || leading_spaces(&rows[i]) == col).then_some((open, col))
+}
+
+/// The last row of the line row `i` opens, short of row `until`, in a pane `width` cells wide: a `⎿` block's text ([`gutter_of`]) in the transcript's box, from its text (past the `⎿` on the block's own row) at the block's column ([`transcript_line_end`]); any other row's from its indent in [`room`] ([`line_end`]).
+pub(crate) fn row_line_end(rows: &[String], i: usize, width: usize, until: usize) -> usize {
+    let row = rows[i].as_str();
+    let text = crate::text::trim_start(row);
+    match gutter_of(rows, i) {
+        Some((_, col)) => {
+            let head = crate::text::trim(text.strip_prefix('⎿').unwrap_or(text));
+            transcript_line_end(rows, i, head, col, width, until)
+        }
+        None => line_end(
+            rows,
+            i,
+            crate::text::trim(row),
+            leading_spaces(row),
+            width,
+            until,
+        ),
+    }
 }
 
 /// The last row of the line row `first` opens, its text there `head` (trimmed) from column `col`, in a pane `width` cells wide ([`room`]): each row after it, short of row `until`, that [`continues`] the row above it.
@@ -78,7 +140,7 @@ pub(crate) fn line_end(
     end
 }
 
-/// Walk backward from `last` across rows that [`continues`] joins at `last`'s [`text_column`], stopping at the row that opens the paragraph or list item (a bullet/marker prefix before `text_column`) or where [`continues`] ceases to hold.
+/// Walk backward from `last` across rows that [`continues`] joins at `last`'s [`text_column`], stopping at the row that opens the paragraph or list item (a bullet/marker prefix before `text_column`) or where [`continues`] ceases to hold. A row of a `⎿` block's text ([`gutter_of`]) is read as [`crate::phase::line_at`] reads the block, line by line from its `⎿` row ([`row_line_end`]): the row that opens the line holding `last`. Outside a `⎿` block the walk keeps [`room`] and its slack, not the transcript's box ([`transcript_room`]): the row it starts from may be a reply's, a vendor `⏺` notice's (its text wrapped in the pane less ten, `NOTICE_MARGIN`) or a dialog's (in [`room`]), which its rows alone do not tell apart.
 #[must_use]
 pub fn line_start(rows: &[String], last: usize, width: usize) -> usize {
     let Some(row) = rows.get(last) else {
@@ -87,6 +149,15 @@ pub fn line_start(rows: &[String], last: usize, width: usize) -> usize {
     let col = leading_spaces(row);
     if text_column(row) != col {
         return last;
+    }
+    if let Some((mut first, _)) = gutter_of(rows, last) {
+        loop {
+            let end = row_line_end(rows, first, width, last + 1);
+            if end >= last {
+                return first;
+            }
+            first = end + 1;
+        }
     }
     let room = room(col, width);
     let mut first = last;
@@ -433,6 +504,192 @@ mod tests {
         ]);
         assert_eq!(line_start(&list, 1, 50), 0, "an item's wrapped row");
         assert_eq!(line_start(&list, 2, 50), 2, "the control: an item opens");
+    }
+
+    /// The walk back from the line last said keeps [`room`] and its slack outside a `⎿` block, not
+    /// the transcript's box ([`transcript_room`]): the row it starts from may be a reply's, a vendor
+    /// `⏺` notice's or a dialog's, and the rows alone do not tell them apart. MEASURED: the 2.1.283
+    /// unreachable API's notice at 80 columns and the 2.1.304 hook's notice (each its text wrapped
+    /// in the pane less ten, `NOTICE_MARGIN`), the 2.1.302 MCP server dialog at 40 and the
+    /// fullscreen 2.1.310 auto mode offer's footer at 34 (each in the pane less twice its column)
+    /// are each read whole.
+    /// NEGATIVE CONTROL: in the transcript's box the line's first row opens a line that ends short of
+    /// its last row ([`transcript_line_end`]), so a walk in that box would lose the line's first
+    /// words.
+    #[test]
+    fn a_notice_or_a_dialogs_line_last_said_is_walked_back_in_the_boxed_room() {
+        use crate::prompt::fixtures::screen;
+        for (name, capture, line) in [
+            (
+                "2.1.283 unreachable API notice at 80",
+                include_str!("fixtures/claude-2.1.283-api-error-enotfound-80col-measured.txt"),
+                "⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+            ),
+            (
+                "2.1.304 hook notice",
+                include_str!(
+                    "fixtures/claude-2.1.304-user-prompt-submit-hook-continue-false-long-reason-wrapped-limit-phrase.txt"
+                ),
+                "⏺ Operation stopped by hook: the nightly pipeline finished its integration suite \
+                 and the deploy gate reported back to the build bot that Usage limit reached · \
+                 resets 3pm",
+            ),
+            (
+                "2.1.302 MCP server dialog at 40",
+                include_str!("fixtures/claude-2.1.302-mcp-server-two-40col.txt"),
+                "MCP servers may execute code or access system resources. All tool calls require \
+                 approval. Learn more in the MCP documentation.",
+            ),
+            (
+                "2.1.310 auto mode offer's footer at 34",
+                include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-34col.txt"),
+                "Enter to confirm · Esc to cancel",
+            ),
+        ] {
+            let rows = screen(capture);
+            let width = crate::question::screen_width(&rows);
+            assert_eq!(
+                crate::phase::last_said_line(&rows, Some(width)).as_deref(),
+                Some(line),
+                "{name}"
+            );
+            let last = crate::phase::last_said_index(&rows).expect("the last row said");
+            let (from, col) = (line_start(&rows, last, width), text_column(&rows[last]));
+            let head = rows[from]
+                .char_indices()
+                .nth(col)
+                .map_or("", |(at, _)| &rows[from][at..]);
+            assert!(
+                from < last
+                    && transcript_line_end(
+                        &rows,
+                        from,
+                        crate::text::trim(head),
+                        col,
+                        width,
+                        rows.len()
+                    ) < last,
+                "NEGATIVE CONTROL: {name}"
+            );
+        }
+    }
+
+    /// A `⎿` row's text is read in its box, which ends at the pane's edge ([`transcript_room`]), as
+    /// Ink wraps it: no slack, the lead an exactly full row leaves counted. On measured captures
+    /// each row whose first word had no room on the row above is the rest of that row's line: the
+    /// 2.1.299 limit notice at 26 columns (`session limit ·` over `resets`, one cell past the
+    /// edge; under its full `(America/Los_Angeles)` row the `/upgrade …` line, which a wrap would
+    /// draw the same, joins too), the 2.1.309 tool output at 40 (`command printed was lost and
+    /// its` over `own`, one cell past), the 2.1.302 auto-continue countdown at 144 (`… Press esc`
+    /// over `to`, one cell past, its row past twice the column's room) and the 2.1.283 question
+    /// answer at 120, whose third row had room for the next word but for the lead its full second
+    /// row leaves. NEGATIVE CONTROL: rows that each had room for the next word are lines of their
+    /// own: the 2.1.309 command's own copy at 179 columns, which the command wrapped at 169 (a room
+    /// of the pane less twice the column, or two cells of slack, joined it), and the 2.1.302 limit
+    /// notice over its `/upgrade …` line at 144.
+    #[test]
+    fn a_gutter_rows_text_is_read_in_a_box_that_ends_at_the_panes_edge() {
+        use crate::prompt::fixtures::{
+            TOOL_DISK_FULL_40_2_1_309, TOOL_PRESTART_PRINTED_EXIT0_179_2_1_309,
+            WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302, screen,
+        };
+        let line_end = |rows: &[String], at: usize, width: usize| {
+            let row = rows[at].as_str();
+            let (head, col) = match crate::text::trim_start(row).strip_prefix('⎿') {
+                Some(after) => (
+                    crate::text::trim(after),
+                    leading_spaces(row) + 1 + leading_spaces(after),
+                ),
+                None => (crate::text::trim(row), leading_spaces(row)),
+            };
+            transcript_line_end(rows, at, head, col, width, rows.len())
+        };
+        let at = |rows: &[String], text: &str| {
+            let last = |ends: bool| {
+                rows.iter().rposition(|r| {
+                    let t = crate::text::trim(r);
+                    t == text || (ends && t.ends_with(text))
+                })
+            };
+            last(false)
+                .or_else(|| last(true))
+                .unwrap_or_else(|| panic!("the row {text:?}"))
+        };
+        for (name, capture, width, from, to) in [
+            (
+                "2.1.299 limit notice at 26",
+                include_str!(
+                    "fixtures/claude-2.1.299-wall-session-auto-continue-cancelled-26col.txt"
+                ),
+                26,
+                "You've hit your",
+                "your usage limit.",
+            ),
+            (
+                "2.1.309 tool output at 40",
+                TOOL_DISK_FULL_40_2_1_309,
+                40,
+                "Disk full: this computer's volume",
+                "anything to make room.",
+            ),
+            (
+                "2.1.302 countdown at 144",
+                include_str!(
+                    "fixtures/claude-2.1.302-wall-sonnet-bucket-auto-continue-cancelled-over-24h.txt"
+                ),
+                144,
+                "may still pause for permission prompts. Press esc",
+                "to cancel the wait.",
+            ),
+            (
+                "2.1.283 question answer at 120",
+                include_str!("fixtures/claude-2.1.283-question-typed-short-term.txt"),
+                120,
+                "→ Decide yourself: choose the option that",
+                "not asked.)",
+            ),
+            (
+                "NEGATIVE CONTROL: the 2.1.309 command's own copy at 179",
+                TOOL_PRESTART_PRINTED_EXIT0_179_2_1_309,
+                179,
+                "Code's temporary directory), so the file",
+                "Code's temporary directory), so the file",
+            ),
+            (
+                "NEGATIVE CONTROL: the 2.1.302 limit notice at 144",
+                WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302,
+                144,
+                "resets 10:06am (America/Los_Angeles)",
+                "resets 10:06am (America/Los_Angeles)",
+            ),
+        ] {
+            let rows = screen(capture);
+            assert_eq!(
+                crate::question::screen_width(&rows),
+                width,
+                "PRECONDITION: {name}: drawn to the pane's edge"
+            );
+            assert_eq!(
+                line_end(&rows, at(&rows, from), width),
+                at(&rows, to),
+                "{name}"
+            );
+        }
+        let answer = screen(include_str!(
+            "fixtures/claude-2.1.283-question-typed-short-term.txt"
+        ));
+        let third = at(&answer, "the user was");
+        assert_eq!(cells(crate::text::trim(&answer[third - 1])), 115, "full");
+        assert!(
+            !continues_exactly(
+                crate::text::trim(&answer[third]),
+                0,
+                5,
+                &answer[third + 1],
+                115
+            ),
+            "PRECONDITION: the lead decides the question answer's last row"
+        );
     }
 
     /// A reply drawn at column2, with a text box `room` cells wide and the reader's right margin.

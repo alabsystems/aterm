@@ -50,6 +50,7 @@ impl std::fmt::Display for Error {
 }
 
 pub(super) struct Context<'a> {
+    pub work: Option<super::account_work::Scope>,
     pub identity: &'a Identity,
     pub home: &'a Path,
     pub state: &'a Path,
@@ -66,8 +67,14 @@ pub(super) fn approve(
         return Err(Error::Configuration);
     }
     let mut credentials: Option<Credentials> = None;
-    let mut browser = MemoryBrowser::start(ctx.identity, ctx.state, Some(ctx.home), deadline)
-        .map_err(Error::Browser)?;
+    let mut browser = MemoryBrowser::start_scoped(
+        ctx.identity,
+        ctx.state,
+        Some(ctx.home),
+        deadline,
+        ctx.work.clone(),
+    )
+    .map_err(Error::Browser)?;
     match browser.restore_session(ctx.home) {
         Ok(_) | Err(google_browser::Error::Session) => {}
         Err(error) => return Err(Error::Browser(error)),

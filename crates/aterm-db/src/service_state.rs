@@ -289,6 +289,11 @@ fn secret_blocker(reason: client::MaterializationBlocker, now_ms: u64) -> Servic
             ServiceAvailability::Unavailable,
             "Vault membership is revoked",
         ),
+        // No path here: a blocker's detail names none (`aterm secrets status` names the folder).
+        MaterializationBlocker::Dropped => (
+            ServiceAvailability::Unavailable,
+            "Vault membership was dropped: no seat, and a rotation left this Mac out with no Remove; set the vault folder aside (aterm secrets status names it) to come back as a new Mac",
+        ),
         MaterializationBlocker::SourceChanged => (
             ServiceAvailability::Unknown,
             "Local vault state does not match the configured source; awaiting a successful sync of that source",
@@ -829,9 +834,12 @@ pub(crate) mod tests {
         assert_eq!(current.secrets.availability, ServiceAvailability::Cached);
     }
 
+    /// Each blocker also reads as its own card, naming no path (`aterm secrets status` names the
+    /// folder): a dropped Mac's, which carries its way back, never reads as a revoked one's.
     #[test]
     fn vault_blockers_never_claim_usable_entries_or_reuse_a_previous_revision() {
         use client::MaterializationBlocker;
+        let mut details = std::collections::BTreeSet::new();
         for (reason, availability) in [
             (
                 MaterializationBlocker::LockUnavailable,
@@ -858,6 +866,10 @@ pub(crate) mod tests {
                 ServiceAvailability::Unavailable,
             ),
             (
+                MaterializationBlocker::Dropped,
+                ServiceAvailability::Unavailable,
+            ),
+            (
                 MaterializationBlocker::SourceChanged,
                 ServiceAvailability::Unknown,
             ),
@@ -867,6 +879,16 @@ pub(crate) mod tests {
             ),
         ] {
             let observation = secret_blocker(reason, 2000);
+            assert!(
+                !observation.detail.contains('/'),
+                "a blocker names no path: {}",
+                observation.detail
+            );
+            assert!(
+                details.insert(observation.detail.clone()),
+                "{reason:?} reads as another blocker: {}",
+                observation.detail
+            );
             assert_eq!(observation.availability, availability);
             assert_eq!(observation.observed_at_ms, 2000);
             assert_eq!(observation.last_success_ms, None);

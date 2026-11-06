@@ -33,16 +33,21 @@ impl Key {
             _ => return Err("Unsupported AES key size".into()),
         })
     }
-    fn block(&self, block: [u8; 16], decrypt: bool) -> [u8; 16] {
-        let batch = [block; 4];
+    fn blocks(&self, batch: &[[u8; 16]; 4], decrypt: bool) -> [[u8; 16]; 4] {
         match (self, decrypt) {
-            (Self::Aes128(k), false) => core::aes128_encrypt(k, &batch)[0],
-            (Self::Aes128(k), true) => core::aes128_decrypt(k, &batch)[0],
-            (Self::Aes192(k), false) => core::aes192_encrypt(k, &batch)[0],
-            (Self::Aes192(k), true) => core::aes192_decrypt(k, &batch)[0],
-            (Self::Aes256(k), false) => core::aes256_encrypt(k, &batch)[0],
-            (Self::Aes256(k), true) => core::aes256_decrypt(k, &batch)[0],
+            (Self::Aes128(k), false) => core::aes128_encrypt(k, batch),
+            (Self::Aes128(k), true) => core::aes128_decrypt(k, batch),
+            (Self::Aes192(k), false) => core::aes192_encrypt(k, batch),
+            (Self::Aes192(k), true) => core::aes192_decrypt(k, batch),
+            (Self::Aes256(k), false) => core::aes256_encrypt(k, batch),
+            (Self::Aes256(k), true) => core::aes256_decrypt(k, batch),
         }
+    }
+    fn block(&self, block: [u8; 16], decrypt: bool) -> [u8; 16] {
+        let mut out = self.blocks(&[block; 4], decrypt);
+        let first = out[0];
+        out.zeroize();
+        first
     }
 }
 
@@ -50,7 +55,17 @@ pub(super) fn cfb(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<
     let key = Key::new(key)?;
     let mut feedback: [u8; 16] = iv.try_into().map_err(|_| "Invalid AES IV")?;
     let mut plain = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
-    for chunk in ciphertext.chunks(16) {
+    let (quads, rem) = ciphertext.as_chunks::<64>();
+    for quad in quads {
+        let [c0, c1, c2, c3] = *quad.as_chunks::<16>().0.first_chunk::<4>().unwrap();
+        let mut masks = key.blocks(&[feedback, c0, c1, c2], false);
+        for (block, mask) in [c0, c1, c2, c3].iter().zip(&masks) {
+            plain.extend(block.iter().zip(mask).map(|(c, m)| c ^ m));
+        }
+        feedback = c3;
+        masks.zeroize();
+    }
+    for chunk in rem.chunks(16) {
         let mut mask = key.block(feedback, false);
         plain.extend(chunk.iter().zip(&mask).map(|(c, m)| c ^ m));
         feedback[..chunk.len()].copy_from_slice(chunk);

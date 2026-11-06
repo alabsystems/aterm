@@ -64,15 +64,18 @@ impl Bench {
         let find_browser: &(dyn Fn(&Path) -> bool + Sync) =
             if self.browser { &found } else { &none_found };
         UpkeepEffects {
+            scope: None,
             fetch: &|_: &Env, source: &str| Err(format!("no fetch in a test: {source}")),
             spawn_renewal: &inline,
             sync_cooldown: &self.cooldown,
             rediscovery: &self.rediscovery,
             renew_guard: &self.guard,
             find_browser,
-            vault_sync: not_a_member,
+            vault_sync: |home, _scope| not_a_member(home),
             spawn_vault: &inline,
-            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            default_check: |_: &Path, _scope| {
+                crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+            },
             mailbox: &ladder_mailbox_files,
             log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned())),
             shared: shared_renewal::Effects::default(),
@@ -425,6 +428,7 @@ fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait
             NOW + 2,
             &guard,
             &spawn,
+            None,
             None,
         );
         assert_eq!(admitted.progressed(), repaired);
@@ -1090,9 +1094,12 @@ fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
         Some(accounts::AttemptOutcome::SignedIn)
     );
     let lines = bench.logged();
-    let cause = crate::harness::cli::opener_link(&desk.store(), &crate::harness::cli::LiveAccounts)
-        .unwrap_err()
-        .to_string();
+    let cause = crate::harness::cli::opener_link(
+        &desk.store(),
+        &crate::harness::cli::LiveAccounts::default(),
+    )
+    .unwrap_err()
+    .to_string();
     let failed: Vec<&String> = lines.iter().filter(|l| l.contains(&cause)).collect();
     assert_eq!(failed.len(), 1, "{lines:?}");
 

@@ -231,8 +231,16 @@ pub(crate) enum Vault {
         /// Entries saved with different values while apart, by name.
         conflicts: Vec<String>,
     },
-    /// The latest envelope has no locker for this machine: the command an admin runs.
+    /// The latest envelope has no locker for this machine and it is not [`Vault::Dropped`]: an
+    /// act it can read took it out, or its log does not say a rotation left it out on purpose
+    /// (none trusted, one that still seats or wraps it while it waits on a heal or a sync, or one
+    /// whose newest epoch never knew it). The command an admin runs.
     Revoked(Option<String>),
+    /// A rotation left this machine out with no act against it that it can read
+    /// (`client::dropped_words`, one-mesh E2): every desk that read the rotation refuses its key,
+    /// so it comes back only as a new Mac, its vault folder set aside. `aterm secrets status`'s
+    /// words.
+    Dropped(String),
     Plain,
 }
 
@@ -302,50 +310,12 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
             stages,
             ..
         } => {
-            let stopped: Vec<&str> = stages
-                .iter()
-                .filter(|stage| stage.status == "stopped")
-                .map(|stage| stage.name.as_str())
-                .collect();
-            let unfinished: Vec<&StageRow> = stages
-                .iter()
-                .filter(|stage| {
-                    !matches!(
-                        stage.status.as_str(),
-                        "ok" | "done" | "applied" | "not-applicable"
-                    )
-                })
-                .collect();
-            if !unfinished.is_empty() && stopped.is_empty() {
-                let automatic = unfinished
+            if stages.iter().any(|stage| stage.status == "stopped") {
+                let stopped: Vec<&str> = stages
                     .iter()
-                    .all(|stage| stage.name == "AI account provisioning");
-                let reasons: Vec<String> = unfinished
-                    .iter()
-                    .map(|stage| {
-                        if stage.detail.trim().is_empty() {
-                            stage.name.clone()
-                        } else {
-                            format!("{}: {}", stage.name, stage.detail)
-                        }
-                    })
+                    .filter(|stage| stage.status == "stopped")
+                    .map(|stage| stage.name.as_str())
                     .collect();
-                Area::due(
-                    NAME,
-                    format!("unfinished: {}", reasons.join("; ")),
-                    if automatic { Who::Aterm } else { Who::Agent },
-                    if automatic {
-                        "automatic provisioning resumes when the synced account roster changes"
-                    } else {
-                        "aterm init"
-                    },
-                )
-            } else if stopped.is_empty() {
-                Area::ok(
-                    NAME,
-                    format!("selected setup completed ({} steps)", stages.len()),
-                )
-            } else {
                 Area::off(
                     NAME,
                     format!(
@@ -354,6 +324,48 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
                         stopped.join(", ")
                     ),
                 )
+            } else {
+                let unfinished: Vec<&StageRow> = stages
+                    .iter()
+                    .filter(|stage| {
+                        !matches!(
+                            stage.status.as_str(),
+                            "ok" | "done" | "applied" | "not-applicable"
+                        )
+                    })
+                    .collect();
+                if unfinished.is_empty() {
+                    Area::ok(
+                        NAME,
+                        format!("selected setup completed ({} steps)", stages.len()),
+                    )
+                } else {
+                    use std::fmt::Write as _;
+                    let automatic = unfinished
+                        .iter()
+                        .all(|stage| stage.name == "AI account provisioning");
+                    let mut says = String::from("unfinished: ");
+                    for (idx, stage) in unfinished.iter().enumerate() {
+                        if idx > 0 {
+                            says.push_str("; ");
+                        }
+                        if stage.detail.trim().is_empty() {
+                            says.push_str(&stage.name);
+                        } else {
+                            let _ = write!(says, "{}: {}", stage.name, stage.detail);
+                        }
+                    }
+                    Area::due(
+                        NAME,
+                        says,
+                        if automatic { Who::Aterm } else { Who::Agent },
+                        if automatic {
+                            "automatic provisioning resumes when the synced account roster changes"
+                        } else {
+                            "aterm init"
+                        },
+                    )
+                }
             }
         }
         Setup::Read { stages, .. } => {
@@ -391,6 +403,13 @@ pub(crate) fn setup_area(setup: &Setup) -> Option<Area> {
     })
 }
 
+/// The step of a Mac a rotation dropped ([`Vault::Dropped`], [`Standing::Dropped`]); both areas
+/// carry it, since each is read on its own and either may be late. No admin's approve and no
+/// person's Allow brings that key back, so it comes back as a new Mac.
+const DROPPED_STEP: &str = "set the vault folder named here aside (rename it; nothing is \
+                            deleted), then join its vault again as a new Mac (`aterm members \
+                            join` for ALab)";
+
 /// The ALab membership area: `aterm members status`'s standing.
 pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
     const NAME: &str = "membership";
@@ -422,6 +441,10 @@ pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
         Standing::Asking(_) => {
             Area::working(NAME, says, "aterm keeps asking until a member lets it in")
         }
+        // Not the setup's, even while it runs: its Secrets step reads a dropped Mac blocked and
+        // plans no join, since a join keeps this Mac's key, which every member that read the
+        // rotation refuses.
+        Standing::Dropped(_) => Area::due(NAME, says, Who::Agent, DROPPED_STEP),
         Standing::NotIn if setup.runs(aterm_types::macos_setup::SECRETS_VAULT_ROW) => {
             Area::working(
                 NAME,
@@ -504,6 +527,7 @@ pub(crate) fn vault_area(vault: &Vault, setup: &Setup) -> Area {
                 None => "on an admin Mac, `aterm secrets approve` lets it in again".to_owned(),
             },
         ),
+        Vault::Dropped(says) => Area::due(NAME, says, Who::Agent, DROPPED_STEP),
         Vault::Plain => Area::ok(NAME, "reading a plain text file"),
     }
 }
@@ -810,22 +834,22 @@ fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
 /// The agents area: the AI CLIs someone asked for. One nobody asked for, signed out, is a note
 /// on demand and never a step.
 pub(crate) fn agents_area(agents: &Agents) -> Area {
+    use std::fmt::Write as _;
     const NAME: &str = "agents";
-    let listed = if agents.asked.is_empty() {
-        "none asked for here".to_owned()
+    let mut says = String::new();
+    if agents.asked.is_empty() {
+        says.push_str("none asked for here");
     } else {
-        agents
-            .asked
-            .iter()
-            .map(|(id, state)| format!("{id} {state}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let says = if agents.unasked == 0 {
-        listed
-    } else {
-        format!("{listed}; {} more on demand", agents.unasked)
-    };
+        for (idx, (id, state)) in agents.asked.iter().enumerate() {
+            if idx > 0 {
+                says.push_str(", ");
+            }
+            let _ = write!(says, "{id} {state}");
+        }
+    }
+    if agents.unasked != 0 {
+        let _ = write!(says, "; {} more on demand", agents.unasked);
+    }
     if !agents.by_aterm.is_empty() {
         Area::due(
             NAME,
@@ -1017,6 +1041,8 @@ fn read_setup() -> Setup {
     Setup::NotHere
 }
 
+/// `aterm secrets status`'s read as a [`Vault`]: a Mac its vault let go is [`Vault::Dropped`]
+/// where no act it can read took it out (`client::dropped_words`), [`Vault::Revoked`] otherwise.
 fn read_vault(paths: &aterm_secrets::client::Paths) -> Vault {
     use aterm_secrets::client::{self, Membership};
     let status = match client::status(paths) {
@@ -1027,12 +1053,10 @@ fn read_vault(paths: &aterm_secrets::client::Paths) -> Vault {
         Membership::Unconfigured => Vault::Unconfigured,
         Membership::Pending => Vault::Pending,
         Membership::Plain => Vault::Plain,
-        Membership::Revoked { .. } => Vault::Revoked(status.approve_command()),
+        Membership::Revoked { seq } => client::dropped_words(paths, seq)
+            .map_or_else(|| Vault::Revoked(status.approve_command()), Vault::Dropped),
         Membership::In { .. } => Vault::In {
-            name: status
-                .config
-                .as_ref()
-                .map_or_else(String::new, |config| config.name.clone()),
+            name: status.config.map_or_else(String::new, |config| config.name),
             entries: status.names.len(),
             follows: read_follows(&paths.home),
             conflicts: client::conflicts(paths).unwrap_or_default(),
@@ -1131,7 +1155,7 @@ fn read_areas() -> Vec<Area> {
     let owed = bounded(|| aterm_machines::sync::Ports::owed_clone(&crate::converge::Live::here()));
 
     let setup = setup(deadline);
-    let mut areas = Vec::new();
+    let mut areas = Vec::with_capacity(9);
     let setup = match setup {
         Some(setup) => {
             areas.extend(setup_area(&setup));
@@ -1184,22 +1208,18 @@ enum Asked {
 }
 
 /// `aterm status`'s words: nothing, `--json`, or `-h`/`--help`; anything else is a usage error.
-fn asked(words: &[String]) -> Option<Asked> {
+fn asked(words: &[impl AsRef<std::ffi::OsStr>]) -> Option<Asked> {
     match words {
         [] => Some(Asked::Text),
-        [flag] if flag == "--json" => Some(Asked::Json),
-        [flag] if flag == "-h" || flag == "--help" => Some(Asked::Help),
+        [flag] if flag.as_ref() == "--json" => Some(Asked::Json),
+        [flag] if flag.as_ref() == "-h" || flag.as_ref() == "--help" => Some(Asked::Help),
         _ => None,
     }
 }
 
 /// `aterm status [--json]`. A read exits 0 whatever it finds: a step due is no failure.
 pub(crate) fn main_entry(args: &[OsString]) -> ExitCode {
-    let words: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let text = match asked(&words) {
+    let text = match asked(args) {
         None => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

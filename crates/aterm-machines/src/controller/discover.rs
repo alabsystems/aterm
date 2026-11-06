@@ -294,7 +294,8 @@ pub fn parse_resolve(text: &str) -> Vec<(String, u16)> {
     const REACHED: &str = " can be reached at ";
     let mut targets: Vec<(String, u16)> = Vec::new();
     for line in text.lines() {
-        let Some(at) = line.find(REACHED) else {
+        // The last marker: the instance name before it is the advertiser's free text.
+        let Some(at) = line.rfind(REACHED) else {
             continue;
         };
         let rest = &line[at + REACHED.len()..];
@@ -1121,5 +1122,13 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
     fn a_resolve_that_cannot_run_locates_nothing() {
         let fake = Fake::root();
         assert!(resolve(&fake, "x", SSH_SERVICE, Duration::from_millis(1)).is_empty());
+    }
+
+    /// An instance name that spells the marker and a host of its own does not choose the
+    /// target: the record's own `can be reached at`, the line's last, does.
+    #[test]
+    fn an_instance_name_that_spells_the_marker_does_not_choose_the_target() {
+        let spoofed = " 0:00:00.001  Lab can be reached at decoy.local.:2222 (interface 1)._ssh._tcp.local. can be reached at real.local.:22 (interface 14)\n";
+        assert_eq!(parse_resolve(spoofed), vec![("real.local".into(), 22)]);
     }
 }

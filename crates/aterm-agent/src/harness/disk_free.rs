@@ -10,7 +10,7 @@
 //! record does not start.
 //! Managed markers, package coordinators and complete registry custody take precedence over
 //! this safelist. A bounded FD preflight and the guarded remover never follow nested links;
-//! partial removal reports the walker's released allocation, not a before/after size estimate.
+//! partial removal reports the walker's counted allocation, not a before/after size estimate.
 
 use std::path::{Path, PathBuf};
 
@@ -117,6 +117,9 @@ pub const GRANT_OFF: &str = "aterm's own grant is off (`[disk] auto_free_gib = 0
 pub const UNJOURNALLED: &str =
     "the disk ledger could not be written, and nothing is removed that it does not record first";
 
+const UNRECORDED_COMPLETION: &str =
+    "the removal's completion could not be written to the disk ledger";
+
 /// What one run's fences read, injected so a test drives them on scratch roots.
 pub struct World<'a> {
     /// The owner's home folder, the base of every root.
@@ -149,7 +152,7 @@ pub struct Admitted {
     pub path: PathBuf,
     /// The root it lies under, as resolved.
     pub root: PathBuf,
-    /// The bytes its removal releases, counted before it ([`super::target::cache_bytes`]).
+    /// The file allocation counted before removal ([`super::target::cache_bytes`]).
     pub bytes: u64,
     /// Whether the count stopped short, so `bytes` is a lower bound.
     pub partial: bool,
@@ -160,14 +163,19 @@ pub struct Admitted {
 /// What became of one path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Removed, releasing `bytes` (at least, when `partial`).
+    /// Removed, accounting for `bytes` of file allocation (at least, when `partial`).
     Removed {
-        /// The bytes counted before the removal.
+        /// The file allocation counted by the remover.
         bytes: u64,
         /// Whether the count stopped short.
         partial: bool,
     },
-    /// `--dry-run`: every fence holds, and its removal would release `bytes`.
+    /// Removed completely, but its completion row could not be written to the disk ledger.
+    Unrecorded {
+        /// The file allocation counted by the remover.
+        bytes: u64,
+    },
+    /// A dry run's eligible file allocation; the removal grant is reported separately.
     Would {
         /// The bytes counted.
         bytes: u64,
@@ -176,9 +184,9 @@ pub enum Verdict {
     },
     /// Not removed, and why.
     Refused(String),
-    /// Its removal started and failed, having released `freed` bytes.
+    /// Its removal started and failed, having counted `freed` bytes of removed file allocation.
     Failed {
-        /// The bytes released before it failed.
+        /// The removed file allocation counted before it failed.
         freed: u64,
         /// What failed.
         why: String,
@@ -195,18 +203,24 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// Whether it was neither removed nor admitted by a dry run: the run's exit status is nonzero
-    /// when any outcome is.
+    /// Whether the operation was refused, failed, or could not record its completion. Any such
+    /// outcome makes the command's exit status nonzero, including a fully removed path.
     #[must_use]
     pub const fn refused(&self) -> bool {
-        matches!(self.verdict, Verdict::Refused(_) | Verdict::Failed { .. })
+        matches!(
+            self.verdict,
+            Verdict::Refused(_) | Verdict::Failed { .. } | Verdict::Unrecorded { .. }
+        )
     }
 
-    /// The bytes it released, or under `--dry-run` would release.
+    /// Counted file allocation removed, or estimated for a dry run. Shared storage means this
+    /// is not a measurement of the change in available volume space.
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         match &self.verdict {
-            Verdict::Removed { bytes, .. } | Verdict::Would { bytes, .. } => *bytes,
+            Verdict::Removed { bytes, .. }
+            | Verdict::Would { bytes, .. }
+            | Verdict::Unrecorded { bytes } => *bytes,
             Verdict::Failed { freed, .. } => *freed,
             Verdict::Refused(_) => 0,
         }
@@ -220,37 +234,43 @@ impl Outcome {
         match &self.verdict {
             Verdict::Removed { bytes, partial } => {
                 format!(
-                    "removed {path} ({}{})",
+                    "removed {path} ({}{} of file allocation)",
                     at_least(*partial),
                     human_bytes(*bytes)
                 )
             }
             Verdict::Would { bytes, partial } => format!(
-                "would remove {path} ({}{})",
+                "would remove {path} ({}{} of file allocation)",
                 at_least(*partial),
+                human_bytes(*bytes)
+            ),
+            Verdict::Unrecorded { bytes } => format!(
+                "removed {path} ({} of file allocation), but {UNRECORDED_COMPLETION}",
                 human_bytes(*bytes)
             ),
             Verdict::Refused(why) => format!("refused {path}: {why}"),
             Verdict::Failed { freed, why } => format!(
-                "failed {path} after releasing {}: {why}",
+                "failed {path} after removing {} of file allocation: {why}",
                 human_bytes(*freed)
             ),
         }
     }
 
     /// The JSON object `--json` prints for it: `path`, `removed`, `bytes`, `bytes_partial`,
-    /// `refused` (why it was not removed, or `null`), `dry_run` and `grant`.
+    /// `refused` (the operation's failure reason, or `null`), `dry_run` and `grant`.
+    /// An unrecorded completion keeps `removed=true` and its bytes, alongside its failure reason.
     #[must_use]
     pub fn to_json(&self, dry_run: bool, grant: bool) -> Value {
         let (removed, partial, refused) = match &self.verdict {
             Verdict::Removed { partial, .. } => (true, *partial, None),
+            Verdict::Unrecorded { .. } => (true, false, Some(UNRECORDED_COMPLETION.to_owned())),
             Verdict::Would { partial, .. } => (false, *partial, None),
             Verdict::Refused(why) => (false, false, Some(why.clone())),
             Verdict::Failed { freed, why } => (
                 false,
                 false,
                 Some(format!(
-                    "the removal failed after releasing {}: {why}",
+                    "the removal failed after removing {} of file allocation: {why}",
                     human_bytes(*freed)
                 )),
             ),
@@ -273,9 +293,62 @@ impl Outcome {
     }
 }
 
-/// THE BYTES SESSION `sid` REMOVED BY THIS COMMAND, by the ledger `rows` hold: what the blocks its
-/// `removed` and `failed` rows say each removal released. Unlike a rise in free space it is that
-/// session's own, though a row the ledger's bound cut is not in it.
+/// One command's counted allocation and path outcomes, independent of its output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Paths removed and journalled completely, or listed as eligible by a dry run.
+    pub successful: usize,
+    /// Paths refused, whose removal failed, or whose completion could not be journalled.
+    pub refused: usize,
+    /// Counted file allocation, including the portion removed before a failure.
+    pub bytes: u64,
+    /// The count is a lower bound because an estimate was incomplete or its sum overflowed.
+    pub bytes_partial: bool,
+}
+
+impl Summary {
+    /// Count every outcome without wrapping a large allocation total or losing a lower bound.
+    #[must_use]
+    pub fn from_outcomes(outcomes: &[Outcome]) -> Self {
+        let mut summary = Self::default();
+        for outcome in outcomes {
+            if outcome.refused() {
+                summary.refused += 1;
+            } else {
+                summary.successful += 1;
+            }
+            let (bytes, overflow) = summary.bytes.overflowing_add(outcome.bytes());
+            summary.bytes = if overflow { u64::MAX } else { bytes };
+            summary.bytes_partial |= overflow
+                || matches!(
+                    outcome.verdict,
+                    Verdict::Removed { partial: true, .. } | Verdict::Would { partial: true, .. }
+                );
+        }
+        summary
+    }
+
+    /// The human summary: allocation accounting, separately from completed path counts.
+    #[must_use]
+    pub fn line(&self, dry_run: bool) -> String {
+        let (action, state) = if dry_run {
+            ("would remove", "matched")
+        } else {
+            ("removed", "completed")
+        };
+        let lower_bound = if self.bytes_partial { "at least " } else { "" };
+        format!(
+            "{action} {lower_bound}{} of file allocation; {} path(s) {state}; {} refused or failed",
+            human_bytes(self.bytes),
+            self.successful,
+            self.refused
+        )
+    }
+}
+
+/// The file allocation session `sid`'s `removed` and `failed` ledger rows counted. Unlike a rise
+/// in available volume space, this accounting belongs to that session; rows cut by the ledger's
+/// bound are not included.
 #[must_use]
 pub fn removed_by(rows: &[String], sid: &str) -> u64 {
     rows.iter()
@@ -546,7 +619,8 @@ pub fn survey(world: &World<'_>) -> Vec<Outcome> {
 /// Free each of `paths` (§8.4): every fence read ([`judge`]), aterm's grant on, a `removing` row
 /// written through `journal` (which says whether it wrote) before the removal starts, its identity
 /// unchanged since it was judged, and a `removed` or `failed` row after it. A refused path gets a
-/// `refused` row, written as it can be.
+/// `refused` row, written as it can be. A failed completion write makes the command fail while
+/// preserving what the remover actually removed.
 /// Under `dry_run` nothing is removed or journalled, whatever the grant.
 pub fn run(
     paths: &[PathBuf],
@@ -616,6 +690,9 @@ fn one(
         Ok(clearance) => clearance,
         Err(why) => return Verdict::Refused(why),
     };
+    if let Err(why) = discover::unused_under(std::slice::from_ref(&a.path), world.processes) {
+        return Verdict::Refused(why);
+    }
     let mut permit = || {
         if clearance.current() {
             Ok(())
@@ -645,14 +722,16 @@ fn record_removal(
                 && done.trouble.is_empty()
                 && done.skipped.is_empty() =>
         {
-            journal(&row(
+            if !journal(&row(
                 world.now,
                 world.sid,
                 &a.path,
                 "removed",
                 Some(done.bytes),
                 why,
-            ));
+            )) {
+                return Verdict::Unrecorded { bytes: done.bytes };
+            }
             Verdict::Removed {
                 bytes: done.bytes,
                 partial: false,
@@ -666,19 +745,22 @@ fn record_removal(
                 .chain(done.skipped.into_iter().map(|(_, why)| why))
                 .collect::<Vec<_>>()
                 .join("; ");
-            let why = if why.is_empty() {
+            let mut why = if why.is_empty() {
                 "removal retained part of the path".to_owned()
             } else {
                 why
             };
-            journal(&row(
+            if !journal(&row(
                 world.now,
                 world.sid,
                 &a.path,
                 "failed",
                 Some(freed),
                 &why,
-            ));
+            )) {
+                why.push_str("; ");
+                why.push_str(UNRECORDED_COMPLETION);
+            }
             Verdict::Failed { freed, why }
         }
         Err(error) => Verdict::Refused(error.to_string()),

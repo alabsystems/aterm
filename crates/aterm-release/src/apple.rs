@@ -1377,14 +1377,15 @@ fn find_matching_cert(
             }
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let is_cer = path
+            let name = entry.file_name();
+            let is_cer = Path::new(&name)
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("cer"));
             if !is_cer {
                 continue;
             }
+            let path = entry.path();
             match ["DER", "PEM"]
                 .into_iter()
                 .find(|form| cert_spki_sha256(&path, form).as_deref() == Some(want.as_str()))
@@ -1938,7 +1939,13 @@ fn write_credentials_profile_in(
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     if let Err(e) = {
         use std::os::unix::fs::PermissionsExt as _;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        if f.metadata()
+            .map_or(true, |m| m.permissions().mode() & 0o7777 != 0o600)
+        {
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        } else {
+            Ok(())
+        }
     }
     .and_then(|()| f.write_all(body.expose()))
     .and_then(|()| crate::durable::sync_all(&f))

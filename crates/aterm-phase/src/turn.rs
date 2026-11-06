@@ -923,7 +923,7 @@ fn tool_group(rows: &[String], i: usize, until: usize, width: usize) -> bool {
     }
 }
 
-/// Whether `row` is the rest of the `⏺ ` or two-space line on the row `above` it, both drawn from column 2, as [`crate::phase::line_at`] reads that line.
+/// Whether `row` is the rest of the `⏺ ` or two-space line on the row `above` it, both drawn from column 2, as [`crate::phase::line_at`] reads that line. It keeps [`crate::wrap::room`] and its slack, not the transcript's box ([`crate::wrap::transcript_room`]): the row above may be a vendor `⏺` notice's, its text wrapped in the pane less ten (`NOTICE_MARGIN`), or a dialog's, drawn in [`crate::wrap::room`], which the two rows alone do not tell from a reply's.
 fn wraps_onto(above: &str, row: &str, width: usize) -> bool {
     let said = match above.strip_prefix("⏺ ") {
         Some(said) => said,
@@ -2217,6 +2217,58 @@ mod tests {
                     "{shape}: {read} rows read for {k}, linear in the rows"
                 );
             }
+        }
+    }
+
+    /// A two-space row under a vendor `⏺` notice or a dialog's paragraph is the rest of its line,
+    /// read in [`crate::wrap::room`] with its slack ([`wraps_onto`]). MEASURED: the 2.1.283
+    /// unreachable API's notice at 80 columns (`(ENOTFOUND)`) and the 2.1.304 hook's notice at 144
+    /// (`Usage limit …`), each its text wrapped in the pane less ten (`NOTICE_MARGIN`), and the
+    /// 2.1.302 MCP server dialog at 40 (`access system …`), drawn in the pane less twice its
+    /// column. NEGATIVE CONTROL: in the transcript's box ([`crate::wrap::transcript_room`]) each
+    /// row's first word fits on the row above, so a reader in that box would read each as a line
+    /// of its own.
+    #[test]
+    fn a_notice_or_a_dialogs_wrapped_row_is_the_rest_of_its_line() {
+        for (name, capture, above) in [
+            (
+                "2.1.283 unreachable API notice at 80",
+                include_str!("fixtures/claude-2.1.283-api-error-enotfound-80col-measured.txt"),
+                "⏺ API Error: Can't reach the API server — check your internet or DNS",
+            ),
+            (
+                "2.1.304 hook notice at 144",
+                include_str!(
+                    "fixtures/claude-2.1.304-user-prompt-submit-hook-continue-false-long-reason-wrapped-limit-phrase.txt"
+                ),
+                "⏺ Operation stopped by hook: the nightly pipeline finished its integration suite \
+                 and the deploy gate reported back to the build bot that",
+            ),
+            (
+                "2.1.302 MCP server dialog at 40",
+                include_str!("fixtures/claude-2.1.302-mcp-server-two-40col.txt"),
+                "  MCP servers may execute code or",
+            ),
+        ] {
+            let rows = crate::prompt::fixtures::screen(capture);
+            let width = crate::question::screen_width(&rows);
+            let at = rows
+                .iter()
+                .position(|r| crate::text::trim_end(r) == above)
+                .unwrap_or_else(|| panic!("{name}: the row {above:?}"));
+            let row = rows[at + 1].as_str();
+            assert!(wraps_onto(&rows[at], row, width), "{name}: {row:?}");
+            let said = crate::text::trim(above.strip_prefix("⏺ ").unwrap_or(above));
+            assert!(
+                !crate::wrap::continues_exactly(
+                    said,
+                    0,
+                    2,
+                    row,
+                    crate::wrap::transcript_room(2, width)
+                ),
+                "NEGATIVE CONTROL: {name}"
+            );
         }
     }
 

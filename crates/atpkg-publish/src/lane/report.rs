@@ -221,12 +221,12 @@ impl NoticeSink for Recorded {
     }
 }
 
-/// The UTC day `now_unix` falls on (`YYYYMMDD`).
+/// The UTC day `now_unix` falls on (`YYYYMMDD`, the year as long as it is), a time before the
+/// epoch read as the epoch's day.
 #[must_use]
 pub fn utc_day(now_unix: i64) -> String {
-    let secs = u64::try_from(now_unix).unwrap_or(0);
-    let stamp = aterm_types::rfc3339::format_rfc3339(secs);
-    stamp[..10].replace('-', "")
+    let (year, month, day) = aterm_types::rfc3339::civil_from_days(now_unix.max(0) / 86_400);
+    format!("{year:04}{month:02}{day:02}")
 }
 
 /// Record `message` unless it was already recorded on this UTC day.
@@ -247,7 +247,9 @@ pub fn record_once(
     let file = dir.join(&today_name);
     let seen = crate::identity::read_regular_text(&file, crate::identity::MAX_META_BYTES)
         .unwrap_or_default();
-    if seen.lines().any(|l| l == message) {
+    // Split on the newline alone: `lines` would also strip a message's own trailing `\r`, and
+    // so never find it again.
+    if seen.split_terminator('\n').any(|l| l == message) {
         return;
     }
     if let Ok(entries) = std::fs::read_dir(dir) {

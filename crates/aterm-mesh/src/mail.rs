@@ -7,7 +7,9 @@
 //! overlay holds to it, or over one dialed for the mail alone, held in a table of its own the
 //! overlay does not prune. Each pass (the job's watch tick) reads the membership log's standings
 //! the mesh applied, routes by them, writes the hand-off the fabric bridge routes by beside
-//! `bus.sock`, and wakes every push waiting out a back-off once a new link or the log came up.
+//! `bus.sock`, vouches with this Mac's node key for its person key
+//! (`aterm_link::person_key::vouch`, §11 C3c), and wakes every push waiting out a back-off once a
+//! new link or the log came up.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -37,6 +39,8 @@ pub struct MailLinks {
 
 #[derive(Default)]
 struct Kept {
+    /// The hand-off built at the last standings generation, and that generation.
+    handoff: Option<(u64, Handoff)>,
     /// The hand-off last written, and where.
     written: Option<(PathBuf, Handoff)>,
     /// The peers linked, and whether `bus.log` was hosted, at the last pass.
@@ -44,6 +48,8 @@ struct Kept {
     hosted: bool,
     /// The last reason a hand-off could not be written, journaled once.
     said: Option<String>,
+    /// The last reason the person key could not be vouched for, journaled once.
+    vouch_said: Option<String>,
 }
 
 /// This Mac's own `bus.log`, as the mesh joined it now, adopted under this Mac's node key: what
@@ -110,6 +116,7 @@ impl MailLinks {
             (Arc::clone(mesh), Arc::clone(overlay), Arc::clone(&mail));
         let routes = Routes::start(RoutesConfig {
             me: mesh.principal().to_owned(),
+            key: mesh.key(),
             source: Arc::new(OwnBus {
                 mesh: Arc::clone(mesh),
             }),
@@ -150,29 +157,51 @@ impl MailLinks {
     /// `bus.log` came up since the last pass.
     pub fn pass(&self) {
         self.mail.judge();
-        let me = self.mesh.principal().to_owned();
-        let Some(standings) = self.mesh.standings() else {
-            return;
+        let generation = self
+            .mesh
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handoff
+            .as_ref()
+            .filter(|(was, _)| *was == generation)
+            .map(|(_, handoff)| handoff.clone());
+        let handoff = if let Some(handoff) = cached {
+            handoff
+        } else {
+            let me = self.mesh.principal().to_owned();
+            let Some(standings) = self.mesh.standings() else {
+                return;
+            };
+            let handoff = Handoff {
+                members: standings
+                    .current
+                    .iter()
+                    .map(aterm_link::federate::node_of)
+                    .chain([me.clone()])
+                    .collect(),
+                moved: standings
+                    .rotated
+                    .iter()
+                    .map(|(old, new)| {
+                        (
+                            aterm_link::federate::node_of(old),
+                            aterm_link::federate::node_of(new),
+                        )
+                    })
+                    .collect(),
+                me,
+            };
+            self.kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .handoff = Some((generation, handoff.clone()));
+            handoff
         };
-        let handoff = Handoff {
-            members: standings
-                .current
-                .iter()
-                .map(aterm_link::federate::node_of)
-                .chain([me.clone()])
-                .collect(),
-            moved: standings
-                .rotated
-                .iter()
-                .map(|(old, new)| {
-                    (
-                        aterm_link::federate::node_of(old),
-                        aterm_link::federate::node_of(new),
-                    )
-                })
-                .collect(),
-            me,
-        };
+        self.vouch();
         // Topics go to the Macs whose presence rows name one.
         self.routes.set(&handoff, &self.mesh.holders());
         let host = self.mesh.bus();
@@ -224,6 +253,36 @@ impl MailLinks {
         drop(kept);
         if woke {
             self.routes.kick();
+        }
+    }
+
+    /// Make this Mac's person key where none reads and sign its certificate with the node key
+    /// where none stands for it, asking nothing (§11 C3c): a person's post to another Mac is sealed
+    /// by it. Done, journaled; failed, journaled once for each reason.
+    fn vouch(&self) {
+        let now = crate::relay::wall_ms(&self.mesh.wall);
+        let me = &self.mesh.me;
+        let vouched = aterm_link::person_key::vouch(&me.dir, me.seed(), now);
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        match vouched {
+            Ok(aterm_link::person_key::Vouched::Kept) => kept.vouch_said = None,
+            Ok(aterm_link::person_key::Vouched::Signed { made }) => {
+                kept.vouch_said = None;
+                aterm_log::info!(
+                    "mesh: the node key signed a certificate of {} person key",
+                    if made { "a new" } else { "this Mac's" }
+                );
+            }
+            Err(e) => {
+                let why = e.to_string();
+                if kept.vouch_said.as_deref() != Some(why.as_str()) {
+                    aterm_log::warn!(
+                        "mesh: the person key could not be vouched for ({why}); a person's post \
+                         to another Mac is refused until it is"
+                    );
+                    kept.vouch_said = Some(why);
+                }
+            }
         }
     }
 

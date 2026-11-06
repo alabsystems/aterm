@@ -266,7 +266,7 @@ fn advertise(state: &State, index: usize, service: Service) -> Answer {
 
 /// The pkt-lines of `body` up to its first flush, each without its trailing LF; `None` when
 /// a length is not four hex digits or runs past the body, or no flush ends the list.
-fn commands(body: &[u8]) -> Option<Vec<Vec<u8>>> {
+fn commands(body: &[u8]) -> Option<Vec<&[u8]>> {
     let mut lines = Vec::new();
     let mut at = 0;
     loop {
@@ -276,7 +276,7 @@ fn commands(body: &[u8]) -> Option<Vec<Vec<u8>>> {
             return Some(lines);
         }
         let payload = body.get(at + 4..at.checked_add(len)?)?;
-        lines.push(payload.strip_suffix(b"\n").unwrap_or(payload).to_vec());
+        lines.push(payload.strip_suffix(b"\n").unwrap_or(payload));
         at += len;
     }
 }
@@ -293,7 +293,7 @@ fn receive(state: &mut State, index: usize, body: &[u8]) -> Answer {
     let mut parsed = Vec::with_capacity(lines.len());
     for line in &lines {
         let command = line.split(|b| *b == 0).next().unwrap_or(&[]);
-        let command = String::from_utf8_lossy(command).into_owned();
+        let command = String::from_utf8_lossy(command);
         let mut words = command.splitn(3, ' ').map(str::to_string);
         let (Some(old), Some(new), Some(reference)) = (words.next(), words.next(), words.next())
         else {
@@ -310,7 +310,7 @@ fn receive(state: &mut State, index: usize, body: &[u8]) -> Answer {
         let repo = &mut state.repos[index];
         let status = if new != ZERO {
             format!("ng {reference} only deletes\n")
-        } else if repo.ref_sha(&reference).as_deref() == Some(old.as_str()) {
+        } else if repo.ref_sha(&reference) == Some(old.as_str()) {
             repo.delete_ref(&reference);
             format!("ok {reference}\n")
         } else {

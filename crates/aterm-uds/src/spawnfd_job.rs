@@ -71,7 +71,8 @@ impl ChildObservation<'_> {
     /// Terminal restoration or the actual owning kernel wait fails.
     pub fn acknowledge(self) -> io::Result<Option<ChildEvent>> {
         self.child.restore_foreground()?;
-        let Some(usage) = rusage::take_job(self.child.id())? else {
+        let observed = rusage::take_job(self.child.id());
+        let Some(usage) = self.child.observe_wait_result(observed)? else {
             return Ok(None);
         };
         let raw = usage.status.into_raw();
@@ -105,16 +106,20 @@ impl Child {
     }
 
     fn job_event(&mut self, block: bool) -> io::Result<Option<ChildObservation<'_>>> {
+        self.handle.require_custody()?;
         if self.handle.status.is_some() || self.usage.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "job observation requires an unreaped child",
             ));
         }
-        Ok(notice(self.id(), block)?.map(|notice| ChildObservation {
-            child: self,
-            notice,
-        }))
+        let result = notice(self.id(), block);
+        Ok(self
+            .observe_wait_result(result)?
+            .map(|notice| ChildObservation {
+                child: self,
+                notice,
+            }))
     }
 }
 

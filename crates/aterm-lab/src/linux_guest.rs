@@ -1228,6 +1228,22 @@ pub fn wait_file(path: &str, secs: u32) -> Vec<String> {
     ]
 }
 
+/// Read, in the guest, what the unit's own processes last wrote. `-u` would add the manager's
+/// `Started <argv>`, whose length uses up a report's cap and hides what the process said.
+#[must_use]
+pub fn unit_journal(name: &str) -> Vec<String> {
+    vec![
+        "journalctl".into(),
+        "--user".into(),
+        "--no-pager".into(),
+        "-o".into(),
+        "cat".into(),
+        "-n".into(),
+        "3".into(),
+        format!("_SYSTEMD_USER_UNIT={name}.service"),
+    ]
+}
+
 /// Wait, in the guest, until the file `path` holds at least `n` lines that contain `text`: a hang detector, as [`wait_socket`].
 #[must_use]
 pub fn wait_lines(path: &str, text: &str, n: usize, secs: u32) -> Vec<String> {

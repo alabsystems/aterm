@@ -988,6 +988,73 @@ fn state_symlinks_shared_directories_and_tampered_backups_are_refused() {
     assert_eq!(hash_file(&f.context.target).unwrap(), current);
 }
 
+/// A dangling link where the state record or either half of the policy proof stands is an
+/// entry these reads refuse, never an absence they read past; the same paths truly absent
+/// are the control.
+#[test]
+fn dangling_links_in_the_update_directory_fail_closed() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let dir = &f.context.dir;
+    f.proof.save(dir).unwrap();
+    assert!(
+        Proof::read(dir).unwrap().policy.is_none(),
+        "no policy pair at all is a proof without a policy"
+    );
+    symlink("missing-policy-sig", dir.join(POLICY_SIG)).unwrap();
+    assert!(
+        Proof::read(dir).is_err(),
+        "a dangling policy signature is a half proof, not no policy"
+    );
+    symlink("missing-policy", dir.join(POLICY)).unwrap();
+    assert!(
+        Proof::read(dir).is_err(),
+        "a dangling policy pair is a proof that cannot be read"
+    );
+    fs::remove_file(dir.join(POLICY)).unwrap();
+    fs::remove_file(dir.join(POLICY_SIG)).unwrap();
+
+    let state_file = dir.join("state.toml");
+    fs::rename(&state_file, dir.join("saved-state")).unwrap();
+    assert!(f.context.read_state().unwrap().is_none());
+    symlink("missing-state", &state_file).unwrap();
+    assert!(
+        f.context.read_state().is_err(),
+        "a dangling state record is not an absent one"
+    );
+    fs::remove_file(&state_file).unwrap();
+    fs::rename(dir.join("saved-state"), &state_file).unwrap();
+    assert!(f.context.read_state().unwrap().is_some());
+}
+
+/// A probe whose second scratch file cannot be made removes the first: a failed create
+/// leaves nothing in the private directory.
+#[test]
+fn a_probe_that_cannot_make_its_error_file_leaves_no_output_file() {
+    let f = Fixture::new();
+    let manifest = Manifest::parse(std::str::from_utf8(&f.proof.appcast).unwrap()).unwrap();
+    let scratch = || {
+        fs::read_dir(&f.context.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("probe-"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(scratch(), Vec::<String>::new());
+    REFUSED_STEM.with(|refused| refused.set(Some("probe-error")));
+    let refused = probe_candidate(
+        &f.context.target,
+        &manifest,
+        native().unwrap(),
+        &f.context.dir,
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    REFUSED_STEM.with(|refused| refused.set(None));
+    let why = refused.unwrap_err();
+    assert!(why.contains("probe-error"), "{why}");
+    assert_eq!(scratch(), Vec::<String>::new());
+}
+
 #[test]
 fn a_linux_apply_and_rollback_order_their_steps_and_keep_the_state_durable() {
     use aterm_durable::{Flush, seam::Recording};

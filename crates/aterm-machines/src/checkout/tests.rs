@@ -463,6 +463,39 @@ fn a_github_origin_is_matched_over_https_and_ssh_and_never_with_a_credential() {
     );
 }
 
+/// An origin that names the repository with the host in another case, a `.git` in any case or
+/// a trailing `/` is that repository, as GitHub serves it at each; an exact remote ignores a
+/// trailing `/` alone. NEGATIVE CONTROL: another repository, or another path, is refused.
+#[test]
+fn an_origin_spelled_another_way_github_serves_is_the_same_repository() {
+    let aterm = Remote::of("https://GitHub.com/o/aterm.GIT/");
+    assert_eq!(
+        aterm,
+        Remote::Github {
+            owner: "o".into(),
+            name: "aterm".into()
+        }
+    );
+    for url in [
+        "https://github.com/o/aterm",
+        "https://GITHUB.COM/o/aterm.git/",
+        "git@GitHub.com:o/aterm.Git",
+        "ssh://git@github.com/o/aterm/",
+    ] {
+        assert!(aterm.admits(url), "{url}");
+    }
+    for url in [
+        "https://github.com/o/other",
+        "https://github.com/o/aterm.git.evil",
+        "https://github.com.evil.invalid/o/aterm",
+    ] {
+        assert!(!aterm.admits(url), "{url}");
+    }
+    let exact = Remote::of("/srv/git/aterm.git");
+    assert!(exact.admits("/srv/git/aterm.git/"));
+    assert!(!exact.admits("/srv/git/aterm"));
+}
+
 #[test]
 fn align_runs_no_hook_and_fetches_from_origin_alone() {
     let live = Live::new();

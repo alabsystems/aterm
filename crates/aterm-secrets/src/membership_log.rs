@@ -63,12 +63,13 @@ pub use budgets::{
 pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
 };
-pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
+pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, RevokingRow, Undo};
 pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 pub use store::{
-    MAX_RECORDS_STREAM, Store, decode_records, decode_records_bounded, encode_records,
+    MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
+    encode_records, on_written,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -1874,6 +1875,21 @@ impl Log {
     fn membership_ref(&self) -> &Membership {
         self.membership
             .get_or_init(|| eval::evaluate_with(self.history(), self.weighing()))
+    }
+
+    /// Whether this log takes the Mac of `binding` out ([`Membership::seat_removed`]): the one
+    /// removal predicate the peer check, a witness's judgement and enrollment share.
+    #[must_use]
+    pub fn seat_removed(&self, binding: &Binding) -> bool {
+        self.membership_ref().seat_removed(binding)
+    }
+
+    /// This log with `membership` as its evaluation, for a test of a caller's judgement on a
+    /// membership no record set here gives (the Unix client's enrollment tests).
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_membership(mut self, membership: Membership) -> Self {
+        self.membership = Arc::new(OnceLock::from(membership));
+        self
     }
 
     fn effective(&self) -> &eval::Effective {

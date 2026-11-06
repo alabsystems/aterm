@@ -1174,8 +1174,13 @@ fn write_beside(full: &Path, data: &[u8], exec: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(want))
-            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        if file
+            .metadata()
+            .map_or(true, |m| m.permissions().mode() & 0o7777 != want)
+        {
+            file.set_permissions(fs::Permissions::from_mode(want))
+                .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        }
     }
     #[cfg(not(unix))]
     let _ = want;
@@ -1269,18 +1274,23 @@ fn cached_archives<'a>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("list {}: {e}", cache.display())),
     };
+    let crate_files: Vec<(&'a LockedCrate, String)> = locked
+        .iter()
+        .map(|krate| (krate, format!("{}-{}.crate", krate.name, krate.version)))
+        .collect();
     let mut found = Vec::new();
     for index in indexes {
         let index = index.map_err(|e| format!("list {}: {e}", cache.display()))?;
         if !index.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        for krate in locked {
-            let archive = index.path().join(format!("{}.crate", krate.stem()));
+        let index_path = index.path();
+        for (krate, file_name) in &crate_files {
+            let archive = index_path.join(file_name);
             match crate::durable::read_file(&archive) {
                 Ok(bytes) => {
                     let matches = sha256_hex(&bytes) == krate.checksum;
-                    found.push((krate, archive, matches));
+                    found.push((*krate, archive, matches));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("read {}: {e}", archive.display())),

@@ -232,6 +232,7 @@ pub fn dump_sheets(
         }
         // Every column any row holds, the known first: what a read adds (`has_password`,
         // `_conflicts`) is not a column.
+        let known_set: BTreeSet<&str> = columns.iter().map(|(c, _)| *c).collect();
         let mut headers: Vec<String> = columns.iter().map(|(c, _)| (*c).to_owned()).collect();
         let mut others = BTreeSet::new();
         for item in items {
@@ -239,14 +240,15 @@ pub fn dump_sheets(
             for key in row.keys() {
                 if !key.starts_with('_')
                     && key != "has_password"
-                    && !headers.iter().any(|h| h == key)
+                    && !known_set.contains(key.as_str())
                 {
                     others.insert(key.clone());
                 }
             }
         }
         headers.extend(others);
-        let mut rows = Vec::new();
+        let is_secret: Vec<bool> = headers.iter().map(|h| secret_column(table, h)).collect();
+        let mut rows = Vec::with_capacity(items.len());
         let mut secrets = BTreeMap::new();
         let mut conflicted = BTreeSet::new();
         for (index, item) in items.iter().enumerate() {
@@ -255,7 +257,7 @@ pub fn dump_sheets(
             let mut cells = Vec::with_capacity(headers.len());
             for (col, header) in headers.iter().enumerate() {
                 let value = row.get(header).unwrap_or(&Value::Null);
-                if secret_column(table, header) {
+                if is_secret[col] {
                     if let Some(secret) = value.as_str().filter(|s| !s.trim().is_empty()) {
                         secrets.insert((row_at, col), Arc::new(Secret::new(secret.to_owned())));
                     }
@@ -281,7 +283,7 @@ pub fn dump_sheets(
                     continue;
                 }
                 for (col, header) in headers.iter().enumerate() {
-                    let disagree = if secret_column(table, header) {
+                    let disagree = if is_secret[col] {
                         cell_as_compared(row.get(header)) != cell_as_compared(other.get(header))
                     } else {
                         row.get(header) != other.get(header)
@@ -386,6 +388,11 @@ impl Planner<'_> {
                 });
             }
         }
+        let account_addresses = if table == Dump::Emails {
+            self.dump_account_addresses(sheet)
+        } else {
+            BTreeSet::new()
+        };
         for (index, cells) in sheet.rows.iter().enumerate() {
             let read = Read {
                 n,
@@ -399,7 +406,7 @@ impl Planner<'_> {
                 continue;
             }
             match table {
-                Dump::Emails => self.dump_email(&read)?,
+                Dump::Emails => self.dump_email(&read, &account_addresses)?,
                 Dump::Phones => self.dump_phone(&read)?,
                 Dump::Accounts => self.dump_account(&read)?,
                 Dump::Computers => self.dump_computer(&read),
@@ -446,26 +453,24 @@ impl Planner<'_> {
         conflicted
     }
 
-    /// Whether this dump's `ai_accounts` table names `address`: the relations an `emails` row
+    /// The addresses this dump's `ai_accounts` table names: the relations an `emails` row
     /// states are carried by that row.
-    fn dump_names_account(&self, sheet: &Sheet, address: &str) -> bool {
+    fn dump_account_addresses(&self, sheet: &Sheet) -> BTreeSet<String> {
         let file = sheet.name.rsplit_once('#').map_or("", |(file, _)| file);
-        self.input.sheets.iter().any(|other| {
-            other.kind == SheetKind::FleetDb(Dump::Accounts)
+        let mut addresses = BTreeSet::new();
+        for other in self.input.sheets {
+            if other.kind == SheetKind::FleetDb(Dump::Accounts)
                 && other.name.rsplit_once('#').map(|(f, _)| f) == Some(file)
-                && other
-                    .headers
-                    .iter()
-                    .position(|h| h == "email")
-                    .is_some_and(|col| {
-                        other.rows.iter().any(|cells| {
-                            cells
-                                .get(col)
-                                .and_then(|c| keys::address(c).ok())
-                                .is_some_and(|a| a == address)
-                        })
-                    })
-        })
+                && let Some(col) = other.headers.iter().position(|h| h == "email")
+            {
+                for cells in &other.rows {
+                    if let Some(addr) = cells.get(col).and_then(|c| keys::address(c).ok()) {
+                        addresses.insert(addr);
+                    }
+                }
+            }
+        }
+        addresses
     }
 
     /// A relation column no row of the dump carries: a finding, by name only.
@@ -494,7 +499,7 @@ impl Planner<'_> {
         }
     }
 
-    fn dump_email(&mut self, read: &Read<'_>) -> Result<()> {
+    fn dump_email(&mut self, read: &Read<'_>, account_addresses: &BTreeSet<String>) -> Result<()> {
         let kind = read.sheet.kind;
         let email = read.col("email");
         let Some(address) = self.address_of(read.n, read.sheet, read.row, read.cells, email) else {
@@ -530,7 +535,7 @@ impl Planner<'_> {
         }
         for column in ["assigned_computers", "services"] {
             if let Some((_, at, _)) = read.get(column)
-                && !self.dump_names_account(read.sheet, &address)
+                && !account_addresses.contains(&address)
             {
                 self.uncarried(ADDRESS.name, &pk, column, at);
             }
@@ -894,8 +899,7 @@ impl Planner<'_> {
         }
         // A placeholder minted this run stays `planned`: fleet_db wrote `active` for every row.
         let placeholder = self
-            .rows
-            .get(&(MACHINE.name, pk.clone()))
+            .row_get(MACHINE.name, &pk)
             .and_then(|row| row.values.get("status"))
             .is_some_and(|want| want.x == json!("planned"));
         for (column, cell, limit) in [
@@ -1024,7 +1028,7 @@ impl Planner<'_> {
                     .iter()
                     .filter_map(|realm| keys::account_pk(realm, email).ok())
                     .find(|account| {
-                        self.rows.contains_key(&(ACCOUNT.name, account.clone()))
+                        self.has_row(ACCOUNT.name, account)
                             || self.current[ACCOUNT.name].rows.contains_key(account)
                     });
                 match account {

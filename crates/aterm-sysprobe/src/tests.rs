@@ -2134,6 +2134,40 @@ fn the_hypervisors_kernel_switch_reads_on_macos_and_nowhere_else() {
     assert_eq!(hv_support(), None);
 }
 
+/// Whether `text` is spelled as Apple spells an OS build: a major number, an uppercase train
+/// letter, a build number and, on a beta, one lowercase letter (`25B78`, `25A5279m`).
+fn is_os_build(text: &str) -> bool {
+    let major = text.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &text.as_bytes()[major..];
+    let Some((train, rest)) = rest.split_first() else {
+        return false;
+    };
+    let build = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    (1..=3).contains(&major)
+        && train.is_ascii_uppercase()
+        && build > 0
+        && matches!(&rest[build..], [] | [b'a'..=b'z'])
+}
+
+/// The OS build reads on macOS, spelled as a build (the release's build-inputs seal holds an
+/// update by it), and nowhere else. CONTROL: the product version (`26.1`) is no build.
+#[test]
+fn the_os_build_reads_on_macos_and_nowhere_else() {
+    #[cfg(target_os = "macos")]
+    {
+        let build = os_build().expect("kern.osversion reads on macOS");
+        assert!(is_os_build(&build), "{build:?}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(os_build(), None);
+    for build in ["25B78", "25A5279m", "9L31a"] {
+        assert!(is_os_build(build), "{build}");
+    }
+    for other in ["26.1", "", "25b78", "B78", "25B", "25B78mm"] {
+        assert!(!is_os_build(other), "{other}");
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() {

@@ -394,6 +394,10 @@ const OPEN_SETTINGS: &str = "Open System Settings";
 /// What VoiceOver hears for the card's Go to tab: the tab it goes to, after the words it shows.
 const GO_TO_TAB_LABEL: &str = "Go to tab: Command Line Tools";
 
+/// What VoiceOver hears for the card's Go to installer: the window it goes to, after the words it
+/// shows.
+pub(super) const GO_TO_INSTALLER_LABEL: &str = "Go to installer: Apple's Command Line Tools";
+
 /// THE CARD RULE (§4.8, pure): everything that needs the person, once each, in the order they
 /// meet it — the permission walk's page, macOS's Local Network question, the Command Line Tools'
 /// password, the vault's Allow and phrase, a code to approve, a failed step with what aterm does
@@ -473,8 +477,13 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                         .reason(Some(super::TOOLS_RECOVERED_NOTE.to_owned()))
                         .button(super::GO_TO_TOOLS_TAB, GO_TO_TAB_LABEL, "Go to tab")
                 }
+                // Apple's window may sit behind others: its button finds it, and starts nothing.
                 Some(ToolsWait::AppleWindow) => {
-                    CardItem::new(slug, Mark::NeedsYou, super::APPLE_WINDOW_NOTE)
+                    CardItem::new(slug, Mark::NeedsYou, super::APPLE_WINDOW_NOTE).button(
+                        super::GO_TO_TOOLS_INSTALLER,
+                        GO_TO_INSTALLER_LABEL,
+                        "Go to installer",
+                    )
                 }
                 // Only an administrator of this Mac installs them: their one step, said here.
                 Some(ToolsWait::NotAdmin) => CardItem::new(
@@ -504,7 +513,7 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                 _ => CardItem::new(
                     slug,
                     Mark::NeedsYou,
-                    format!("{} needs you", subject.name()),
+                    format!("Needs you: {}", subject.name()),
                 )
                 .reason(row.note.clone()),
             }
@@ -537,7 +546,7 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                     CardItem::new(
                         slug,
                         Mark::NeedsYou,
-                        format!("{} needs you", subject.name()),
+                        format!("Needs you: {}", subject.name()),
                     )
                     .reason(row.note.clone())
                     .for_row(subject)
@@ -547,7 +556,7 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                 let mut item = CardItem::new(
                     slug,
                     Mark::NeedsYou,
-                    format!("{} needs you", subject.name()),
+                    format!("Needs you: {}", subject.name()),
                 )
                 .reason(row.note.clone())
                 .for_row(subject);
@@ -822,7 +831,7 @@ fn line_state(
         };
         return with_lead(LineState::new(
             Mark::NeedsYou,
-            format!("{} needs you{more}", first.subject.name()),
+            format!("Needs you: {}{more}", first.subject.name()),
         ));
     }
     // Nothing of it read yet: its scope, calm, and the headline says Checking once.

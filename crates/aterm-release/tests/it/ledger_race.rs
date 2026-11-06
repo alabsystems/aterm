@@ -6,10 +6,11 @@
 use crate::{changelog, ledger};
 
 use aterm_uds::spawnfd::command;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::push_hook::HookRunner;
 use ledger::testing::Git;
 use ledger::{ClaimPlan, GitRunner, LEDGER_FLOOR, RunOut};
 
@@ -155,37 +156,6 @@ fn rival_land_section(fix: &Fixture, line: &str, version: &str) {
         &["commit", "-q", "-am", "rival: full claim"],
     );
     run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
-}
-
-struct HookRunner<F: FnMut(u32)> {
-    inner: Git,
-    pushes: Cell<u32>,
-    on_push: RefCell<F>,
-}
-
-impl<F: FnMut(u32)> HookRunner<F> {
-    fn new(work: &Path, on_push: F) -> Self {
-        HookRunner {
-            inner: Git::new(work),
-            pushes: Cell::new(0),
-            on_push: RefCell::new(on_push),
-        }
-    }
-}
-
-impl<F: FnMut(u32)> GitRunner for HookRunner<F> {
-    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
-        if args.first() == Some(&"push") {
-            let n = self.pushes.get() + 1;
-            self.pushes.set(n);
-            (self.on_push.borrow_mut())(n);
-        }
-        self.inner.git(args)
-    }
-
-    fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
-        self.inner.git_input(args, input)
-    }
 }
 
 fn rival_peer_push(fix: &Fixture) {
@@ -864,4 +834,25 @@ fn offline_fetch_fails_closed() {
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     res.unwrap_err();
     assert_eq!(attempts, 0, "no offline claim may roll anything");
+}
+
+#[test]
+fn a_push_lost_at_the_remote_is_a_lost_race_and_a_refused_one_is_not() {
+    // git 2.56's receive-pack, whose ref moved between its advertisement and its update (a
+    // pre-receive hook moved it), says why on the push's own line, below a `remote: error:
+    // cannot lock ref …` line of its own; GitHub gives the lock's words as the reason.
+    let git_reason = " ! [remote rejected] main -> main (incorrect old value provided)\nerror: \
+                      failed to push some refs to '/tmp/o.git'";
+    let github = " ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at \
+                  bd0944f2c96d but expected f5da300a05b1)\nerror: failed to push some refs";
+    let here = " ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs";
+    for stderr in [git_reason, github, here] {
+        assert!(ledger::lost_race(stderr), "{stderr}");
+    }
+    let refused = " ! [remote rejected] main -> main (protected branch hook declined)\nerror: \
+                   failed to push some refs";
+    let offline = "fatal: unable to access 'https://github.com/o/r/': Could not resolve host";
+    for stderr in [refused, offline] {
+        assert!(!ledger::lost_race(stderr), "{stderr}");
+    }
 }

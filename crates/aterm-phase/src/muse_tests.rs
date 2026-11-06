@@ -2464,6 +2464,26 @@ fn a_turn_failure_is_a_wall_or_no_evidence() {
     );
 }
 
+/// A fault row is the turn's stop notice ([`ScreenReader::stopped_turn`]), read whole. Negative
+/// controls: the words quoted inside a reply, a plain reply, and Claude Code's reader read none.
+#[test]
+fn a_fault_row_is_the_turns_stop_notice_and_only_its_own() {
+    let rows = screen(END_OF_TURN);
+    let reply = |text: &str| edited(&rows, "◆ echo", text);
+    for fault in [
+        "A configuration problem stopped this turn. Fix it in /settings.",
+        "This turn could not prepare the conversation.",
+    ] {
+        let s = reply(&format!("◆ {fault}"));
+        assert_eq!(MuseReader.stopped_turn(&s).as_deref(), Some(fault));
+        assert_eq!(ClaudeReader.stopped_turn(&s), None, "the control: {fault}");
+    }
+    let quoted =
+        reply("◆ It said: A configuration problem stopped this turn. Fix it in /settings.");
+    assert_eq!(MuseReader.stopped_turn(&quoted), None, "the control");
+    assert_eq!(MuseReader.stopped_turn(&rows), None, "the control");
+}
+
 #[test]
 fn background_notices_are_no_replys_words() {
     let rows = screen(END_OF_TURN);

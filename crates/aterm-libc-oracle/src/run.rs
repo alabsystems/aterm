@@ -3,7 +3,7 @@
 
 //! Runs the oracle phases for this host's native cell.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -164,7 +164,7 @@ impl Run<'_> {
 
         let ws = Workspace::new(&trust, &oracle, &options.target_dir);
         let union = self.inputs(&ws, root, cell)?;
-        self.siblings(&shim_src);
+        let sources = self.siblings(&shim_src);
         let Some(union) = union else {
             self.skip_rest("the inputs are unusable");
             return Ok(());
@@ -208,7 +208,7 @@ impl Run<'_> {
             );
             return Ok(());
         }
-        self.controls(&trust, root, cell, &reference)
+        self.controls(&trust, root, cell, &reference, sources)
     }
 
     fn inputs(
@@ -291,9 +291,9 @@ impl Run<'_> {
         Ok(Some(union))
     }
 
-    fn siblings(&mut self, shim_src: &Path) {
+    fn siblings(&mut self, shim_src: &Path) -> Option<BTreeMap<&'static str, String>> {
         let since = Instant::now();
-        let (detail, findings) = match siblings::read_sources(shim_src) {
+        let (detail, findings, sources) = match siblings::read_sources(shim_src) {
             Ok(sources) => {
                 let found = siblings::compare(&sources);
                 let pairs: Vec<&str> = cells::sibling_pairs()
@@ -306,7 +306,11 @@ impl Run<'_> {
                 } else {
                     format!("{} of {} same-OS pairs fail", failing.len(), pairs.len())
                 };
-                (detail, found.into_iter().map(Finding::Sibling).collect())
+                (
+                    detail,
+                    found.into_iter().map(Finding::Sibling).collect(),
+                    Some(sources),
+                )
             }
             Err(error) => (
                 "the cell sources are unreadable".into(),
@@ -314,9 +318,11 @@ impl Run<'_> {
                     what: "the shim's cell sources".into(),
                     detail: error.to_string(),
                 }],
+                None,
             ),
         };
         self.phase(Phase::Siblings, since, detail, findings);
+        sources
     }
 
     fn surface(
@@ -398,9 +404,10 @@ impl Run<'_> {
         root: &Path,
         cell: &'static Cell,
         reference: &Reference,
+        sources: Option<BTreeMap<&'static str, String>>,
     ) -> Result<(), CouldNotRun> {
         let since = Instant::now();
-        let report = controls::run(trust, root, cell, reference)?;
+        let report = controls::run(trust, root, cell, reference, sources)?;
         let mut detail = format!("{} planted defects caught", report.caught.len());
         if !report.failed.is_empty() {
             detail.push_str(&format!(", {} not", report.failed.len()));

@@ -13,7 +13,7 @@ use crate::grapheme::ColumnMap;
 use crate::index::{
     CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError, scan_line,
 };
-use crate::iterators::next_literal_match;
+use crate::iterators::literal_occurrence;
 use crate::types::{SearchMatch, SearchResults};
 
 enum RowMatcher {
@@ -219,11 +219,11 @@ impl BudgetedSearch {
         match &mut self.matcher {
             RowMatcher::Literal => {
                 let searcher = crate::bytesearch::Searcher::new(self.query.as_bytes());
-                let mut next_byte = 0;
-                while let Some((found, resume)) =
-                    next_literal_match(abs_row, text, &searcher, &col_map, next_byte)
-                {
-                    next_byte = resume;
+                for at in searcher.matches_in::<false>(text.as_bytes()) {
+                    let found = literal_occurrence(abs_row, at, self.query.len(), &col_map);
+                    if found.start_col == found.end_col {
+                        continue;
+                    }
                     self.matches.push(found);
                     if self.matches.len() >= MAX_SEARCH_MATCHES {
                         break;
@@ -232,7 +232,7 @@ impl BudgetedSearch {
             }
             RowMatcher::CaseInsensitive(matcher) => {
                 let matches = &mut self.matches;
-                matcher.visit_matches(abs_row, text, &col_map, |found| {
+                matcher.visit_matches::<false>(abs_row, text, &col_map, |found| {
                     matches.push(found);
                     matches.len() < MAX_SEARCH_MATCHES
                 });

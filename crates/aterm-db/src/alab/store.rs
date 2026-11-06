@@ -336,13 +336,15 @@ impl Registry {
     /// declaration from another Mac says the lab holds the registry. A Mac that holds it holds
     /// that declaration, so where none is here a peer's fresh round over the catalog that brought
     /// nothing says that peer holds none of the registry (the import's empty-view guard,
-    /// `alab::command`). `None` where there is no Commons here.
+    /// `alab::command`). `None` where there is no Commons here. `deadline` bounds the read, an
+    /// import's own pass rather than an admission's, since a loaded Mac's catalog read can outrun
+    /// the latter.
     ///
     /// # Errors
-    /// Custody, membership or the catalog's storage cannot be read.
-    pub fn catalog_word(&self) -> Result<Option<(Digest, bool)>> {
+    /// Custody, membership or the catalog's storage cannot be read by `deadline`.
+    pub fn catalog_word(&self, deadline: std::time::Instant) -> Result<Option<(Digest, bool)>> {
         Ok(
-            application::peek_declaration(&self.paths, descriptor(self.generation()))?
+            application::peek_declaration(&self.paths, descriptor(self.generation()), deadline)?
                 .map(|declaration| (declaration.catalog, declaration.elsewhere)),
         )
     }
@@ -353,10 +355,12 @@ impl Registry {
     /// # Errors
     /// Custody, membership or the catalog's storage cannot be read.
     pub fn declared(&self) -> Result<bool> {
-        Ok(
-            application::peek_declaration(&self.paths, descriptor(self.generation()))?
-                .is_some_and(|declaration| declaration.declared),
-        )
+        Ok(application::peek_declaration(
+            &self.paths,
+            descriptor(self.generation()),
+            crate::admission::deadline(),
+        )?
+        .is_some_and(|declaration| declaration.declared))
     }
 
     /// The Commons uuids of the current members, what `check` calls live.
@@ -548,7 +552,7 @@ impl Registry {
     /// As [`Self::register`], but for being no Writer.
     pub fn preview(&self, config: &Path, probe: &Probe, now_ms: u64) -> Result<Registered> {
         let compiled = self.generation();
-        let trust = match self.admitted(config)? {
+        let trust = match self.admitted_policy(config)? {
             Ok(trust) => trust,
             Err(outcome) => return Ok(quiet(outcome)),
         };
@@ -584,7 +588,7 @@ impl Registry {
     /// This Mac's custody, its `[commons]` policy or the registry's storage cannot be read.
     pub fn lab(&self, config: &Path, held: Option<Inventory>) -> Result<Option<LabRead>> {
         let compiled = self.generation();
-        if self.admitted(config)?.is_err() {
+        if self.admitted_policy(config)?.is_err() {
             return Ok(None);
         }
         let seen = application::observe_store_if_declared(
@@ -619,10 +623,9 @@ impl Registry {
         Ok(seen)
     }
 
-    /// What every pass reads first: this Mac's trust, or the outcome that ends the pass, when
-    /// there is no Commons, `[commons]` turns sharing off or excludes the registry or the catalog,
-    /// or the registry is not declared here.
-    fn admitted(
+    /// This Mac's trust, or the outcome that ends a pass when there is no Commons or `[commons]`
+    /// turns sharing off or excludes the registry or the catalog.
+    fn admitted_policy(
         &self,
         config: &Path,
     ) -> Result<std::result::Result<aterm_secrets::commons::journal::Trust, Outcome>> {
@@ -640,6 +643,21 @@ impl Registry {
         {
             return Ok(Err(Outcome::Excluded));
         }
+        Ok(Ok(trust))
+    }
+
+    /// What every pass reads first: this Mac's trust, or the outcome that ends the pass, when
+    /// there is no Commons, `[commons]` turns sharing off or excludes the registry or the catalog,
+    /// or the registry is not declared here.
+    fn admitted(
+        &self,
+        config: &Path,
+    ) -> Result<std::result::Result<aterm_secrets::commons::journal::Trust, Outcome>> {
+        let compiled = self.generation();
+        let trust = match self.admitted_policy(config)? {
+            Ok(trust) => trust,
+            Err(outcome) => return Ok(Err(outcome)),
+        };
         if application::observe_store_if_declared(&self.paths, descriptor(compiled), |_, _, _| {
             Ok(())
         })?

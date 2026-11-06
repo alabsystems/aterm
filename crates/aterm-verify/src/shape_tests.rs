@@ -713,6 +713,8 @@ fn artifact(names: &[&str], fresh: bool) -> Artifact {
     Artifact {
         filenames: names.iter().map(|n| (*n).to_owned()).collect(),
         fresh,
+        package: None,
+        test: false,
     }
 }
 
@@ -794,6 +796,59 @@ fn a_cut_the_closing_call_rebuilt_is_refused() {
     let out = "warning: x\n{\"reason\":\"compiler-artifact\",\"filenames\":[\"/d/a\"],\"fresh\":true}\n\
                {\"reason\":\"build-finished\",\"success\":true}\n";
     assert_eq!(artifacts(out), [artifact(&["/d/a"], true)]);
+}
+
+/// A COMPILE'S MESSAGES NAME EACH ARTIFACT'S PACKAGE, WHETHER IT IS A TEST BUILD, AND EACH BUILD
+/// SCRIPT IT RAN, as cargo spells them: a path package's id with its name and with only its
+/// version (its folder is its name), a registry package's, the form before cargo 1.77; the
+/// `out_dir` of each `build-script-executed`. NEGATIVE CONTROL: an id of no form read names no
+/// package, an artifact with no `profile.test` is no test build, and a build script's message is
+/// no artifact.
+#[test]
+fn a_compiles_messages_name_each_artifacts_package_and_each_script_run() {
+    for (id, name) in [
+        (
+            "path+file:///w/aterm/crates/bc#bc-pkg@0.1.0",
+            Some("bc-pkg"),
+        ),
+        ("path+file:///w/aterm/crates/atpkg#0.155.0", Some("atpkg")),
+        (
+            "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200",
+            Some("serde"),
+        ),
+        (
+            "git+https://github.com/x/cargo?branch=b#0.52.0",
+            Some("cargo"),
+        ),
+        (
+            "libc 0.2.186 (registry+https://github.com/rust-lang/crates.io-index)",
+            Some("libc"),
+        ),
+        ("path+file:///#0.1.0", None),
+        ("no-fragment", None),
+        ("", None),
+    ] {
+        assert_eq!(package_name(id).as_deref(), name, "{id}");
+    }
+    let out = concat!(
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///w/aterm/crates/atpkg#0.155.0","profile":{"test":true},"filenames":["/b/debug/build/atpkg/1111111111111111/out/atpkg-1111111111111111"],"fresh":false}"#,
+        "\n",
+        r#"{"reason":"build-script-executed","package_id":"path+file:///w/aterm/crates/atpkg#0.155.0","out_dir":"/b/debug/build/atpkg/2222222222222222/out"}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","package_id":"what","filenames":["/t/debug/atpkg"],"fresh":true}"#,
+        "\n",
+    );
+    let read = artifacts(out);
+    assert_eq!(
+        read.iter()
+            .map(|a| (a.package.as_deref(), a.test, a.fresh))
+            .collect::<Vec<_>>(),
+        vec![(Some("atpkg"), true, false), (None, false, true)]
+    );
+    assert_eq!(
+        script_runs(out),
+        vec!["/b/debug/build/atpkg/2222222222222222/out".to_owned()]
+    );
 }
 
 /// Three crates whose every call builds their shared dependency `d`: `-p a`, `-p b` and the

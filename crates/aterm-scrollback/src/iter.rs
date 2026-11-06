@@ -10,7 +10,13 @@ use std::collections::VecDeque;
 use super::{Line, Scrollback, ScrollbackError, ScrollbackStorage};
 
 /// One bulk read for the streaming walk.
-pub(crate) type SegmentResult = Result<Vec<Line>, (ScrollbackError, usize)>;
+pub(crate) type SegmentResult = Result<Segment, (ScrollbackError, usize)>;
+
+/// A hot line needs no collection; compressed tiers decode a block at a time.
+pub(crate) enum Segment {
+    Line(Line),
+    Block(Vec<Line>),
+}
 
 impl Scrollback {
     /// Iterate over all lines (oldest to newest).
@@ -73,7 +79,7 @@ pub(crate) fn read_segment_tiers(
     let warm_count = warm.line_count();
 
     if idx < cold_count {
-        cold.take_lines_from(idx).map_err(|e| {
+        cold.take_lines_from(idx).map(Segment::Block).map_err(|e| {
             let skip = cold
                 .segment_len_at(idx)
                 .min(cold_count.saturating_sub(idx))
@@ -82,18 +88,20 @@ pub(crate) fn read_segment_tiers(
         })
     } else if idx < cold_count.saturating_add(warm_count) {
         let warm_idx = idx.saturating_sub(cold_count);
-        warm.take_lines_from(warm_idx).map_err(|e| {
-            let skip = warm
-                .segment_len_at(warm_idx)
-                .min(warm_count.saturating_sub(warm_idx))
-                .max(1);
-            (e, skip)
-        })
+        warm.take_lines_from(warm_idx)
+            .map(Segment::Block)
+            .map_err(|e| {
+                let skip = warm
+                    .segment_len_at(warm_idx)
+                    .min(warm_count.saturating_sub(warm_idx))
+                    .max(1);
+                (e, skip)
+            })
     } else {
         let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
         match hot.get(hot_idx) {
-            Some(line) => Ok(vec![line.clone()]),
-            None => Ok(Vec::new()),
+            Some(line) => Ok(Segment::Line(line.clone())),
+            None => Ok(Segment::Block(Vec::new())),
         }
     }
 }
@@ -178,11 +186,15 @@ impl<'a> Iterator for DenseScrollbackIter<'a> {
             }
             let tier_left = self.hot_start.saturating_sub(self.idx);
             match self.storage.read_segment(self.idx) {
-                Ok(mut lines) if !lines.is_empty() => {
+                Ok(Segment::Line(line)) => {
+                    self.idx = self.idx.saturating_add(1);
+                    return Some(Some(Cow::Owned(line)));
+                }
+                Ok(Segment::Block(mut lines)) if !lines.is_empty() => {
                     lines.truncate(tier_left);
                     self.buf = VecDeque::from(lines);
                 }
-                Ok(_) => return self.placeholder(),
+                Ok(Segment::Block(_)) => return self.placeholder(),
                 Err((e, skip)) => {
                     aterm_log::warn!(
                         "scrollback dense walk: {skip} unreadable line(s) at {}: {e}",
@@ -234,7 +246,11 @@ impl Iterator for ScrollbackIter<'_> {
                 return None;
             }
             match self.scrollback.read_segment(self.idx) {
-                Ok(lines) => {
+                Ok(Segment::Line(line)) => {
+                    self.idx = self.idx.saturating_add(1);
+                    return Some(line);
+                }
+                Ok(Segment::Block(lines)) => {
                     if lines.is_empty() {
                         return None;
                     }

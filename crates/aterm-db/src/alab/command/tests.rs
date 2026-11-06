@@ -277,7 +277,12 @@ fn any_mac_imports_the_same_sheets_to_the_same_rows() {
 
 /// An import into a registry this Mac holds none of waits while a peer's fresh round over the
 /// registry's table says the lab holds what this Mac has not heard, and while no peer's round
-/// says anything; it goes ahead where no peer is known or a fresh round exchanged nothing.
+/// says anything; it goes ahead where no peer is known or a fresh round exchanged nothing,
+/// whatever other peers' rounds failed (measured 2026-11-05: about half of a 56-Mac lab's rounds
+/// failed on every pass, and a guard that waited on any failure never let the import go).
+/// NEGATIVE CONTROL (run 2026-11-05, then restored): with a failed round over the registry
+/// waiting again, the failed peer beside a drained one holds the import back: `` left:
+/// Some("MUTANT failed") right: None ``.
 /// NEGATIVE CONTROL: with the `(known && !drained)` refusal dropped (always `None` at the end), a
 /// stale round lets the import through: `` assertion failed: waits(round(stale, ...)).is_some() ``.
 #[test]
@@ -301,8 +306,19 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
         |repair: RepairObservation| empty_view_wait(Some(table), None, [Some(&repair)], NOW);
     let exchanged =
         |at, on, received| round(at, RepairOutcome::Exchanged, None, on, received, None);
-    // A fresh round that brought, deferred or failed exchanging the registry.
+    // A fresh round that brought or deferred registry records, a failed one's count included.
     assert!(waits(exchanged(recent, table, Some(4))).is_some());
+    assert!(
+        waits(round(
+            recent,
+            RepairOutcome::Failed,
+            Some(RepairStage::Application),
+            table,
+            Some(1),
+            None
+        ))
+        .is_some()
+    );
     assert!(
         waits(round(
             recent,
@@ -314,16 +330,21 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
         ))
         .is_some()
     );
-    assert!(
-        waits(round(
-            recent,
-            RepairOutcome::Failed,
-            Some(RepairStage::Application),
-            table,
-            None,
-            None
-        ))
-        .is_some()
+    // A failed round is no word: alone it leaves the lab unheard, and beside a peer that drained
+    // the registry it holds nothing back, since some peer of a large lab fails on every pass.
+    let failed = round(
+        recent,
+        RepairOutcome::Failed,
+        Some(RepairStage::Application),
+        table,
+        None,
+        None,
+    );
+    assert!(waits(failed.clone()).is_some());
+    let drained = exchanged(recent, table, Some(0));
+    assert_eq!(
+        empty_view_wait(Some(table), None, [Some(&failed), Some(&drained)], NOW),
+        None
     );
     // No round that speaks: stale, over another table, failed before exchanging, or none.
     assert!(waits(exchanged(stale, table, Some(0))).is_some());
@@ -374,8 +395,8 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
 /// and a round over the catalog speaks instead, where this Mac's catalog holds no other Mac's
 /// declaration of the registry (the guard passes the catalog's id only then): one that exchanged
 /// and brought nothing lets the first import go, beside a peer that says nothing; one that
-/// deferred or failed exchanging the catalog waits; one that brought catalog records, a stale one
-/// or one over another table says nothing. Measured on three Macs for E1 (2026-11-05): with only
+/// deferred catalog records waits; one that failed, brought catalog records, is stale or is over
+/// another table says nothing. Measured on three Macs for E1 (2026-11-05): with only
 /// the catalog and the journal held, every round was over one of them and the first import
 /// refused for good.
 /// NEGATIVE CONTROL: with the catalog arm of `empty_view_wait` removed (run 2026-11-05, then
@@ -433,16 +454,24 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
         ))
         .is_some()
     );
-    assert!(
-        waits(round(
-            recent,
-            RepairOutcome::Failed,
-            Some(RepairStage::Application),
-            catalog,
-            None,
-            None
-        ))
-        .is_some()
+    // A failed catalog round says nothing: alone the import waits, beside a drained one it goes.
+    let failed = round(
+        recent,
+        RepairOutcome::Failed,
+        Some(RepairStage::Application),
+        catalog,
+        None,
+        None,
+    );
+    assert!(waits(failed.clone()).is_some());
+    assert_eq!(
+        empty_view_wait(
+            Some(table),
+            Some(catalog),
+            [Some(&failed), Some(&drained)],
+            NOW
+        ),
+        None
     );
     assert!(waits(exchanged(recent, catalog, Some(2))).is_some());
     assert!(waits(exchanged(stale, catalog, Some(0))).is_some());
@@ -470,7 +499,11 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
 #[test]
 fn another_macs_declaration_of_the_registry_holds_an_empty_import_back() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
-    let word = |i: usize| Registry::at(lab.paths[i].clone()).catalog_word().unwrap();
+    let word = |i: usize| {
+        Registry::at(lab.paths[i].clone())
+            .catalog_word(std::time::Instant::now() + std::time::Duration::from_secs(60))
+            .unwrap()
+    };
     let (catalog, before) = word(1).expect("a Commons is here");
     assert!(!before);
     assert_eq!(word(0), Some((catalog, false)));

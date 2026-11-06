@@ -80,6 +80,11 @@ impl Lease {
         self.active = false;
         Ok(())
     }
+
+    /// A lost child no longer supplies the numeric group authority for restoration.
+    pub(super) fn disarm(&mut self) {
+        self.active = false;
+    }
 }
 
 impl Drop for Lease {

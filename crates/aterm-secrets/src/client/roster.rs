@@ -1445,8 +1445,9 @@ pub(super) fn log_labels(paths: &Paths) -> crate::Result<(BTreeMap<String, Strin
 /// [`log_labels`]).
 ///
 /// - A Mac the log labels with a bare `m<N>` takes that label as given, the sheet's 24-hour hold
-///   included (the person's Allow settled it), unless another row holds it, the deny-list names
-///   it, or the policy reserves it; then it gets the roster's own label.
+///   included (the person's Allow settled it), unless another live row holds it (one of a Mac
+///   the vault still names, which the deny-lists do not name), the deny-list names it, or the
+///   policy reserves it; then it gets the roster's own label.
 /// - A Mac the log does not label (F10's fallback, a reinstalled Mac, a code approval) never
 ///   takes an `m<N>` the log holds for another Mac: asking under one, it gets the next free one,
 ///   which counts the log's labels.
@@ -1474,6 +1475,9 @@ pub(super) fn maintain_swarm_roster_on_approve(
         .collect();
     let held_by_log =
         |host: &str| leading_m_label(host).is_some_and(|(_, label)| log_numbers.contains(&label));
+    // The Macs the vault still names: a row of one it removed holds no label, as in
+    // [`assign_newcomer`].
+    let active: BTreeSet<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
     for (recipient, requested_host, vault_name) in newly_approved {
         let fresh = !roster.members.iter().any(|row| &row.recipient == recipient);
         let logged = log_by_recipient
@@ -1502,7 +1506,10 @@ pub(super) fn maintain_swarm_roster_on_approve(
             continue;
         };
         let held_elsewhere = roster.members.iter().any(|row| {
-            &row.recipient != recipient && (row.label == *label || row.aliases.contains(label))
+            &row.recipient != recipient
+                && !roster.is_member_denied(row)
+                && active.contains(&row.recipient)
+                && (row.label == *label || row.aliases.contains(label))
         });
         if held_elsewhere
             || roster.is_label_denied(label)
@@ -1959,6 +1966,67 @@ email = "one@example.org"
                 under_lock.member_by_label_or_alias("m111").is_some(),
                 "expected m111 in roster under StateLock, got {under_lock:?}"
             );
+        }
+
+        // A Mac the log labels m110 takes it over a row that still says m110 when that row is
+        // of a Mac the vault removed, or one whose node is denied. Control: a live row of a Mac
+        // the vault names keeps m110, and the newcomer keeps the roster's own label.
+        let adm = admin_open(&admin_paths).unwrap();
+        for (case, named, denied, takes) in [
+            ("removed", false, false, true),
+            ("denied", true, true, true),
+            ("live", true, false, false),
+        ] {
+            let mut doc = adm.doc.clone();
+            let stale = Identity::generate().unwrap().recipient().to_bech32();
+            if named {
+                doc.add_machine(&format!("stale-{case}"), &stale).unwrap();
+            }
+            let mut roster = SwarmRoster::from_document(&doc).unwrap().unwrap();
+            roster.members.push(crate::swarm_roster::SwarmMember {
+                recipient: stale,
+                vault_name: format!("stale-{case}"),
+                label: "m110".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                hw_hint: None,
+                admitted_ms: 1_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: Some("stale-node".to_owned()),
+                node_key: None,
+            });
+            if denied {
+                roster.deny_nodes.push("stale-node".to_owned());
+            }
+            doc.set_entry(
+                &Audience::Everyone,
+                ROSTER_ENTRY,
+                roster.to_toml().as_bytes(),
+            )
+            .unwrap();
+            let newcomer = Identity::generate().unwrap().recipient().to_bech32();
+            doc.add_machine(&format!("logged-{case}"), &newcomer)
+                .unwrap();
+            let log = (
+                BTreeMap::from([(newcomer.clone(), "m110".to_owned())]),
+                vec!["m110".to_owned()],
+            );
+            maintain_swarm_roster_on_approve(
+                &adm,
+                &mut doc,
+                &[(
+                    newcomer.clone(),
+                    "m110".to_owned(),
+                    format!("logged-{case}"),
+                )],
+                &log,
+                9_000,
+            )
+            .unwrap();
+            let after = SwarmRoster::from_document(&doc).unwrap().unwrap();
+            let label = &after.member_by_recipient(&newcomer).unwrap().label;
+            assert_eq!(label == "m110", takes, "{case}: {label}");
         }
         running.stop();
     }

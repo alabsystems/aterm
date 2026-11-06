@@ -226,6 +226,9 @@ struct Knobs {
     new_orphan: bool,
     /// [`NEW`] never holds the conversation's lock: it started fresh.
     new_lockless: bool,
+    /// [`NEW`] holds [`C2`]'s presence lock in place of [`C1`]'s: its conversation moved in the
+    /// TUI (`/clear`) since it took the one it resumed.
+    new_moved: bool,
     /// Who holds the lock cannot be read.
     holders_unreadable: bool,
     /// Another live process ([`OTHER`]) holds the lock from this read of it
@@ -274,6 +277,18 @@ struct Script {
     knobs: Knobs,
     lock_reads: AtomicUsize,
     opener_reads: AtomicUsize,
+}
+
+impl Script {
+    /// Whether the relaunched [`NEW`] holds [`C1`]'s presence lock ([`Self::lock`]), as its open
+    /// files and the lock's holders both read.
+    fn new_holds_lock(&self) -> bool {
+        self.relaunched.load(Ordering::SeqCst)
+            && AgyKernel::alive(self, NEW)
+            && !self.knobs.new_lockless
+            && !self.knobs.new_moved
+            && !self.knobs.new_reborn
+    }
 }
 
 impl Kernel for Script {
@@ -351,10 +366,13 @@ impl AgyKernel for Script {
     }
 
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>> {
-        Some(if pid == TUI && !self.exited.load(Ordering::SeqCst) {
-            self.files.clone()
-        } else {
-            Vec::new()
+        Some(match pid {
+            TUI if !self.exited.load(Ordering::SeqCst) => self.files.clone(),
+            NEW if self.knobs.new_moved => {
+                vec![self.lock.with_file_name(format!("{C2}.lock"))]
+            }
+            NEW if self.new_holds_lock() => vec![self.lock.clone()],
+            _ => Vec::new(),
         })
     }
 
@@ -368,7 +386,7 @@ impl AgyKernel for Script {
         }
         let mut h = Vec::new();
         if self.relaunched.load(Ordering::SeqCst) {
-            if AgyKernel::alive(self, NEW) && !self.knobs.new_lockless && !self.knobs.new_reborn {
+            if self.new_holds_lock() {
                 h.push(NEW);
             }
         } else if AgyKernel::alive(self, TUI) {
@@ -1642,6 +1660,32 @@ fn a_relaunch_stopped_before_adoption_is_never_typed_again() {
     assert_eq!(control.lines(), 2, "{:#?}", control.typed());
 }
 
+/// Whether the host reads the agy the relaunch line started ([`NEW`]) as the session's resume
+/// ([`crate::harness::relaunch::resumes_conversation_with`]: the line's own `--conversation`, or
+/// the record by [`crate::harness::relaunch::agent_resumed_with`], which answers the same here),
+/// the conversation it holds now read from `k`. NEGATIVE CONTROL: with `relaunch_found_fresh` out
+/// of `resumes_conversation_with`, or the held conversation out of its `launch_resumes`, the
+/// line's argument alone answers yes to the fresh agy and to the one that moved.
+fn resumed_here(rig: &Rig, k: &Script) -> bool {
+    let mut snap = rig.snap(None);
+    snap.pid = NEW;
+    snap.start = Kernel::process_start(&rig.kernel, NEW).expect("NEW's start");
+    snap.argv = rig
+        .kernel
+        .agy_children(SHELL)
+        .into_iter()
+        .find_map(|(pid, argv)| (pid == NEW).then_some(argv))
+        .expect("NEW under the shell");
+    let held = |config: &Path, pid: u32| conversation_held(config, pid, k);
+    let host = crate::harness::relaunch::resumes_conversation_with(Some(&rig.opts), &snap, &held);
+    assert_eq!(
+        crate::harness::relaunch::agent_resumed_with(&rig.opts, &snap, &held),
+        host,
+        "the record answers as the host does"
+    );
+    host
+}
+
 #[test]
 fn a_relaunch_that_started_fresh_is_told_and_typed_nothing() {
     for hand_back in [true, false] {
@@ -1662,7 +1706,11 @@ fn a_relaunch_that_started_fresh_is_told_and_typed_nothing() {
         assert_eq!(rig.state().resumed_pid, 0, "never adopted");
         assert_eq!(
             rig.state().phase,
-            Phase::Failed("started-fresh".to_string())
+            Phase::Failed(super::super::STARTED_FRESH.to_string())
+        );
+        assert!(
+            !resumed_here(&rig, &rig.kernel),
+            "hand_back={hand_back}: the fresh agy is no resume of the session"
         );
     }
     assert!(matches!(
@@ -1676,6 +1724,26 @@ fn a_relaunch_that_started_fresh_is_told_and_typed_nothing() {
         ExitCause::Exit,
     );
     assert_eq!((r.step.as_str(), r.pid), ("adopted", NEW), "{r:?}");
+    assert_eq!(
+        conversation_held(&control.config, NEW, &control.kernel),
+        Some(Some(C1.to_string())),
+        "the adopted agy holds the conversation's lock"
+    );
+    assert!(
+        resumed_here(&control, &control.kernel),
+        "control: the adopted agy resumes it"
+    );
+    let moved = Script {
+        knobs: Knobs {
+            new_moved: true,
+            ..Knobs::default()
+        },
+        ..rig_kernel(&control)
+    };
+    assert!(
+        !resumed_here(&control, &moved),
+        "the adopted agy that moved onto another conversation since resumes it no more"
+    );
     let typed = relaunch_rig("held-typed", false, Knobs::default());
     let r = typed.attempt(&typed.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
     assert_eq!(r.step, "continued", "{r:?}");

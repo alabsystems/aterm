@@ -201,7 +201,7 @@ fn local_observations_track_path_and_length_without_polling_urls() {
     let (desk, source) = local_source_desk();
     let config = desk.config.join("aterm.toml");
     let rediscovery = Mutex::new(Rediscovery::default());
-    let due = || key_file_changed(&desk.home, &desk.state, &config, NOW, &rediscovery);
+    let due = || key_file_changed(&desk.home, &desk.state, &config, NOW, &rediscovery, None);
     assert!(due());
     assert!(!due());
     let file = fs::File::options().write(true).open(&source).unwrap();

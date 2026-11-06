@@ -1008,7 +1008,7 @@ fn publication_case(
         cli,
         &store,
         SignInPolicy {
-            host: &LiveAccounts,
+            host: &LiveAccounts::default(),
             row,
             logins: &records.logins,
             roster_path: &path,

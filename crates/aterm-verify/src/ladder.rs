@@ -385,6 +385,7 @@ mod tests {
             output: output.into(),
             code: None,
             spawn_error: spawn.map(str::to_string),
+            usage: None,
         };
         let noise = "ERROR logger: auxiliary checksum unavailable\n".repeat(32);
         let mut r = Report::new("test (--workspace)");
@@ -445,6 +446,7 @@ mod tests {
             output,
             code: Some(101),
             spawn_error: None,
+            usage: None,
         };
         let mut r = Report::new("test (--workspace)");
         r.decide_child(&run(log(&format!("{sentinel} — strays alive"))), "refused");

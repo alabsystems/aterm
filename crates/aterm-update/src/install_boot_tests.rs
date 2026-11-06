@@ -1220,6 +1220,12 @@ fn a_window_re_trial_is_bounded() {
         &s, &sentinel, 11, &installed, now
     ));
     std::fs::remove_file(&s.ready).unwrap();
+    std::os::unix::fs::symlink("missing-ready.toml", &s.ready).unwrap();
+    assert!(
+        !rearm_window_unproven_trial(&s, &sentinel, 11, &installed, now),
+        "a dangling ready link is a stage, not its absence"
+    );
+    std::fs::remove_file(&s.ready).unwrap();
     assert_eq!(sentinel.read_state(), None);
     assert!(
         WindowUnproven::read(&s).is_some(),
@@ -1523,6 +1529,45 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
     assert!(write_private_file(&link, b"clobbered").is_err());
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// A private write makes its file 0600 before a byte of it changes. A file it cannot make 0600
+/// (another user's, whose chmod is refused: the seam stands in for one) keeps its bytes and its
+/// mode, and the refusal comes back instead of the data landing readable by others. A FIFO in a
+/// record's place is refused at once. Control: a file already 0600 takes the new bytes and stays
+/// 0600.
+#[test]
+fn a_private_write_is_private_before_its_bytes_land() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = scratch("boot-private-write-mode");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let wide = s.root.join("private-write-wide");
+    std::fs::write(&wide, "before").unwrap();
+    std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let refused = as_if_the_private_mode_is_refused(|| write_private_file(&wide, b"secret"));
+    assert_eq!(
+        refused.map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EPERM))
+    );
+    assert_eq!(std::fs::read(&wide).unwrap(), b"before");
+    assert_eq!(mode(&wide), 0o644);
+    write_private_file(&wide, b"secret").unwrap();
+    assert_eq!(std::fs::read(&wide).unwrap(), b"secret");
+    assert_eq!(mode(&wide), 0o600, "a 0644 file ends 0600");
+
+    let private = s.root.join("private-write-private");
+    std::fs::write(&private, "before").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    write_private_file(&private, b"after").unwrap();
+    assert_eq!(std::fs::read(&private).unwrap(), b"after");
+    assert_eq!(mode(&private), 0o600);
+
+    let fifo = s.root.join("private-write-fifo");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c_fifo` is a NUL-terminated path in this test's scratch folder.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    assert!(write_private_file(&fifo, b"blocked").is_err());
     let _ = std::fs::remove_dir_all(&s.root);
 }
 

@@ -7152,25 +7152,107 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
 }
 
 /// Whether the foreground agent `snap` resumes a conversation: its own arguments resume one,
-/// whoever ran it, or aterm's relaunch resumed it ([`agent_resumed`], read with `opts`).
+/// whoever ran it, or aterm's relaunch resumed it ([`agent_resumed`], read with `opts`). An agy's
+/// own arguments prove no resume where the conversation it holds now is another than the one they
+/// name (a `/clear` since), or where a relaunch record of its tab, read with `opts`, failed that
+/// very process [`STARTED_FRESH`](super::upgrade_drive::STARTED_FRESH): aterm's own relaunch line
+/// names the conversation it asked for, whatever the agy opened.
 #[must_use]
 pub fn resumes_conversation(opts: Option<&Opts>, snap: &Snapshot) -> bool {
-    launch_resumes(snap) || opts.is_some_and(|o| agent_resumed(o, snap))
+    resumes_conversation_with(opts, snap, &super::upgrade_drive::agy_conversation_held)
 }
 
-fn launch_resumes(snap: &Snapshot) -> bool {
+/// [`resumes_conversation`], reading the conversation an agy holds now through `agy_held`, at most
+/// once ([`agent_resumed_with`]).
+pub(in crate::harness) fn resumes_conversation_with(
+    opts: Option<&Opts>,
+    snap: &Snapshot,
+    agy_held: &dyn Fn(&Path, u32) -> Option<Option<String>>,
+) -> bool {
+    let read = std::cell::OnceCell::new();
+    let held = |config: &Path, pid: u32| read.get_or_init(|| agy_held(config, pid)).clone();
+    (launch_resumes(snap, &held) && !opts.is_some_and(|o| relaunch_found_fresh(o, snap)))
+        || opts.is_some_and(|o| agent_resumed_with(o, snap, &held))
+}
+
+fn launch_resumes(
+    snap: &Snapshot,
+    agy_held: &dyn Fn(&Path, u32) -> Option<Option<String>>,
+) -> bool {
     match snap.agent() {
         upgrade::Agent::Claude => upgrade::launch_resume(&snap.argv).is_some(),
         upgrade::Agent::Codex => super::codex_alab::resumed_thread(&snap.argv).is_some(),
         upgrade::Agent::Muse => super::upgrade_muse::resumes(&snap.argv),
-        upgrade::Agent::Agy => super::upgrade_agy::resumes(&snap.argv),
+        upgrade::Agent::Agy => {
+            super::upgrade_agy::resumes(&snap.argv)
+                && super::upgrade_agy::resumed_conversation(&snap.argv).is_none_or(|named| {
+                    snap.agy()
+                        .and_then(|run| agy_held(&run.config, snap.pid))
+                        .unwrap_or_else(|| snap.session.clone())
+                        .is_none_or(|cur| cur == named)
+                })
+        }
     }
 }
 
-/// Whether `snap` is a foreground agent that aterm's own relaunch resumed on its conversation in
-/// tab `snap.tab` (and `opts.only_sid` when set), rather than a program started afresh.
+/// Whether a relaunch record of `snap`'s tab failed `snap`'s own process
+/// [`STARTED_FRESH`](super::upgrade_drive::STARTED_FRESH) (its relaunched pid, of the record's
+/// start where both are read). A record that cannot be read proves nothing.
+fn relaunch_found_fresh(opts: &Opts, snap: &Snapshot) -> bool {
+    if snap.pid == 0 {
+        return false;
+    }
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
+        return false;
+    };
+    let snap_start = squash(&snap.start);
+    dir.flatten().any(|e| {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            return false;
+        }
+        let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            return false;
+        };
+        let Ok(Some(st)) = load_record(opts, &session) else {
+            return false;
+        };
+        st.tab == snap.tab
+            && st.agent == snap.agent()
+            && st.relaunched_pid == snap.pid
+            && matches!(&st.phase, upgrade::Phase::Failed(why)
+                if why == super::upgrade_drive::STARTED_FRESH)
+            && (st.relaunched_start.is_empty()
+                || snap_start.is_empty()
+                || snap_start == squash(&st.relaunched_start))
+    })
+}
+
+/// Whether `snap` is a foreground agent resuming the conversation of one of tab `snap.tab`'s
+/// relaunch records (and `opts.only_sid` when set), rather than a program started afresh: its argv
+/// resumes the record's conversation, which the conversation it holds, where read, does not
+/// contradict, and it is the record's own process, started no earlier than the record's line
+/// ([`St::relaunched_at`]). That is the record's relaunched or resumed process (of the record's
+/// start where it has one, else started by [`St::done_at`] where that is set), or any process
+/// while the record is [`Relaunched`](upgrade::Phase::Relaunched) and claims neither: a person's
+/// own resume counts where the record names it (`upgrade_drive::resumed_by_another`) or came
+/// first. No record counts that starts afresh (`starts_afresh`), has no line, was failed
+/// [`STARTED_FRESH`](super::upgrade_drive::STARTED_FRESH), or names `snap` as the process that
+/// exited (save a cold restore's pid that a process started since its line reused); nor, for an
+/// agy, one whose conversation it holds now is another ([`agent_resumed_with`]).
 #[must_use]
 pub fn agent_resumed(opts: &Opts, snap: &Snapshot) -> bool {
+    agent_resumed_with(opts, snap, &super::upgrade_drive::agy_conversation_held)
+}
+
+/// [`agent_resumed`], reading the conversation an agy holds now through `agy_held` (`None`: its
+/// files are unread, and the snapshot's own conversation stands; `Some(None)`: no one
+/// conversation, as before its lock is taken).
+pub(in crate::harness) fn agent_resumed_with(
+    opts: &Opts,
+    snap: &Snapshot,
+    agy_held: &dyn Fn(&Path, u32) -> Option<Option<String>>,
+) -> bool {
     if snap.pid == 0 {
         return false;
     }
@@ -7194,7 +7276,7 @@ pub fn agent_resumed(opts: &Opts, snap: &Snapshot) -> bool {
         let Ok(Some(st)) = load_record(opts, &session) else {
             return false;
         };
-        record_resumed_snapshot(snap, &snap_start, snap_began, &session, &st)
+        record_resumed_snapshot(snap, &snap_start, snap_began, &session, &st, agy_held)
     })
 }
 
@@ -7204,11 +7286,14 @@ fn record_resumed_snapshot(
     snap_began: Option<u64>,
     session: &str,
     st: &St,
+    agy_held: &dyn Fn(&Path, u32) -> Option<Option<String>>,
 ) -> bool {
     if st.tab != snap.tab
         || st.agent != snap.agent()
         || starts_afresh(&st.cause)
         || st.relaunched_at == 0
+        || matches!(&st.phase, upgrade::Phase::Failed(why)
+            if why == super::upgrade_drive::STARTED_FRESH)
     {
         return false;
     }
@@ -7220,11 +7305,16 @@ fn record_resumed_snapshot(
     {
         return false;
     }
-    snap_resumes_record(snap, session, st)
+    snap_resumes_record(snap, session, st, agy_held)
         && snap_matches_relaunch(snap.pid, snap_start, snap_began, st)
 }
 
-fn snap_resumes_record(snap: &Snapshot, session: &str, st: &St) -> bool {
+fn snap_resumes_record(
+    snap: &Snapshot,
+    session: &str,
+    st: &St,
+    agy_held: &dyn Fn(&Path, u32) -> Option<Option<String>>,
+) -> bool {
     match snap.agent() {
         upgrade::Agent::Claude => {
             upgrade::launch_resume(&snap.argv).flatten().as_deref() == Some(session)
@@ -7247,7 +7337,12 @@ fn snap_resumes_record(snap: &Snapshot, session: &str, st: &St) -> bool {
             !st.thread.is_empty()
                 && super::upgrade_agy::resumed_conversation(&snap.argv).as_deref()
                     == Some(st.thread.as_str())
-                && snap.session.as_deref().is_none_or(|cur| cur == st.thread)
+                && snap
+                    .agy()
+                    .and_then(|run| agy_held(&run.config, snap.pid))
+                    .unwrap_or_else(|| snap.session.clone())
+                    .as_deref()
+                    .is_none_or(|cur| cur == st.thread)
         }
     }
 }

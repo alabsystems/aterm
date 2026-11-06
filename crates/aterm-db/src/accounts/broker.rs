@@ -643,14 +643,16 @@ impl Broker {
         let observed = client::observe_verified_entry(&paths, &config, ENTRY)
             .map_err(crate::table::failure)?
             .ok_or_else(denied)?;
-        if let Some(previous) = state.floors.get(&paths.dir) {
+        if let Some(previous) = state.floors.get_mut(&paths.dir) {
             if !observed.version.not_before(previous) {
                 return Err(denied());
             }
+            *previous = observed.version;
         } else if state.floors.len() >= 9 {
             return Err(denied());
+        } else {
+            state.floors.insert(paths.dir.clone(), observed.version);
         }
-        state.floors.insert(paths.dir.clone(), observed.version);
         let now = self.lease_now();
         state.leases.retain(|_, lease| {
             lease.expires > now

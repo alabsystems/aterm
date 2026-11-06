@@ -82,8 +82,8 @@ pub enum Reading {
 /// waiting row's note gives (design §3.3), never the engine's line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// The git every clone runs (the Command Line Tools', else Xcode's) is not installed.
-    CommandLineTools,
+    /// Neither managed Git nor the developer tools' Git is ready yet.
+    GitReadiness,
     /// aterm's GitHub settings (`~/.config/aterm/init.toml`) cannot be used.
     Settings,
     /// The GitHub token file the vault syncs is not on this Mac yet.
@@ -111,7 +111,7 @@ pub enum Wait {
 impl Wait {
     /// Every reason, for the round trip.
     pub const ALL: [Self; 11] = [
-        Self::CommandLineTools,
+        Self::GitReadiness,
         Self::Settings,
         Self::Token,
         Self::TokenUnusable,
@@ -126,7 +126,7 @@ impl Wait {
 
     fn slug(self) -> &'static str {
         match self {
-            Self::CommandLineTools => "command-line-tools",
+            Self::GitReadiness => "git-readiness",
             Self::Settings => "settings",
             Self::Token => "token",
             Self::TokenUnusable => "token-unusable",
@@ -140,20 +140,21 @@ impl Wait {
         }
     }
 
-    /// What ends this wait (design §3.6): GitHub answering again, or room on the disk (which the
-    /// disk watch, a finished download or a person frees), each tried again by itself while the
-    /// run has tries left ([`FailureKind::Transient`]), or a person's act for every other reason, which no pass
-    /// retries: the token the vault syncs is refused, missing, unusable or another account's,
-    /// aterm's GitHub settings cannot be used, a folder is in a repository's place, or Apple's
-    /// Command Line Tools are not installed ([`FailureKind::NeedsPerson`]).
+    /// What ends this wait (design §3.6): Git becoming ready, GitHub answering again, or room on
+    /// the disk (which the disk watch, a finished download or a person frees), tried again while
+    /// the run has tries left ([`FailureKind::Transient`]). Other reasons need a person's act:
+    /// the token the vault syncs is refused, missing, unusable or another account's,
+    /// or aterm's settings or an existing repository destination need attention
+    /// ([`FailureKind::NeedsPerson`]).
     #[must_use]
     pub const fn kind(self) -> FailureKind {
         match self {
-            Self::Unreached | Self::GitHub | Self::RepositoryInventory | Self::DiskSpace => {
-                FailureKind::Transient
-            }
-            Self::CommandLineTools
-            | Self::Settings
+            Self::GitReadiness
+            | Self::Unreached
+            | Self::GitHub
+            | Self::RepositoryInventory
+            | Self::DiskSpace => FailureKind::Transient,
+            Self::Settings
             | Self::Token
             | Self::TokenUnusable
             | Self::TokenRefused
@@ -168,7 +169,7 @@ impl Wait {
     #[must_use]
     pub const fn note(self) -> &'static str {
         match self {
-            Self::CommandLineTools => aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING,
+            Self::GitReadiness => "Waiting for Git to finish installing",
             Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
             Self::Token => "Add your GitHub token to the Secrets vault",
             Self::TokenUnusable => "Fix your GitHub token file; aterm doctor says how",

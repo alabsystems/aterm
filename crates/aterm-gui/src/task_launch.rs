@@ -534,10 +534,20 @@ pub(crate) struct Launch {
     /// What the supervisor may approve on a permission box (`[harness] approve`) when the worker
     /// was registered: a claim worker's mode follows it ([`worker_fresh`]).
     pub(crate) approve: aterm_agent::supervise::config::Approve,
+    /// Account preparation retires after every other launch resource, including an unstarted box.
+    pub(crate) account_scope: Option<aterm_agent::harness::account_work::Scope>,
 }
 
 /// Start the worker's launcher.
 pub(crate) fn launch_worker(work: Launch) {
+    if account_preparation_cancelled(&work) {
+        stall_why(
+            &work,
+            "held",
+            "account preparation stopped for shutdown or update",
+        );
+        return;
+    }
     let (ctx, local, agent) = (Arc::clone(&work.ctx), work.local, work.agent);
     let started = std::thread::Builder::new()
         .name(format!("aterm-worker-{local}"))
@@ -743,7 +753,7 @@ impl PoolSeat {
     }
 }
 
-fn native_google_agent(agent: aterm_phase::Program) -> bool {
+pub(crate) fn native_google_agent(agent: aterm_phase::Program) -> bool {
     use aterm_phase::Program;
     match agent {
         Program::Agy => true,
@@ -765,6 +775,7 @@ impl NativeGoogleAdmission {
     fn prepare(
         agent: aterm_phase::Program,
         starter: aterm_agent::harness::worker::Starter,
+        scope: Option<aterm_agent::harness::account_work::Scope>,
     ) -> Result<(aterm_agent::harness::worker::Starter, Self), String> {
         #[cfg(unix)]
         if native_google_agent(agent) {
@@ -773,7 +784,8 @@ impl NativeGoogleAdmission {
                 aterm_agent::harness::accounts::Cli::Agy,
                 &parts.home,
             );
-            let worker = aterm_agent::harness::accounts_pool::prepare_google_worker(
+            let worker = aterm_agent::harness::accounts_pool::prepare_google_worker_scoped(
+                scope.ok_or("Native Google account preparation has no App admission")?,
                 &parts.seat(),
                 &program,
                 starter.clone(),
@@ -784,7 +796,7 @@ impl NativeGoogleAdmission {
             };
             return Ok((starter, Self { worker }));
         }
-        let _ = agent;
+        let _ = (agent, scope);
         Ok((
             starter,
             Self {
@@ -805,6 +817,14 @@ impl NativeGoogleAdmission {
 }
 
 fn run_worker_launch(work: &Launch) {
+    if account_preparation_cancelled(work) {
+        stall_why(
+            work,
+            "held",
+            "account preparation stopped for shutdown or update",
+        );
+        return;
+    }
     if work.dialect == Dialect::Fish && !fish_answer(&work.shell) {
         stall_refused(
             work,
@@ -834,12 +854,23 @@ fn run_worker_launch(work: &Launch) {
         |starter| {
             let _google_mark =
                 native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
-            NativeGoogleAdmission::prepare(work.agent, starter)
+            if account_preparation_cancelled(work) {
+                return Err("account preparation stopped for shutdown or update".into());
+            }
+            NativeGoogleAdmission::prepare(work.agent, starter, work.account_scope.clone())
         },
     ) {
         Ok(prepared) => prepared,
         Err(refused) => {
-            stall_why(work, refused_why(&refused), refused.why());
+            if account_preparation_cancelled(work) {
+                stall_why(
+                    work,
+                    "held",
+                    "account preparation stopped for shutdown or update",
+                );
+            } else {
+                stall_why(work, refused_why(&refused), refused.why());
+            }
             return;
         }
     };
@@ -848,6 +879,14 @@ fn run_worker_launch(work: &Launch) {
     } else {
         admitted
     };
+    if account_preparation_cancelled(work) {
+        stall_why(
+            work,
+            "held",
+            "account preparation stopped for shutdown or update",
+        );
+        return;
+    }
     let caller = admitted.starter();
     let rotated = match agy_rotation_held(work, caller) {
         Ok(rotated) => {
@@ -865,7 +904,11 @@ fn run_worker_launch(work: &Launch) {
     let prompt = match await_prompt(work, Duration::ZERO) {
         Ok(prompt) => prompt,
         Err(why) => {
-            stall(work, &why);
+            if account_preparation_cancelled(work) {
+                stall_why(work, "held", &why);
+            } else {
+                stall(work, &why);
+            }
             return;
         }
     };
@@ -893,6 +936,11 @@ fn run_worker_launch(work: &Launch) {
                 return;
             };
             let typed = type_at_prompt(work, prompt, |prompt| {
+                if account_preparation_cancelled(work) {
+                    return Ok(Err(Untyped::Blocked(
+                        "account preparation stopped for shutdown or update".into(),
+                    )));
+                }
                 if let Err(why) = google.check(&admitted) {
                     return Ok(Err(Untyped::Blocked(why)));
                 }
@@ -902,6 +950,7 @@ fn run_worker_launch(work: &Launch) {
                     prompt,
                     line: line.clone(),
                     reply,
+                    account_scope: work.account_scope.clone(),
                 })
             });
             let Some(written) = typed else {
@@ -1362,6 +1411,9 @@ pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFenc
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
     let mut held = Held::default();
     loop {
+        if account_preparation_cancelled(work) {
+            return Err("account preparation stopped for shutdown or update".to_string());
+        }
         if !session_alive(work) {
             return Err(SHELL_ENDED.to_string());
         }
@@ -1492,7 +1544,11 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
                 return None;
             }
             Ok(Err(Untyped::Blocked(why))) => {
-                stall_refused(work, &why);
+                if account_preparation_cancelled(work) {
+                    stall_why(work, "held", &why);
+                } else {
+                    stall_refused(work, &why);
+                }
                 return None;
             }
             Err(why) => {
@@ -1504,6 +1560,28 @@ pub(crate) fn type_at_prompt<E: std::fmt::Display>(
             }
         }
     }
+}
+
+/// Apply the App account cancellation veto before ordinary worker launch admission.
+///
+/// # Errors
+///
+/// Returns [`Untyped::Blocked`] for a cancelled account scope, or the unchanged errors from
+/// [`type_launch_line`] for its prompt, identity, human-input and task fences.
+pub(crate) fn type_scoped_launch_line(
+    store: &Store,
+    sid: &aterm_session::SessionId,
+    nonce: aterm_session::LaunchNonce,
+    prompt: PromptFence,
+    line: &str,
+    scope: Option<&aterm_agent::harness::account_work::Scope>,
+) -> Result<&'static str, Untyped> {
+    if scope.is_some_and(|scope| scope.cancelled()) {
+        return Err(Untyped::Blocked(
+            "account preparation stopped for shutdown or update".into(),
+        ));
+    }
+    type_launch_line(store, sid, nonce, prompt, line)
 }
 
 /// Admit and type the worker's initial line ON THE MAIN THREAD.
@@ -1697,19 +1775,34 @@ fn stall_refused(work: &Launch, why: &str) {
 /// Why a worker's launch never typed where its shell went first.
 const SHELL_ENDED: &str = "its shell ended before its line was typed";
 
-/// Whether `work`'s session is still there to type into.
+/// Whether the App closed this preparation's admitted account epoch.
+fn account_preparation_cancelled(work: &Launch) -> bool {
+    work.account_scope
+        .as_ref()
+        .is_some_and(|scope| scope.cancelled())
+}
+
+/// Whether `work`'s session is still there and its account preparation may continue.
 fn session_alive(work: &Launch) -> bool {
-    work.store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(work.local)
-        .is_some_and(|h| !matches!(h.state, SessionState::Exited))
+    !account_preparation_cancelled(work)
+        && work
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_local(work.local)
+            .is_some_and(|h| !matches!(h.state, SessionState::Exited))
 }
 
 /// A launcher that gave up waiting on a pool: its shell's end ends that wait too, and then the
 /// pool's refusal is not why ([`stall`]); otherwise it is ([`stall_refused`]).
 pub(crate) fn stall_gave_up(work: &Launch, why: &str) {
-    if session_alive(work) {
+    if account_preparation_cancelled(work) {
+        stall_why(
+            work,
+            "held",
+            "account preparation stopped for shutdown or update",
+        );
+    } else if session_alive(work) {
         stall_refused(work, why);
     } else {
         stall(work, SHELL_ENDED);

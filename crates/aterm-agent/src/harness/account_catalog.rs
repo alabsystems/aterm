@@ -227,6 +227,70 @@ pub(crate) fn text_all(catalog: &Result<Catalog, String>) -> String {
     text_rows(catalog, None, None)
 }
 
+/// A report's part of the catalog: the rows this Mac runs, each whose source is in question, and a
+/// count of the others, which `accounts table` lists. On a sheet of 83 rows, 80 of them other
+/// Macs', the listing made up most of the report and came after the answer.
+pub(crate) fn text_here(
+    catalog: &Result<Catalog, String>,
+    cli: Cli,
+    roster: Option<&Roster>,
+) -> String {
+    let Ok(rows) = catalog else {
+        return text_rows(catalog, Some(cli), roster);
+    };
+    let of_cli = rows.rows.iter().filter(|row| row.belongs_to(cli));
+    let (shown, others): (Vec<_>, Vec<_>) = of_cli.partition(|row| {
+        row.stopped
+            || row.conflicted
+            || roster.is_some_and(|roster| rows.local_label(row, roster).is_some())
+    });
+    let mut out = header(rows);
+    if !others.is_empty() {
+        out.push_str(&format!(
+            ": {} of its {} rows are not on this Mac (`aterm harness accounts table` lists them)",
+            others.len(),
+            others.len() + shown.len()
+        ));
+    }
+    out.push('\n');
+    for row in shown {
+        out.push_str(&row_line(rows, row, roster));
+    }
+    out
+}
+
+fn header(catalog: &Catalog) -> String {
+    format!(
+        "Commons account catalog: {}{}",
+        if catalog.table.is_empty() {
+            catalog.import_table.as_deref().unwrap_or("unknown")
+        } else {
+            &catalog.table
+        },
+        if catalog.history_complete {
+            ""
+        } else {
+            " (incomplete history)"
+        }
+    )
+}
+
+fn row_line(catalog: &Catalog, row: &Account, roster: Option<&Roster>) -> String {
+    let local = roster.and_then(|roster| catalog.local_label(row, roster));
+    format!(
+        "  {}{} [{}]: {} {}; local {}\n",
+        row.label,
+        row.email
+            .as_deref()
+            .map(|email| format!(" <{email}>"))
+            .unwrap_or_default(),
+        row.key,
+        row.provider,
+        row.state_words(),
+        local.unwrap_or("not configured")
+    )
+}
+
 fn text_rows(
     catalog: &Result<Catalog, String>,
     cli: Option<Cli>,
@@ -235,37 +299,14 @@ fn text_rows(
     match catalog {
         Err(why) => format!("Commons account catalog unavailable: {why}\n"),
         Ok(catalog) => {
-            let mut out = format!(
-                "Commons account catalog: {}{}\n",
-                if catalog.table.is_empty() {
-                    catalog.import_table.as_deref().unwrap_or("unknown")
-                } else {
-                    &catalog.table
-                },
-                if catalog.history_complete {
-                    ""
-                } else {
-                    " (incomplete history)"
-                }
-            );
+            let mut out = header(catalog);
+            out.push('\n');
             for row in catalog
                 .rows
                 .iter()
                 .filter(|row| cli.is_none_or(|cli| row.belongs_to(cli)))
             {
-                let local = roster.and_then(|roster| catalog.local_label(row, roster));
-                out.push_str(&format!(
-                    "  {}{} [{}]: {} {}; local {}\n",
-                    row.label,
-                    row.email
-                        .as_deref()
-                        .map(|email| format!(" <{email}>"))
-                        .unwrap_or_default(),
-                    row.key,
-                    row.provider,
-                    row.state_words(),
-                    local.unwrap_or("not configured")
-                ));
+                out.push_str(&row_line(catalog, row, roster));
             }
             out
         }
@@ -363,6 +404,66 @@ mod tests {
             Some("none")
         );
         assert!(text_all(&catalog).contains(NAMED_BROWSER_UNSUPPORTED));
+    }
+
+    /// A REPORT LISTS THIS MAC'S ROWS AND COUNTS THE REST, and keeps a row whose source is in
+    /// question, which no count would show. CONTROLS: `text`, the `accounts table` listing, still
+    /// has every row, and another CLI's row is neither listed nor counted.
+    #[test]
+    fn a_report_lists_this_macs_rows_and_counts_the_rest() {
+        let with = |label: &str, provider: &str| Account {
+            label: label.into(),
+            provider: provider.into(),
+            email: Some(format!("{label}@example.test")),
+            ..account()
+        };
+        let mut questioned = with("questioned", "anthropic");
+        questioned.conflicted = true;
+        let catalog = Ok(Catalog {
+            table: "table".into(),
+            history_complete: true,
+            rows: vec![
+                with("mine", "anthropic"),
+                with("theirs", "anthropic"),
+                with("further", "anthropic"),
+                questioned,
+                with("codexrow", "openai"),
+            ],
+            ..Default::default()
+        });
+        let roster = Roster {
+            rows: vec![accounts::Row {
+                label: "local".into(),
+                email: Some("mine@example.test".into()),
+                ..Default::default()
+            }],
+        };
+        let here = text_here(&catalog, Cli::Claude, Some(&roster));
+        assert!(
+            here.contains("2 of its 4 rows are not on this Mac"),
+            "{here}"
+        );
+        assert!(here.contains("<mine@example.test>"), "{here}");
+        assert!(here.contains("local local"), "{here}");
+        assert!(here.contains("<questioned@example.test>"), "{here}");
+        assert!(
+            !here.contains("theirs@") && !here.contains("further@"),
+            "{here}"
+        );
+        assert!(!here.contains("codexrow@"), "{here}");
+        let all = text(&catalog, Cli::Claude, Some(&roster));
+        for label in ["mine", "theirs", "further", "questioned"] {
+            assert!(all.contains(&format!("<{label}@example.test>")), "{all}");
+        }
+        assert!(
+            text_here(&catalog, Cli::Claude, None).contains("3 of its 4 rows"),
+            "with no roster only the questioned row stays"
+        );
+        let unavailable = Err("unreadable".to_owned());
+        assert_eq!(
+            text_here(&unavailable, Cli::Claude, None),
+            text(&unavailable, Cli::Claude, None)
+        );
     }
 
     #[test]

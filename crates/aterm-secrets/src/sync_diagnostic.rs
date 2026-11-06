@@ -83,6 +83,7 @@ impl SyncDiagnostic {
                 "refused" => ErrorKind::Refused,
                 "member-busy" => ErrorKind::MemberBusy,
                 "lab-identity" => ErrorKind::LabIdentity,
+                "dropped" => ErrorKind::Dropped,
                 "other" => ErrorKind::Other,
                 _ => return None,
             })),
@@ -107,6 +108,7 @@ pub const fn failure_reason(kind: ErrorKind) -> &'static str {
         ErrorKind::Refused => "source refused the version",
         ErrorKind::MemberBusy => "a member's vault pass held its state",
         ErrorKind::LabIdentity => "a lab identity never joins the live ALab",
+        ErrorKind::Dropped => "a rotation dropped this Mac from the vault it would join",
         ErrorKind::Other => "unclassified failure",
     }
 }
@@ -126,6 +128,7 @@ const fn failure_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Refused => "refused",
         ErrorKind::MemberBusy => "member-busy",
         ErrorKind::LabIdentity => "lab-identity",
+        ErrorKind::Dropped => "dropped",
         ErrorKind::Other => "other",
     }
 }
@@ -157,6 +160,7 @@ mod tests {
             SyncDiagnostic::Failed(ErrorKind::Refused),
             SyncDiagnostic::Failed(ErrorKind::MemberBusy),
             SyncDiagnostic::Failed(ErrorKind::LabIdentity),
+            SyncDiagnostic::Failed(ErrorKind::Dropped),
             SyncDiagnostic::Failed(ErrorKind::Other),
         ] {
             for ending in ["", "\n", "\r\n"] {

@@ -9,6 +9,7 @@
 //! the floor ([`Obligation::key`], `crate::trust_facts`), so a lapse every run has is the code's.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -110,15 +111,17 @@ impl Obligation {
     /// share a key, so runs are compared as multisets of keys.
     #[must_use]
     pub fn key(&self) -> String {
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{}",
-            self.function,
-            self.kind,
-            self.file,
-            self.anchor,
-            norm_desc(&self.desc)
-        );
-        hex(&Sha256::digest(material.as_bytes()))[..16].to_string()
+        let mut hasher = Sha256::new();
+        hasher.update(self.function.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.file.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.anchor.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(norm_desc(&self.desc).as_bytes());
+        hex(&hasher.finalize()[..8])
     }
 
     /// One line a reader finds it by: its function, kind, file and line, and its anchor in
@@ -157,17 +160,16 @@ impl Record {
 
     #[must_use]
     pub fn to_text(&self) -> String {
+        let total = self.total();
+        let proved = self.proved();
         let mut out = format!(
-            "{RECORD_MAGIC}\npackage\t{}\nunit\t{}\nfunctions\t{}\ntotal\t{}\nproved\t{}\n",
-            self.package,
-            self.unit,
-            self.functions,
-            self.total(),
-            self.proved()
+            "{RECORD_MAGIC}\npackage\t{}\nunit\t{}\nfunctions\t{}\ntotal\t{total}\nproved\t{proved}\n",
+            self.package, self.unit, self.functions,
         );
         for o in &self.rows {
-            out.push_str(&format!(
-                "o\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            let _ = writeln!(
+                out,
+                "o\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 o.function,
                 o.kind,
                 o.file,
@@ -179,9 +181,9 @@ impl Record {
                 o.stop,
                 o.anchor,
                 o.desc
-            ));
+            );
         }
-        out.push_str(&format!("end\t{}\n", self.total()));
+        let _ = writeln!(out, "end\t{total}");
         out
     }
 

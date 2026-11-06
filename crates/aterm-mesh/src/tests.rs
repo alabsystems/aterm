@@ -183,6 +183,8 @@ struct Mac {
     /// What the membership watcher's change probe answers next.
     changed: Arc<AtomicBool>,
     seen: Arc<Seen>,
+    /// The stores whose records this Mac's mesh moves (§11 B7b), where a test gives it some.
+    stores: Option<Arc<dyn crate::Stores>>,
     run: Option<Running>,
 }
 
@@ -214,6 +216,7 @@ impl Mac {
             standings: Arc::default(),
             changed: Arc::default(),
             seen: Arc::default(),
+            stores: None,
             run: None,
         }
     }
@@ -255,6 +258,7 @@ impl Mac {
             changed: Some(Arc::new(move || changed.swap(false, Ordering::AcqRel))),
             watch_every: HANG,
             observe: Some(Arc::new(move |event: &Event| seen.note(event))),
+            stores: self.stores.clone(),
         })
         .expect("the mesh opens");
         assert_eq!(mesh.principal(), self.principal);
@@ -271,6 +275,8 @@ impl Mac {
             serve: Arc::new(move |incoming: Incoming| {
                 if incoming.op() == FleetOp::Bus {
                     serving_mesh.serve_bus(incoming);
+                } else if incoming.op() == FleetOp::Inventory {
+                    serving_mesh.serve_inventory(incoming);
                 } else {
                     incoming.refuse("op");
                 }
@@ -2397,6 +2403,9 @@ mod rule {
         );
     }
 }
+
+#[path = "tables_tests.rs"]
+mod tables;
 
 /// `bus.log` in the node service (§11 C2), on this lab.
 mod bus;

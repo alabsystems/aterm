@@ -829,19 +829,40 @@ impl Child {
     }
 
     pub(super) fn owns_custody(&self, key: &Arc<()>) -> bool {
-        Arc::ptr_eq(&self.custody, key)
+        self.handle.require_custody().is_ok() && Arc::ptr_eq(&self.custody, key)
+    }
+
+    fn observe_wait_result<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &result {
+            self.handle.observe_wait_error(error);
+            if self.handle.require_custody().is_err()
+                && let Some(lease) = self.foreground.as_mut()
+            {
+                lease.disarm();
+            }
+        }
+        result
+    }
+
+    /// Whether this actual handle still pins an unreaped child's numeric identity.
+    #[must_use]
+    pub fn owns_unreaped(&self) -> bool {
+        !self.is_reaped() && self.handle.require_custody().is_ok()
     }
 
     /// Wait for this actual child's terminal exit without reaping it. Stop,
     /// trace and continue events do not establish completion. The cached result
     /// of a prior reap is returned without supplying a new identity pin.
     /// # Errors
-    /// Exit observation or the kernel exit watch fails; the child remains owned.
+    /// Exit observation or the kernel exit watch fails. `ECHILD` permanently forfeits
+    /// numeric custody; other observation failures leave ownership unchanged.
     pub fn wait_exited(&mut self) -> io::Result<()> {
+        self.handle.require_custody()?;
         if self.usage.is_some() || self.handle.status.is_some() {
             return Ok(());
         }
-        if rusage::observe_exit(self.id(), true)? {
+        let result = rusage::observe_exit(self.id(), true);
+        if self.observe_wait_result(result)? {
             Ok(())
         } else {
             Err(io::Error::other(
@@ -884,6 +905,7 @@ impl Child {
     /// # Errors
     /// Its controlling process/session changed, or a terminal/mask operation failed.
     pub fn restore_foreground(&mut self) -> io::Result<()> {
+        self.handle.require_custody()?;
         if self.foreground.is_some() && (self.usage.is_some() || self.handle.status.is_some()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -898,10 +920,12 @@ impl Child {
     }
 
     fn before_reap(&mut self, block: bool) -> io::Result<bool> {
+        self.handle.require_custody()?;
         if self.foreground.is_none() {
             return Ok(true);
         }
-        if !rusage::observe_exit(self.id(), block)? {
+        let result = rusage::observe_exit(self.id(), block);
+        if !self.observe_wait_result(result)? {
             if block {
                 return Err(io::Error::other(
                     "blocking wait observed no owned-child exit",
@@ -930,6 +954,7 @@ impl Child {
     }
 
     fn collect_rusage(&mut self, block: bool) -> io::Result<Option<Rusage>> {
+        self.handle.require_custody()?;
         if let Some(usage) = self.usage {
             return Ok(Some(usage));
         }
@@ -941,7 +966,8 @@ impl Child {
         if !self.before_reap(block)? {
             return Ok(None);
         }
-        let usage = rusage::wait(self.id(), block)?;
+        let result = rusage::wait(self.id(), block);
+        let usage = self.observe_wait_result(result)?;
         if let Some(usage) = usage {
             self.handle.status = Some(usage.status);
             self.usage = Some(usage);
@@ -954,10 +980,12 @@ impl Child {
     /// # Errors
     /// `waitid`'s, other than `EINTR` (retried); `Unsupported` off Darwin and Linux.
     pub fn exited(&mut self) -> io::Result<bool> {
+        self.handle.require_custody()?;
         if self.usage.is_some() || self.handle.status.is_some() {
             return Ok(true);
         }
-        rusage::exited(self.id())
+        let result = rusage::exited(self.id());
+        self.observe_wait_result(result)
     }
 
     /// The child's pid.
@@ -1149,7 +1177,11 @@ impl Command {
             stdout: stdout.map(ChildStdout::from),
             stderr: stderr.map(ChildStderr::from),
             foreground: None,
-            handle: super::LaneChild { pid, status: None },
+            handle: super::LaneChild {
+                pid,
+                status: None,
+                custody: super::WaitCustody::default(),
+            },
             usage: None,
             custody: Arc::new(()),
         })
@@ -1341,15 +1373,24 @@ impl Command {
 struct Handle {
     child: std::process::Child,
     status: Option<ExitStatus>,
+    custody: super::WaitCustody,
 }
 
 #[cfg(not(target_vendor = "apple"))]
 impl Handle {
+    fn require_custody(&self) -> io::Result<()> {
+        self.custody.require()
+    }
+
+    fn observe_wait_error(&mut self, error: &io::Error) {
+        self.custody.observe_error(error, self.status.is_some());
+    }
     fn id(&self) -> u32 {
         self.child.id()
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        self.require_custody()?;
         if self.status.is_some() {
             Ok(())
         } else {
@@ -1366,6 +1407,7 @@ impl Handle {
     }
 
     fn signal(&mut self, signal: i32) -> io::Result<()> {
+        self.require_custody()?;
         if self.status.is_some() {
             return Ok(());
         }
@@ -1379,19 +1421,29 @@ impl Handle {
     }
 
     fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.require_custody()?;
         if let Some(status) = self.status {
             return Ok(status);
         }
-        let status = self.child.wait()?;
+        let result = self.child.wait();
+        if let Err(error) = &result {
+            self.observe_wait_error(error);
+        }
+        let status = result?;
         self.status = Some(status);
         Ok(status)
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.require_custody()?;
         if let Some(status) = self.status {
             return Ok(Some(status));
         }
-        self.status = self.child.try_wait()?;
+        let result = self.child.try_wait();
+        if let Err(error) = &result {
+            self.observe_wait_error(error);
+        }
+        self.status = result?;
         Ok(self.status)
     }
 }
@@ -1497,6 +1549,7 @@ impl Command {
             handle: Handle {
                 child,
                 status: None,
+                custody: super::WaitCustody::default(),
             },
             usage: None,
             custody: Arc::new(()),

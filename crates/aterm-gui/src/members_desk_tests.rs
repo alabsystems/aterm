@@ -670,7 +670,8 @@ fn the_undo_row_offers_undo_until_this_mac_signed() {
 /// exclusion meant no desk) fails the `desk().is_some()` assert. `left` counting `control-excluded`
 /// as gone without asking `client::member_by_log` (as before) fails "a seated member has not
 /// left". `left` never counting `control-excluded` or `control-not-visible` as gone fails "a
-/// member with no pinned anchor has left".
+/// member with no pinned anchor has left". `left` not counting `dropped` as gone fails "a dropped
+/// member has left".
 #[test]
 fn a_member_commons_control_leaves_out_keeps_its_desk() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -743,5 +744,24 @@ fn a_member_commons_control_leaves_out_keeps_its_desk() {
     assert!(left(&fixture.member), "a member its log removed has left");
     follow_local(app.members.slot, &fixture.member);
     assert!(app.members.desk().is_none(), "its desk is dropped");
+    let unavailable = || match aterm_secrets::commons::observe(&fixture.member) {
+        Ok(aterm_secrets::commons::Observation::Unavailable(why)) => Some(why),
+        _ => None,
+    };
+    assert_eq!(
+        unavailable(),
+        Some(aterm_secrets::commons::Unavailable::Revoked),
+        "a removed member reads revoked"
+    );
+    // A Mac a rotation dropped with no `Remove` (one-mesh E2) reads dropped and has left as well;
+    // `client::test_read_dropped` stands in for that judgment.
+    client::test_read_dropped(|| {
+        assert_eq!(
+            unavailable(),
+            Some(aterm_secrets::commons::Unavailable::Dropped),
+            "a dropped member reads dropped"
+        );
+        assert!(left(&fixture.member), "a dropped member has left");
+    });
     fixture.server.stop();
 }

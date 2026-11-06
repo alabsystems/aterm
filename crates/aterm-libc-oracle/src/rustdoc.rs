@@ -88,12 +88,24 @@ pub fn kind_of(item: &Value) -> Option<(&str, &Value)> {
         .map(|(kind, inner)| (kind.as_str(), inner))
 }
 
-/// An item id as the index keys it.
-#[must_use]
-pub fn id_key(id: &Value) -> Option<String> {
+fn with_id_str<R>(id: &Value, f: impl FnOnce(&str) -> Option<R>) -> Option<R> {
     match id {
-        Value::Number(n) => n.as_u64().map(|n| n.to_string()),
-        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => {
+            let mut n = n.as_u64()?;
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            loop {
+                i -= 1;
+                buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            let s = std::str::from_utf8(&buf[i..]).ok()?;
+            f(s)
+        }
+        Value::String(s) => f(s.as_str()),
         _ => None,
     }
 }
@@ -118,13 +130,15 @@ impl Doc {
     /// The item `id` names, if the index has it.
     #[must_use]
     pub fn item(&self, id: &Value) -> Option<&Value> {
-        self.doc.get("index")?.get(&id_key(id)?)
+        let index = self.doc.get("index")?;
+        with_id_str(id, |key| index.get(key))
     }
 
     /// The `paths` summary for `id` (crate id and full path), if any.
     #[must_use]
     pub fn path_summary(&self, id: &Value) -> Option<&Value> {
-        self.doc.get("paths")?.get(&id_key(id)?)
+        let paths = self.doc.get("paths")?;
+        with_id_str(id, |key| paths.get(key))
     }
 
     /// The crate-root public surface.
@@ -150,8 +164,18 @@ impl Doc {
         out: &mut Public<'d>,
     ) {
         const MAX_GLOB_DEPTH: usize = 40;
-        let Some(key) = id_key(module) else { return };
-        if depth > MAX_GLOB_DEPTH || !seen.insert(key) {
+        if depth > MAX_GLOB_DEPTH {
+            return;
+        }
+        let inserted = with_id_str(module, |key| {
+            if seen.contains(key) {
+                Some(false)
+            } else {
+                seen.insert(key.to_string());
+                Some(true)
+            }
+        });
+        if inserted != Some(true) {
             return;
         }
         let Some(children) = self

@@ -222,12 +222,13 @@ fn site_id(id: &str) -> Result<&str, String> {
 
 /// `text` for a URL query: every byte but RFC 3986's unreserved ones percent-encoded.
 fn query(text: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -338,9 +339,9 @@ pub fn deploy(
         let doc = answer
             .json()
             .map_err(|_| refused(&answer, "naming the files", v))?;
-        let asked = match doc.get("uploadRequiredHashes") {
-            None => Vec::new(),
-            Some(Value::Array(asked)) => asked.clone(),
+        let asked: &[Value] = match doc.get("uploadRequiredHashes") {
+            None => &[],
+            Some(Value::Array(asked)) => asked.as_slice(),
             Some(_) => {
                 return Err(not_released(
                     "naming the files: uploadRequiredHashes is not a list".into(),

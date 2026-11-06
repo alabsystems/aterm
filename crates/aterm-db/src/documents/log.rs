@@ -255,20 +255,50 @@ impl Log {
     /// The cells without the operations in `skip`, as if they had never been applied: an
     /// ATT/1 reader passes the automatic records past their writer's quota
     /// (`typed::owned::quota`), which stay in history and dependencies but never project.
+    #[cfg(test)]
     pub(crate) fn cells_without(&self, skip: &BTreeSet<Digest>) -> Cells {
         self.project(None, skip, true).0
+    }
+    /// The cells without the operations in `skip`, as if they had never been applied (an ATT/1
+    /// reader passes the automatic records past their writer's quota, `typed::owned::quota`,
+    /// which stay in history and dependencies but never project), together with the retained
+    /// operation ids that are unavailable, withheld or refused and not in `awaited`
+    /// (`att::View::refused`), computed in one pass without building a full [`Snapshot`].
+    pub(crate) fn cells_and_refused(
+        &self,
+        skip: &BTreeSet<Digest>,
+        awaited: &BTreeSet<Digest>,
+    ) -> (Cells, Vec<Digest>) {
+        let (cells, refusals, _) = self.project(None, skip, true);
+        let refused = self
+            .records
+            .iter()
+            .filter(|&(id, (op, _))| {
+                (!op.available
+                    || !op.catalog_eligible
+                    || op.refusal.is_some()
+                    || refusals.contains_key(id)
+                    || self.opaque_authors.contains(&op.header.actor))
+                    && !awaited.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        (cells, refused)
+    }
+    pub(crate) const fn retained(&self) -> usize {
+        self.retained
     }
     /// Every eligible business record with its decoded command, in record-id order.
     /// Causal-only merges remain in snapshots and dependencies, not this list. An application
     /// whose records are append-only per writer reads these, never the cells, whose causal
     /// replacement would let one writer's record hide another's.
-    pub(crate) fn eligible(&self) -> Vec<(Operation, Command)> {
+    pub(crate) fn eligible(&self) -> Vec<(&Operation, &Command)> {
         self.eligible_and_merges().0
     }
     /// [`Self::eligible`], and each eligible causal-only merge as its writer and sequence: the
     /// joins `application::append` writes before a record on a wide frontier, which a typed
     /// reader charges to that record's writer (`typed::owned::quota`).
-    pub(crate) fn eligible_and_merges(&self) -> (Vec<(Operation, Command)>, Merges) {
+    pub(crate) fn eligible_and_merges(&self) -> (Vec<(&Operation, &Command)>, Merges) {
         let (_, _, eligible) = self.project(None, &BTreeSet::new(), false);
         let mut records = Vec::new();
         let mut merges = Vec::new();
@@ -282,7 +312,7 @@ impl Log {
                 Some(Command::Merge { .. }) => {
                     merges.push((operation.header.actor, operation.header.sequence));
                 }
-                Some(command) => records.push((operation.clone(), command.clone())),
+                Some(command) => records.push((operation, command)),
                 None => {}
             }
         }
@@ -326,18 +356,27 @@ impl Log {
     /// or forked writer's and a quarantined payload never project here, and a new append names
     /// only the catalog projection's heads, so such records are inert rather than awaited.
     pub(crate) fn awaited(&self, own: Actor) -> BTreeSet<Digest> {
-        let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
         let mut awaited = BTreeSet::new();
+        for (id, (operation, _)) in &self.records {
+            let header = &operation.header;
+            if (header.actor == own && (!operation.available || !operation.catalog_eligible))
+                || header
+                    .parents
+                    .iter()
+                    .chain(header.previous.iter())
+                    .any(|parent| !self.records.contains_key(parent))
+            {
+                awaited.insert(*id);
+            }
+        }
+        if awaited.is_empty() {
+            return awaited;
+        }
+        let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
         for (id, (operation, _)) in &self.records {
             let header = &operation.header;
             for parent in header.parents.iter().chain(header.previous.iter()) {
                 children.entry(*parent).or_default().push(*id);
-                if !self.records.contains_key(parent) {
-                    awaited.insert(*id);
-                }
-            }
-            if header.actor == own && (!operation.available || !operation.catalog_eligible) {
-                awaited.insert(*id);
             }
         }
         let mut todo: Vec<Digest> = awaited.iter().copied().collect();
@@ -361,15 +400,19 @@ impl Log {
                 "local proposal writer has withheld, unavailable or refused history; recovery required",
             ));
         }
-        let (_, refusals, _) = self.project(None, &BTreeSet::new(), false);
-        if refusals.keys().any(|id| {
-            self.records
-                .get(id)
-                .is_some_and(|(op, _)| op.header.actor == actor)
+        if self.records.values().any(|(op, cmd)| {
+            op.header.actor == actor && matches!(cmd, Some(Command::Revert { .. }))
         }) {
-            return Err(Error::new(
-                "local proposal writer has withheld, unavailable or refused history; recovery required",
-            ));
+            let (_, refusals, _) = self.project(None, &BTreeSet::new(), false);
+            if refusals.keys().any(|id| {
+                self.records
+                    .get(id)
+                    .is_some_and(|(op, _)| op.header.actor == actor)
+            }) {
+                return Err(Error::new(
+                    "local proposal writer has withheld, unavailable or refused history; recovery required",
+                ));
+            }
         }
         Ok(())
     }

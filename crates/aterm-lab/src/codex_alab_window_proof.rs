@@ -485,6 +485,12 @@ fn secs_at(t: i64) -> String {
     format!("+{} s", t / 1000)
 }
 
+/// The `landing` count of This Mac's row `here` as read: what follows its lead (`This Mac` or the
+/// machine's title, [`surfaces::here_counts`]), 0 for a row that is not This Mac's (`-`, unread).
+fn landing_on_this_mac(here: &str) -> usize {
+    surfaces::here_counts(here).map_or(0, |counts| surfaces::count_in(counts, "landing"))
+}
+
 /// The first read of `s` where `want` holds, with its time.
 fn first_read(s: &Seen, want: impl Fn(&Read) -> bool) -> Option<&(i64, Read)> {
     s.reads.iter().find(|(_, r)| want(r))
@@ -638,9 +644,7 @@ fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
         ),
         line.is_some(),
     );
-    let here = first_read(s, |r| {
-        r.held() && surfaces::count_in(&r.here, "landing") >= 1
-    });
+    let here = first_read(s, |r| r.held() && landing_on_this_mac(&r.here) >= 1);
     proof.check(
         &format!(
             "window: {name} This Mac counts it landing while it holds ({})",
@@ -678,7 +682,7 @@ fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
         if r.hover == "?" || r.hover.contains("not landed yet") {
             left.push(format!("hover {:?}", r.hover));
         }
-        if surfaces::count_in(&r.here, "landing") != 0 {
+        if landing_on_this_mac(&r.here) != 0 {
             left.push(format!("This Mac {:?}", r.here));
         }
         left
@@ -925,6 +929,31 @@ mod tests {
     const OWN_13916: &str = "codex-alab 0.1.0-dev.13916 \u{b7} based on OpenAI Codex 0.165.0 \
                              \u{2500}\u{2500}\u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]\u{2500}\
                              \u{2500}\u{2500}[ALab on]";
+
+    /// This Mac's first count sits right after its lead, so the row is read past ` — ` under
+    /// either lead; a row that is not This Mac's counts nothing.
+    #[test]
+    fn this_mac_s_first_count_is_read_past_its_lead() {
+        assert_eq!(
+            landing_on_this_mac("This Mac \u{2014} 1 landing \u{b7} 1 resting \u{b7} 3 shells"),
+            1
+        );
+        assert_eq!(
+            landing_on_this_mac("m0 Heron \u{2014} 2 landing \u{b7} 2 shells"),
+            2
+        );
+        assert_eq!(
+            landing_on_this_mac("m8 Heron \u{2014} 1 resting \u{b7} 2 landing"),
+            2
+        );
+        assert_eq!(landing_on_this_mac("m8 Heron \u{2014} 3 shells"), 0);
+        assert_eq!(landing_on_this_mac("-"), 0, "CONTROL: never read");
+        assert_eq!(
+            surfaces::count_in("This Mac \u{2014} 1 landing", "landing"),
+            0,
+            "CONTROL: the whole row hides its first count"
+        );
+    }
 
     #[test]
     fn the_pad_is_the_row_over_the_last_prompt() {

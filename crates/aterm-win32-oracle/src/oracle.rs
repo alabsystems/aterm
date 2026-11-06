@@ -243,18 +243,18 @@ pub fn caught_import(
 /// The imports `triple`'s probes must name: every generated function the
 /// model keeps for its architecture, plus each `link!` of aterm-win32's
 /// hand-written files (`hand_written`, counted by [`hand_written_imports`]).
-fn expected_imports(model: &Model, triple: &str, hand_written: usize) -> usize {
+fn expected_imports(variants: &[&crate::source::Item], triple: &str, hand_written: usize) -> usize {
     let arch = triple.split('-').next().unwrap_or("");
+    let arch_needle = format!("\"{arch}\"");
     hand_written
-        + model
-            .variants()
+        + variants
             .iter()
             .filter(|it| {
                 it.kind == "fn"
                     && !it
                         .arch
                         .iter()
-                        .any(|a| a.contains("target_arch") && !a.contains(&format!("\"{arch}\"")))
+                        .any(|a| a.contains("target_arch") && !a.contains(&arch_needle))
             })
             .map(|it| &it.name)
             .collect::<BTreeSet<_>>()
@@ -378,7 +378,7 @@ pub fn stage(root: &Path, tmp: &Path) -> Result<(PathBuf, PathBuf)> {
     copy_tree(&root.join("crates/aterm-win32/src"), &krate.join("src"))?;
     Ok((workspace, krate))
 }
-pub fn plant(krate: &Path, p: &Plant) -> Result<()> {
+pub fn plant(krate: &Path, p: &Plant) -> Result<(PathBuf, String)> {
     let path = krate.join(p.file);
     let text = read(&path)?;
     let count = text.matches(p.old).count();
@@ -389,13 +389,18 @@ pub fn plant(krate: &Path, p: &Plant) -> Result<()> {
             path.display()
         ));
     }
-    crate::write_fresh(&path, text.replacen(p.old, p.new, 1)).map_err(|e| e.to_string())
+    crate::write_fresh(&path, text.replacen(p.old, p.new, 1)).map_err(|e| e.to_string())?;
+    Ok((path, text))
 }
 pub fn gate(root: &Path, model: &Model, tools: &Tools, target: &Path) -> Result<u8> {
     let mut runner = System;
     let workspace = root.join("win32-oracle");
     let mut findings = vec![];
     let measured = (|| -> Result<()> {
+        let variants = model.variants();
+        let hand_written = hand_written_imports(&root.join("crates/aterm-win32"))?;
+        let temporary = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+        let (ws, krate) = stage(root, temporary.path())?;
         for triple in TRIPLES {
             println!("== {triple} (STOCK EXCEPTION: Windows std, compile/import oracle only)");
             if checked(
@@ -406,16 +411,12 @@ pub fn gate(root: &Path, model: &Model, tools: &Tools, target: &Path) -> Result<
                 triple,
                 "aterm-win32-conformance",
             )? {
-                println!("  ok conformance: {} declarations", model.variants().len())
+                println!("  ok conformance: {} declarations", variants.len())
             } else {
                 findings.push(format!("{triple} conformance"));
             }
             let want = import_table(&mut runner, tools, &workspace, target, triple, "upstream")?;
-            let expected = expected_imports(
-                model,
-                triple,
-                hand_written_imports(&root.join("crates/aterm-win32"))?,
-            );
+            let expected = expected_imports(&variants, triple, hand_written);
             if want.len() != expected {
                 return Err(format!(
                     "upstream gave {} of {expected} imports",
@@ -429,42 +430,47 @@ pub fn gate(root: &Path, model: &Model, tools: &Tools, target: &Path) -> Result<
                 println!("  ok imports: {} symbols, same DLLs", want.len())
             }
             for p in PLANTS {
-                let temporary = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-                let (ws, krate) = stage(root, temporary.path())?;
-                plant(&krate, p)?;
-                if !checked(
-                    &mut runner,
-                    tools,
-                    &ws,
-                    target,
-                    triple,
-                    "aterm-win32-under-test",
-                )? {
-                    findings.push(format!("{triple} plant {} breaks subject itself", p.name));
-                    continue;
-                }
-                let conforms = checked(
-                    &mut runner,
-                    tools,
-                    &ws,
-                    target,
-                    triple,
-                    "aterm-win32-conformance",
-                )?;
-                let caught = if p.phase == "conformance" {
-                    !conforms
-                } else {
-                    conforms
-                        && caught_import(
-                            &want,
-                            import_table(&mut runner, tools, &ws, target, triple, "facade"),
-                        )?
-                };
-                if caught {
-                    println!("  ok plant {} caught by {}", p.name, p.phase)
-                } else {
-                    findings.push(format!("{triple} plant {} not caught", p.name));
-                }
+                let (planted_path, original) = plant(&krate, p)?;
+                let check_res = (|| -> Result<()> {
+                    if !checked(
+                        &mut runner,
+                        tools,
+                        &ws,
+                        target,
+                        triple,
+                        "aterm-win32-under-test",
+                    )? {
+                        findings.push(format!("{triple} plant {} breaks subject itself", p.name));
+                        return Ok(());
+                    }
+                    let conforms = checked(
+                        &mut runner,
+                        tools,
+                        &ws,
+                        target,
+                        triple,
+                        "aterm-win32-conformance",
+                    )?;
+                    let caught = if p.phase == "conformance" {
+                        !conforms
+                    } else {
+                        conforms
+                            && caught_import(
+                                &want,
+                                import_table(&mut runner, tools, &ws, target, triple, "facade"),
+                            )?
+                    };
+                    if caught {
+                        println!("  ok plant {} caught by {}", p.name, p.phase)
+                    } else {
+                        findings.push(format!("{triple} plant {} not caught", p.name));
+                    }
+                    Ok(())
+                })();
+                let restore_res =
+                    crate::write_fresh(&planted_path, original).map_err(|e| e.to_string());
+                check_res?;
+                restore_res?;
             }
         }
         Ok(())

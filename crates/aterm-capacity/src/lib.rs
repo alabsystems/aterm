@@ -133,11 +133,13 @@ mod retained_cohort_tests;
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
     Short, Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory,
-    covering, gib, never, reserved, span,
+    covering, covering_disk, gib, never, reserved, span,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
-pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
+pub use footprint::{
+    Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size, walks,
+};
 #[cfg(any(test, debug_assertions))]
 pub use ledger::Turn;
 pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
@@ -264,16 +266,39 @@ pub(crate) fn own_roots() -> (Option<PathBuf>, Option<PathBuf>) {
     }
 }
 
+/// Admission priority. Running Ordinary work is never preempted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+    /// A release's bounded core pool.
+    Release,
+    /// Foreground development work.
+    #[default]
+    Ordinary,
+    /// Repeatable work which yields to foreground claims.
+    Background,
+}
+
+/// The cutter marks its descendants with this environment variable.
+pub const RELEASE_RUN_ENV: &str = "ATERM_RELEASE_RUN";
+
+mod background;
+mod jobserver;
+pub use jobserver::{Jobserver, Token};
+
 /// What a claim needs. Sizes are bytes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Need {
+    /// Priority among waiters, followed by arrival order.
+    pub rank: Rank,
     /// What the work is, as a person reads it in a wait line: `trust check aterm-render`.
     pub what: String,
     /// Its peak memory.
     pub mem: u64,
     /// Memory that must stay available beside its peak for it to be admitted (a VM's host margin): asked of the room, never reserved, so needs admitted side by side share one margin.
     pub margin: u64,
-    /// The cores it would use; it is granted its share of them, at least one, never more, and never waits for them ([`Claim::cores`]). `0`: none asked.
+    /// The cores it would use. Admission waits when held grants and higher priority waiters
+    /// leave none; otherwise it grants at least one, bounded by room and the request
+    /// ([`Claim::cores`]). `0`: none asked.
     pub cores: u32,
     /// The disk it will write, on the volume holding [`Self::path`].
     pub disk: u64,
@@ -324,6 +349,13 @@ impl Need {
             what: what.into(),
             ..Need::default()
         }
+    }
+
+    /// Set the priority of this claim explicitly.
+    #[must_use]
+    pub const fn rank(mut self, rank: Rank) -> Need {
+        self.rank = rank;
+        self
     }
 
     /// Its peak memory, `bytes`.
@@ -474,6 +506,19 @@ pub const COVER_ENV: &str = "ATERM_CAPACITY_COVER";
 /// stage that claims no memory): a build inside it is covered by none, and claims for itself.
 pub const NO_COVER: &str = "none";
 
+/// THE DISK COVER MARKER: what the holder of one disk claim sized for a whole tree of work (the
+/// release's, `aterm_release::release_disk`) exports to the work it starts under it: that claim's
+/// own name ([`Record::cover_marker`], `<start_ms>-<pid>-<seq>`, which carries its holder's pid).
+/// A run inside it that would claim disk for itself (`aterm_verify::disk`) reads that holder's
+/// claims alone, checks the holder is itself or an ancestor, and is covered by the named claim
+/// alone while it is held and only where its writes land on that claim's volume
+/// ([`covering_disk`]): it measures nothing and claims nothing more, since its writes are part of
+/// what the claim was sized for. The claim file's lock is its liveness, and
+/// its start and sequence number make a reused pid name no claim. Never [`COVER_ENV`], which a
+/// holder of memory claims rewrites for each work it starts; and never any ancestor's disk claim
+/// but the one named, so an unrelated claim of an ancestor (a VM's disk) covers nothing.
+pub const DISK_COVER_ENV: &str = "ATERM_DISK_COVERED";
+
 /// A memory claim made from a measured peak adds a fifth of it ([`peak_claim`]): one library's
 /// recorded Trust check peaks moved by 14% between two runs on one prover (aterm-render, 13.2 GB
 /// on 2026-10-22 and 15.0 GB on 2026-10-21).
@@ -567,6 +612,9 @@ pub enum Admit {
     /// Wait for room ([`admit`]).
     #[default]
     Wait,
+    /// Repeatable background work, launched in its own process group. A foreground waiter
+    /// asks it to yield at its next stage; a release ends that group immediately.
+    Preemptible,
     /// Override resource-only admission and say what it would have waited for: at once, but
     /// only in its turn, so it waits while another admission holds the ledger's lock.
     /// Requested Timing refuses this mode: an override cannot qualify measurements.
@@ -592,6 +640,7 @@ impl Admit {
     pub const fn word(self) -> &'static str {
         match self {
             Admit::Wait => "wait",
+            Admit::Preemptible => "preemptible",
             Admit::Now => "now",
         }
     }

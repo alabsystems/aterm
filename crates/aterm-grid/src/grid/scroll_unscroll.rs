@@ -80,6 +80,8 @@ impl Grid {
         self.storage.note_history_popped(available, n);
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.force_selection_invalidation();
+        // A double-width row pushed past the region's foot leaves the screen.
+        self.resync_any_double_width();
         let top_u16 = self.storage.scroll_region.top;
         let bottom_u16 = self.storage.scroll_region.bottom;
         self.storage

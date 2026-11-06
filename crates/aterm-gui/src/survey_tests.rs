@@ -2074,3 +2074,55 @@ fn a_record_shows_only_while_its_group_is_in_front() {
         "CONTROL: the record's own group in front again"
     );
 }
+
+/// A listener-cached snapshot whose swarm roster was unread is never served again: the next
+/// survey reads the roster afresh, so a writer's moment is not repeated for a minute (one-mesh
+/// E2). NEGATIVE CONTROL: the same snapshot with its roster read is served from the cache until
+/// [`FACTS_CACHE_TTL`] passes, and a snapshot of another node never is.
+#[test]
+fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
+    let facts = |roster_unread: bool| aterm_agent::survey_facts::SwarmSurveyFacts {
+        node: Some("n-1".to_owned()),
+        label: (!roster_unread).then(|| "m5".to_owned()),
+        roster_unread,
+        version: "0.155.0".to_owned(),
+        window: false,
+        window_last: None,
+        sessions: 0,
+        ssh_host_key: None,
+        moves: None,
+        accounts: Vec::new(),
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        server_heard: Vec::new(),
+        home: None,
+        home_free_mb: None,
+        repos: None,
+    };
+    let at = std::time::Instant::now();
+    let soon = at + std::time::Duration::from_secs(1);
+    let unread = Here {
+        facts: Some(facts(true)),
+        ..here()
+    };
+    let read = Here {
+        facts: Some(facts(false)),
+        ..here()
+    };
+    assert!(
+        !serves_cached(at, &unread, soon, Some("n-1")),
+        "an unread roster is read afresh"
+    );
+    assert!(
+        serves_cached(at, &read, soon, Some("n-1")),
+        "the control: a read roster is served from the cache"
+    );
+    assert!(
+        !serves_cached(at, &read, at + FACTS_CACHE_TTL, Some("n-1")),
+        "the control: past the TTL nothing is served"
+    );
+    assert!(
+        !serves_cached(at, &read, soon, Some("n-2")),
+        "the control: another node's snapshot is not served"
+    );
+}

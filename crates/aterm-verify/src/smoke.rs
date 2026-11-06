@@ -87,7 +87,8 @@ impl SmokeChild {
         let spawning = group::Spawning::begin();
         if group::stopping() {
             return Err(std::io::Error::other(
-                "the run was interrupted before this child started",
+                crate::exec::halted()
+                    .unwrap_or("the run was interrupted before this child started"),
             ));
         }
         let child = cmd.stdin(Stdio::null()).process_group(0).spawn()?;

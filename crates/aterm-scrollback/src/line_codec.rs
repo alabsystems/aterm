@@ -8,6 +8,16 @@ use aterm_alloc::SmallVec;
 use aterm_rle::Rle;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    static RECORDS_WRITTEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_records_written() -> usize {
+    RECORDS_WRITTEN.with(|count| count.replace(0))
+}
+
 /// Absolute cap on a single deserialized line's content byte length.
 pub(crate) const MAX_LINE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -117,6 +127,8 @@ impl Line {
     /// Shared byte writer.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn append_serialized(&self, result: &mut Vec<u8>) {
+        #[cfg(test)]
+        RECORDS_WRITTEN.with(|count| count.set(count.get() + 1));
         let content = self.content.as_bytes();
         let content_len = content.len();
 

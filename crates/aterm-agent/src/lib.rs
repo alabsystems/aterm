@@ -61,6 +61,8 @@ mod fleet_member;
 /// (F17, ATERM-KI-1105-10).
 #[cfg(unix)]
 pub mod fleet_vault;
+#[cfg(unix)]
+mod lan_members;
 /// This machine's name: `machine-name.toml` (`docs/DESIGN-machine-names-2026-11-04.md` §3.3).
 #[cfg(unix)]
 pub mod machine_name;

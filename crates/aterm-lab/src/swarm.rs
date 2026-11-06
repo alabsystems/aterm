@@ -28,6 +28,9 @@ pub mod mailbox;
 #[path = "swarm_partition.rs"]
 pub mod partition;
 
+#[path = "swarm_e2e.rs"]
+pub mod e2e;
+
 /// Hang detector for an event that must happen.
 const HANG: Duration = Duration::from_secs(60);
 
@@ -60,17 +63,17 @@ pub struct RotateOpts {
 pub fn parse_args(args: &[String]) -> Result<RotateOpts, Fail> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(Fail::usage(
-            "swarm rotate|mailbox-signin|partition [--aterm PATH] [--keep]",
+            "swarm rotate|mailbox-signin|partition|e2e [--aterm PATH] [--keep]",
         ));
     };
     if sub == "-h" || sub == "--help" {
         return Err(Fail::usage(
-            "swarm rotate|mailbox-signin|partition [--aterm PATH] [--keep]",
+            "swarm rotate|mailbox-signin|partition|e2e [--aterm PATH] [--keep]",
         ));
     }
     if sub != "rotate" {
         return Err(Fail::usage(format!(
-            "swarm: unknown subcommand '{sub}' (expected 'rotate', 'mailbox-signin' or 'partition')"
+            "swarm: unknown subcommand '{sub}' (expected 'rotate', 'mailbox-signin', 'partition' or 'e2e')"
         )));
     }
     let mut opts = RotateOpts::default();
@@ -720,6 +723,9 @@ pub fn cmd_swarm(args: &[String]) -> Res {
     }
     if args.first().map(String::as_str) == Some("partition") {
         return partition::cmd_partition(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("e2e") {
+        return e2e::cmd(&args[1..]);
     }
     let opts = parse_args(args)?;
     let aterm = resolve_aterm(opts.aterm)?;

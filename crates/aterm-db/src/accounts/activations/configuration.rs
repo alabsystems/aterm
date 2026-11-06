@@ -49,7 +49,10 @@ impl Configuration {
         )
     }
 
-    fn from_snapshot(request: &Request, snapshot: crate::documents::log::Snapshot) -> Result<Self> {
+    fn from_snapshot(
+        request: &Request,
+        mut snapshot: crate::documents::log::Snapshot,
+    ) -> Result<Self> {
         #[cfg(test)]
         CAPTURES.with(|count| count.set(count.get() + 1));
         let (table, key, configuration, provider, method) = match &request.action {
@@ -88,17 +91,17 @@ impl Configuration {
                 .as_str()
                 .ok_or_else(|| Error::new("account plan has an invalid key"))?;
             let lookup = (collection.to_owned(), key.to_owned());
-            let cell = snapshot
+            let mut cell = snapshot
                 .cells
-                .get(&lookup)
+                .remove(&lookup)
                 .ok_or_else(|| Error::new("account closure is incomplete"))?;
             if cell.stopped || cell.candidates.len() != 1 {
                 return Err(Error::new("account closure is not unique"));
             }
-            values
-                .entry(lookup.0)
-                .or_default()
-                .insert(lookup.1, cell.candidates[0].value.clone());
+            values.entry(lookup.0).or_default().insert(
+                lookup.1,
+                cell.candidates.pop().expect("single candidate").value,
+            );
         }
         if !values
             .get("accounts")

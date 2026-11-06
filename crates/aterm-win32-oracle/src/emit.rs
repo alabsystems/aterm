@@ -648,11 +648,19 @@ impl Model {
     /// Only `record` publishes these; normal generation still requires all
     /// recorded anchors before publishing its facade or conformance checks.
     pub fn recorder_outputs(&self, root: &Path) -> Result<BTreeMap<PathBuf, String>> {
+        self.recorder_outputs_for(root, &self.variants())
+    }
+
+    fn recorder_outputs_for(
+        &self,
+        root: &Path,
+        variants: &[&Item],
+    ) -> Result<BTreeMap<PathBuf, String>> {
         let manifest = PathBuf::from("win32-oracle/record/Cargo.toml");
         Ok(BTreeMap::from([
             (
                 PathBuf::from("win32-oracle/record/src/main.rs"),
-                recorder(&self.up, &self.variants())?,
+                recorder(&self.up, variants)?,
             ),
             (
                 manifest.clone(),
@@ -665,7 +673,8 @@ impl Model {
     }
 
     pub fn outputs(&self, root: &Path) -> Result<BTreeMap<PathBuf, String>> {
-        let mut out = self.recorder_outputs(root)?;
+        let variants = self.variants();
+        let mut out = self.recorder_outputs_for(root, &variants)?;
         for (p, t) in crate_files(&self.up, &self.keep, &self.enabled)? {
             out.insert(PathBuf::from("crates/aterm-win32").join(p), t);
         }
@@ -699,7 +708,6 @@ impl Model {
         if string(&recorded, "windows-sys")? != VERSION {
             return Err("recorded upstream version differs".into());
         }
-        let variants = self.variants();
         out.insert(
             "win32-oracle/conformance/src/lib.rs".into(),
             conformance(&self.up, &variants, &recorded)?,

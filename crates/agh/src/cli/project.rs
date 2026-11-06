@@ -33,6 +33,21 @@ fn is_key(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The first key of a valid field path `text`, without allocating its steps.
+fn head_of(text: &str) -> Option<&str> {
+    let mut head = None;
+    for part in text.split('.') {
+        let key = part.strip_suffix("[]").unwrap_or(part);
+        if !is_key(key) {
+            return None;
+        }
+        if head.is_none() {
+            head = Some(key);
+        }
+    }
+    head
+}
+
 impl FieldPath {
     /// The path `text` writes: `KEY ("[]")? ("." KEY ("[]")?)*`, with KEY `[A-Za-z0-9_]+`.
     /// # Errors
@@ -345,20 +360,19 @@ pub fn validate_fields(noun: Noun, fields: &[FieldPath], sample: Option<&Value>)
     let Some(sample) = sample else {
         return Ok(());
     };
-    let mut names: Vec<String> = default_fields(noun)
+    let mut names: Vec<&str> = default_fields(noun)
         .iter()
         .chain(derived_fields(noun))
-        .filter_map(|text| FieldPath::parse(text).ok())
-        .filter_map(|path| path.head().map(str::to_string))
+        .filter_map(|text| head_of(text))
         .collect();
     if let Some(map) = sample.as_object() {
-        names.extend(map.keys().cloned());
+        names.extend(map.keys().map(String::as_str));
     }
-    names.sort();
+    names.sort_unstable();
     names.dedup();
     for field in fields {
         let Some(head) = field.head() else { continue };
-        if !names.iter().any(|name| name == head) {
+        if names.binary_search(&head).is_err() {
             return Err(Error::usage(format!(
                 "no field {head} in {}; fields: {}",
                 noun.slug(),
@@ -372,11 +386,7 @@ pub fn validate_fields(noun: Noun, fields: &[FieldPath], sample: Option<&Value>)
 /// Whether the verb must compute `field` (a derived field that costs a request).
 #[must_use]
 pub fn wants(noun: Noun, opts: &OutputOpts, field: &str) -> bool {
-    let names = |text: &str| {
-        FieldPath::parse(text.trim())
-            .ok()
-            .is_some_and(|path| path.head() == Some(field))
-    };
+    let names = |text: &str| head_of(text.trim()) == Some(field);
     let in_fields = opts
         .fields
         .as_deref()
@@ -390,37 +400,32 @@ pub fn wants(noun: Noun, opts: &OutputOpts, field: &str) -> bool {
 
 /// The noun's pure derived fields, computed from GitHub's own keys.
 fn pure_derived(noun: Noun, value: &Map) -> Vec<(&'static str, Value)> {
-    let at = |path: &[&str]| -> Value {
+    let str_at = |path: &[&str]| -> Option<&str> {
         let mut here = value.get(path[0]);
         for key in &path[1..] {
             here = here.and_then(|v| v.get(key));
         }
-        here.cloned().unwrap_or(Value::Null)
+        here.and_then(Value::as_str)
     };
-    let string = |v: Value| match v {
-        Value::String(_) => v,
-        _ => Value::Null,
-    };
+    let string = |opt: Option<&str>| opt.map_or(Value::Null, |s| Value::String(s.to_string()));
     match noun {
         Noun::Commit => {
-            let subject = match at(&["commit", "message"]) {
-                Value::String(message) => {
-                    Value::String(message.lines().next().unwrap_or("").to_string())
-                }
-                _ => Value::Null,
+            let subject = match str_at(&["commit", "message"]) {
+                Some(message) => Value::String(message.lines().next().unwrap_or("").to_string()),
+                None => Value::Null,
             };
-            let author = match string(at(&["author", "login"])) {
-                Value::String(login) if !login.is_empty() => Value::String(login),
-                _ => string(at(&["commit", "author", "name"])),
+            let author = match str_at(&["author", "login"]) {
+                Some(login) if !login.is_empty() => Value::String(login.to_string()),
+                _ => string(str_at(&["commit", "author", "name"])),
             };
             vec![
-                ("date", string(at(&["commit", "committer", "date"]))),
+                ("date", string(str_at(&["commit", "committer", "date"]))),
                 ("subject", subject),
                 ("author", author),
             ]
         }
-        Noun::Branch | Noun::Tag => vec![("sha", string(at(&["commit", "sha"])))],
-        Noun::Compare => vec![("merge_base", string(at(&["merge_base_commit", "sha"])))],
+        Noun::Branch | Noun::Tag => vec![("sha", string(str_at(&["commit", "sha"])))],
+        Noun::Compare => vec![("merge_base", string(str_at(&["merge_base_commit", "sha"])))],
         _ => Vec::new(),
     }
 }

@@ -2613,6 +2613,50 @@ impl Drop for BridgeLostGuard {
     }
 }
 
+struct AccountServices {
+    lifetime: aterm_agent::harness::account_work::Lifetime,
+    interactive_browser: bool,
+}
+
+impl AccountServices {
+    fn renew(&self, caller: &str, rest: &str) -> String {
+        self.renew_with(
+            caller,
+            rest,
+            aterm_agent::harness::remote_renew::serve_scoped,
+        )
+    }
+
+    fn renew_with(
+        &self,
+        caller: &str,
+        rest: &str,
+        serve: impl FnOnce(&aterm_agent::harness::account_work::Lifetime, &str, &str) -> String,
+    ) -> String {
+        serve(&self.lifetime, caller, rest)
+    }
+
+    fn challenge(&self, caller: &str, rest: &str) -> String {
+        self.challenge_with(
+            caller,
+            rest,
+            aterm_agent::harness::challenge_relay::serve_scoped,
+        )
+    }
+
+    fn challenge_with(
+        &self,
+        caller: &str,
+        rest: &str,
+        serve: impl FnOnce(&aterm_agent::harness::account_work::Lifetime, &str, &str) -> String,
+    ) -> String {
+        if !self.interactive_browser {
+            return "ERR claude-challenge requires a serving window\n".into();
+        }
+        serve(&self.lifetime, caller, rest)
+    }
+}
+
 /// Say `generation`'s loss over `store`, waking each session's watchers its halt owes a wake.
 #[cfg(any(unix, test))]
 fn say_bridge_lost(store: &Store, generation: crate::fabric::BridgeGeneration) {
@@ -2625,7 +2669,7 @@ struct ControlWorkerContext {
     active: ActiveHandle,
     store: Store,
     proxy: EventLoopProxy<Wake>,
-    interactive_browser: bool,
+    account_services: AccountServices,
     token: Arc<String>,
     sock_dir: std::path::PathBuf,
     recovery_count_admission: Arc<crate::keeper_link::RecoveryCountAdmission>,
@@ -2717,7 +2761,7 @@ impl control_lanes::LaneService for ControlWorkerContext {
         serve_request_line(
             request,
             scope,
-            self.interactive_browser,
+            &self.account_services,
             stream,
             reader,
             out,
@@ -2806,7 +2850,7 @@ impl ControlWorkerContext {
         match serve_preresolved(
             &stream,
             Scope::Bridge,
-            self.interactive_browser,
+            &self.account_services,
             &self.active,
             &self.store,
             &self.proxy,
@@ -2847,7 +2891,7 @@ impl ControlWorkerContext {
         let _ = serve_preresolved(
             &stream,
             Scope::Fleet { content, drive },
-            self.interactive_browser,
+            &self.account_services,
             &self.active,
             &self.store,
             &self.proxy,
@@ -3358,6 +3402,7 @@ pub(crate) fn spawn(
     store: Store,
     proxy: EventLoopProxy<Wake>,
     interactive_browser: bool,
+    account_work: aterm_agent::harness::account_work::Lifetime,
     plan: control_auth::SocketPlan,
     startup_config: crate::app_config::Config,
     root_identity: Option<(SessionId, aterm_session::LaunchNonce)>,
@@ -3429,7 +3474,10 @@ pub(crate) fn spawn(
                 active: active.clone(),
                 store: store.clone(),
                 proxy: proxy.clone(),
-                interactive_browser,
+                account_services: AccountServices {
+                    lifetime: account_work,
+                    interactive_browser,
+                },
                 token: token.clone(),
                 sock_dir: sock_dir.clone(),
                 recovery_count_admission,
@@ -4804,7 +4852,7 @@ struct DispatchCx<'a> {
     store: &'a Store,
     scope: Scope,
     proxy: &'a EventLoopProxy<Wake>,
-    interactive_browser: bool,
+    account_services: &'a AccountServices,
     sock_dir: &'a std::path::Path,
 }
 
@@ -4914,16 +4962,15 @@ fn dispatch_owner(
                 || "local".to_owned(),
                 |driver| format!("fleet:{}", driver.node),
             );
-            aterm_agent::harness::remote_renew::serve(&caller, rest)
+            cx.account_services.renew(&caller, rest)
         }
-        "claude-challenge" if cx.interactive_browser => {
+        "claude-challenge" => {
             let caller = crate::fabric::serving_driver().map_or_else(
                 || "local".to_owned(),
                 |driver| format!("fleet:{}", driver.node),
             );
-            aterm_agent::harness::challenge_relay::serve(&caller, rest)
+            cx.account_services.challenge(&caller, rest)
         }
-        "claude-challenge" => "ERR claude-challenge requires a serving window\n".into(),
         "topic" => dispatch_topic_verb(rest, selector, scope, store, own_session),
         "story" => dispatch_story_verb(rest, selector, scope, store, own_session, proxy),
         "sessions" => match rest.trim() {
@@ -6372,7 +6419,7 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
 fn serve_preresolved(
     stream: &CtlStream,
     scope: Scope,
-    interactive_browser: bool,
+    account_services: &AccountServices,
     active: &ActiveHandle,
     store: &Store,
     proxy: &EventLoopProxy<Wake>,
@@ -6400,7 +6447,7 @@ fn serve_preresolved(
         let disposition = serve_request_line(
             request,
             scope,
-            interactive_browser,
+            account_services,
             stream,
             &mut reader,
             &mut out,
@@ -7519,7 +7566,7 @@ fn recovery_count_refusal(
 fn serve_request_line(
     request: Request,
     scope: Scope,
-    interactive_browser: bool,
+    account_services: &AccountServices,
     stream: &CtlStream,
     reader: &mut control_lanes::LaneReader<'_>,
     out: &mut control_lanes::Outbox,
@@ -7658,7 +7705,7 @@ fn serve_request_line(
             store,
             scope,
             proxy,
-            interactive_browser,
+            account_services,
             sock_dir,
         },
     );

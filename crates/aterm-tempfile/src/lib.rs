@@ -545,16 +545,17 @@ const STAND_IN_CACHE: &str = "atv-standins-";
 /// `cached_in` gives next. `None` when the cache cannot be used; the stand-in is then written
 /// in place.
 ///
-/// macOS assesses the first exec of each file, so a test pays one assessment per text, not one
-/// per stand-in. That file's one name is never removed. macOS reads an exec's file by name to
-/// assess it, and a file with several names (hard links, one per stand-in) need not be named by
-/// the link an exec ran it through: on 27.0.1, once one fixture had opened its link, an exec
-/// through another fixture's left the kernel naming the file, by its id, by the first fixture's
-/// link. A fixture removing its own (its directory going at its end) could so leave the
-/// assessment of another fixture's exec reading a name that was gone; syspolicyd then ended that
-/// stand-in as malware (`killed by signal 9`, an exec security-policy exit). A symlink is no
-/// name of the file: an exec through it runs the file by its one name, and `$0` is still the
-/// stand-in's own path, so a body finds what lies beside it.
+/// macOS assesses the first exec of each file, so a test pays one assessment per text, not one per
+/// stand-in. Nothing here removes that file's one name, and each call marks it used (`used`), so
+/// macOS's temporary-file cleaners leave it while stand-ins are laid from it (a stand-in running
+/// does not keep it). macOS reads an exec's file by name to assess it, and a file with several
+/// names (hard links, one per stand-in) need not be named by the link an exec ran it through: on
+/// 27.0.1, once one fixture had opened its link, an exec through another fixture's left the kernel
+/// naming the file, by its id, by the first fixture's link. A fixture removing its own (its
+/// directory going at its end) could so leave the assessment of another fixture's exec reading a
+/// name that was gone; syspolicyd then ended that stand-in as malware (`killed by signal 9`, an
+/// exec security-policy exit). A symlink is no name of the file: an exec through it runs the file
+/// by its one name, and `$0` is still the stand-in's own path, so a body finds what lies beside it.
 ///
 /// Test support that aterm-verify's `standin` reaches in every profile it builds in, so it is
 /// not gated by profile; no shipped code calls it.
@@ -571,7 +572,8 @@ pub fn shared_stand_in(text: &str) -> Option<PathBuf> {
 
 /// [`shared_stand_in`] over the memo `shared`, for user `me` and the temporary directory `tmp`:
 /// the file `shared` names for `text` while it still [`holds`] `text`, else `cached_in`'s, which
-/// `shared` names from then on; `None`, and `text` unnamed, when the cache cannot be used.
+/// `shared` names from then on, either one marked [`used`]; `None`, and `text` unnamed, when the
+/// cache cannot be used.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn shared_in(
@@ -582,13 +584,30 @@ fn shared_in(
 ) -> Option<PathBuf> {
     if let Some(file) = shared.get(text) {
         if holds(me, file, text) {
-            return Some(file.clone());
+            return Some(used(file.clone()));
         }
         shared.remove(text);
     }
     let file = cached_in(me, tmp, text)?;
     shared.insert(text.to_owned(), file.clone());
-    Some(file)
+    Some(used(file))
+}
+
+/// `file`, its access time made now where it can be. macOS's temporary-file cleaners take a
+/// slot by its access time (dirhelper, in `/var/folders`, one whose access time is more than 3
+/// days old; tmp_cleaner, in `/tmp`, one whose access, modification and change times all are),
+/// and on APFS a read or a run of an assessed file leaves an access time already past its
+/// modification time as it is (measured 2026-10-28 on macOS 27.0). So neither `holds` reading
+/// a slot nor a stand-in running keeps it: only this mark does, and a slot no call has marked
+/// for 3 days is the cleaners' even while stand-ins laid from it run. One removed shows through
+/// every symlink laid to it.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn used(file: PathBuf) -> PathBuf {
+    if let Ok(open) = fs::File::open(&file) {
+        let _ = open.set_times(fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+    }
+    file
 }
 
 /// Whether `file` is a slot a stand-in of `text` may run: a regular file of `me`'s (not a link
@@ -641,12 +660,12 @@ fn holds(me: u32, file: &Path, text: &str) -> bool {
 /// refused.
 ///
 /// The cache holds one file per text (a slot more only where a writer died mid-write or two
-/// first writers raced), so it stays as small as the set of texts, and no file in it is ever
-/// renamed, linked or removed. A file is made under its own name with no exec bit, written,
-/// closed, and only then made mode 0555. A slot is used only when it is a regular file of `me`'s,
-/// mode 0555, holding exactly `text`, so no process runs one still being written (an exec of a
-/// file open for writing is `ETXTBSY` on Linux), and a slot that is not becomes the next slot's
-/// turn.
+/// first writers raced), so it stays as small as the set of texts, and nothing here renames,
+/// links or removes a file in it (macOS's cleaners take a slot no call has marked [`used`] for
+/// 3 days). A file is made under its own name with no exec bit, written, closed, and only then
+/// made mode 0555. A slot is used only when it is a regular file of `me`'s, mode 0555, holding
+/// exactly `text`, so no process runs one still being written (an exec of a file open for
+/// writing is `ETXTBSY` on Linux), and a slot that is not becomes the next slot's turn.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
@@ -1210,6 +1229,71 @@ mod tests {
             Some("#!/bin/sh\nexit")
         );
         assert_eq!(fs::read_to_string(slot(1)).ok().as_deref(), Some(text));
+    }
+
+    /// A SLOT HANDED OUT LOOKS JUST USED. macOS's temporary-file cleaners take a file by its
+    /// access time, which `holds` reading a slot does not move on APFS (the slot is aged with
+    /// both times equal, which a read there leaves as they are): the slot each call hands out,
+    /// whether `cached_in` found it (made by an earlier process) or the memo named it, is handed
+    /// out with its access time made now. NEGATIVE CONTROL: only that: the slot handed out keeps
+    /// its modification time (it is not written), and a slot passed over keeps its age. That slot
+    /// is one a writer left mid-write (0600), which `holds` refuses without reading, aged to an
+    /// access time before its modification time, which a read would move on APFS as under
+    /// Linux's relatime, so the control fails on a mark of it, not on a filesystem's read policy.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_handed_out_is_marked_used_and_one_passed_over_is_not() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        use std::time::{Duration, SystemTime};
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+        const CLEANED: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+        let me = euid();
+        let tmp = tempdir().expect("scratch");
+        let text = "#!/bin/sh\nexit 8\n";
+        let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&cache)
+            .expect("the cache");
+        let other = cache.join(format!("{:016x}-0", fnv1a(text.as_bytes())));
+        fs::write(&other, "#!/bin/sh\nexit").expect("lay a slot");
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).expect("chmod a slot");
+        let slot = cached_in(me, tmp.path(), text).expect("the text's slot");
+        let unused = SystemTime::now() - CLEANED - DAY;
+        let age = |file: &Path, accessed: SystemTime| {
+            let times = fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(unused);
+            fs::File::open(file)
+                .and_then(|f| f.set_times(times))
+                .expect("aged");
+        };
+        let since = |file: &Path, of: fn(&fs::Metadata) -> io::Result<SystemTime>| {
+            let at = fs::metadata(file).and_then(|m| of(&m)).expect("its times");
+            SystemTime::now().duration_since(at).unwrap_or_default()
+        };
+        let mut shared = BTreeMap::new();
+        for named in ["found in the cache", "named by the memo"] {
+            age(&slot, unused);
+            age(&other, unused - DAY);
+            let got = shared_in(&mut shared, me, tmp.path(), text);
+            assert_eq!(got.as_ref(), Some(&slot), "{named}");
+            assert!(
+                since(&slot, fs::Metadata::accessed) < CLEANED,
+                "{} handed out ({named}) still looks unused",
+                slot.display()
+            );
+            assert!(
+                since(&slot, fs::Metadata::modified) >= CLEANED,
+                "{} was written",
+                slot.display()
+            );
+            assert!(
+                since(&other, fs::Metadata::accessed) >= CLEANED,
+                "{} passed over ({named}) was marked used",
+                other.display()
+            );
+        }
     }
 
     /// A cache folder that is not the user's alone is refused and nothing is made in it: one

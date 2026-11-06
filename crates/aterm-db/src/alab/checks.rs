@@ -258,21 +258,18 @@ pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
         }
     }
     // Machines: a live label that is another live machine's alias names two Macs.
-    let machine_aliases: Vec<(&String, BTreeSet<&str>)> = machines
+    let machine_aliases: Vec<(&String, &crate::typed::cell::Field)> = machines
         .rows
         .iter()
         .filter(|(_, r)| r.live())
-        .filter_map(|(pk, r)| {
-            let aliases = r.fields.get("aliases")?.members();
-            (!aliases.is_empty()).then_some((pk, aliases))
-        })
+        .filter_map(|(pk, r)| Some((pk, r.fields.get("aliases")?)))
         .collect();
     for (pk, row) in machines.rows.iter().filter(|(_, r)| r.live()) {
         let Some(label) = text(row, "label") else {
             continue;
         };
         for (other, aliases) in &machine_aliases {
-            if *other != pk && aliases.contains(label) {
+            if *other != pk && aliases.has_member(label) {
                 found.push(Finding {
                     kind: "label-ambiguous",
                     collection: MACHINE.name,

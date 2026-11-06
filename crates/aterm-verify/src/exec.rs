@@ -269,6 +269,42 @@ pub struct Run {
     pub code: Option<i32>,
     /// Set when the child could not be spawned at all (tool vanished mid-run).
     pub spawn_error: Option<String>,
+    /// What its tree used, as its clock read it ([`TreeUsage`]); `None` where no read of its tree
+    /// found a member (a host with no reading: every platform but macOS; a child that never
+    /// started), never zeros.
+    pub usage: Option<TreeUsage>,
+}
+
+/// WHAT A CHILD'S TREE USED (`docs/DESIGN-fast-build-release-2026-11-05.md` §4.1, A1), as its
+/// clock read its process group ([`Host::group_usage`]): on exactly the reads that book its
+/// stage's meter ([`crate::memory::Meter::book`]: the clock's reads and the sweep's read of its
+/// ended leader), booked into a meter of its own as well, so the CPU of a stage's children sums
+/// to the stage's observed CPU ([`crate::memory::Meter::observed_cpu`]), apart from what the
+/// output children of a walk the stage runs ([`bounded`]) book into its meter, which no run
+/// carries, and from an incarnation two children's reads both find, which each of them counts.
+/// A lower bound, as the stage's is: a member that ends between two reads takes what it used
+/// since the read before with it, and a descendant that leaves the group (`setsid`, `setpgid`)
+/// is never read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeUsage {
+    /// CPU time: each process incarnation read (by pid and start) at the most its counter was
+    /// read at, summed.
+    pub cpu: Duration,
+    /// Time runnable, on a core or waiting for one, read and summed as `cpu` is.
+    pub runnable: Duration,
+    /// The part of its work its tree spent waiting for a core, which its ceiling left out
+    /// ([`core_wait`]).
+    pub starved: Duration,
+    /// The time a wait of its tree for admission or a lock was marked
+    /// ([`aterm_toolchain::waits`]), which its ceiling left out too.
+    pub waited: Duration,
+    /// From its spawn to its end.
+    pub wall: Duration,
+    /// The most its tree held at one read, footprint bytes, and never less than the largest
+    /// lifetime peak a read found ([`crate::memory::Meter::peak`]).
+    pub peak_bytes: u64,
+    /// The process incarnations read.
+    pub processes: usize,
 }
 
 /// The OS's own sentence for ENOSPC.
@@ -318,6 +354,9 @@ pub enum Unfinished {
     TimedOut(Duration),
     /// It panicked (the panic printed on stderr).
     Panicked,
+    /// The run's end left it unfinished: these words, the halt's once its first proven red ended
+    /// the run ([`halted`]), else an interrupt's. The walk's thread is left to the process's exit.
+    Stopped(&'static str),
 }
 
 impl Unfinished {
@@ -327,28 +366,50 @@ impl Unfinished {
         match self {
             Self::TimedOut(d) => format!("did not finish within the {}s ceiling", d.as_secs()),
             Self::Panicked => "panicked (above, on stderr)".to_string(),
+            Self::Stopped(why) => format!("was left unfinished: {why}"),
         }
     }
 }
+
+/// How often a wait for an in-process walk ([`bounded`]) looks whether the run is ending.
+const WALK_LOOK: Duration = Duration::from_millis(50);
 
 /// Run an in-process walk on a thread of its own under the child ceiling, on the wall clock: no
 /// walk waits for admission or a lock. Each child the walk starts books into the meter of the
 /// stage that called this ([`crate::memory::current`]), on the walk's thread or through the
 /// output executor it installs. Its quiet reservation, when the calling stage has one, stays
 /// held until the worker actually ends even if the ceiling returns first. The actual stage
-/// memory reservation is shared across the same handoff; a cover marker alone cannot hold it.
+/// memory reservation is shared across the same handoff; a cover marker alone cannot hold it. The
+/// run's end does not wait for it: once a halt or an interrupt is ending the run ([`ending`]), the
+/// wait gives up within [`WALK_LOOK`], closing the walk's command scope so it starts no child.
 /// # Errors
-/// [`Unfinished`]: the walk timed out or panicked.
+/// [`Unfinished`]: the walk timed out, panicked, or was left to the run's end.
 pub fn bounded<T: Send + 'static>(
     ceiling: Option<Duration>,
     walk: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Unfinished> {
-    bounded_wait(walk, |rx| match ceiling {
-        Some(limit) => rx.recv_timeout(limit).map_err(|e| match e {
-            std::sync::mpsc::RecvTimeoutError::Timeout => Unfinished::TimedOut(limit),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => Unfinished::Panicked,
-        }),
-        None => rx.recv().map_err(|_| Unfinished::Panicked),
+    bounded_wait(walk, |rx| {
+        let started = Instant::now();
+        loop {
+            let left = ceiling.map(|limit| limit.saturating_sub(started.elapsed()));
+            match rx.recv_timeout(left.map_or(WALK_LOOK, |left| left.min(WALK_LOOK))) {
+                Ok(answer) => return Ok(answer),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Unfinished::Panicked);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if ending() {
+                return Err(Unfinished::Stopped(
+                    halted().unwrap_or("the run was interrupted while it ran"),
+                ));
+            }
+            if let (Some(limit), Some(left)) = (ceiling, left)
+                && left <= WALK_LOOK
+            {
+                return Err(Unfinished::TimedOut(limit));
+            }
+        }
     })
 }
 
@@ -778,6 +839,52 @@ struct Usage<'a> {
     span: CoreWaitSpan,
 }
 
+/// A CHILD'S OWN METER ([`TreeUsage`]): every read its clock and its sweep make of its tree, booked
+/// as its stage's meter books them ([`crate::memory::Meter::book`]), and each incarnation's most
+/// runnable time beside them.
+#[derive(Debug, Default)]
+struct Own {
+    meter: crate::memory::Meter,
+    /// The most runnable time each process incarnation, by pid and start, was read at.
+    runnable: std::sync::Mutex<BTreeMap<(u32, u64), u64>>,
+}
+
+impl Own {
+    /// Book a read of the process group `pgid`, whose members are `members`.
+    fn book(&self, pgid: u32, members: &[aterm_sysprobe::MemberUsage]) {
+        self.meter.book(pgid, members);
+        let mut runnable = self
+            .runnable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for m in members {
+            let most = runnable.entry((m.pid, m.start)).or_default();
+            *most = (*most).max(m.runnable_ns);
+        }
+    }
+
+    /// What the child used, its clock `clock` and its wall `wall`; `None` when no read booked a
+    /// member of its tree.
+    fn usage(&self, clock: &Clock<'_>, wall: Duration) -> Option<TreeUsage> {
+        let cpu = self.meter.observed_cpu()?;
+        let runnable = self
+            .runnable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .fold(0_u64, |sum, ns| sum.saturating_add(*ns));
+        Some(TreeUsage {
+            cpu: Duration::from_nanos(cpu.nanoseconds),
+            runnable: Duration::from_nanos(runnable),
+            starved: clock.starved,
+            waited: clock.waited,
+            wall,
+            peak_bytes: self.meter.peak().unwrap_or(0),
+            processes: cpu.processes,
+        })
+    }
+}
+
 /// A child's clock (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT): the time it
 /// worked, which its ceiling bounds, apart from the time a wait of its tree for admission or a
 /// lock was marked in `marks` ([`aterm_toolchain::waits`]), which only its holders bound, and the
@@ -788,8 +895,9 @@ struct Usage<'a> {
 /// left alone (CW-WAIT-UNBOUNDED). Each span counts as the last look found it; a read of the tree
 /// then moves from its work to [`Clock::starved`] what the reads of the last [`CORE_WAIT_SPAN`]
 /// show it waited for a core and have not moved yet ([`CoreWaitSpan::book`]). Each read also
-/// books the tree's footprint into its stage's memory meter (VERIFY-MEM, [`crate::memory`]), and
-/// the clock's end takes the tree out of it.
+/// books the tree's footprint into its stage's memory meter (VERIFY-MEM, [`crate::memory`]) and
+/// into the child's own ([`Own`], [`TreeUsage`]), and the clock's end takes the tree out of its
+/// stage's.
 struct Clock<'a> {
     marks: Option<&'a Path>,
     last: Instant,
@@ -806,6 +914,9 @@ struct Clock<'a> {
     waits_before: Vec<aterm_toolchain::waits::Waiting>,
     /// `None` once its host has no reading of the tree: every span with no marked wait is work.
     usage: Option<Usage<'a>>,
+    /// The child's own meter, which each read that books its stage's meter books too
+    /// ([`TreeUsage`]); `None` for a clock that keeps no account of its child.
+    own: Option<&'a Own>,
     /// The stage meter its reads of the tree book into, and the tree's process group.
     meter: Option<(Arc<crate::memory::Meter>, u32)>,
     /// When the child began, and when its first [`READ_USAGE_EVERY`]'s reads for its meter last
@@ -837,6 +948,7 @@ impl<'a> Clock<'a> {
             starved: Duration::ZERO,
             waits: Vec::new(),
             waits_before: Vec::new(),
+            own: None,
             usage: Some(Usage {
                 host,
                 pgid,
@@ -850,19 +962,36 @@ impl<'a> Clock<'a> {
         }
     }
 
+    /// This clock books its reads into `own` as well ([`Clock::own`]).
+    fn owning(mut self, own: &'a Own) -> Clock<'a> {
+        self.own = Some(own);
+        self
+    }
+
+    /// Book a read of the tree's members into its stage's meter and its own, where it has them.
+    fn book(&self, members: &[aterm_sysprobe::MemberUsage]) {
+        if let Some((meter, pgid)) = &self.meter {
+            meter.book(*pgid, members);
+        }
+        if let (Some(own), Some(u)) = (self.own, &self.usage) {
+            own.book(u.pgid, members);
+        }
+    }
+
     /// Count the span since the last tick, then look again once [`LOOK_EVERY`] has passed, and
     /// read the tree once [`READ_USAGE_EVERY`] has; through the first of those, read it for its
-    /// stage's meter alone as often as [`meter_due`] says.
+    /// meters alone (its stage's, its own) as often as [`meter_due`] says.
     fn tick(&mut self) {
         let now = Instant::now();
         if now.saturating_duration_since(self.begun) < READ_USAGE_EVERY
             && meter_due(self.begun, self.metered_at, now)
         {
             self.metered_at = Some(now);
-            if let (Some((meter, pgid)), Some(u)) = (&self.meter, &self.usage)
-                && let Some(members) = u.host.group_usage(*pgid)
+            if (self.meter.is_some() || self.own.is_some())
+                && let Some(u) = &self.usage
+                && let Some(members) = u.host.group_usage(u.pgid)
             {
-                meter.book(*pgid, &members);
+                self.book(&members);
             }
         }
         let span = now.saturating_duration_since(self.last);
@@ -891,8 +1020,9 @@ impl<'a> Clock<'a> {
     }
 
     /// Read what the tree used since the last read, book what it holds into its stage's meter
-    /// ([`crate::memory::Meter::book`]), and move to [`Clock::starved`] the part of its work that
-    /// the reads of its span show it spent waiting for a core and have not moved yet
+    /// ([`crate::memory::Meter::book`]) and its own ([`Clock::own`]), and move to
+    /// [`Clock::starved`] the part of its work that the reads of its span show it spent waiting
+    /// for a core and have not moved yet
     /// ([`CoreWaitSpan::book`]), unless it has made no progress for [`NO_PROGRESS_HANG`]: then the
     /// span is forgotten and nothing moves. A host with no reading ends the reads.
     fn read_usage(&mut self) {
@@ -909,6 +1039,9 @@ impl<'a> Clock<'a> {
         };
         if let Some((meter, pgid)) = &self.meter {
             meter.book(*pgid, &members);
+        }
+        if let Some(own) = self.own {
+            own.book(u.pgid, &members);
         }
         let (used, seen) = used_between(&u.seen, members);
         u.seen = seen;
@@ -1003,6 +1136,9 @@ impl<'a> Clock<'a> {
     /// Why a child the run's end ended decided nothing: what it waited for, holder named, when
     /// the last look found it waiting ([`Clock::look`]).
     fn ended(&self) -> String {
+        if let Some(words) = halted() {
+            return words.to_owned();
+        }
         if self.waits.is_empty() {
             return "the run was interrupted while this child ran".to_string();
         }
@@ -1062,8 +1198,19 @@ const STUCK_GRACE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const STUCK_GRACE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// The words of the halt that ended the run at its first proven red (`group::halt`), which
+/// every child it ended or kept from starting says in place of an interrupt's; none while no halt
+/// has, and never off Unix, where no group is ended.
+pub(crate) fn halted() -> Option<&'static str> {
+    #[cfg(unix)]
+    let halted = group::halted();
+    #[cfg(not(unix))]
+    let halted = None;
+    halted
+}
+
 /// Whether the run must end now: an interrupt is ending it.
-fn ending() -> bool {
+pub(crate) fn ending() -> bool {
     #[cfg(unix)]
     let stopping = group::stopping();
     #[cfg(not(unix))]
@@ -1075,7 +1222,7 @@ fn ending() -> bool {
 /// end every test's children. It marks the run ending, as the handler does first; the test then
 /// sends its child the handler's `SIGTERM` itself.
 #[cfg(test)]
-mod ends {
+pub(crate) mod ends {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1087,7 +1234,7 @@ mod ends {
     }
 
     /// End this thread's run once `flag` is set, setting `seen` once its clock finds a wait.
-    pub(super) fn when(flag: Arc<AtomicBool>, seen: Arc<AtomicBool>) {
+    pub(crate) fn when(flag: Arc<AtomicBool>, seen: Arc<AtomicBool>) {
         END.with(|e| *e.borrow_mut() = Some((flag, seen)));
     }
 
@@ -1205,14 +1352,17 @@ fn finish(
             String::from_utf8_lossy(&crate::read_captured(p).unwrap_or_default()).into_owned()
         })
     };
+    let own = Own::default();
     #[cfg(unix)]
     let sweep = |pgid: u32| {
-        // The unreaped leader still has its final counters. Descendants which
-        // exited between earlier samples remain absent from this lower bound.
-        if let Some(meter) = crate::memory::current()
-            && let Some(members) = env.host.group_usage(pgid)
-        {
-            meter.book(pgid, &members);
+        // The unreaped leader still has its final counters, booked into the stage's meter and
+        // the child's own alike. Descendants which exited between earlier samples remain absent
+        // from this lower bound.
+        if let Some(members) = env.host.group_usage(pgid) {
+            if let Some(meter) = crate::memory::current() {
+                meter.book(pgid, &members);
+            }
+            own.book(pgid, &members);
         }
         if let Some(groups) = stage_groups {
             groups.group_ended(pgid, label);
@@ -1229,7 +1379,7 @@ fn finish(
     #[cfg(unix)]
     if group::stopping() {
         return (
-            failed_to_wait("the run was interrupted before this child started"),
+            failed_to_wait(halted().unwrap_or("the run was interrupted before this child started")),
             read_log(log),
         );
     }
@@ -1238,7 +1388,7 @@ fn finish(
     #[cfg(unix)]
     if group::stopping() {
         return (
-            failed_to_wait("the run was interrupted before this child started"),
+            failed_to_wait(halted().unwrap_or("the run was interrupted before this child started")),
             read_log(log),
         );
     }
@@ -1260,7 +1410,11 @@ fn finish(
         .as_ref()
         .and_then(|_| log.and_then(|path| test_progress::Progress::open(path).ok()));
     let begun = Instant::now();
-    let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current());
+    let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current()).owning(&own);
+    let used = |run: Run, clock: &Clock<'_>| Run {
+        usage: own.usage(clock, begun.elapsed()),
+        ..run
+    };
     let mut told = false;
     let mut nap = Duration::from_millis(1);
     loop {
@@ -1288,14 +1442,16 @@ fn finish(
                 if let Some(line) = clock.starved_line() {
                     eprintln!("verify: {label}: {line}");
                 }
-                return (reaped(Ok(st)), read_log(log));
+                return (used(reaped(Ok(st)), &clock), read_log(log));
             }
             Ok(None) => {}
             Err(_) if ending() => {
                 clock.look();
-                return (failed_to_wait(&clock.ended()), read_log(log));
+                return (used(failed_to_wait(&clock.ended()), &clock), read_log(log));
             }
-            Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
+            Err(e) => {
+                return (used(failed_to_wait(&e.to_string()), &clock), read_log(log));
+            }
         }
         clock.tick();
         if ending() {
@@ -1320,12 +1476,16 @@ fn finish(
                 Some(cmd.term_grace.unwrap_or(STUCK_GRACE)),
             );
             return (
-                Run {
-                    ok: false,
-                    output: killed,
-                    code: None,
-                    spawn_error: Some(why),
-                },
+                used(
+                    Run {
+                        ok: false,
+                        output: killed,
+                        code: None,
+                        spawn_error: Some(why),
+                        usage: None,
+                    },
+                    &clock,
+                ),
                 read_log(log),
             );
         } else if let Some(limit) = ceiling
@@ -1337,7 +1497,10 @@ fn finish(
                 &mut live,
                 cmd.term_grace,
             );
-            return (over_ceiling(cmd, &clock, limit, &killed), read_log(log));
+            return (
+                used(over_ceiling(cmd, &clock, limit, &killed), &clock),
+                read_log(log),
+            );
         }
         std::thread::sleep(nap);
         nap = (nap * 2).min(Duration::from_millis(25));
@@ -1408,6 +1571,7 @@ fn over_ceiling(cmd: &Cmd, clock: &Clock<'_>, limit: Duration, kill: &str) -> Ru
         ),
         code: None,
         spawn_error: None,
+        usage: None,
     }
 }
 
@@ -1495,6 +1659,9 @@ pub mod group {
     static STOPPING: AtomicBool = AtomicBool::new(false);
     /// Set when a wait for capacity took the interrupt and [`stop_run`] ends the run.
     static WAIT_STOPPED: AtomicBool = AtomicBool::new(false);
+    /// Set when the run's first proven red ends it ([`halt`]) before any interrupt did: an
+    /// interrupt after it is the run's first, which it reports before it dies of.
+    static HALTING: AtomicBool = AtomicBool::new(false);
     static SPAWNING: AtomicUsize = AtomicUsize::new(0);
     /// The interrupt the run dies of once it has reported ([`end_interrupted`]), set by the
     /// handler once every stage group is ended; 0 while there is none.
@@ -1599,7 +1766,7 @@ pub mod group {
             if super::ending() {
                 let _ = self.kill();
                 return Err(std::io::Error::other(
-                    "the run was interrupted while this child ran",
+                    halted().unwrap_or("the run was interrupted while this child ran"),
                 ));
             }
             self.group = None;
@@ -1906,6 +2073,11 @@ pub mod group {
                     reraise(sig);
                 }
             }
+            if HALTING.load(Ordering::SeqCst) {
+                // A halt is ending the run and has ended its groups ([`halt`]): this is the run's
+                // first interrupt, so it reports, then dies of it.
+                die_after_report(sig);
+            }
             return;
         }
         HANDLING.store(true, Ordering::SeqCst);
@@ -1926,8 +2098,13 @@ pub mod group {
             }
         }
         sweep(SIGKILL);
-        // The run reports what it has, then dies of `sig` ([`end_interrupted`]); its watchdog
-        // re-raises it past [`REPORT_GRACE`] if it has not. Without a watchdog, at once.
+        die_after_report(sig);
+    }
+
+    /// The run reports what it has, then dies of `sig` ([`end_interrupted`]); its watchdog
+    /// re-raises it past [`REPORT_GRACE`] if it has not. Without a watchdog, at once. Called from
+    /// the handler: async-signal-safe.
+    fn die_after_report(sig: i32) {
         PENDING.store(sig, Ordering::SeqCst);
         let fd = WATCHDOG.load(Ordering::SeqCst);
         let byte = u8::try_from(sig).unwrap_or(u8::MAX);
@@ -2011,6 +2188,29 @@ pub mod group {
         }
     }
 
+    /// The words of the halt that ended the run ([`halt`]); none while no halt has.
+    static HALTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    /// End the run at its first proven red (`crate::sched::Halt`, design §4.3 A3), as [`stop_run`]
+    /// does: no stage child starts after this, and every live one's group is ended (SIGTERM, a
+    /// grace, then SIGKILL). Each child it ends or keeps from starting says `words` ([`halted`])
+    /// and reads as stopped, not as a finding, so its row is NOT RUN; a run an interrupt already
+    /// ends keeps the interrupt's words. An interrupt after it is the run's first: the run reports,
+    /// then dies of it. Returns once every live group has left or the grace is spent.
+    pub fn halt(words: &str) {
+        if !stopping() {
+            let _ = HALTED.set(words.to_owned());
+            HALTING.store(true, Ordering::SeqCst);
+        }
+        end_groups();
+    }
+
+    /// The words of the halt that ended the run ([`halt`]), if one did.
+    #[must_use]
+    pub fn halted() -> Option<&'static str> {
+        HALTED.get().map(String::as_str)
+    }
+
     /// End the run as [`kill_on_interrupt`]'s handler would, but without dying of it: a wait for
     /// capacity took the interrupt (`aterm_toolchain::interrupt`) and named what it waited for.
     /// No stage child starts after this, every live one's group is ended (SIGTERM, a grace, then
@@ -2019,6 +2219,12 @@ pub mod group {
     /// ends it at once.
     pub fn stop_run() {
         WAIT_STOPPED.store(true, Ordering::SeqCst);
+        end_groups();
+    }
+
+    /// Mark the run ending ([`stopping`]) and end every live stage group: SIGTERM, a grace, then
+    /// SIGKILL. Returns at once when the run was already ending.
+    fn end_groups() {
         if STOPPING.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -2051,6 +2257,12 @@ pub mod group {
         }
     }
 
+    /// The interrupt the run will die of once it has reported; 0 while there is none.
+    #[cfg(test)]
+    pub(crate) fn pending() -> i32 {
+        PENDING.load(Ordering::SeqCst)
+    }
+
     /// How many stage groups are listed now.
     #[cfg(test)]
     pub(crate) fn live_count() -> usize {
@@ -2067,6 +2279,7 @@ fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
             output: ended_by_signal(st),
             code: st.code(),
             spawn_error: None,
+            usage: None,
         },
         Err(e) => failed_to_wait(&e.to_string()),
     }
@@ -2097,6 +2310,7 @@ fn failed_to_wait(why: &str) -> Run {
         output: String::new(),
         code: None,
         spawn_error: Some(why.to_string()),
+        usage: None,
     }
 }
 
@@ -2106,6 +2320,7 @@ fn spawn_failure(cmd: &Cmd, why: &str) -> Run {
         output: format!("aterm-verify: cannot run {}: {why}", cmd.program.display()),
         code: None,
         spawn_error: Some(why.to_string()),
+        usage: None,
     }
 }
 
@@ -2763,6 +2978,7 @@ mod tests {
                 output: String::new(),
                 code: None,
                 spawn_error: None,
+                usage: None,
             });
             if cfg!(any(target_vendor = "apple", target_os = "linux")) {
                 assert!(record.is_some(), "the stand-in keeps a record");
@@ -3614,6 +3830,116 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A host whose every read of a group finds one member, the group's leader, whose counters
+    /// have grown by 1 ms of CPU, 2 ms runnable and 1 MiB held at each read so far, whatever
+    /// the group: how many reads a child gets is the clock's affair, and its last is its most.
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    struct Counting {
+        reads: AtomicU64,
+    }
+
+    #[cfg(unix)]
+    impl Host for Counting {
+        fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+            let n = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(vec![aterm_sysprobe::MemberUsage {
+                pid: pgid,
+                start: 1,
+                cpu_ns: n * 1_000_000,
+                runnable_ns: n * 2_000_000,
+                footprint: n << 20,
+                peak_footprint: n << 20,
+                ..aterm_sysprobe::MemberUsage::default()
+            }])
+        }
+
+        fn idle(&self) -> Option<Duration> {
+            None
+        }
+
+        fn cores(&self) -> u32 {
+            1
+        }
+    }
+
+    /// A STAGE'S CHILDREN SUM TO THEIR STAGE (A1): two children run one after the other under one
+    /// stage's meter each return the use their own reads found, booked on exactly the reads that
+    /// book the stage (the clock's, then the sweep's of the ended leader, the last and most), so
+    /// their CPU sums to the stage's observed CPU to the nanosecond, whatever number of reads each
+    /// got. Each child's CPU is its last read's, its runnable time twice that, its peak that
+    /// read's footprint. NEGATIVE CONTROL: a sweep that books the stage's meter and not the
+    /// child's own leaves each child its second-to-last read, and the sum falls short by 2 ms.
+    #[cfg(unix)]
+    #[test]
+    fn a_stages_children_sum_to_their_stage() {
+        let tmp = crate::mktemp_dir("atv-usage-sum").expect("mktemp");
+        let host: &'static Counting = Box::leak(Box::default());
+        let stage = crate::memory::Meter::new();
+        let _metering = crate::memory::metering(Some(Arc::clone(&stage)));
+        let env = ExecEnv {
+            host,
+            ..env_in(&tmp)
+        };
+        let child = || {
+            let out = run(&Cmd::new("/bin/sh").args(["-c", "exit 0"]), env);
+            assert!(out.ok, "{out:?}");
+            (
+                out.usage.expect("its tree was read"),
+                host.reads.load(Ordering::SeqCst),
+            )
+        };
+        let (a, after_a) = child();
+        let (b, after_b) = child();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            a.cpu,
+            ms(after_a),
+            "the first child's last read is its most"
+        );
+        assert_eq!(b.cpu, ms(after_b), "{b:?}");
+        assert_eq!(
+            (a.runnable, a.peak_bytes, a.processes),
+            (ms(2 * after_a), after_a << 20, 1)
+        );
+        let observed = stage.observed_cpu().expect("the stage was read");
+        assert_eq!(
+            a.cpu + b.cpu,
+            Duration::from_nanos(observed.nanoseconds),
+            "the children sum to their stage"
+        );
+        assert_eq!(a.processes + b.processes, observed.processes);
+        assert!(a.wall > Duration::ZERO && b.wall > Duration::ZERO);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A host with no reading of a child's tree (every platform but macOS) gives its run no
+    /// usage, never zeros; nor does a child that never started. NEGATIVE CONTROL: the same child
+    /// on a host that reads its tree has usage.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_with_no_reading_gives_a_run_no_usage() {
+        let tmp = crate::mktemp_dir("atv-usage-none").expect("mktemp");
+        let child = Cmd::new("/bin/sh").args(["-c", "exit 3"]);
+        let out = run(&child, env_in(&tmp));
+        assert_eq!((out.ok, out.code, out.usage), (false, Some(3), None));
+        let missing = run(&Cmd::new("/no/such/tool"), env_in(&tmp));
+        assert!(missing.spawn_error.is_some() && missing.usage.is_none());
+        let host: &'static Counting = Box::leak(Box::default());
+        let read = run(
+            &child,
+            ExecEnv {
+                host,
+                ..env_in(&tmp)
+            },
+        );
+        assert!(
+            read.usage.is_some_and(|u| u.cpu > Duration::ZERO),
+            "{read:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// A stage child that writes its pid to `pidfile` (its shell leads its group), then runs
     /// `then`.
     #[cfg(unix)]
@@ -3700,6 +4026,11 @@ mod tests {
             );
             assert!(!out.ok && out.code.is_none(), "{how}: {out:?}");
             assert!(
+                out.usage.is_some_and(|u| u.starved > Duration::ZERO),
+                "{how}: its usage names the wait for a core: {:?}",
+                out.usage
+            );
+            assert!(
                 out.output.contains(crate::findings::CEILING_KILL)
                     && out.output.contains("of work, over the 3.0s ceiling")
                     && out
@@ -3718,7 +4049,8 @@ mod tests {
         );
         assert!(
             out.output.contains("of work, over the 3.0s ceiling")
-                && !out.output.contains("for a core"),
+                && !out.output.contains("for a core")
+                && out.usage.is_none(),
             "{}",
             out.output
         );

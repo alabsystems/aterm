@@ -28,9 +28,9 @@ pub fn disk_size(bytes: u64, rotational: bool) -> String {
         return (*sold).to_owned();
     }
     if bytes < 999_500_000_000 {
-        return format!("{}GB", (bytes + 500_000_000) / 1_000_000_000);
+        return format!("{}GB", rounded(bytes, 1_000_000_000));
     }
-    let tenths = (bytes + 50_000_000_000) / 100_000_000_000;
+    let tenths = rounded(bytes, 100_000_000_000);
     if tenths.is_multiple_of(10) {
         format!("{}TB", tenths / 10)
     } else {
@@ -41,8 +41,13 @@ pub fn disk_size(bytes: u64, rotational: bool) -> String {
 /// Memory as Apple sells it: whole gibibytes, written `GB` (`hw.memsize` 34359738368 is `32GB`).
 #[must_use]
 pub fn memory_size(bytes: u64) -> String {
-    const GIB: u64 = 1 << 30;
-    format!("{}GB", (bytes + GIB / 2) / GIB)
+    format!("{}GB", rounded(bytes, 1 << 30))
+}
+
+/// `bytes` in whole `unit`s (an even number), half a unit rounding up, for every `bytes`: no
+/// half unit is added first, which a reading near `u64::MAX` has no room for.
+fn rounded(bytes: u64, unit: u64) -> u64 {
+    bytes / unit + u64::from(bytes % unit >= unit / 2)
 }
 
 /// `text` as macOS turns a Computer Name into a Local hostname.
@@ -75,4 +80,25 @@ pub fn label_form_keeping(text: &str, keep: &str) -> String {
         }
     }
     out.trim_end_matches('-').to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{disk_size, memory_size};
+
+    /// The largest reading names the top size, half units rounding up as for every other.
+    /// NEGATIVE CONTROL: the readings either side of a half unit round down and up.
+    #[test]
+    fn a_reading_near_the_top_of_u64_rounds_without_overflow() {
+        assert_eq!(memory_size(u64::MAX), "17179869184GB");
+        assert_eq!(disk_size(u64::MAX, true), "18446744.1TB");
+        assert_eq!(disk_size(u64::MAX, false), "18446744.1TB");
+        const GIB: u64 = 1 << 30;
+        assert_eq!(memory_size(32 * GIB + GIB / 2 - 1), "32GB");
+        assert_eq!(memory_size(32 * GIB + GIB / 2), "33GB");
+        assert_eq!(disk_size(1_049_999_999_999, true), "1TB");
+        assert_eq!(disk_size(1_050_000_000_000, true), "1.1TB");
+        assert_eq!(disk_size(499_499_999_999, true), "499GB");
+        assert_eq!(disk_size(499_500_000_000, true), "500GB");
+    }
 }

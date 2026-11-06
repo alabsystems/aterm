@@ -682,6 +682,14 @@ fn nullable_native_results_write_null_or_an_owned_interface_and_reject_null_slot
             ),
             E_POINTER
         );
+        let attr = range_vt(&range).GetAttributeValue;
+        assert_eq!(
+            attr(range.as_raw(), UIA_IsReadOnlyAttributeId, ptr::null_mut()),
+            E_POINTER
+        );
+        let mut attr_val = VARIANT::default();
+        assert_eq!(attr(range.as_raw(), 0, &mut attr_val), 0);
+        VariantClear(&mut attr_val);
     }
 }
 

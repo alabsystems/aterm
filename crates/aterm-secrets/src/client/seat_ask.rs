@@ -17,6 +17,12 @@
 //! spacing (one ask per round at most, then pauses up to 15 minutes), and under the same home-LAN
 //! rule at the desk (`client::readmit`). Nothing new is minted, nothing rotates, and a lab
 //! identity never asks. Once seated, the ask stops at the next round.
+//!
+//! One that no member seated drops at the next rotation (S1's decision (b)): its sync opens no
+//! locker ([`Stored::Revoked`]), as a removed Mac's does, but no act it can read took it out.
+//! [`seat`] judges such a Mac's log too and reads it [`Seat::Out`], and `aterm secrets status`
+//! says it was dropped, not revoked ([`dropped`], [`out_words`]): only a `Remove` revokes
+//! (one-mesh E2).
 
 use super::*;
 use crate::membership_log::{EpochAudience, Log};
@@ -33,7 +39,9 @@ pub enum Seat {
     /// recipient, or no newest epoch wraps it: no seat comes by asking, and none is asked for.
     Out,
     /// Nothing to judge by: no vault, a vault whose locker never opened here, no trusted log
-    /// (a Mac on F10's envelope alone), or local state that cannot be read.
+    /// (a Mac on F10's envelope alone), or local state that cannot be read. A Mac its vault let
+    /// go (`Membership::Revoked`) whose log still seats or wraps it reads unjudged too: it waits
+    /// on a heal or a sync, and only [`Seat::Out`] is read for it.
     Unjudged,
 }
 
@@ -51,19 +59,46 @@ pub fn seat(paths: &Paths) -> Seat {
 }
 
 fn seat_read(paths: &Paths) -> crate::Result<Seat> {
+    Ok(
+        judged_by(paths)?.map_or(Seat::Unjudged, |(membership, log, recipient)| {
+            match (membership, judge(&log, &recipient)) {
+                // A Mac its vault let go whose log still seats or wraps it waits on a heal or a
+                // sync: only `Out` is read for it, so a person's join takes the path it took
+                // before E2.
+                (Stored::Revoked, Seat::Seated | Seat::Seatless) => Seat::Unjudged,
+                (_, seat) => seat,
+            }
+        }),
+    )
+}
+
+/// What a [`Seat`] is judged by: the vault's stored membership, the trusted log this Mac holds,
+/// and its own recipient.
+type JudgedBy = (Stored, Log, crate::age::Recipient);
+
+/// [`JudgedBy`] for a Mac whose locker opened here, in ([`Stored::In`]) or let go since
+/// ([`Stored::Revoked`]); `None` where nothing judges ([`Seat::Unjudged`]): no vault, a locker
+/// that never opened here, no identity, or no trusted log.
+fn judged_by(paths: &Paths) -> crate::Result<Option<JudgedBy>> {
     let Some(config) = config(paths)? else {
-        return Ok(Seat::Unjudged);
+        return Ok(None);
     };
-    if load_state(paths)?.membership != Stored::In {
-        return Ok(Seat::Unjudged);
+    let membership = load_state(paths)?.membership;
+    let opened_here = match membership {
+        Stored::In => true,
+        Stored::Revoked => !revoked_unjudged(),
+        Stored::None | Stored::Pending | Stored::Plain => false,
+    };
+    if !opened_here {
+        return Ok(None);
     }
     let Some(identity) = read_identity(paths)? else {
-        return Ok(Seat::Unjudged);
+        return Ok(None);
     };
     let Some(configured) = log_entries::trusted_configured_log(paths, &config)? else {
-        return Ok(Seat::Unjudged);
+        return Ok(None);
     };
-    Ok(judge(&configured.log, &identity.recipient()))
+    Ok(Some((membership, configured.log, identity.recipient())))
 }
 
 /// What `log` says of the Mac whose recipient is `recipient` ([`Seat`]).
@@ -89,6 +124,86 @@ pub(super) fn judge(log: &Log, recipient: &crate::age::Recipient) -> Seat {
     Seat::Seatless
 }
 
+/// Whether `log` names an act that took `recipient` out: a `Remove` (or quorum `Remove`) of a
+/// seat that holds it, a node removal of its newest seat or of the founder entry that lists it,
+/// or a seat move that superseded the seat holding it with no newer holder
+/// ([`Log::recipient_is_removed`]; `log_entries::recipient_denied_by_roster_or_log` with no
+/// roster). These are the acts a sync reads before a rotation's omission
+/// (`log_entries::configured_entries`).
+fn removed_by_an_act(log: &Log, recipient: &crate::age::Recipient) -> bool {
+    log.recipient_is_removed(recipient)
+        || log_entries::recipient_denied_by_roster_or_log(None, log, recipient)
+}
+
+/// Whether this Mac's vault let it go with no act against it that it can read (one-mesh E2): its
+/// sync opened no locker here ([`Stored::Revoked`]), the log it holds reads it [`Seat::Out`], a
+/// newest `[everyone]` epoch left its recipient out ([`Log::audience_left_out_recipient`]), and
+/// that log names no act that took it out (`removed_by_an_act`). A rotation, whose carry is the
+/// current seats, left out a recipient no seat bound: a founder that never took its seat, or a
+/// Mac let in through the envelope alone (S1's decision (b)). A desk that read that rotation
+/// refuses that key, so it comes back as a new Mac, its vault folder set aside; but a seat a
+/// member signed for it before reading the rotation, which this Mac has not read yet, reaches it
+/// later, and M5's gap heal then wraps it the newest epoch and it reads in again by itself. A
+/// roster deny that an admin's revoke of such a Mac writes is sealed to the audience that left it
+/// out, so this Mac cannot read it and reads itself dropped. `false` where nothing judges
+/// ([`Seat::Unjudged`]), the Mac is in, or local state cannot be read.
+#[must_use]
+pub fn dropped(paths: &Paths) -> bool {
+    if read_dropped() {
+        return matches!(config(paths), Ok(Some(_)))
+            && load_state(paths).is_ok_and(|state| state.membership == Stored::Revoked);
+    }
+    judged_by(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|(membership, log, recipient)| {
+            membership == Stored::Revoked
+                && judge(&log, &recipient) == Seat::Out
+                && log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+                && !removed_by_an_act(&log, &recipient)
+        })
+}
+
+/// What `aterm secrets status` says of a Mac its vault let go (`Membership::Revoked` at `seq`,
+/// the newest version it read while out, 0 for one that read only the log, so no version that
+/// let it go): dropped where no act it can read took it out ([`dropped_words`]), revoked
+/// otherwise.
+#[must_use]
+pub fn out_words(paths: &Paths, seq: u64) -> String {
+    dropped_words(paths, seq).unwrap_or_else(|| format!("revoked{}", out_since(seq)))
+}
+
+/// [`out_words`] of a Mac [`dropped`] reads dropped, from one read of its log, and the way back:
+/// set its vault folder, which holds its identity, aside, and it comes back as a new Mac. `None`
+/// for any other Mac (one an act took out, one that is in, or local state that cannot be read),
+/// whose surface says its own words. The surfaces that tell a Mac its vault let it go ask this
+/// or [`dropped`] (one-mesh E2): `aterm secrets status`, `aterm members status`, `aterm status`,
+/// the setup's vault item, System State's Secrets row, the fleet sync's peers read, and Network
+/// State's secrets and accounts cards.
+#[must_use]
+pub fn dropped_words(paths: &Paths, seq: u64) -> Option<String> {
+    dropped(paths).then(|| {
+        format!(
+            "dropped: no seat; a rotation left this Mac out with no Remove{}; set the vault \
+             folder ({}) aside to come back as a new Mac",
+            out_since(seq),
+            paths.dir.display()
+        )
+    })
+}
+
+/// How a status line dates a Mac its vault let go at `seq` (`Membership::Revoked`): " (out as of
+/// seq N)", N the newest version it read while out, never the version that let it go; nothing
+/// for 0, a Mac that read only the log.
+#[must_use]
+pub fn out_since(seq: u64) -> String {
+    if seq == 0 {
+        String::new()
+    } else {
+        format!(" (out as of seq {seq})")
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// NEGATIVE CONTROL (one-mesh S1): while set on a thread, [`asks_for_seat`] answers `false`
@@ -106,6 +221,61 @@ fn self_ask_off() -> bool {
         || aterm_types::negative_control::on("no-seat-ask");
     #[cfg(not(any(test, debug_assertions)))]
     false
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// NEGATIVE CONTROL (one-mesh E2, f204): while set on a thread, [`seat`] reads a Mac its
+    /// vault let go ([`Stored::Revoked`]) [`Seat::Unjudged`] and [`dropped`] answers `false`
+    /// there, as before E2, so a recipient a rotation dropped with no `Remove` reads "revoked".
+    /// A whole process (a lab instance) turns it on with the negative control `revoked-unjudged`
+    /// (`aterm_types::negative_control::on`).
+    pub(crate) static REVOKED_UNJUDGED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether this build reads a Mac its vault let go unjudged ([`REVOKED_UNJUDGED`]); never in a
+/// release build.
+fn revoked_unjudged() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    return REVOKED_UNJUDGED.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("revoked-unjudged");
+    #[cfg(not(any(test, debug_assertions)))]
+    false
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// While set on a thread ([`test_read_dropped`]), [`dropped`] answers there for every
+    /// configured Mac its vault let go ([`Stored::Revoked`]) as for one a rotation left out.
+    static READ_DROPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread stands in for the dropped judgment ([`READ_DROPPED`]); never in a
+/// release build.
+fn read_dropped() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    return READ_DROPPED.with(std::cell::Cell::get);
+    #[cfg(not(any(test, debug_assertions)))]
+    false
+}
+
+/// Run `read` with [`dropped`], and so [`dropped_words`] and [`out_words`], reading every
+/// configured Mac its vault let go ([`Stored::Revoked`]) as dropped on this thread, its log
+/// unread: the stand-in another crate's test reads for what its surface says of a dropped Mac,
+/// whose fixture holds no rotation that left it out.
+/// `a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped` holds the judgment
+/// itself to a real rotation. The setting is put back when `read` returns or unwinds.
+#[cfg(any(test, debug_assertions))]
+pub fn test_read_dropped<T>(read: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_DROPPED.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(READ_DROPPED.with(|cell| cell.replace(true)));
+    read()
 }
 
 /// Whether this Mac asks ALab's members for a seat: its vault is the ALab vault at a URL, its

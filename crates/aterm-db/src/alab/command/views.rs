@@ -49,6 +49,7 @@ use crate::{
 };
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub use super::session::Place;
@@ -375,14 +376,16 @@ fn seats(paths: &Paths, view: &att::View, rows: &mut [Value]) -> Result<Vec<Valu
         owned(registry::MAILBOX_OBS.name),
         None,
     );
+    let mut bound_by_machine: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for (uuid, machine) in &lab.bound {
+        bound_by_machine
+            .entry(machine.as_str())
+            .or_default()
+            .push(uuid);
+    }
     for row in rows.iter_mut() {
         let Some(seats) = row.get(MACHINE.prefix).and_then(Value::as_str).map(|pk| {
-            let bound: Vec<&String> = lab
-                .bound
-                .iter()
-                .filter(|(_, machine)| *machine == pk)
-                .map(|(uuid, _)| uuid)
-                .collect();
+            let bound = bound_by_machine.get(pk).map_or(&[][..], Vec::as_slice);
             json!(bound)
         }) else {
             continue;

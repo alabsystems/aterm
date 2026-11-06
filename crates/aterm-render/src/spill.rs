@@ -148,7 +148,8 @@ impl SpillGeom {
             return None;
         }
         // Rows past the frame's foot reach nothing.
-        let mut end = usize::from(ramp.h).min(self.frame_h - y);
+        let row_cap = usize::from(ramp.h).min(self.frame_h - y);
+        let mut end = row_cap;
         let mut top = 0;
         if x >= self.pad && xe <= self.frame_w - self.pad {
             // Inside the grid's columns: only the rows above its top and those
@@ -165,7 +166,8 @@ impl SpillGeom {
         }
         let (mut top, mut end) = (top as u16, end as u16);
         if ramp.joined > 0 {
-            let (j0, j1) = (ramp.join, ramp.join + ramp.joined + 1);
+            // The run widens the span to its rows, but not past the foot.
+            let (j0, j1) = (ramp.join, (ramp.join + ramp.joined + 1).min(row_cap as u16));
             if j0 < end && top < j1 {
                 (top, end) = (top.min(j0), end.max(j1));
             }
@@ -1948,5 +1950,34 @@ mod tests {
         spill.set_include_veils(false);
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 4, "policy flip without veils present is free");
+    }
+
+    /// A ramp whose run crosses the frame's foot keeps only the rows above it: the run widens
+    /// the kept span to its own rows, never past the rows the frame holds.
+    #[test]
+    fn a_run_across_the_frame_foot_keeps_no_row_below_it() {
+        let geom = SpillGeom {
+            pad: 8,
+            pad_top: 8,
+            head: 0,
+            frame_w: 100,
+            frame_h: 50,
+        };
+        let ramp = |y| GlowRamp {
+            x: 0,
+            y,
+            w: 4,
+            h: 6,
+            join: 0,
+            joined: 5,
+            ..GlowRamp::default()
+        };
+        let ends: [GlowEnd; 2] = [1, 1];
+        assert_eq!(geom.band_rows(&ramp(48), &ends), Some((0, 2)));
+        assert_eq!(
+            geom.band_rows(&ramp(10), &ends),
+            Some((0, 6)),
+            "control: inside the frame"
+        );
     }
 }

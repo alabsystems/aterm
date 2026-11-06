@@ -5,8 +5,6 @@
 //! github-auth-door, gh-spawn and agh-fx: GitHub is reached through agh's doors. agh-fx's
 //! third clause keeps every child agh spawns in its child door, `crates/agh/src/fx/child.rs`.
 
-use std::path::Path;
-
 use super::rules::{
     CENSUS_CRATE, ClockShape, PRODUCT, UseLeaf, first_hit, type_alias, use_leaves, use_statements,
 };
@@ -115,8 +113,10 @@ const AGH_CLOCKS: &[(&str, ClockShape, &str)] = &[
 
 const SPAWNERS: &[&str] = &["command(", "Command::new(", "transparent(", "Cmd::new("];
 
-fn shipped_product(file: &SourceFile) -> bool {
-    !file.rel.starts_with(CENSUS_CRATE) && !crate::is_test_file(Path::new(&file.rel))
+/// Is `file` product code outside the census crate, and no test code
+/// ([`super::rules::TestCode::holds`])?
+fn shipped_product(tree: &Tree<'_>, file: &SourceFile) -> bool {
+    !file.rel.starts_with(CENSUS_CRATE) && !tree.corpus.test_code().holds(&file.rel)
 }
 
 fn cap_of(caps: &[(&str, usize)], rel: &str) -> usize {
@@ -168,7 +168,7 @@ fn contains_ignore_case(hay: &str, needle: &str) -> bool {
 
 fn github_auth_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
-        if !shipped_product(file) {
+        if !shipped_product(tree, file) {
             continue;
         }
         if file.rel.starts_with(AGH) {
@@ -246,7 +246,7 @@ fn bearer_clause(file: &SourceFile, out: &mut Vec<Finding>) {
 
 fn gh_spawn(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
-        if !shipped_product(file) || !file.mentions(&["\"gh\"", "/gh\""]) {
+        if !shipped_product(tree, file) || !file.mentions(&["\"gh\"", "/gh\""]) {
             continue;
         }
         let cap = cap_of(GH_SPAWN_CAPS, &file.rel);
@@ -298,7 +298,7 @@ fn spawns_gh(line: &Line<'_>) -> bool {
 
 fn agh_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(&[AGH_SRC]) {
-        if crate::is_test_file(Path::new(&file.rel)) {
+        if tree.corpus.test_code().holds(&file.rel) {
             continue;
         }
         let doors = !file.rel.starts_with(AGH_FX_HOME);

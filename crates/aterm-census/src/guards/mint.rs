@@ -3,8 +3,6 @@
 
 //! launcher-mint: ensures `root_authority` and the `launcher-mint` feature are only used in launcher crates outside tests.
 
-use std::path::Path;
-
 use super::rules::PRODUCT;
 use super::{Bound, Finding, Rule, Tree, has};
 
@@ -32,7 +30,7 @@ pub(super) const LAUNCHER_MINT: Rule = Rule {
 fn launcher_mint(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
         if LAUNCHERS.iter().any(|l| file.rel.starts_with(l))
-            || (crate::is_test_file(Path::new(&file.rel)) && !file.rel.contains("/benches/"))
+            || tree.corpus.test_code().holds(&file.rel)
             || !file.mentions(&[MINT])
         {
             continue;

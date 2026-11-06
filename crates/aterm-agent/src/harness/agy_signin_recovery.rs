@@ -274,15 +274,16 @@ fn decode(
     }))
 }
 
-pub(super) fn run(
+pub(super) fn run_scoped(
     program: &Path,
     state: &Path,
     home: &Path,
     account: &str,
     staging: StagedGoogleLogin<'_>,
     deadline: Instant,
+    work: Option<super::super::account_work::Scope>,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
-    run_with_checked(
+    run_with_journal(
         program,
         state,
         home,
@@ -290,7 +291,18 @@ pub(super) fn run(
         staging,
         deadline,
         |token, expected, wait| super::super::google_profile::read(token, expected, wait).map(drop),
-        run_google_at,
+        |program, state, home, account, staging, deadline| {
+            run_google_at_scoped(
+                program,
+                state,
+                home,
+                account,
+                staging,
+                deadline,
+                work.clone(),
+            )
+        },
+        ("pending-native-google", work.clone()),
     )
 }
 
@@ -320,7 +332,9 @@ fn check_completed(
     path: &Path,
     scope: [u8; 32],
 ) -> Result<(), GoogleLoginError> {
-    result.check_binding()?;
+    // Recording this exact completed native effect is retirement metadata, not
+    // admission of another provider/status/publication operation.
+    result.check_binding_authority()?;
     if checkpoint_scope(
         state,
         result.revision.ok_or(GoogleLoginError::Configuration)?,
@@ -416,6 +430,7 @@ fn direct_with(
                 account: account.into(),
                 revision: registry.binding_revision("agy", account),
                 recovery: None,
+                work: None,
             })
         } else {
             // A direct profile may be in use or deliberately changed. Never copy an
@@ -475,6 +490,7 @@ fn run_with(
     clippy::too_many_arguments,
     reason = "the canonical reader and native runner are independent injected effects of one bounded recovery attempt"
 )]
+#[cfg(test)]
 fn run_with_checked(
     program: &Path,
     state: &Path,
@@ -501,7 +517,7 @@ fn run_with_checked(
         deadline,
         check,
         fresh,
-        "pending-native-google",
+        ("pending-native-google", None),
     )
 }
 
@@ -525,8 +541,20 @@ fn run_with_journal(
         Option<StagedGoogleLogin<'_>>,
         Instant,
     ) -> Result<UnverifiedGoogleGrant, GoogleLoginError>,
-    folder: &'static str,
+    journal_context: (&'static str, Option<super::super::account_work::Scope>),
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
+    let (folder, work) = journal_context;
+    let work_current = || {
+        if work
+            .as_ref()
+            .is_some_and(super::super::account_work::Scope::cancelled)
+        {
+            Err(GoogleLoginError::Configuration)
+        } else {
+            Ok(())
+        }
+    };
+    work_current()?;
     let failure = || GoogleLoginError::Native(Error::Profile);
     remaining(deadline).map_err(GoogleLoginError::Native)?;
     if !program.is_absolute()
@@ -563,6 +591,7 @@ fn run_with_journal(
         journal.unchanged().map_err(GoogleLoginError::Recovery)?;
         let token =
             native_access_token(candidate.token.as_slice()).map_err(GoogleLoginError::Recovery)?;
+        work_current()?;
         let verdict = check(
             token.as_str().ok_or_else(failure)?,
             binding.expected_email(),
@@ -570,6 +599,7 @@ fn run_with_journal(
                 .map_err(GoogleLoginError::Native)?
                 .min(Duration::from_secs(30)),
         );
+        work_current()?;
         remaining(deadline).map_err(GoogleLoginError::Native)?;
         journal.unchanged().map_err(GoogleLoginError::Recovery)?;
         if current_checkpoint_scope(state, account, staging.expected_email) != Some(scope) {
@@ -595,8 +625,9 @@ fn run_with_journal(
                     &StagedRecovery {
                         expected_email: staging.expected_email,
                         current: &|| {
-                            current_checkpoint_scope(state, account, staging.expected_email)
-                                == Some(scope)
+                            work_current().is_ok()
+                                && current_checkpoint_scope(state, account, staging.expected_email)
+                                    == Some(scope)
                         },
                     },
                     deadline,
@@ -616,6 +647,7 @@ fn run_with_journal(
     } else {
         None
     };
+    work_current()?;
     let mut result = if let Some(candidate) = candidate {
         let claim = stage_profile(staging.profile, None).map_err(GoogleLoginError::Native)?;
         let path = staging
@@ -631,12 +663,13 @@ fn run_with_journal(
             None
         } else {
             Some(
-                super::super::google_browser::PendingSession::recover(
+                super::super::google_browser::PendingSession::recover_scoped(
                     identity,
                     state,
                     home,
                     candidate.cookies,
                     candidate.previous,
+                    work.clone(),
                 )
                 .map_err(|_| failure())?,
             )
@@ -653,6 +686,7 @@ fn run_with_journal(
             account: account.into(),
             revision: registry.binding_revision("agy", account),
             recovery: None,
+            work: work.clone(),
         }
     } else {
         journal.unchanged().map_err(GoogleLoginError::Recovery)?;
@@ -668,6 +702,7 @@ fn run_with_journal(
                     .then_some(seed.path())
             })
             .or_else(|| (!had_candidate).then_some(staging.previous).flatten());
+        work_current()?;
         fresh(
             program,
             state,
@@ -680,6 +715,7 @@ fn run_with_journal(
             deadline,
         )?
     };
+    result.retain_work(work.clone());
     check_completed(&result, program, state, account, &expected_path, scope)?;
     if !resumed {
         // Preserve a completed native effect even if its authorization budget just
@@ -691,5 +727,6 @@ fn run_with_journal(
     }
     result.recovery = Some(journal);
     remaining(deadline).map_err(GoogleLoginError::Native)?;
+    work_current()?;
     Ok(result)
 }

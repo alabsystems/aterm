@@ -452,8 +452,8 @@ struct Inner {
     backstop: Option<Duration>,
     /// Each profile's load, once per process.
     credentials: Mutex<BTreeMap<String, std::result::Result<Arc<Credential>, LoadError>>>,
-    /// Each repository's numeric id, by `Slug::key`: the only memo (design §14).
-    ids: Mutex<BTreeMap<String, u64>>,
+    /// Each repository's numeric id, by [`Slug`]: the only memo (design §14).
+    ids: Mutex<BTreeMap<Slug, u64>>,
     meter: Mutex<Meter>,
     /// The inline profiles whose login a `GET /user` bound (design §6.1), or is binding now.
     bound: Mutex<Bindings>,
@@ -764,17 +764,22 @@ impl Github {
             .credentials
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let loaded = credentials.entry(profile.to_string()).or_insert_with(|| {
-            let loaded = identity::load(row, &*self.inner.env).map(Arc::new);
-            if let Ok(cred) = &loaded {
-                self.inner.redactor.learn(cred.expose());
-            }
-            loaded
-        });
-        match loaded {
+        if let Some(loaded) = credentials.get(profile) {
+            return match loaded {
+                Ok(_) => Presence::Present,
+                Err(e) => e.presence(),
+            };
+        }
+        let loaded = identity::load(row, &*self.inner.env).map(Arc::new);
+        if let Ok(cred) = &loaded {
+            self.inner.redactor.learn(cred.expose());
+        }
+        let presence = match &loaded {
             Ok(_) => Presence::Present,
             Err(e) => e.presence(),
-        }
+        };
+        credentials.insert(profile.to_string(), loaded);
+        presence
     }
 
     /// Whether the profile's cached credential vouches for draft access.
@@ -810,7 +815,7 @@ impl Github {
             .ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&slug.key())
+            .get(slug)
         {
             return Ok((*id, 0));
         }
@@ -836,7 +841,7 @@ impl Github {
             .ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(slug.key(), id);
+            .insert(slug.clone(), id);
     }
 
     /// Count in this client's meter the requests `spent` sent before it was built (vault
@@ -1522,7 +1527,7 @@ pub(crate) fn retarget(call: &mut Call, old: &Slug, new: &Slug) {
     if let Some(rest) = after_prefix(&call.path, &repo_root(old)).map(str::to_string) {
         call.path = format!("{}{rest}", repo_root(new));
     }
-    if repo_of(&call.route).is_some_and(|slug| slug.key() == old.key()) {
+    if repo_of(&call.route).is_some_and(|slug| slug == old) {
         call.route.target = RouteTarget::Repo(new.clone());
     }
 }
@@ -1559,7 +1564,7 @@ fn route_target_text(target: &RouteTarget) -> String {
 pub(crate) fn write_target(call: &Call, permit: &Permit) -> Result<()> {
     let (same, origin_ok) = match (&call.route.target, permit.target()) {
         (RouteTarget::Repo(a), PermitTarget::Repo(b)) => (
-            a.key() == b.key(),
+            a == b,
             matches!(call.origin, OriginRole::Api | OriginRole::Uploads),
         ),
         (RouteTarget::Identity, PermitTarget::Identity) => (true, call.origin == OriginRole::Api),

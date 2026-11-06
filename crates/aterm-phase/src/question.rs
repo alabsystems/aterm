@@ -971,10 +971,12 @@ pub(crate) fn trailers(rows: &[String], from: usize, width: usize) -> Option<Opt
     Some(afk)
 }
 
-/// The widest row on the screen, in chars.
+/// The widest row on the screen, in the cells the grid lays it out in ([`cells`]): what the grid
+/// stores in a cell with the character before it (a combining mark, a joiner, a variation
+/// selector) widens no row, so a row drawn to the pane's edge measures the pane, whatever it holds.
 pub(crate) fn screen_width(rows: &[String]) -> usize {
     rows.iter()
-        .map(|r| crate::text::trim_end(r).chars().count())
+        .map(|r| cells(crate::text::trim_end(r)))
         .max()
         .unwrap_or(0)
 }

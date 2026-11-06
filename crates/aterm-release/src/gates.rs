@@ -2147,13 +2147,6 @@ pub fn own_cutter_with(
             short(commit)
         ));
     }
-    if crate::accepted_measure::policy_cutter(git, commit, stamp) {
-        return Ok(format!(
-            "cutter {} carries only release-policy changes for owner-accepted source {}",
-            short(stamp),
-            short(commit)
-        ));
-    }
     let parent = git
         .git(&["rev-parse", "--verify", "-q", &format!("{commit}^1")])
         .ok()

@@ -860,27 +860,37 @@ pub fn shape(
     Shaped::Calls(calls)
 }
 
-/// One artifact a call's compile reported (`compiler-artifact`): the files it names, and whether
-/// cargo found it fresh or built it.
+/// One artifact a call's compile reported (`compiler-artifact`): the files it names, whether
+/// cargo found it fresh or built it, its package and whether it is a test build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Artifact {
     /// Its `filenames`.
     pub filenames: Vec<String>,
     /// Its `fresh`.
     pub fresh: bool,
+    /// Its package's name, read from its `package_id` ([`package_name`]).
+    pub package: Option<String>,
+    /// Its `profile.test`: a build of a test, which cargo makes only for a selected package (one of
+    /// the workspace's own).
+    pub test: bool,
+}
+
+/// The messages of a compile's `--message-format=json…` output whose `reason` is `reason`, in
+/// order.
+fn messages<'a>(output: &'a str, reason: &'a str) -> impl Iterator<Item = aterm_json::Value> + 'a {
+    let quoted = format!("\"{reason}\"");
+    output
+        .lines()
+        .filter(move |l| l.starts_with('{') && l.contains(&quoted))
+        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+        .filter(move |v| v.get("reason").and_then(aterm_json::Value::as_str) == Some(reason))
 }
 
 /// The artifacts a compile's `--message-format=json…` output reports, in order; lines that are
 /// not a `compiler-artifact` message are not read.
 #[must_use]
 pub fn artifacts(output: &str) -> Vec<Artifact> {
-    output
-        .lines()
-        .filter(|l| l.starts_with('{') && l.contains("\"compiler-artifact\""))
-        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
-        .filter(|v| {
-            v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
-        })
+    messages(output, "compiler-artifact")
         .map(|v| Artifact {
             filenames: v
                 .get("filenames")
@@ -896,8 +906,50 @@ pub fn artifacts(output: &str) -> Vec<Artifact> {
                 .get("fresh")
                 .and_then(aterm_json::Value::as_bool)
                 .unwrap_or(false),
+            package: v
+                .get("package_id")
+                .and_then(aterm_json::Value::as_str)
+                .and_then(package_name),
+            test: v
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(aterm_json::Value::as_bool)
+                .unwrap_or(false),
         })
         .collect()
+}
+
+/// The `out_dir` of each build script a compile's `--message-format=json…` output says it ran
+/// (`build-script-executed`), fresh or run again: the folder of that run's unit.
+#[must_use]
+pub fn script_runs(output: &str) -> Vec<String> {
+    messages(output, "build-script-executed")
+        .filter_map(|v| {
+            v.get("out_dir")
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The package a cargo `package_id` names: `<source>#<name>@<version>`, `<source>#<version>` (a
+/// source whose last path segment is the name) or, before cargo 1.77, `<name> <version>
+/// (<source>)`; `None` for any other form.
+#[must_use]
+pub fn package_name(id: &str) -> Option<String> {
+    if let Some((name, rest)) = id.split_once(' ') {
+        return (!name.is_empty() && rest.contains(" (")).then(|| name.to_owned());
+    }
+    let (source, fragment) = id.rsplit_once('#')?;
+    let name = match fragment.split_once('@') {
+        Some((name, _)) => name,
+        None => source
+            .split_once('?')
+            .map_or(source, |(path, _)| path)
+            .rsplit('/')
+            .next()?,
+    };
+    (!name.is_empty() && !name.contains(':')).then(|| name.to_owned())
 }
 
 /// A cut that passed, the files of the artifacts it built (not fresh), and when it began.
@@ -908,13 +960,19 @@ pub type Built = (
 );
 
 /// What a run's shaped test compile has done so far ([`crate::Ctx::shape_run`]): the files each
-/// cut built, and what each call's time line says of them.
+/// cut built, what each call's time line says of them, and the units of the build directory
+/// every call reported as its outputs.
 #[derive(Debug, Default)]
 pub struct Run {
     /// Each cut that passed ([`Built`]).
     pub built: Vec<Built>,
     /// What the fresh check said for each call, by its index.
     pub said: std::collections::BTreeMap<usize, String>,
+    /// The units of the main lane's build directory each call's artifacts are outputs of, fresh
+    /// or built, and the packages the calls built tests of ([`crate::disk::note_used`]): what a
+    /// release run that passes keeps as the record the cache's bound reads
+    /// ([`crate::disk::keep_used`], `atpkg::build_cache::stale::USED`).
+    pub used: atpkg::build_cache::stale::Used,
 }
 
 /// THE FRESH CHECK: whether what the cuts `built` built came back fresh in a later call's

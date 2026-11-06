@@ -1546,14 +1546,8 @@ fn vet_unsigned_pkg(
         let bytes = sys
             .read_file(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        if parts.len() == 1
-            && parts[0] == "Distribution"
-            && allows_external_scripts(&String::from_utf8_lossy(&bytes))
-        {
-            return Err(
-                "the unsigned pkg's Distribution allows external scripts, so its JavaScript could run programs as root with no signature"
-                    .into(),
-            );
+        if parts.len() == 1 && parts[0] == "Distribution" {
+            vet_distribution(&bytes)?;
         }
         if !is_macho(&bytes) {
             continue;
@@ -1574,6 +1568,81 @@ fn vet_unsigned_pkg(
         "unsigned pkg: no installer signature to assess; {machos} Mach-O file(s) verified as team {team}"
     ));
     Ok(())
+}
+
+/// Refuse an unsigned pkg's `Distribution` that allows external scripts
+/// ([`allows_external_scripts`]), or that this scan cannot read as Installer's XML parser reads
+/// it: bytes that are not UTF-8 (a UTF-16 document, whose attribute names are not the scanned
+/// bytes), a NUL, a DTD (an entity or an `ATTLIST` default supplies an attribute the text never
+/// spells), or an XML declaration naming another encoding.
+fn vet_distribution(bytes: &[u8]) -> Result<(), String> {
+    let unread = |what: &str| {
+        format!("the unsigned pkg's Distribution {what}, so its installer options cannot be vetted")
+    };
+    let Ok(xml) = std::str::from_utf8(bytes) else {
+        return Err(unread("is not UTF-8"));
+    };
+    if xml.contains('\0') {
+        return Err(unread("holds a NUL byte"));
+    }
+    let lower = xml.to_ascii_lowercase();
+    if ["<!doctype", "<!entity", "<!attlist"]
+        .iter()
+        .any(|dtd| lower.contains(dtd))
+    {
+        return Err(unread("declares a DTD"));
+    }
+    if let Some(why) = foreign_encoding(&lower) {
+        return Err(unread(&why));
+    }
+    if allows_external_scripts(xml) {
+        return Err(
+            "the unsigned pkg's Distribution allows external scripts, so its JavaScript could run programs as root with no signature"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// What makes an XML declaration in `lower` (the document, ASCII-lowercased) name anything but
+/// UTF-8: an unterminated `<?xml`, an `encoding` without a quoted value, or another encoding.
+fn foreign_encoding(lower: &str) -> Option<String> {
+    let mut rest = lower;
+    while let Some(at) = rest.find("<?xml") {
+        rest = &rest[at + "<?xml".len()..];
+        let Some(end) = rest.find("?>") else {
+            return Some("has an unterminated XML declaration".into());
+        };
+        let declaration = &rest[..end];
+        rest = &rest[end..];
+        let mut from = 0;
+        while let Some(found) = declaration[from..].find("encoding") {
+            let at = from + found;
+            from = at + "encoding".len();
+            let spaced = at
+                .checked_sub(1)
+                .and_then(|before| declaration.as_bytes().get(before))
+                .is_some_and(u8::is_ascii_whitespace);
+            if !spaced {
+                continue;
+            }
+            let value = declaration[from..]
+                .trim_start()
+                .strip_prefix('=')
+                .map(str::trim_start)
+                .and_then(|v| {
+                    let quote = v.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+                    let body = &v[1..];
+                    body.find(quote).map(|close| &body[..close])
+                });
+            match value {
+                Some(name) if name.trim() == "utf-8" => {}
+                Some(name) => return Some(format!("declares the encoding {:?}", name.trim())),
+                None => return Some("has an XML declaration whose encoding is unread".into()),
+            }
+        }
+    }
+    None
 }
 
 /// Returns `true` if a product archive `Distribution` XML permits external scripts (`system.run`).
@@ -3284,6 +3353,84 @@ pub(crate) mod tests {
         ));
         assert!(allows_external_scripts("allow-external-scripts"));
         assert!(allows_external_scripts(r#"allow-external-scripts="false"#));
+    }
+
+    /// A UTF-16 Distribution hides `allow-external-scripts` from the byte scan (each ASCII
+    /// letter is followed by a NUL), so it is refused as unread, not admitted. NEGATIVE
+    /// CONTROL: the same document in UTF-8 is refused for its external scripts, and a clean
+    /// UTF-8 one passes.
+    #[test]
+    fn an_unsigned_pkg_whose_distribution_is_not_utf8_is_refused_before_its_scan() {
+        let doc = r#"<?xml version="1.0" encoding="UTF-16"?><installer-gui-script><options allow-external-scripts="yes"/></installer-gui-script>"#;
+        let mut utf16le = vec![0xff, 0xfe];
+        for unit in doc.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (sys, ctx, sha) = unsigned_pkg_listing(&|x| format!("{x}/Distribution\0"));
+        let stage = stage_path(0);
+        let x = format!("{stage}/expanded");
+        sys.on_write(
+            &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
+            Path::new(&format!("{x}/Distribution")),
+            &utf16le,
+        );
+        let items = expand(&[gh_row(&sha)], &ctx).unwrap();
+        let why = items[0].apply(&sys, &ctx).unwrap_err();
+        assert!(why.contains("is not UTF-8"), "{why}");
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|c| c.starts_with("/usr/sbin/installer"))
+        );
+
+        let utf8 = doc.replace("UTF-16", "UTF-8");
+        let why = vet_distribution(utf8.as_bytes()).unwrap_err();
+        assert!(why.contains("allows external scripts"), "{why}");
+        vet_distribution(
+            br#"<?xml version="1.0" encoding="utf-8" standalone="no"?><installer-gui-script minSpecVersion="1"><options customize="never" allow-external-scripts="no"/></installer-gui-script>"#,
+        )
+        .unwrap();
+        vet_distribution(b"\xef\xbb\xbf<installer-gui-script><options/></installer-gui-script>")
+            .unwrap();
+    }
+
+    /// Text an entity, an attribute default, a NUL or a foreign encoding could rewrite before
+    /// Installer reads its options is refused; a declaration naming UTF-8 is not.
+    #[test]
+    fn a_distribution_the_scan_cannot_read_as_installer_does_is_refused() {
+        for (doc, says) in [
+            (
+                "<!DOCTYPE installer-gui-script [ <!ATTLIST options allow-external-scripts CDATA \"true\"> ]><options/>",
+                "declares a DTD",
+            ),
+            ("<!doctype x><options/>", "declares a DTD"),
+            ("<!ENTITY x \"y\"><options/>", "declares a DTD"),
+            ("<options/>\0", "holds a NUL byte"),
+            (
+                "<?xml version=\"1.0\" encoding=\"UTF-7\"?><options/>",
+                "declares the encoding \"utf-7\"",
+            ),
+            (
+                "<?xml version='1.0' encoding = 'ISO-8859-1' ?><options/>",
+                "declares the encoding \"iso-8859-1\"",
+            ),
+            (
+                "<?xml version=\"1.0\" encoding=utf-8?><options/>",
+                "encoding is unread",
+            ),
+            (
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"",
+                "unterminated XML declaration",
+            ),
+        ] {
+            let why = vet_distribution(doc.as_bytes()).unwrap_err();
+            assert!(why.contains(says), "{doc:?}: {why}");
+            assert!(why.contains("cannot be vetted"), "{doc:?}: {why}");
+        }
+        vet_distribution(
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><?xml-stylesheet href=\"encoding.xsl\"?><options/>",
+        )
+        .unwrap();
     }
 
     #[test]

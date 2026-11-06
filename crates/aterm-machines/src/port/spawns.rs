@@ -40,6 +40,9 @@ impl<'a> Spawns<'a> {
 }
 
 impl System for Spawns<'_> {
+    fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
+        self.live.keyboard_service_ids()
+    }
     fn scratch_dir(&self, parent: Option<&Path>, label: &str) -> io::Result<Scratch<'_>> {
         self.live.scratch_dir(parent, label)
     }
@@ -61,6 +64,9 @@ impl System for Spawns<'_> {
     }
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.live.read_file(path)
+    }
+    fn admit_runtime(&self, root: &Path) -> Result<(), String> {
+        self.live.admit_runtime(root)
     }
     fn read_owned_file(
         &self,

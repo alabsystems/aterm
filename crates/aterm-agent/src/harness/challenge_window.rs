@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The fleet challenge service's visible Claude OAuth browser. It automates navigation and
-//! callback capture only: every sign-in, consent and human-verification control is the person's.
+//! loopback or hosted-code callback capture only: every sign-in, consent and human-verification
+//! control is the person's.
 
 use super::headless_oauth::{BrowserChild, CdpClient};
 use aterm_json::json;
@@ -18,6 +19,14 @@ const CALLBACK_URL_JS: &str = r#"(() => {
     : "";
   return failed || raw;
 })()"#;
+
+pub(super) fn work_current(scope: Option<&super::account_work::Scope>) -> Result<(), String> {
+    if scope.is_some_and(super::account_work::Scope::cancelled) {
+        Err("account work admissions are paused".into())
+    } else {
+        Ok(())
+    }
+}
 
 fn callback(
     cdp: &mut CdpClient,
@@ -65,7 +74,12 @@ fn callback(
         return Err("the central challenge reached an invalid local callback".into());
     }
     if url.starts_with("https://") && !flow.admits_provider_url(url) {
-        return Err("the central challenge left its pinned Claude OAuth flow".into());
+        return Err(format!(
+            "the central challenge left its pinned Claude OAuth flow at {}: {}",
+            super::headless_oauth::url_place(url),
+            flow.provider_refusal(url)
+                .unwrap_or_else(|| "unvalidated destination".into())
+        ));
     }
     Ok(cdp.take_matching_event_url(session, |url| flow.is_callback(url)))
 }
@@ -75,7 +89,9 @@ fn drive(
     authorize_url: &str,
     flow: &super::open_url::MailboxFlow,
     timeout: Duration,
+    scope: Option<&super::account_work::Scope>,
 ) -> Result<String, String> {
+    work_current(scope)?;
     let end = Instant::now()
         .checked_add(timeout)
         .ok_or("the central challenge deadline is invalid")?;
@@ -91,6 +107,7 @@ fn drive(
     let target_id = target["targetId"]
         .as_str()
         .ok_or("the central challenge browser created no target")?;
+    work_current(scope)?;
     let attached = cdp
         .call(
             None,
@@ -103,9 +120,11 @@ fn drive(
         .as_str()
         .ok_or("the central challenge browser attached no session")?;
     for method in ["Page.enable", "Runtime.enable", "Network.enable"] {
+        work_current(scope)?;
         cdp.call(Some(session), method, json!({}), left())
             .map_err(|_| "the central challenge browser could not observe its page".to_owned())?;
     }
+    work_current(scope)?;
     cdp.call(
         Some(session),
         "Fetch.enable",
@@ -116,6 +135,7 @@ fn drive(
         left(),
     )
     .map_err(|_| "the central challenge callback could not be contained".to_owned())?;
+    work_current(scope)?;
     cdp.call(
         Some(session),
         "Page.navigate",
@@ -124,6 +144,7 @@ fn drive(
     )
     .map_err(|_| "the central challenge page did not open".to_owned())?;
     loop {
+        work_current(scope)?;
         if left().is_zero() {
             return Err("the central challenge was not completed in time".into());
         }
@@ -134,7 +155,11 @@ fn drive(
     }
 }
 
-fn launch(browser: &Path, profile: &Path) -> Result<(BrowserChild, CdpClient), String> {
+fn launch(
+    browser: &Path,
+    profile: &Path,
+    scope: &super::account_work::Scope,
+) -> Result<(BrowserChild, CdpClient), String> {
     use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
     use std::os::fd::OwnedFd;
 
@@ -152,16 +177,16 @@ fn launch(browser: &Path, profile: &Path) -> Result<(BrowserChild, CdpClient), S
         .stdin(ChildStdio::Null)
         .stdout(ChildStdio::Null)
         .stderr(ChildStdio::Null);
+    work_current(Some(scope))?;
     let child = spawn_with_two_fds(
         command,
         OwnedFd::from(command_read),
         OwnedFd::from(event_write),
     )
     .map_err(|_| "the central challenge browser did not start".to_owned())?;
-    Ok((
-        BrowserChild::new(child),
-        CdpClient::new(command_write, event_read),
-    ))
+    let child = BrowserChild::new(child);
+    let cdp = CdpClient::new_scoped(command_write, event_read, Some(scope.clone()))?;
+    Ok((child, cdp))
 }
 
 /// Open `authorize_url` in the central service's visible browser and return its exact callback.
@@ -170,11 +195,17 @@ pub(super) fn authorize(
     authorize_url: &str,
     email: Option<&str>,
     timeout: Duration,
+    scope: &super::account_work::Scope,
 ) -> Result<String, String> {
+    work_current(Some(scope))?;
     if super::browser_window::no_window_desk().is_some() {
         return Err("the central challenge has no interactive desktop".into());
     }
     let flow = super::open_url::MailboxFlow::new(authorize_url)?;
+    #[cfg(target_os = "macos")]
+    if super::safari_window::available() {
+        return super::safari_window::authorize(authorize_url, &flow, timeout, Some(scope));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("the central challenge has no home directory")?;
@@ -191,6 +222,7 @@ pub(super) fn authorize(
         aterm_types::fs_restricted::ensure_private_dir(dir)
             .map_err(|_| "the central challenge profile could not be prepared".to_owned())?;
     }
+    work_current(Some(scope))?;
     let _claimed = super::browser_window::ProfileLock::claim(&profile)
         .map_err(|_| "the central challenge profile is already in use".to_owned())?;
     super::browser_window::quiet_password_manager(&profile)
@@ -199,12 +231,14 @@ pub(super) fn authorize(
         .map_err(|_| "the central challenge profile could not be marked".to_owned())?;
 
     let result = (|| {
-        let (mut child, mut cdp) = launch(&browser, &profile)?;
-        let result = drive(&mut cdp, authorize_url, &flow, timeout);
+        let (mut child, mut cdp) = launch(&browser, &profile, scope)?;
+        let result = drive(&mut cdp, authorize_url, &flow, timeout, Some(scope));
         let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
         let _ = child.close();
         result
     })();
+
+    work_current(Some(scope))?;
 
     let headless = super::headless_oauth::find_headless_browser(Some(&home))
         .filter(|found| found.is_headless_shell)
@@ -218,7 +252,14 @@ pub(super) fn authorize(
         .web_session_key
         .zip(origin.as_deref())
         .map(|(key, origin)| (origin, key));
-    let tidied = super::browser_window::tidy_profile(&headless, &profile, session, TIDY_WITHIN);
+    let tidied = super::browser_window::tidy_profile_scoped(
+        &headless,
+        &profile,
+        session,
+        TIDY_WITHIN,
+        Some(scope.clone()),
+    );
+    work_current(Some(scope))?;
     if tidied.is_ok() {
         let _ = super::browser_window::clear_untidied(&profile);
     }
@@ -240,6 +281,9 @@ mod tests {
 
     const AUTHORIZE: &str = "https://claude.ai/oauth/authorize?client_id=claude&redirect_uri=http%3A%2F%2F127.0.0.1%3A4321%2Fcallback&state=state";
     const CALLBACK: &str = "http://127.0.0.1:4321/callback?code=secret&state=state";
+    const HOSTED_AUTHORIZE: &str = "https://claude.com/cai/oauth/authorize?client_id=claude&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=state";
+    const HOSTED_CALLBACK: &str =
+        "https://platform.claude.com/oauth/code/callback?code=secret&state=state";
 
     fn browser(url: &'static str) -> (CdpClient, std::thread::JoinHandle<()>) {
         let (mut commands, to_browser) = std::io::pipe().unwrap();
@@ -270,9 +314,9 @@ mod tests {
                         "Target.createTarget" => json!({"targetId":"t1"}),
                         "Target.attachToTarget" => json!({"sessionId":"s1"}),
                         "Runtime.evaluate" if url == CALLBACK => {
-                            json!("https://example.invalid/not-the-callback")
+                            json!({"result":{"value":"https://example.invalid/not-the-callback"}})
                         }
-                        "Runtime.evaluate" => json!(url),
+                        "Runtime.evaluate" => json!({"result":{"value":url}}),
                         _ => json!({}),
                     };
                     let mut reply = aterm_json::to_vec(&json!({"id":id,"result":result})).unwrap();
@@ -289,8 +333,26 @@ mod tests {
         let flow = super::super::open_url::MailboxFlow::new(AUTHORIZE).unwrap();
         let (mut cdp, peer) = browser(CALLBACK);
         assert_eq!(
-            drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60)),
+            drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60), None),
             Ok(CALLBACK.to_owned())
+        );
+        drop(cdp);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn the_window_drive_returns_the_exact_hosted_code_callback() {
+        let flow = super::super::open_url::MailboxFlow::new(HOSTED_AUTHORIZE).unwrap();
+        let (mut cdp, peer) = browser(HOSTED_CALLBACK);
+        assert_eq!(
+            drive(
+                &mut cdp,
+                HOSTED_AUTHORIZE,
+                &flow,
+                Duration::from_secs(60),
+                None
+            ),
+            Ok(HOSTED_CALLBACK.to_owned())
         );
         drop(cdp);
         peer.join().unwrap();
@@ -304,7 +366,7 @@ mod tests {
             "https://example.invalid/callback",
         ] {
             let (mut cdp, peer) = browser(url);
-            assert!(drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60)).is_err());
+            assert!(drive(&mut cdp, AUTHORIZE, &flow, Duration::from_secs(60), None).is_err());
             drop(cdp);
             peer.join().unwrap();
         }

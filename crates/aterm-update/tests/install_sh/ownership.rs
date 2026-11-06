@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use aterm_spec::wait::{MUST_HAPPEN, PARKED_SECS, until_within};
 
-use crate::support::{Lib, Scratch, bash, install_sh, q, read, s, sh, symlink, system_path, tree};
+use crate::support::{
+    HELD, Lib, Scratch, bash, install_sh, q, read, s, sh, symlink, system_path, tree,
+};
 
 const ATERM: &str = "#!/bin/sh\necho \"aterm 0.99.0\"\n";
 const OTHER: &str = "#!/bin/sh\necho \"other 1.0\"\n";
@@ -90,7 +92,11 @@ fn the_app_destination_verdict() {
 
 #[test]
 fn the_bin_entry_verdict() {
-    let scratch = Scratch::new();
+    bin_entry_verdict(&Scratch::new(), None);
+}
+
+/// [`the_bin_entry_verdict`] in `scratch`, each run of `held` cut off unrun ([`Lib::hold`]).
+fn bin_entry_verdict(scratch: &Scratch, held: Option<&Path>) {
     let store = scratch.mkdir("store");
     let bundle_exe = scratch.join("own/aterm.app/Contents/MacOS/aterm");
     let entry = |name: &str| scratch.join(&format!("bin.{name}/aterm"));
@@ -114,6 +120,9 @@ fn the_bin_entry_verdict() {
     );
     scratch.write("bin.unrunnable/aterm", "not executable\n");
     let mut lib = Lib::new();
+    if let Some(held) = held {
+        lib.hold(held);
+    }
     let rows = [
         (&absent, "absent".to_string()),
         (&bundle, "ours".into()),
@@ -148,7 +157,13 @@ fn the_bin_entry_verdict() {
             )
         })
         .collect();
-    let recs = lib.run(&scratch);
+    // `foreign`'s verdict is the same whether it answered or the bound cut it off unrun: its
+    // answer shows it ran.
+    let answered = lib.call(
+        format!("first_line_bounded {} --version", q(s(&foreign))),
+        &[],
+    );
+    let recs = lib.run(scratch);
     for ((path, want), (verdict, plan)) in rows.iter().zip(calls) {
         assert_eq!(recs[verdict].out, *want, "{}", path.display());
         let plan = &recs[plan].out;
@@ -161,6 +176,12 @@ fn the_bin_entry_verdict() {
             _ => assert!(plan.contains(&format!("{p} would be SKIPPED")), "{plan}"),
         }
     }
+    let answered = &recs[answered];
+    each_showed_it_ran([(
+        foreign.as_path(),
+        answered.code.as_str(),
+        !answered.out.is_empty(),
+    )]);
 }
 
 /// The source lane puts its `aterm` on PATH by the bin entry verdict: a pre-store aterm there is
@@ -276,9 +297,44 @@ fn kept(lane: &str, line: &str) -> String {
     format!("{lane} | grep \"^{line}\"; echo \"status $?\"")
 }
 
+/// The pids a staller wrote to `parked` as it parked (`$$ $! $PPID`), which show it ran, past
+/// macOS's check of its first exec, before the bound cut it off; `None` when it wrote none, as
+/// one the check still held at the bound writes none.
+fn parked_pids(parked: &Path) -> Option<[u32; 3]> {
+    read(parked)
+        .split_whitespace()
+        .map(|pid| pid.parse().ok())
+        .collect::<Option<Vec<u32>>>()
+        .and_then(|pids| pids.try_into().ok())
+}
+
+/// Fails the test unless each program in `runs` (with the call that ran it, and whether a line
+/// it wrote shows it ran) showed it ran, naming each that did not: a program install.sh's bound
+/// may have cut off unrun, as it cuts off a first exec macOS's check still holds, where that
+/// cut-off changes nothing else the test checks. The failing test keeps its scratch (`Drop for
+/// Scratch`); a pass would remove a file macOS may still be checking. A test checks it last,
+/// after every check that shows its other programs ran.
+#[track_caller]
+fn each_showed_it_ran<'a>(runs: impl IntoIterator<Item = (&'a Path, &'a str, bool)>) {
+    let unshown: Vec<String> = runs
+        .into_iter()
+        .filter(|(_, _, shown)| !shown)
+        .map(|(program, call, _)| format!("\n  {}: {call}", program.display()))
+        .collect();
+    assert!(unshown.is_empty(), "{UNSHOWN}{}", unshown.concat());
+}
+
+/// What [`each_showed_it_ran`] fails with, before the programs it names.
+const UNSHOWN: &str = "cut off before it showed it ran, so this test keeps its scratch:";
+
 #[test]
 fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
-    let scratch = Scratch::new();
+    asked_what_it_is(&Scratch::new(), None);
+}
+
+/// [`a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin`] in `scratch`, each run of
+/// `held` cut off unrun ([`HELD`]).
+fn asked_what_it_is(scratch: &Scratch, held: Option<&Path>) {
     let store = scratch.mkdir("store");
     let tmp = scratch.mkdir("tmp");
     let home = scratch.mkdir("home");
@@ -290,7 +346,7 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let apps = scratch.mkdir("rd/apps");
     let answering = scratch.stand_in("rd/apps/aterm.app/Contents/MacOS/aterm", ATERM);
     let bin = scratch.mkdir("rd/bin");
-    scratch.program("rd/bin/aterm-ctl", READER);
+    let ctl = scratch.program("rd/bin/aterm-ctl", READER);
     let placed = scratch.mkdir("rd/store");
     scratch.stand_in("rd/store/aterm", READER);
     let none = scratch.mkdir("rd/none");
@@ -386,9 +442,11 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
             "printf 'echo LINE-AFTER-THE-PROBE\\n' | {bash} -c '
 			ATERM_INSTALL_LIBRARY_ONLY=1; . \"$1\" >/dev/null 2>&1
 			uname() {{ echo Darwin; }}
+			{hold}
 			printf \"said=%s\\n\" \"$({call})\"
 			while IFS= read -r line; do eval \"$line\"; done' _ {install} {args}",
             bash = q(s(&bash())),
+            hold = held.map_or("", |_| HELD),
             install = q(s(&install_sh())),
             args = args.join(" "),
         );
@@ -398,6 +456,7 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
                 ("PATH", system_path()),
                 ("HOME", s(&home)),
                 ("TMPDIR", s(&tmp)),
+                ("HELD_EXE", held.map_or("", s)),
             ],
         );
         assert_eq!(
@@ -407,6 +466,27 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
             run.stderr
         );
     }
+    // The verdicts on `reader` and `ctl` are the same whether they answered or the bound cut
+    // them off unrun: their answers show they ran.
+    let mut lib = Lib::new();
+    if let Some(held) = held {
+        lib.hold(held);
+    }
+    let asked = [&reader, &ctl].map(|program| {
+        let call = lib.call(
+            format!("first_line_bounded {} --version", q(s(program))),
+            &[],
+        );
+        (program, call)
+    });
+    let recs = lib.run(scratch);
+    each_showed_it_ran(asked.map(|(program, at)| {
+        (
+            program.as_path(),
+            recs[at].code.as_str(),
+            !recs[at].out.is_empty(),
+        )
+    }));
 }
 
 #[cfg(target_os = "macos")]
@@ -624,12 +704,9 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
             1,
             "{call}: the bound reads the clock, so its first look past it is its last"
         );
-        let ran = read(&parked(name));
-        let child: u32 = ran
-            .split_whitespace()
-            .nth(1)
-            .and_then(|pid| pid.parse().ok())
-            .unwrap_or_else(|| panic!("{call}: the staller's line: {ran:?}"));
+        let Some([_, child, _]) = parked_pids(&parked(name)) else {
+            panic!("{call}: the staller's line: {:?}", read(&parked(name)))
+        };
         until_within(
             MUST_HAPPEN,
             &format!("{call}: the cut-off run's process group, its parked child too, is killed"),
@@ -702,7 +779,12 @@ fn a_bundle_with_an_unread_program_inventory_is_never_swapped() {
 
 #[test]
 fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
-    let scratch = Scratch::new();
+    left_where_it_is(&Scratch::new(), None);
+}
+
+/// [`a_program_that_has_not_shown_it_ran_is_left_where_it_is`] in `scratch`, each run of
+/// `held` cut off unrun ([`Lib::hold`]).
+fn left_where_it_is(scratch: &Scratch, held: Option<&Path>) {
     let silent = silent_staller();
     let answers = scratch.program("proof/answers", ATERM);
     let fails = scratch.stand_in("proof/fails", "#!/bin/sh\nexit 3\n");
@@ -743,7 +825,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     scratch.program("proof/whole/aterm.app/Contents/MacOS/aterm", ATERM);
     symlink(&stalls, &whole.join("Contents/MacOS/atpkg"));
     let dest = scratch.mkdir("proof/dest");
-    let held = scratch.program("proof/dest/aterm.app/Contents/MacOS/aterm", &silent);
+    let dest_aterm = scratch.program("proof/dest/aterm.app/Contents/MacOS/aterm", &silent);
     let staged = scratch.mkdir("proof/dest/aterm.app.installing.x");
     scratch.mkdir("proof/store");
     let placed = scratch.program("proof/store/aterm", &silent);
@@ -758,11 +840,17 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     };
     let mut lib = Lib::new();
     lib.step(PARKED_CLOCK);
+    if let Some(held) = held {
+        lib.hold(held);
+    }
     lib.step(format!(
         "export STALL_PARKED={} STALL_ANSWER=x STALL_FINISHES=",
         q(s(&parked("none")))
     ));
-    let stalled = |lib: &mut Lib, name: &str, call: String| {
+    // Every staller the bound cuts off, and the line it writes as it parks (parked_pids).
+    let mut cut = Vec::new();
+    let mut stalled = |lib: &mut Lib, name: &str, staller: &Path, call: String| {
+        cut.push((parked(name), staller.to_path_buf(), call.clone()));
         lib.step(format!("export STALL_PARKED={}", q(s(&parked(name)))));
         lib.call(call, &["UNPROVEN"])
     };
@@ -775,6 +863,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     proven.push(stalled(
         &mut lib,
         "said",
+        &said_then_parked,
         format!("showed_it_ran {}", q(s(&said_then_parked))),
     ));
     for exe in [&answers, &quiet, &refused, &blank, &nuls] {
@@ -790,6 +879,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let cut_off = stalled(
         &mut lib,
         "stalls",
+        &stalls,
         format!("showed_it_ran {}", q(s(&stalls))),
     );
     let mut interrupted = Vec::new();
@@ -821,6 +911,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let as_nobody_cut_off = stalled(
         &mut lib,
         "nobody",
+        &stalls,
         format!(
             "( {}; showed_it_ran {} )",
             root("exec \"$@\""),
@@ -840,6 +931,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     proven.push(stalled(
         &mut lib,
         "blank",
+        &blank_then_parked,
         format!(
             "( {}; showed_it_ran {} )",
             root("exec \"$@\""),
@@ -859,16 +951,19 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let sibling = stalled(
         &mut lib,
         "toolset",
+        &siblings.join("atpkg"),
         format!("bundle_showed_it_ran {}", q(s(&toolset))),
     );
     let early = stalled(
         &mut lib,
         "dest",
+        &dest_aterm,
         format!("may_replace {}/aterm.app", q(s(&dest))),
     );
     let swap = stalled(
         &mut lib,
         "swap",
+        &dest_aterm,
         format!(
             "( STAGE={}; swap_staged_bundle {} )",
             q(s(&staged)),
@@ -878,6 +973,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let replace = stalled(
         &mut lib,
         "store",
+        &placed,
         format!(
             "( STORE_DIR={}; place_store_binary {} )",
             q(s(placed.parent().unwrap())),
@@ -889,6 +985,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
     let unbuilt = stalled(
         &mut lib,
         "source",
+        &placed,
         source_lane(
             &q(s(&checkout)),
             &q(s(placed.parent().unwrap())),
@@ -896,7 +993,7 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
             &q(s(&answers)),
         ),
     );
-    let recs = lib.run(&scratch);
+    let recs = lib.run(scratch);
     for i in &proven {
         assert_eq!(
             recs[*i].rc, 0,
@@ -975,12 +1072,12 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
         (
             early,
             s(&dest).to_string() + "/aterm.app",
-            s(&held).to_string(),
+            s(&dest_aterm).to_string(),
         ),
         (
             swap,
             s(&dest).to_string() + "/aterm.app",
-            s(&held).to_string(),
+            s(&dest_aterm).to_string(),
         ),
         (replace, s(&placed).to_string(), s(&placed).to_string()),
         (unbuilt, s(&placed).to_string(), s(&placed).to_string()),
@@ -996,13 +1093,76 @@ fn a_program_that_has_not_shown_it_ran_is_left_where_it_is() {
             recs[i].err
         );
     }
-    assert!(held.is_file() && staged.is_dir(), "the swap moved nothing");
+    assert!(
+        dest_aterm.is_file() && staged.is_dir(),
+        "the swap moved nothing"
+    );
     assert_eq!(read(&placed), silent, "the store's aterm stays as it is");
     assert!(
         !checkout.join("target").exists(),
         "the source lane built nothing: {}",
         recs[unbuilt].out
     );
+    each_showed_it_ran(cut.iter().map(|(parked, staller, call)| {
+        (
+            staller.as_path(),
+            call.as_str(),
+            parked_pids(parked).is_some(),
+        )
+    }));
+}
+
+/// A program install.sh's bound cut off before it showed it ran fails its test, whatever else
+/// the test checks, so its scratch keeps the program: each test here with a program whose
+/// verdicts are the same answered or cut off unrun, run with that program held (each run of it
+/// cut off at once, unrun, as the bound cuts off a first exec macOS's check still holds), fails
+/// naming that program alone ([`each_showed_it_ran`]), and the program is still there. NEGATIVE
+/// CONTROL: each test passes unheld (its own `#[test]`), every program having shown it ran.
+#[test]
+fn a_program_held_past_its_bound_fails_its_test_and_keeps_its_scratch() {
+    type Test = fn(&Scratch, Option<&Path>);
+    let tests: [(Test, &str); 6] = [
+        (
+            left_where_it_is,
+            "proof/toolset/aterm.app/Contents/MacOS/atpkg",
+        ),
+        (
+            left_where_it_is,
+            "proof/dest/aterm.app/Contents/MacOS/aterm",
+        ),
+        (left_where_it_is, "proof/store/aterm"),
+        (bin_entry_verdict, "bin.foreign/aterm"),
+        (asked_what_it_is, "rd/aterm"),
+        (asked_what_it_is, "rd/bin/aterm-ctl"),
+    ];
+    for (test, rel) in tests {
+        let mut laid = None;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let scratch = Scratch::new();
+            let held = scratch.join(rel);
+            laid = Some((scratch.path().to_path_buf(), held.clone()));
+            test(&scratch, Some(&held));
+        }));
+        let why = failed.expect_err(&format!("{rel}: its test passed held"));
+        let why = why.downcast_ref::<String>().map_or("", String::as_str);
+        let (root, held) = laid.expect("laid");
+        let named: Vec<&str> = why
+            .strip_prefix(UNSHOWN)
+            .map_or(Vec::new(), |named| named.lines().skip(1).collect());
+        let at = format!("  {}: ", held.display());
+        assert!(
+            !named.is_empty() && named.iter().all(|line| line.starts_with(&at)),
+            "{rel}: {why}"
+        );
+        assert!(
+            held.is_file(),
+            "{} went with its failing test",
+            held.display()
+        );
+        // Every other program there showed it ran, and the held one never started: nothing in
+        // the kept scratch is being checked.
+        std::fs::remove_dir_all(&root).expect("the kept scratch removed");
+    }
 }
 
 #[test]

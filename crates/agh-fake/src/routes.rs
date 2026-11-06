@@ -151,9 +151,13 @@ impl Request {
     /// The value of query parameter `name`, form-decoded as GitHub reads a query: a `+` is a
     /// space, and `%2B` a `+`.
     pub(crate) fn query(&self, name: &str) -> Option<String> {
-        self.raw_query()
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| aterm_codec::pct::decode(&v.replace('+', " ")))
+        self.raw_query().find(|(k, _)| *k == name).map(|(_, v)| {
+            if v.contains('+') {
+                aterm_codec::pct::decode(&v.replace('+', " "))
+            } else {
+                aterm_codec::pct::decode(v)
+            }
+        })
     }
 
     /// Whether the method is a read.
@@ -747,13 +751,15 @@ fn joined(segs: &[&str]) -> String {
 
 /// `text` as one RFC 3986 path segment, as GitHub writes a tag or an asset name into a URL.
 fn segment(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(b));
         } else {
             out.push('%');
-            out.push_str(&aterm_codec::hex::encode_upper(&[b]));
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 0x0f)]));
         }
     }
     out
@@ -1109,7 +1115,7 @@ fn repo_route(state: &State, req: &Request, ctx: &Ctx, index: usize, rest: &[&st
             let reference = format!("refs/{}", joined(name));
             repo.ref_sha(&reference)
                 .map_or_else(Answer::not_found, |sha| {
-                    Answer::json(200, &ref_json(state, repo, &reference, &sha))
+                    Answer::json(200, &ref_json(state, repo, &reference, sha))
                 })
         }
         ["branches"] => branches(state, req, repo),
@@ -1433,7 +1439,7 @@ fn wrapped_base64(bytes: &[u8]) -> String {
     let flat = aterm_codec::base64::encode(bytes).unwrap_or_default();
     let mut out = String::with_capacity(flat.len() + flat.len() / 60 + 1);
     for chunk in flat.as_bytes().chunks(60) {
-        out.push_str(&String::from_utf8_lossy(chunk));
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
         out.push('\n');
     }
     out
@@ -1524,7 +1530,7 @@ fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
                     "size": f.bytes.len(), "sha": blob_sha(&f.bytes),
                     "url": entry_url(&p), "download_url": download(&p)}),
                 None => json!({"type": "dir", "name": name, "path": p, "size": 0,
-                    "sha": dir_sha(&resolved, &p), "url": entry_url(&p), "download_url": null}),
+                    "sha": dir_sha(resolved, &p), "url": entry_url(&p), "download_url": null}),
             }
         })
         .collect();
@@ -1565,13 +1571,13 @@ fn tree(state: &State, req: &Request, repo: &Repo, reference: &str) -> Answer {
                     "url": format!("http://127.0.0.1:{api}/repos/{full}/git/blobs/{sha}")})
             }
             None => {
-                let sha = dir_sha(&resolved, &path);
+                let sha = dir_sha(resolved, &path);
                 json!({"path": path, "mode": "040000", "type": "tree", "sha": sha,
                     "url": format!("http://127.0.0.1:{api}/repos/{full}/git/trees/{sha}")})
             }
         })
         .collect();
-    let sha = dir_sha(&resolved, "");
+    let sha = dir_sha(resolved, "");
     Answer::json(
         200,
         &json!({"sha": sha, "url": format!("http://127.0.0.1:{api}/repos/{full}/git/trees/{sha}"),
@@ -1615,9 +1621,10 @@ fn commits(state: &State, req: &Request, repo: &Repo) -> Answer {
         .filter(|&i| {
             let c = &repo.commits[i];
             let on_path = path.as_ref().is_none_or(|p| {
-                c.paths
-                    .iter()
-                    .any(|q| q == p || q.starts_with(&format!("{p}/")))
+                c.paths.iter().any(|q| {
+                    q == p
+                        || (q.starts_with(p.as_str()) && q.as_bytes().get(p.len()) == Some(&b'/'))
+                })
             });
             let after = since.as_ref().is_none_or(|s| c.date.as_str() >= s.as_str());
             let by = author.as_ref().is_none_or(|a| {
@@ -1721,8 +1728,7 @@ fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer
 /// The web origin: a release asset by tag and name (`/{o}/{r}/releases/download/{tag}/{name}`),
 /// of a published release the listing lag does not hide.
 fn web(state: &State, req: &Request) -> Answer {
-    let path = req.path().to_string();
-    let segs = segments(&path);
+    let segs = segments(req.path());
     let ["releases", "download", tag @ .., name] = segs.get(2..).unwrap_or(&[]) else {
         return Answer::text(404, "Not Found");
     };
@@ -1753,8 +1759,7 @@ fn web(state: &State, req: &Request) -> Answer {
 
 /// The CDN: `/assets/{id}?sig=…` → the bytes; each GET counts a download.
 fn cdn(state: &mut State, req: &Request) -> Answer {
-    let path = req.path().to_string();
-    let segs = segments(&path);
+    let segs = segments(req.path());
     let id = match segs.as_slice() {
         ["assets", id] if req.is_read() => crate::parse_uint::<u64>(id),
         _ => None,
@@ -1886,8 +1891,7 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     if req.path() == "/graphql" && req.method == "POST" {
         return atomic_refs::update(state, req, ctx);
     }
-    let path = req.path().to_string();
-    let segs = segments(&path);
+    let segs = segments(req.path());
     if let ["user", "keys", rest @ ..] = segs.as_slice() {
         return key_write(state, req, ctx, rest);
     }
@@ -2425,8 +2429,7 @@ fn delete_asset(state: &mut State, index: usize, id: &str) -> Answer {
 /// The uploads origin: `POST /repos/{o}/{r}/releases/{id}/assets?name=…`, the request's body
 /// as a new asset of that name under the request's `Content-Type`.
 fn upload(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
-    let path = req.path().to_string();
-    let segs = segments(&path);
+    let segs = segments(req.path());
     let ["repos", o, r, "releases", id, "assets"] = segs.as_slice() else {
         return Answer::not_found();
     };

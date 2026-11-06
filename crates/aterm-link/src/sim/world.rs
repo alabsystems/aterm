@@ -184,6 +184,21 @@ pub(crate) enum Mutant {
     /// (`Bridge::broker_settles_the_pin`, critic item F07): a flush of another device settles
     /// nothing of the state dir's.
     TrustAnotherDevicesFlush,
+    /// The pin's settle's answer is read only where F07 first read it, at an idle moment or a
+    /// park that took nothing (`Bridge::read_the_pins_settle`, critic item F07's review): under
+    /// a stream of items the answer sits unread, and the first take waits for the queue to
+    /// drain past D06's hold.
+    SettleReadOnlyWhenIdle,
+    /// The take the settle's answer lets go is held for a commit to carry as any later take is
+    /// (`MirrorRun::fence_settled`, critic item F07's review): the open's first take waits up to
+    /// a grace more behind its fence.
+    SettledFenceTakeWaitsForACommit,
+    /// A settle the broker refused is forgotten (`Bridge::pin_settle_refused`, critic item F07):
+    /// every pass asks that broker again and is refused again, and the pin is never fenced.
+    SettleRefusalForgotten,
+    /// A settle the broker refused is taken as its answer (`Bridge::pin_settle_refused`, critic
+    /// item F07): the pin is held as the fence with no flush behind its barriers.
+    RefusedSettleMakesTheFence,
     /// A drain peeks the outbox with a post still in flight, its answer not read first, and
     /// sends what it lists.
     PeekPastOwedPost,
@@ -399,6 +414,11 @@ pub(crate) enum Mutant {
     /// critic item F17's review read it (`Bridge::window_accuses`, `self_window`): a fresh
     /// window's first own record raises it past a forged own record below, unaccused.
     FloorOffTheOldest,
+    /// A window whose `acked` file was missing, unreadable or empty is floored at 0, not at the
+    /// head its attach reads, as every build before critic item F20 loaded it
+    /// (`Bridge::floor_at_the_head`): every own record an earlier run landed is accused as
+    /// forged.
+    UnreadWindowAtZero,
     /// A landed post's reservation is forgotten ahead of aterm's `outbox sent`
     /// (`Bridge::land_group`, critic item E07; a landed receipt's ahead of its `deliver
     /// receipt=`, since F15): a bridge killed between leaves the next one a post aterm still
@@ -459,6 +479,34 @@ pub(crate) enum Mutant {
     /// dial loop. Its control is a bridge unit test on a clock the test holds (critic item E04e,
     /// `busy_local_events_cannot_accelerate_a_failed_broker_retry`).
     EventEndsTheBackoff,
+    /// A reservation's answer its read back cannot vouch for drops the broker link
+    /// (`reason=read`), as every build before critic item F21 dropped it
+    /// (`Bridge::unverified_publication`): every drain ends at that reservation, and every
+    /// other sender's posts wait with it until retention cuts its record. The seeded worlds
+    /// meet no such answer, so its control is a bridge unit test on a real broker
+    /// (`an_unverifiable_reservation_holds_only_its_own_sender`).
+    UnverifiableDropsTheLink,
+    /// A reservation's answer its read back cannot vouch for holds nothing
+    /// (`Bridge::post_refused`, critic item F21): the drain goes on to its sender's later
+    /// posts, which land ahead of its retry. Its control is the same bridge unit test.
+    UnverifiableHoldsNothing,
+    /// The attach's replay publishes a sender's later entries past one whose answer its read
+    /// back cannot vouch for (`Bridge::replay_in_flight`'s point 5, critic item F21): a later
+    /// post lands ahead of the held one's retry. Its control is a bridge unit test
+    /// (`the_attachs_replay_holds_an_unverifiable_entrys_sender`).
+    ReplayPastAnUnverifiableEntry,
+    /// A held lane's post, keyed or not, or owed receipt whose record the attach's replay read
+    /// back on the bus waits for the hold (`Bridge::landed_behind_an_unverifiable_hold`, critic
+    /// item F21): its record is not delivered, and each delivery that meets it drops the link,
+    /// for as long as the hold lasts. Its controls are the replay's bridge unit test and
+    /// `a_held_lanes_receipt_or_keyed_post_the_replay_read_back_is_retired_where_it_landed`.
+    HeldRecordWaitsForTheHold,
+    /// The attach's replay holds a later entry by its record's `from=`, whatever aterm's outbox
+    /// lists (`Bridge::replay_in_flight`'s point 5 as F21 first cut it): an entry whose post
+    /// already left the outbox, its record given up by retention, is dropped and never
+    /// published again. Its control is a bridge unit test
+    /// (`an_entry_whose_post_left_the_outbox_is_published_behind_an_unverifiable_one`).
+    HoldPastTheListing,
 }
 
 /// What one run is.
@@ -2750,7 +2798,7 @@ impl World {
             14 => {
                 let n = 1 + u32::try_from(self.rng.below(2)).unwrap_or(0);
                 if self.opts.refused_batches {
-                    lock(&self.core.broker.state).refuse_next = n;
+                    self.core.broker.refuse_next(n);
                     self.note(format!(
                         "broker refuses the next {n} of the node's publishes and commits"
                     ));

@@ -239,7 +239,8 @@ impl DeviceHandle<'_> {
     /// # Panics
     ///
     /// Where [`Self::try_upload_texture_region`] answers `Err`, and on Metal
-    /// where the region leaves the texture or `bytes` is short of it.
+    /// where the region leaves the texture, `bytes_per_row` is short or
+    /// unaligned for the texel width, or `bytes` is short of it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload_texture_region(
         &self,
@@ -257,6 +258,49 @@ impl DeviceHandle<'_> {
     }
 }
 
+/// Why `replaceRegion:` of the `w × h` region at `(x, y)` of a `tex_w × tex_h` texture whose
+/// texels are `bpt` bytes (`None`: a format this layer does not know) would read or write outside
+/// what it is given: the region leaves the texture, a row of `bytes_per_row` is short of `w`
+/// texels or not a whole number of them, or `len` bytes are short of `h` such rows. `None` when
+/// the upload is sound.
+#[cfg(target_os = "macos")]
+fn metal_region_refusal(
+    (tex_w, tex_h): (usize, usize),
+    bpt: Option<usize>,
+    (x, y, w, h): (u32, u32, u32, u32),
+    len: usize,
+    bytes_per_row: u32,
+) -> Option<String> {
+    let inside = |at: u32, span: u32, size: usize| {
+        (at as usize)
+            .checked_add(span as usize)
+            .is_some_and(|end| end <= size)
+    };
+    if !inside(x, w, tex_w) || !inside(y, h, tex_h) {
+        return Some(format!(
+            "region upload of {w}x{h} at ({x}, {y}) leaves a {tex_w}x{tex_h} texture"
+        ));
+    }
+    let Some(bpt) = bpt else {
+        return Some(format!(
+            "region upload of {w}x{h} into a texture of unknown texel size"
+        ));
+    };
+    let stride = bytes_per_row as usize;
+    if (w as usize).checked_mul(bpt).is_none_or(|row| stride < row) || !stride.is_multiple_of(bpt) {
+        return Some(format!(
+            "region upload of {w}x{h} ({bpt}-byte texels) needs a stride of at least {w} whole \
+             texels, got {bytes_per_row} bytes"
+        ));
+    }
+    if stride.checked_mul(h as usize).is_none_or(|need| len < need) {
+        return Some(format!(
+            "region upload of {w}x{h} rows needs {bytes_per_row}*{h} bytes, got {len}"
+        ));
+    }
+    None
+}
+
 impl DeviceHandle<'_> {
     /// [`Self::upload_texture_region`], answering `Err` where the GL or D3D11
     /// device refuses the write (a region outside the texture, or a removed
@@ -265,8 +309,8 @@ impl DeviceHandle<'_> {
     ///
     /// # Panics
     ///
-    /// On Metal, where the region leaves the texture or `bytes` is short of
-    /// it.
+    /// On Metal, where the region leaves the texture, `bytes_per_row` is short
+    /// or unaligned for the texel width, or `bytes` is short of it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_upload_texture_region(
         &self,
@@ -296,22 +340,21 @@ impl DeviceHandle<'_> {
                         depth: 1,
                     },
                 };
-                assert!(
-                    bytes.len() >= bytes_per_row as usize * h as usize,
-                    "device layer: region upload of {w}x{h} rows needs \
-                     {bytes_per_row}*{h} bytes, got {}",
-                    bytes.len()
-                );
-                assert!(
-                    (x + w) as usize <= texture.width() && (y + h) as usize <= texture.height(),
-                    "device layer: region upload of {w}x{h} at ({x}, {y}) leaves a {}x{} \
-                     texture",
-                    texture.width(),
-                    texture.height()
-                );
+                let bpt = mtl::PixelFormat::from_raw(mtl::texture_pixel_format_raw(texture.obj()))
+                    .map(mtl::PixelFormat::bytes_per_texel);
+                if let Some(why) = metal_region_refusal(
+                    (texture.width(), texture.height()),
+                    bpt,
+                    (x, y, w, h),
+                    bytes.len(),
+                    bytes_per_row,
+                ) {
+                    panic!("device layer: {why}");
+                }
                 // SAFETY: a `LayerTexture::Metal` comes only from this layer's mint, which creates
-                // Managed 2-D textures, so `replaceRegion:` is legal; the region lies in the
-                // texture and the band length is asserted above.
+                // Managed 2-D textures, so `replaceRegion:` is legal; `metal_region_refusal` found
+                // the region inside the texture, each row at least `w` whole texels of its format,
+                // and `bytes` at least `h` rows of `bytes_per_row`.
                 unsafe { texture.upload(region, bytes, bytes_per_row as usize) };
                 Ok(())
             }
@@ -1153,8 +1196,12 @@ pub(crate) fn metal_stage_readback(
     h: usize,
 ) -> Result<(mtl::Obj, usize), String> {
     let padded = crate::padded_bytes_per_row(w);
+    let size = padded
+        .checked_mul(h.max(1))
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or_else(|| format!("metal readback: {w}x{h} staging size overflows"))?;
     let readback = DeviceHandle::Metal(mint)
-        .try_create_readback_buffer("aterm-gpu metal readback", (padded * h.max(1)) as u64)?
+        .try_create_readback_buffer("aterm-gpu metal readback", size)?
         .into_metal()
         .into_obj();
     let mut cb = session.begin()?;
@@ -1343,8 +1390,39 @@ mod tests {
         Some(MetalResourceDevice::new(&dev, Arc::new(LossLatch::new())))
     }
 
-    /// The Metal arm's length guards: a short row band and an overlong buffer
-    /// write both fail the layer's assert before `replaceRegion:` / `memcpy`.
+    /// `replaceRegion:`'s contract, judged without a device: the region inside the texture
+    /// (no wrapping origin), each row at least `w` whole texels, and `h` such rows of bytes.
+    #[test]
+    fn a_metal_region_upload_is_refused_unless_it_fits_its_rows_and_texture() {
+        let refusal = |tex, bpt, region, len, stride| {
+            super::metal_region_refusal(tex, bpt, region, len, stride)
+        };
+        assert_eq!(refusal((8, 8), Some(4), (0, 0, 8, 8), 256, 32), None);
+        assert_eq!(refusal((8, 8), Some(4), (7, 7, 1, 1), 4, 4), None);
+        assert_eq!(refusal((8, 8), Some(4), (0, 0, 2, 3), 3 * 64, 64), None);
+        assert_eq!(refusal((8, 8), Some(1), (0, 0, 8, 1), 8, 8), None);
+        for (tex, bpt, region, len, stride) in [
+            ((8, 8), Some(4), (u32::MAX, 0, 1, 1), 4, 4),
+            ((8, 8), Some(4), (0, u32::MAX, 1, 1), 4, 4),
+            ((8, 8), Some(4), (1, 0, 8, 1), 32, 32),
+            ((8, 8), Some(4), (0, 0, 8, 1), 32, 0),
+            ((8, 8), Some(4), (0, 0, 8, 1), 32, 31),
+            ((8, 8), Some(4), (0, 0, 2, 1), 10, 10),
+            ((8, 8), Some(4), (0, 0, 8, 2), 63, 32),
+            ((8, 8), Some(1), (0, 0, 8, 1), 0, 0),
+            ((8, 8), None, (0, 0, 1, 1), 64, 8),
+        ] {
+            let why = refusal(tex, bpt, region, len, stride);
+            assert!(
+                why.as_deref().is_some_and(|w| w.contains("region upload")),
+                "{tex:?} {bpt:?} {region:?} len={len} stride={stride}: {why:?}"
+            );
+        }
+    }
+
+    /// The Metal arm's length guards: a short row band, a zero stride, a wrapping origin and an
+    /// overlong buffer write each fail the layer's assert before `replaceRegion:` / `memcpy`,
+    /// while a full upload and a one-texel corner region at an exact fit go through.
     #[test]
     fn the_metal_arm_refuses_short_uploads_and_oversized_writes() {
         let Some(mint) = mint() else {
@@ -1373,6 +1451,31 @@ mod tests {
             .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
             .unwrap_or_default();
         assert!(msg.contains("region upload"), "got: {msg}");
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.upload_texture_rows(&tex, 0, 1, &[], 0, 8);
+        }))
+        .expect_err("a zero row stride for a non-empty width must refuse");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default();
+        assert!(msg.contains("region upload"), "got: {msg}");
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.upload_texture_region(&tex, u32::MAX, 0, 1, 1, &[0], 1);
+        }))
+        .expect_err("a wrapping x + w origin must refuse");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default();
+        assert!(msg.contains("region upload"), "got: {msg}");
+
+        handle.upload_texture_full(&tex, &[0u8; 64], 8, 8, 8);
+        handle.upload_texture_region(&tex, 7, 7, 1, 1, &[0], 1);
 
         let buf = handle
             .try_create_instance_buffer("device-layer short-buffer probe", 4)

@@ -1237,6 +1237,10 @@ fn work_said(s: &Fields) -> Option<String> {
 
 struct Block {
     header: String,
+    /// Its home and checkout lines ([`home_lines`]): under the budget they fold after the shells
+    /// and before any agent loses a word, each a line of its own, the checkout lines before any
+    /// instance's home line, counted on the closing line.
+    home: Vec<String>,
     /// The sessions, most pressing first.
     entries: Vec<Entry>,
 }
@@ -1260,6 +1264,8 @@ struct Blocks {
 struct Shown {
     /// Number of session lines shown per block (remaining entries fold into `+N`).
     lines: Vec<usize>,
+    /// Per block, how many of its home lines show, from the first.
+    homes: Vec<usize>,
     /// Per block, per entry, which of its excerpts show: bit `j` its `j`th.
     excerpts: Vec<Vec<u8>>,
     /// How wide an excerpt line is drawn ([`Excerpt::line`]).
@@ -1279,6 +1285,11 @@ impl Shown {
         }
         Shown {
             lines: blocks.items.iter().map(|b| entries(b).len()).collect(),
+            homes: blocks
+                .items
+                .iter()
+                .map(|b| b.as_ref().map_or(0, |b| b.home.len()))
+                .collect(),
             excerpts: blocks
                 .items
                 .iter()
@@ -1296,6 +1307,7 @@ impl Shown {
     fn filled(blocks: &Blocks, order: &[Unit], n: usize) -> Shown {
         let mut shown = Shown::all(blocks, Class::Agent, EXCERPT_CHARS);
         shown.lines.iter_mut().for_each(|n| *n = 0);
+        shown.homes.iter_mut().for_each(|n| *n = 0);
         shown
             .excerpts
             .iter_mut()
@@ -1304,17 +1316,53 @@ impl Shown {
             match *unit {
                 Unit::Line(b, e) => shown.lines[b] = shown.lines[b].max(e + 1),
                 Unit::Excerpt(b, e, j) => shown.excerpts[b][e] |= 1 << j,
+                Unit::Home(b, k) => shown.homes[b] = shown.homes[b].max(k + 1),
             }
         }
         shown
     }
 }
 
-/// One step of budget allocation: a session line or a single excerpt line.
+/// One step of budget allocation: a session line, a single excerpt line, or a block's `k`th home
+/// line (with every one before it).
 #[derive(Clone, Copy)]
 enum Unit {
     Line(usize, usize),
     Excerpt(usize, usize, usize),
+    Home(usize, usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// NEGATIVE CONTROL: while set on a thread, [`fill_order`] ranks a block's home lines with its
+    /// header, as before they could fold, so thirty Macs' home lines take the room of the last
+    /// machine's most pressing agent's words.
+    static HOME_WITH_HEADER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// NEGATIVE CONTROL: while set on a thread, a block's home lines are one fill unit, as they
+    /// were first made: a home with many checkouts that does not fit leaves its room unused by
+    /// every unit after it.
+    static HOME_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a block's home lines are one fill unit ([`HOME_WHOLE`]); never outside this crate's
+/// tests.
+fn home_whole() -> bool {
+    #[cfg(test)]
+    return HOME_WHOLE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
+/// The tier of a block's home lines in [`fill_order`]: after every agent's excerpts and before
+/// the running and idle shells, so the shells fold first and the home lines next, before any
+/// agent loses a word (one-mesh E2: at thirty Macs the home lines of DX-2 had cost the last
+/// machine's most pressing agent its words).
+fn home_tier() -> u8 {
+    #[cfg(test)]
+    if HOME_WITH_HEADER.with(std::cell::Cell::get) {
+        return 0;
+    }
+    3
 }
 
 fn excerpt_rank(word: &str) -> usize {
@@ -1332,6 +1380,17 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
         let Ok(block) = block else {
             continue;
         };
+        // Each home line is a unit of one line, so a long checkout list strands no room: every
+        // instance's home line first, then the checkout lines a round at a time.
+        if home_whole() {
+            if let Some(last) = block.home.len().checked_sub(1) {
+                keyed.push(((home_tier(), 0, 0, 0, b), Unit::Home(b, last)));
+            }
+        } else {
+            for k in 0..block.home.len() {
+                keyed.push(((home_tier(), usize::from(k > 0), k, 0, b), Unit::Home(b, k)));
+            }
+        }
         let mut nth = [0usize; 8];
         let mut round = 0usize;
         for (e, entry) in block.entries.iter().enumerate() {
@@ -1339,8 +1398,8 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
             let k = nth[class];
             nth[class] += 1;
             let line = match entry.class {
-                Class::Running => (3, 0, k, 0, b),
-                Class::Shell => (4, 0, k, 0, b),
+                Class::Running => (4, 0, k, 0, b),
+                Class::Shell => (5, 0, k, 0, b),
                 _ => (0, class, k, 0, b),
             };
             keyed.push((line, Unit::Line(b, e)));
@@ -1518,14 +1577,15 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
                     .collect();
                 entries.sort_by_key(|entry| entry.class);
                 let mut header = header_line(reply, survey);
-                for line in accounts_line(survey, reply.remote)
-                    .into_iter()
-                    .chain(home_lines(survey))
-                {
+                if let Some(line) = accounts_line(survey, reply.remote) {
                     header.push('\n');
                     header.push_str(&line);
                 }
-                Ok(Block { header, entries })
+                Ok(Block {
+                    header,
+                    home: home_lines(survey),
+                    entries,
+                })
             }
             Err(why) => Err(unanswered_line(&reply.label, why)),
         })
@@ -1547,7 +1607,7 @@ pub(crate) fn render_full(replies: &[HostReply], own: Option<&str>) -> String {
 
 fn render(blocks: &Blocks, shown: &Shown) -> String {
     let mut out = String::new();
-    let (mut cut_sessions, mut cut_excerpts) = (0usize, 0usize);
+    let (mut cut_sessions, mut cut_excerpts, mut cut_homes) = (0usize, 0usize, 0usize);
     for (b, block) in blocks.items.iter().enumerate() {
         let block = match block {
             Ok(block) => block,
@@ -1559,6 +1619,12 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
         };
         out.push_str(&block.header);
         out.push('\n');
+        let homes = shown.homes[b].min(block.home.len());
+        for line in &block.home[..homes] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        cut_homes += usize::from(homes < block.home.len());
         let lines = shown.lines[b].min(block.entries.len());
         for (e, entry) in block.entries[..lines].iter().enumerate() {
             let words = shown.excerpts[b][e];
@@ -1581,8 +1647,13 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
         }
         cut_sessions += rest.len();
     }
-    if cut_sessions > 0 || cut_excerpts > 0 {
-        out.push_str(&left_out_line(cut_sessions, cut_excerpts, blocks.fleet));
+    if cut_sessions > 0 || cut_excerpts > 0 || cut_homes > 0 {
+        out.push_str(&left_out_line(
+            cut_sessions,
+            cut_excerpts,
+            cut_homes,
+            blocks.fleet,
+        ));
     }
     out
 }
@@ -1590,7 +1661,12 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
 /// Prefix for the footer line reporting budget-omitted sessions or excerpts.
 pub const LEFT_OUT_LEAD: &str = "… the budget left out ";
 
-fn left_out_line(cut_sessions: usize, cut_excerpts: usize, fleet: bool) -> String {
+fn left_out_line(
+    cut_sessions: usize,
+    cut_excerpts: usize,
+    cut_homes: usize,
+    fleet: bool,
+) -> String {
     let mut what: Vec<String> = Vec::new();
     if cut_excerpts > 0 {
         what.push(format!(
@@ -1612,11 +1688,19 @@ fn left_out_line(cut_sessions: usize, cut_excerpts: usize, fleet: bool) -> Strin
             }
         ));
     }
-    format!(
-        "{LEFT_OUT_LEAD}{}; {} for more\n",
-        what.join(" and "),
-        remedies(fleet)
-    )
+    // An instance's home and checkout lines, which fold after the shells: a short clause, so
+    // the line keeps within its cap at a fleet's three-figure counts.
+    let mut said = what.join(" and ");
+    if cut_homes > 0 {
+        if !said.is_empty() {
+            said.push_str(", ");
+        }
+        said.push_str(&format!(
+            "{cut_homes} {}",
+            if cut_homes == 1 { "home" } else { "homes" }
+        ));
+    }
+    format!("{LEFT_OUT_LEAD}{said}; {} for more\n", remedies(fleet))
 }
 
 fn more_line(rest: &[Entry]) -> String {

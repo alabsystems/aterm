@@ -6912,6 +6912,122 @@ fn a_muse_code_session_is_supervised_end_to_end() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
+/// A MUSE CODE FAULT IS HANDED OVER ONCE ITS POINT: the badge names the fault's row, set once
+/// however many looks read the same point, and nothing is typed into the session, where the fault
+/// ends a turn nobody asked or answers the loop's own continuation, a busy frame read before it
+/// or none. Negative controls: the same sessions ending on a plain reply are continued, with no
+/// badge.
+#[test]
+fn a_muse_code_fault_is_handed_over_once_and_nothing_is_typed() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let ends_on = |row: &str| {
+        let mut rows = screen(u::END_OF_TURN);
+        let at = rows
+            .iter()
+            .rposition(|r| r.starts_with("◆ echo"))
+            .expect("the reply");
+        rows[at] = row.to_string();
+        rows
+    };
+    let fault = ends_on("◆ A configuration problem stopped this turn. Fix it in /settings.");
+    let mut m = muse_mock(vec![screen(u::BUSY), fault]);
+    m.vanish_after = Some(4);
+    let (lines, _) = watch_lines(&mut m, &hosted(30));
+    assert_eq!(
+        count(&m, "meta set attention"),
+        1,
+        "{lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert!(
+        m.attention
+            .as_deref()
+            .is_some_and(|a| a.contains("Muse Code stopped the turn: A configuration problem")),
+        "{:?}",
+        m.attention
+    );
+    assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+    assert!(m.presses().is_empty(), "{:#?}", m.requests);
+
+    // The fault answering the loop's own continuation: one line typed, then the badge.
+    let typed = |text: &str| {
+        let mut rows = screen(u::END_OF_TURN_1_4_10);
+        let caret = aterm_phase::muse::composer(&rows).expect("the composer");
+        rows[caret] = format!("❯ {text}");
+        rows
+    };
+    let faulted = {
+        let mut rows = screen(u::END_OF_TURN_1_4_10);
+        let head = rows
+            .iter()
+            .rposition(|r| r.starts_with("◆ Hi!"))
+            .expect("the reply");
+        rows[head] =
+            "◆ A configuration problem stopped this turn. Fix it in /settings.".to_string();
+        rows
+    };
+    let run = |busy: bool, last: Vec<String>| {
+        let mut rows = vec![
+            screen(u::BUSY_1_4_10),
+            screen(u::END_OF_TURN_1_4_10),
+            typed("keep going"),
+        ];
+        if busy {
+            rows.push(screen(u::BUSY_1_4_10));
+        }
+        rows.push(last);
+        let cols: Vec<(usize, usize)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let c = aterm_phase::muse::composer(r)?;
+                let t = r[c].strip_prefix('❯')?.trim();
+                (!t.is_empty()).then(|| (i, 2 + t.chars().count()))
+            })
+            .collect();
+        let mut m = muse_mock(rows);
+        m.screen_cols.extend(cols);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        m.vanish_after = Some(4);
+        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let continued = lines.iter().filter(|l| l.starts_with("CONTINUED ")).count();
+        (m, lines, continued)
+    };
+    for busy in [true, false] {
+        let (m, lines, continued) = run(busy, faulted.clone());
+        assert_eq!(continued, 1, "busy={busy}: {lines:#?}\n{:#?}", m.requests);
+        assert_eq!(
+            count(&m, "meta set attention"),
+            1,
+            "busy={busy}: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            m.attention
+                .as_deref()
+                .is_some_and(|a| a.contains("Muse Code stopped the turn: A configuration problem")),
+            "busy={busy}: {:?}",
+            m.attention
+        );
+    }
+    let (m, lines, continued) = run(true, screen(u::END_OF_TURN_1_4_10));
+    assert!(continued >= 1, "the control: {lines:#?}\n{:#?}", m.requests);
+    assert_eq!(
+        count(&m, "meta set attention"),
+        0,
+        "the control: {lines:#?}"
+    );
+}
+
 #[test]
 fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
     use aterm_phase::muse::fixtures as u;

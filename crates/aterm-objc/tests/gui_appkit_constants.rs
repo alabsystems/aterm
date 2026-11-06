@@ -48,6 +48,7 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_EVENT_MASK_KEY_DOWN",                "NSEventMaskKeyDown"),
     ("NS_ALERT_FIRST_BUTTON_RETURN",          "NSAlertFirstButtonReturn"),
     ("NS_ALERT_SECOND_BUTTON_RETURN",         "NSAlertSecondButtonReturn"),
+    ("NS_ALERT_THIRD_BUTTON_RETURN",          "NSAlertThirdButtonReturn"),
     ("NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC",     "NSWindowToolbarStyleAutomatic"),
     ("NS_WINDOW_TOOLBAR_STYLE_EXPANDED",      "NSWindowToolbarStyleExpanded"),
     ("NS_WINDOW_TOOLBAR_STYLE_PREFERENCE",    "NSWindowToolbarStylePreference"),

@@ -32,6 +32,8 @@ mod driver;
 #[path = "driver_windows.rs"]
 mod driver;
 
+mod beside;
+
 /// `aterm doctor`'s own rows as converge items; `crates/aterm` composes them with the packages'
 /// repair items and `aterm pkg doctor`.
 pub mod doctor;
@@ -891,7 +893,7 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         Later, a grant aterm verified that reads off again (found at\n\
      \x20                         launch, or when macOS shows its \"access data from other apps\"\n\
      \x20                         dialog for a program of yours) puts one line on aterm's\n\
-     \x20                         menu-bar menu, \"System State: Full Disk Access needs you\",\n\
+     \x20                         menu-bar menu, \"System State: Needs you: Full Disk Access\",\n\
      \x20                         which opens System State; nothing is filed in Messages, and\n\
      \x20                         Not now on that step keeps the line dark until Permissions is\n\
      \x20                         set up again. Off pauses the steps with no answer\n\
@@ -1704,36 +1706,45 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
     .flatten();
     let withheld = args_read_withheld(program_check.as_ref());
     let withheld = withheld.as_deref();
-    fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
-        handle
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    }
+    use beside::Beside;
     fn unread<T>() -> Result<T, String> {
         Err("not read".to_owned())
     }
+    // Each probe on a thread of its own, or in this one where no thread starts.
     let (mut rows, hand_over, rust_docs) = std::thread::scope(|scope| {
         let check_full = withheld.is_some();
-        let devtools =
-            reads("devtools:").then(|| scope.spawn(move || (ports.devtools)(fix, check_full)));
-        let spotlight = reads("spotlight:").then(|| scope.spawn(ports.spotlight));
-        let services = reads("services:").then(|| scope.spawn(ports.services));
-        let privacy = reads("privacy:").then(|| scope.spawn(ports.privacy));
-        let debugger = reads("debugger:").then(|| scope.spawn(ports.debugger));
+        let devtools = reads("devtools:").then(|| {
+            beside::start(scope, "aterm-doctor-devtools", move || {
+                (ports.devtools)(fix, check_full)
+            })
+        });
+        let spotlight = reads("spotlight:")
+            .then(|| beside::start(scope, "aterm-doctor-spotlight", ports.spotlight));
+        let services = reads("services:")
+            .then(|| beside::start(scope, "aterm-doctor-services", ports.services));
+        let privacy =
+            reads("privacy:").then(|| beside::start(scope, "aterm-doctor-privacy", ports.privacy));
+        let debugger = reads("debugger:")
+            .then(|| beside::start(scope, "aterm-doctor-debugger", ports.debugger));
         let instances = reads("instances:").then(|| {
-            scope.spawn(move || match withheld {
+            beside::start(scope, "aterm-doctor-instances", move || match withheld {
                 Some(why) => Err(why.to_owned()),
                 None => (ports.instances)(),
             })
         });
-        let fabric = reads("fabric:").then(|| scope.spawn(move || (ports.fabric)(withheld)));
+        let fabric = reads("fabric:").then(|| {
+            beside::start(scope, "aterm-doctor-fabric", move || {
+                (ports.fabric)(withheld)
+            })
+        });
         let leftovers = reads("leftovers:").then(|| {
-            scope.spawn(move || match withheld {
+            beside::start(scope, "aterm-doctor-leftovers", move || match withheld {
                 Some(why) => Err(why.to_owned()),
                 None => (ports.leftovers)(),
             })
         });
-        let awake = reads("awake:").then(|| scope.spawn(ports.awake));
+        let awake =
+            reads("awake:").then(|| beside::start(scope, "aterm-doctor-awake", ports.awake));
         let recovery = if reads("recovery:") {
             recovery_facts()
         } else {
@@ -1746,25 +1757,25 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
         };
         let machine = MachineFacts {
             console_host: reads("conpty:").then(console_host_fact).flatten(),
-            fabric: fabric.and_then(join),
-            awake: awake.and_then(join),
-            spotlight: spotlight.and_then(join),
-            services: services.and_then(join),
+            fabric: fabric.and_then(Beside::answer),
+            awake: awake.and_then(Beside::answer),
+            spotlight: spotlight.and_then(Beside::answer),
+            services: services.and_then(Beside::answer),
             shim_cache: reads("services:").then(shim_cache_fact).flatten(),
             network: reads("network:").then(network_fact).flatten(),
             program_check,
-            leftovers: leftovers.map(join),
+            leftovers: leftovers.map(Beside::answer),
             ..MachineFacts::absent()
         };
         let privacy = privacy.map_or_else(
             || PrivacyFacts::not_measured(ProbeLabel::UnsupportedPlatform),
-            join,
+            Beside::answer,
         );
         let debugger = debugger.map_or_else(
             || DebuggerFacts::not_measured(DebuggerProbeLabel::UnsupportedPlatform),
-            join,
+            Beside::answer,
         );
-        let mut instances = instances.map_or_else(unread, join);
+        let mut instances = instances.map_or_else(unread, Beside::answer);
         if let (Ok(census), Some(serving)) = (
             instances.as_mut(),
             machine.fabric.as_ref().and_then(|(.., serving)| *serving),
@@ -1772,7 +1783,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             aterm_ctl::census::supervise(census, serving, ports.offered);
         }
         let (devtools, devtools_due) =
-            devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
+            devtools.map_or_else(|| (DevtoolsFacts::absent(), None), Beside::answer);
         let fda_due =
             fix && privacy_row(&privacy).2 == PrivacyNext::HandOver && (ports.person_here)();
         let hand_over = Missing {
@@ -2789,19 +2800,31 @@ fn enters() -> &'static std::sync::atomic::AtomicU64 {
     static READER: std::sync::Once = std::sync::Once::new();
     READER.call_once(|| {
         if std::io::stdin().is_terminal() && stdin_in_foreground() {
-            std::thread::spawn(|| {
-                let mut line = String::new();
-                while std::io::stdin()
-                    .read_line(&mut line)
-                    .is_ok_and(|read| read > 0)
-                {
-                    line.clear();
-                    LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
+            std::thread::spawn(|| count_enters(std::io::stdin(), &LINES));
         }
     });
     &LINES
+}
+
+/// Count each `\n` read from `input` into `lines` until it ends or fails. Bytes, not text: a key
+/// whose byte is not UTF-8 (a pasted Latin-1 `é`, a stray Meta key) is no Enter, and it does not
+/// end the count.
+fn count_enters(mut input: impl std::io::Read, lines: &std::sync::atomic::AtomicU64) {
+    let mut read = [0u8; 256];
+    loop {
+        match input.read(&mut read) {
+            Ok(0) => return,
+            Ok(n) => {
+                let enters = read[..n].iter().filter(|&&byte| byte == b'\n').count();
+                lines.fetch_add(
+                    u64::try_from(enters).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Set once Enter is pressed at this terminal after this call ([`enters`]): it ends doctor's
@@ -7190,6 +7213,17 @@ mod tests {
         assert_eq!(read.len(), 9, "{read:?}");
     }
 
+    /// Where no thread starts, doctor's own probes read in the caller instead: the same rows,
+    /// each probe once. NEGATIVE CONTROL: the gather that has its threads reads the same.
+    #[test]
+    fn doctors_own_probes_read_in_the_caller_where_no_thread_starts() {
+        let every = |label: &str| super::doctor::reads(&[], label);
+        let threaded = CountedReads::new(None).rows(&every);
+        let here = crate::beside::tests::refusing(|| CountedReads::new(None).rows(&every));
+        assert_eq!(here, threaded);
+        assert_eq!(here.1.len(), 9, "{here:?}");
+    }
+
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
         use aterm_containment::consent::{DevToolProbe, DevToolProbeLabel};
         atpkg::devtools::Facts {
@@ -7875,6 +7909,20 @@ mod tests {
         );
         super::enters().fetch_add(1, Relaxed);
         assert!(second.load(Relaxed));
+    }
+
+    /// Every `\n` on stdin is an Enter, whatever bytes come before or between: a byte that is
+    /// not UTF-8 neither counts nor ends the count. NEGATIVE CONTROL: bytes with no `\n` count
+    /// none.
+    #[test]
+    fn a_byte_that_is_not_utf8_does_not_end_the_enter_count() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let lines = AtomicU64::new(0);
+        super::count_enters(&b"\xff\n\xc3(\nok\n\n"[..], &lines);
+        assert_eq!(lines.load(Relaxed), 4);
+        let none = AtomicU64::new(0);
+        super::count_enters(&b"\xff\xfe typed, never entered"[..], &none);
+        assert_eq!(none.load(Relaxed), 0);
     }
 
     /// `aterm init` hands its Permissions phase's grants to the window's walk by their row

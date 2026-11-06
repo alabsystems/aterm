@@ -21,7 +21,7 @@ impl Proton {
         String,
     > {
         // Use the same bounded address and header validation as SMTP.
-        let _validated = crate::smtp::encode(draft)?;
+        crate::smtp::validate_draft(draft)?;
         let index = self
             .send_keys
             .iter()

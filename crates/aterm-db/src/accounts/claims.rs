@@ -273,7 +273,7 @@ fn latest(logs: &[(Source, Log)], machines: &BTreeMap<Actor, [u8; 16]>) -> BTree
         let (tier, generation) = source.tier();
         for (operation, command) in log.eligible() {
             let actor = operation.header.actor;
-            let Ok((machine, body, _, _)) = row_fields(&command) else {
+            let Ok((machine, body, _, _)) = row_fields(command) else {
                 continue;
             };
             if machines.get(&actor) != Some(&machine) {
@@ -521,9 +521,10 @@ pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
 }
 
 /// Hand this Mac's latest row to its peers now through `pusher`, this process's Commons runtime
-/// ([`crate::runtime::Pusher::push_until`]): each round the runtime begins repairs the day table
-/// that holds the row first, until a round that began after the ask caught a peer up on it, or
-/// `deadline`.
+/// ([`crate::runtime::Pusher::push_until`]): a neighbour's acknowledgement on the mesh's relay
+/// reaches it at once ([`crate::runtime::Pusher::relay`]); otherwise each round the runtime
+/// begins repairs the day table that holds the row first, until a round that began after the ask
+/// caught a peer up on it, or `deadline`.
 /// What a Mac does as it goes to sleep or stops, when no later round of its own may come.
 ///
 /// # Errors

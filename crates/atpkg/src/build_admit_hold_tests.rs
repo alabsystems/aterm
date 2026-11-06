@@ -54,6 +54,28 @@ fn a_holders_words_read_back_whole() {
     assert_eq!(Words::parse(&words.render()[..4]), None, "a word short");
 }
 
+/// THE METER'S FIRST READ IS VOUCHED FOR BY THE FRONT'S IDENTITY READ AFTER IT: the meter starts
+/// first, and a front whose serial changed by the identity read keeps no meter. NEGATIVE CONTROL:
+/// an unchanged serial keeps the meter, started once, before the read.
+#[test]
+fn the_front_is_read_after_its_meters_first_read() {
+    for (serial_holds, kept) in [(true, Some("meter")), (false, None)] {
+        let order = std::cell::RefCell::new(Vec::new());
+        let meter = meter_for_front(
+            || {
+                order.borrow_mut().push("meter");
+                "meter"
+            },
+            || {
+                order.borrow_mut().push("front");
+                serial_holds
+            },
+        );
+        assert_eq!(meter, kept, "serial held: {serial_holds}");
+        assert_eq!(*order.borrow(), ["meter", "front"]);
+    }
+}
+
 fn pid_t(pid: u32) -> i32 {
     i32::try_from(pid).expect("a pid")
 }
@@ -169,6 +191,83 @@ fn a_watch_whose_kevent_fails_waits_by_reading_its_pid() {
         .recv_timeout(MUST_HAPPEN)
         .expect("hang detector: the watch's end");
     assert_eq!((end, lived), (End::Unknown, false));
+    let _ = shell.wait();
+}
+
+/// A WATCH THAT READS ITS PROCESS'S PID GONE BEFORE THE EXIT'S EVENT WAITS FOR THAT EVENT AND
+/// ITS STATUS: macOS stops reading a killed process's pid before it queues `NOTE_EXIT`, and here
+/// the read says gone at every wake while the process lives on, holding that gap open until the
+/// test kills it. NEGATIVE CONTROL (by hand: the first wake that reads the pid gone taken for the
+/// end, `End::Unknown`, as the holder's one look at an empty queue took it): the wait comes back
+/// with no status while its process lives, and a killed build's survivors lost its claim so.
+#[test]
+fn a_watch_that_reads_its_pid_gone_before_the_exit_waits_for_its_status() {
+    let mut shell = waiting_shell();
+    let watch = Watch::on(shell.id()).expect("watched");
+    let (tx, rx) = mpsc::channel();
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&ticks);
+    std::thread::spawn(move || {
+        let end = watch.wait_reading(&mut || true, EXIT_EVENT_WAKES, &mut || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let _ = tx.send(end);
+    });
+    let mut early = None;
+    until_within(MUST_HAPPEN, "two wakes of the watch, or its end", || {
+        if let Ok(end) = rx.try_recv() {
+            early = Some(end);
+            return Some(());
+        }
+        (ticks.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
+    });
+    assert_eq!(early, None, "the watch came back while its process lived");
+    shell.kill().expect("killed");
+    let end = rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("hang detector: its death");
+    let End::Status(status) = end else {
+        panic!("no status: {end:?}");
+    };
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "{status:#x}"
+    );
+    let _ = shell.wait();
+}
+
+/// A WATCH TAKES ITS PID READ GONE FOR AN END WITH NO STATUS ONLY AT `wakes` WAKES IN A ROW with
+/// no exit event, and a read of it live counts anew: the reads say gone, live, then gone at a
+/// process that lives on, `wakes` 2, and the end (`End::Unknown`) comes back at the fourth wake.
+/// NEGATIVE CONTROLS (each by hand): the bound dropped, so only an event ends the wait, fires the
+/// hang detector; the count kept across the live read ends it at the third wake.
+#[test]
+fn a_watch_takes_its_pid_gone_for_an_end_only_at_wakes_in_a_row() {
+    let mut shell = waiting_shell();
+    let watch = Watch::on(shell.id()).expect("watched");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reads = 0u32;
+        let mut ticks = 0u32;
+        let end = watch.wait_reading(
+            &mut || {
+                reads += 1;
+                reads != 2
+            },
+            2,
+            &mut || ticks += 1,
+        );
+        let _ = tx.send((end, ticks));
+    });
+    let ended = rx
+        .recv_timeout(MUST_HAPPEN)
+        .expect("hang detector: the watch's end");
+    assert_eq!(ended, (End::Unknown, 4));
+    assert!(
+        shell.try_wait().expect("the shell's state").is_none(),
+        "the shell still waits for its line"
+    );
+    drop(shell.stdin.take());
     let _ = shell.wait();
 }
 

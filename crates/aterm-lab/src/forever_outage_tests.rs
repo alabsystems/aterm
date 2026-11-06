@@ -389,6 +389,44 @@ fn an_outage_met_by_cruise_is_tried_on_its_rungs_and_resumed_once() {
     assert!(why.contains("dumps after the lift were not read"), "{why}");
 }
 
+/// O2'S CRUISE ACT IS TIMED ONLY BY A BACK-OFF NAMED BEFORE IT: one journaled after Cruise's act,
+/// of that act's own answer, times a later act. NEGATIVE CONTROL: with no back-off before an act a
+/// second past the scaled ladder's fourth step and the grace from the resume, and one after it,
+/// the act FAILs as no back-off named, where the later back-off's due passed it; a second earlier
+/// it holds.
+#[test]
+fn o2s_cruise_act_is_timed_by_a_back_off_named_before_it() {
+    let resumed = 704_100;
+    let within = ladder_step_ms(4, outage::SCALE) + PERSISTENCE_GRACE_MS;
+    let late = |act: i64| {
+        let mut s = cruise_outage();
+        s.journal.remove(line_at(&s, resumed + 3_900, "WAITING "));
+        let i = line_at(&s, resumed + 34_000, "CONTINUED");
+        s.journal[i].0 = T0 + act;
+        let r = s.ledger.iter().position(|r| r.ts == T0 + resumed + 34_000);
+        s.ledger[r.expect("Cruise's act")].ts = T0 + act;
+        s.journal
+            .push(j(act + 3_800, &format!("EVENT idle seq=7 {DONE_CLAIM}")));
+        s.journal.push(backs_off(act + 3_900, 7, 3, act + 63_900));
+        s.ledger.push(point(act + 3_800, 3));
+        s.end_ms = T0 + act + 70_000;
+        s
+    };
+    let (w, why) = o2(&late(resumed + within - 1_000));
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("no back-off named"), "{why}");
+    let (w, why) = o2(&late(resumed + within + 1_000));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        !why.contains("THE CHAIN'S RECORDS")
+            && why.contains(
+                "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +1125.1 s, 421.0 s \
+                 after the resume (no back-off named)"
+            ),
+        "{why}"
+    );
+}
+
 /// MAIN'S RULE FAILS THE OUTAGE: its typed retry a minute after the overload, with its own wait's
 /// words ("overloaded retry 1"), and nothing on the outage's rungs, so the lab's hang detector
 /// lifts it and no sooner.

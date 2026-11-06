@@ -14,6 +14,7 @@ const EMAIL: &str = "owner@example.test";
 const NOW: i64 = 1_800_000_000;
 
 struct Approval {
+    cancel_on_current: std::sync::Mutex<Option<crate::harness::account_work::Lifetime>>,
     live: AtomicBool,
     generation: AtomicU64,
     recoveries: AtomicUsize,
@@ -45,9 +46,15 @@ impl Authority for Approval {
         })
     }
     fn current(&self, grant: &Grant, row: &accounts::Row) -> Result<(), String> {
-        (self.prepare(row)? == *grant)
+        let result = (self.prepare(row)? == *grant)
             .then_some(())
-            .ok_or_else(|| "changed".into())
+            .ok_or_else(|| "changed".into());
+        if result.is_ok()
+            && let Some(work) = self.cancel_on_current.lock().unwrap().take()
+        {
+            drop(work.pause().unwrap());
+        }
+        result
     }
     fn request_recovery(
         &self,
@@ -69,6 +76,9 @@ impl Authority for Approval {
 }
 
 struct Host {
+    work: Option<crate::harness::account_work::Scope>,
+    cancel: Option<crate::harness::account_work::Lifetime>,
+    status_calls: AtomicUsize,
     approval: Arc<Approval>,
     calls: AtomicUsize,
     online_calls: AtomicUsize,
@@ -98,6 +108,25 @@ fn write_login(path: &Path, email: &str) {
     }
 }
 impl AccountsHost for Host {
+    fn renew_outcome(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<RenewalExit, RenewalFailure> {
+        let code = self.renew_flow(home, email, browser)?;
+        if self.mode == 16 {
+            Err(RenewalFailure::deferred())
+        } else {
+            Ok(code.into())
+        }
+    }
+    fn work_cancelled(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(crate::harness::account_work::Scope::cancelled)
+    }
+
     fn current_exe(&self) -> Option<PathBuf> {
         (self.mode != 7).then(|| std::env::current_exe().unwrap())
     }
@@ -108,6 +137,9 @@ impl AccountsHost for Host {
     ) -> Result<shared_provider::ClaudeProfile, shared_provider::ObservationError> {
         assert_eq!(token, "synthetic-access");
         self.online_calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode == 13 {
+            drop(self.cancel.as_ref().unwrap().pause().unwrap());
+        }
         if self.mode == 9 {
             return Err(shared_provider::ObservationError::Unavailable(
                 "fixture canonical provider outage".into(),
@@ -184,6 +216,9 @@ impl AccountsHost for Host {
                 .unwrap();
             }
         }
+        if self.mode == 11 {
+            drop(self.cancel.as_ref().unwrap().pause().unwrap());
+        }
         if self.mode == 2 {
             self.approval.live.store(false, Ordering::SeqCst);
         }
@@ -205,6 +240,10 @@ impl AccountsHost for Host {
         Ok(0)
     }
     fn status_in_home(&self, _: &str) -> Result<Captured, String> {
+        self.status_calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode == 12 {
+            drop(self.cancel.as_ref().unwrap().pause().unwrap());
+        }
         Ok(Captured { code: Some(0), stdout: format!(r#"{{"loggedIn":true,"authMethod":"claude.ai","email":"{EMAIL}","subscriptionType":"max"}}"#).into_bytes() })
     }
     fn claude_identity_in_home(&self, home: &str, email: &str) -> profile::IdentityObservation {
@@ -232,6 +271,7 @@ fn fixture(mode: u8) -> (Tmp, Env, Arc<Approval>, Host) {
     let mut env = env_at(&tmp);
     env.now = NOW;
     let approval = Arc::new(Approval {
+        cancel_on_current: std::sync::Mutex::new(None),
         live: AtomicBool::new(true),
         generation: AtomicU64::new(1),
         recoveries: AtomicUsize::new(0),
@@ -240,6 +280,9 @@ fn fixture(mode: u8) -> (Tmp, Env, Arc<Approval>, Host) {
         unpinned: AtomicBool::new(false),
     });
     let host = Host {
+        work: None,
+        cancel: None,
+        status_calls: AtomicUsize::new(0),
         approval: approval.clone(),
         calls: AtomicUsize::new(0),
         online_calls: AtomicUsize::new(0),
@@ -368,6 +411,7 @@ fn run_with_provider(
     let roster = env.accounts_roster().unwrap();
     let signin = adoption_sign_in(&store, &roster, &candidate);
     super::super::shared_adoption::adopt(env, host, &store, &signin, &roster, candidate)
+        .map_err(|failure| failure.to_string())
 }
 
 /// The started sign-in [`super::super::shared_adoption::adopt`] takes for `candidate`, naming
@@ -703,6 +747,7 @@ fn interrupted_first_adoption_reconciles_same_staging_without_another_provider_e
 
 #[cfg(unix)]
 struct ChangeDuringProof {
+    cancel: Option<crate::harness::account_work::Lifetime>,
     approval: Arc<Approval>,
     config: PathBuf,
     off: Option<&'static str>,
@@ -729,7 +774,9 @@ impl shared_provider::LoginProof for ChangedProof {
     fn check_current(&self) -> Result<(), String> {
         self.inner.check_current()?;
         self.change.checked.fetch_add(1, Ordering::SeqCst);
-        if let Some(off) = self.change.off {
+        if let Some(work) = &self.change.cancel {
+            drop(work.pause().unwrap());
+        } else if let Some(off) = self.change.off {
             fs::write(&self.change.config, off).unwrap();
         } else {
             self.change.approval.live.store(false, Ordering::SeqCst);
@@ -772,6 +819,7 @@ impl shared_provider::Provider for ChangeDuringProof {
             Box::new(ChangedProof {
                 inner,
                 change: Self {
+                    cancel: self.cancel.clone(),
                     approval: self.approval.clone(),
                     config: self.config.clone(),
                     off: self.off,
@@ -797,6 +845,7 @@ fn publication_rechecks_root_and_local_off_after_the_final_credential_read() {
         let (_tmp, env, approval, host) = fixture(0);
         let checked = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(ChangeDuringProof {
+            cancel: None,
             approval: approval.clone(),
             config: config_beside_for_test(&host.roster),
             off,
@@ -1035,4 +1084,132 @@ fn shared_native_admission_rechecks_root_roster_and_binding_during_observation()
         assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
         assert!(provider.seen.lock().unwrap()[0].current(None).is_err());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_shared_adoption_retains_pending_custody_without_publishing_or_recovery() {
+    for mode in [0, 11, 12, 13, 14, 15] {
+        let (_tmp, env, approval, mut host) = fixture(mode);
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        host.work = Some(lifetime.enter().unwrap());
+        host.cancel = Some(lifetime.clone());
+        let old = accounts::Row {
+            label: "owner".into(),
+            email: Some("local@example.test".into()),
+            ..Default::default()
+        };
+        let text = accounts::append_rows_for(Cli::Claude, "", &[old]).unwrap();
+        aterm_uds::atomic_file::write(&host.roster, text.as_bytes(), 0o600).unwrap();
+        host.before = Some(text.into_bytes());
+        let home = env.home.as_ref().unwrap();
+        aterm_types::fs_restricted::ensure_private_dir(home).unwrap();
+        write_login(home, "local@example.test");
+        let original_profile = fs::read(home.join(".claude.json")).unwrap();
+        let original_credential = fs::read(home.join(".credentials.json")).unwrap();
+        let store = env.accounts_store();
+        store
+            .transact(NOW, &mut None, |state| {
+                state.active = Some("owner".into());
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let grant = approval.prepare(&candidate(&approval).row).unwrap();
+        let checked = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn shared_provider::Provider> = if mode == 14 {
+            Arc::new(ChangeDuringProof {
+                cancel: Some(lifetime.clone()),
+                approval: approval.clone(),
+                config: config_beside_for_test(&host.roster),
+                off: None,
+                checked: checked.clone(),
+            })
+        } else {
+            Arc::new(shared_provider::ClaudeOauth)
+        };
+        if mode == 0 {
+            drop(lifetime.pause().unwrap());
+        }
+        if mode == 15 {
+            *approval.cancel_on_current.lock().unwrap() = Some(lifetime.clone());
+        }
+        assert!(run_with_provider(&env, &host, &approval, provider).is_err());
+        assert!(host.work_cancelled());
+        assert_eq!(
+            host.calls.load(Ordering::SeqCst),
+            usize::from(mode != 0 && mode != 15)
+        );
+        assert_eq!(
+            host.status_calls.load(Ordering::SeqCst),
+            usize::from((12..=14).contains(&mode))
+        );
+        assert_eq!(checked.load(Ordering::SeqCst), usize::from(mode == 14));
+        assert_eq!(fs::read(&host.roster).ok(), host.before);
+        assert_eq!(
+            fs::read(home.join(".claude.json")).unwrap(),
+            original_profile
+        );
+        assert_eq!(
+            fs::read(home.join(".credentials.json")).unwrap(),
+            original_credential
+        );
+        let (state, _) = store.load(NOW + 1).unwrap();
+        assert_eq!(state.active.as_deref(), Some("owner"));
+        let (logins, _) = store.load_logins(NOW + 1).unwrap();
+        if mode == 0 || mode == 15 {
+            assert!(logins.shared.latest(grant.source).is_none());
+            if mode == 15 {
+                assert_eq!(
+                    fs::read_dir(store.logins_dir()).unwrap().count(),
+                    0,
+                    "known pre-begin cancellation left unretained staging"
+                );
+            }
+        } else {
+            let pending = logins.shared.latest(grant.source).unwrap();
+            assert_eq!(pending.outcome, accounts::shared::Outcome::Pending);
+            assert!(Path::new(&pending.intent.staging).exists());
+        }
+        assert_eq!(
+            approval.recoveries.load(Ordering::SeqCst),
+            0,
+            "cancellation alone cannot request replacement authority"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_unavailable_issuer_keeps_the_consumed_shared_attempt_pending_without_replay() {
+    let (_tmp, env, approval, mut host) = fixture(16);
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    host.work = lifetime.enter();
+    let store = env.accounts_store();
+    let roster = env.accounts_roster().unwrap();
+    let candidate = candidate(&approval);
+    let grant = approval.prepare(&candidate.row).unwrap();
+    let signin = adoption_sign_in(&store, &roster, &candidate);
+    let failure =
+        super::super::shared_adoption::adopt(&env, &host, &store, &signin, &roster, candidate)
+            .unwrap_err();
+    assert!(failure.is_deferred());
+    assert!(
+        !host.work_cancelled(),
+        "remote refusal must not close the requester's App epoch"
+    );
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(host.online_calls.load(Ordering::SeqCst), 0);
+    assert!(!roster.exists());
+    let pending = store
+        .load_logins(NOW + 1)
+        .unwrap()
+        .0
+        .shared
+        .latest(grant.source)
+        .cloned()
+        .unwrap();
+    assert_eq!(pending.outcome, accounts::shared::Outcome::Pending);
+    assert!(Path::new(&pending.intent.staging).exists());
+    assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
 }

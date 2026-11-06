@@ -213,15 +213,34 @@ pub fn list_themes_alias(first: &str, rest: &[OsString]) -> Option<Vec<OsString>
     })
 }
 
-/// `aterm theme …` from the front door.
+/// `aterm theme …` from the front door, its answer spelled for the shell that reads each stream
+/// (the CLI's `cli_text`).
 pub fn main_entry(args: Vec<OsString>, host: &dyn ThemeHost) -> ExitCode {
     let outcome = run(&args, scheme::user_theme_dir().as_deref(), host);
-    if let Err(e) = aterm_uds::stdout::answer(&outcome.stdout) {
-        eprintln!("aterm theme: the answer was not written ({e})");
-        return ExitCode::from(1);
+    ExitCode::from(delivered(
+        &outcome,
+        &|text| aterm_uds::stdout::answer(&crate::cli_text::for_stdout(text)),
+        &|text| eprint!("{}", crate::cli_text::for_stderr(text)),
+    ))
+}
+
+/// Write `outcome` to `stdout` and `stderr`: its stderr goes out even when its stdout could not
+/// be written. The exit status is its code, or 1, with the failure's line on `stderr`, when the
+/// stdout was not written.
+fn delivered(
+    outcome: &Outcome,
+    stdout: &dyn Fn(&str) -> std::io::Result<()>,
+    stderr: &dyn Fn(&str),
+) -> u8 {
+    let written = stdout(&outcome.stdout);
+    stderr(&outcome.stderr);
+    match written {
+        Ok(()) => outcome.code,
+        Err(e) => {
+            stderr(&format!("aterm theme: the answer was not written ({e})\n"));
+            1
+        }
     }
-    eprint!("{}", outcome.stderr);
-    ExitCode::from(outcome.code)
 }
 
 /// The verb, with the themes folder injected (`None`: none could be found).
@@ -471,6 +490,44 @@ pub(crate) fn write_atomically(
 pub(crate) mod tests {
     use super::*;
     use aterm_types::scheme_import::{self, MAX_IMPORT_BYTES};
+
+    /// An answer whose stdout cannot be written still says its stderr, then why the stdout was
+    /// lost, and exits 1. NEGATIVE CONTROL: a written stdout keeps the outcome's own code and
+    /// adds nothing to its stderr.
+    #[test]
+    fn an_unwritten_answer_still_says_its_stderr() {
+        let outcome = Outcome {
+            stdout: "a list\n".into(),
+            stderr: "aterm theme: a warning\n".into(),
+            code: 3,
+        };
+        for writes in [false, true] {
+            let out = std::cell::RefCell::new(String::new());
+            let err = std::cell::RefCell::new(String::new());
+            let code = delivered(
+                &outcome,
+                &|text| {
+                    if !writes {
+                        return Err(std::io::Error::other("the disk is full"));
+                    }
+                    out.borrow_mut().push_str(text);
+                    Ok(())
+                },
+                &|text| err.borrow_mut().push_str(text),
+            );
+            if writes {
+                assert_eq!((code, out.take()), (3, "a list\n".to_owned()));
+                assert_eq!(err.take(), "aterm theme: a warning\n");
+            } else {
+                assert_eq!(code, 1);
+                assert_eq!(
+                    err.take(),
+                    "aterm theme: a warning\n\
+                     aterm theme: the answer was not written (the disk is full)\n"
+                );
+            }
+        }
+    }
 
     struct ScratchDir(aterm_tempfile::TempDir);
 

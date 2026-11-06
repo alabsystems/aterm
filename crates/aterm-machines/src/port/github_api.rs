@@ -69,12 +69,7 @@ fn failure(kind: agh::Kind) -> GithubFailure {
 }
 
 fn read_with(client: &agh::Github, endpoint: &str) -> Result<GithubResponse, GithubError> {
-    if !endpoint.starts_with('/')
-        || endpoint.starts_with("//")
-        || endpoint
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'#')
-    {
+    if !super::github_rest::one_path(endpoint) {
         return Err(GithubError::other("invalid GitHub API endpoint"));
     }
     let target = if endpoint == "/user" {
@@ -261,6 +256,8 @@ mod tests {
             "/user\n",
             "/user name",
             "/user#frag",
+            "/\\example.invalid/user",
+            "/user/\u{e9}",
         ] {
             assert!(read_with(&client, endpoint).is_err());
         }

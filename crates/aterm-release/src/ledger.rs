@@ -97,6 +97,27 @@ pub trait GitRunner {
             args.join(" ")
         )))
     }
+
+    /// `git <args>` with each `env` pair set in git's environment, for a write whose bytes the caller pins (`line::carry`: the carried commit's author and committer, so a rebuild makes the same commit).
+    fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<RunOut> {
+        if env.is_empty() {
+            return self.git(args);
+        }
+        Err(Error::new(format!(
+            "git {}: this runner sets git no environment",
+            args.join(" ")
+        )))
+    }
+}
+
+/// A `git push` that failed because the remote ref moved (a lost compare-and-swap, which a rebuild on the new tip answers), judged by git's stderr: refused by this git, which saw the moved tip in the remote's advertisement (`[rejected]`, `fetch first`, `non-fast-forward`), or by the remote, whose ref moved between that advertisement and its update (`[remote rejected]` with git's `incorrect old value provided`, or a `cannot lock ref`, as GitHub words it).
+pub(crate) fn lost_race(push_stderr: &str) -> bool {
+    push_stderr.contains("non-fast-forward")
+        || push_stderr.contains("fetch first")
+        || push_stderr.contains("[rejected]")
+        || (push_stderr.contains("[remote rejected]")
+            && (push_stderr.contains("incorrect old value")
+                || push_stderr.contains("cannot lock ref")))
 }
 
 /// Run `cmd` (a `git` with its leading arguments) with `args` and `input` on its stdin, captured as [`RunOut`].
@@ -143,12 +164,17 @@ impl GitCli {
 
 impl GitRunner for GitCli {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
+        self.git_env(args, &[])
+    }
+
+    fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<RunOut> {
         use aterm_uds::spawnfd::Stdio;
         let mut git = command(aterm_uds::os_path!("git"));
         let child = crate::credential_wait::ask_no_one(&mut git)
             .arg("-C")
             .arg(&self.repo)
             .args(args)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -189,7 +215,7 @@ pub(crate) const BYTE_EXACT: [&str; 6] = [
 pub fn object_git(repo: &Path) -> Command {
     let mut cmd = command(aterm_uds::os_path!("git"));
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
             cmd.env_remove(&key);
         }
     }
@@ -242,25 +268,26 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
         if raw.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = raw.split_whitespace().collect();
-        if fields.len() != 2 {
+        let mut fields = raw.split_whitespace();
+        let (Some(build_str), Some(version_str), None) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             return Err(Error::new(format!(
                 "{LEDGER_FILE} line {line_no}: malformed record {raw:?} — expected \
                  \"<build_number> <version>\" (the ledger is append-only; never edit it)"
             )));
-        }
-        let build: u64 = (!fields[0].is_empty() && fields[0].bytes().all(|b| b.is_ascii_digit()))
-            .then(|| fields[0].parse().ok())
+        };
+        let build: u64 = (!build_str.is_empty() && build_str.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| build_str.parse().ok())
             .flatten()
             .ok_or_else(|| {
                 Error::new(format!(
-                    "{LEDGER_FILE} line {line_no}: build number {:?} is not a u64",
-                    fields[0]
+                    "{LEDGER_FILE} line {line_no}: build number {build_str:?} is not a u64"
                 ))
             })?;
         records.push(Record {
             build,
-            version: fields[1].to_string(),
+            version: version_str.to_string(),
         });
     }
     Ok(records)
@@ -444,10 +471,7 @@ pub fn claim(
         }
         let push_err = push.stderr_utf8().trim().to_string();
 
-        let lost_race = push_err.contains("non-fast-forward")
-            || push_err.contains("fetch first")
-            || push_err.contains("[rejected]");
-        if !lost_race {
+        if !lost_race(&push_err) {
             return Err(Error::new(format!(
                 "git push origin main failed (NOT a fast-forward rejection — retrying \
                  cannot help); aborting with the checkout on the published commit, nothing \
@@ -701,13 +725,16 @@ pub fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
 
 /// The release version is spliced into a tag name, a changelog heading, the DMG asset name and the ledger grammar, so it must be canonical `MAJOR.MINOR.PATCH` (a release is the workspace `MAJOR.MINOR.0`; see `VERSIONING.md`): three non-empty ASCII-digit components, no leading zero unless the component is `"0"`, so one version has one spelling. cli.rs applies the same check to version arguments up front.
 pub fn check_version_shape(version: &str) -> Result<()> {
-    let parts: Vec<&str> = version.split('.').collect();
-    let ok = parts.len() == 3
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && (p.len() == 1 || !p.starts_with('0'))
-        });
+    let mut parts = version.split('.');
+    let ok = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(maj), Some(min), Some(pat), None)
+            if [maj, min, pat].into_iter().all(|p| {
+                !p.is_empty()
+                    && p.bytes().all(|b| b.is_ascii_digit())
+                    && (p.len() == 1 || !p.starts_with('0'))
+            })
+    );
     if !ok {
         return Err(Error::new(format!(
             "version {version:?} is not canonical MAJOR.MINOR.PATCH (e.g. \"0.2.0\")"
@@ -739,10 +766,15 @@ pub(crate) mod testing {
 
     impl super::GitRunner for Git {
         fn git(&self, args: &[&str]) -> super::Result<super::RunOut> {
+            self.git_env(args, &[])
+        }
+
+        fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> super::Result<super::RunOut> {
             let out = git()
                 .arg("-C")
                 .arg(&self.repo)
                 .args(args)
+                .envs(env.iter().copied())
                 .output()
                 .map_err(|e| {
                     super::Error::new(format!("failed to spawn git {}: {e}", args.join(" ")))

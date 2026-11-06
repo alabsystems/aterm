@@ -383,7 +383,8 @@ pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &st
     )
 }
 
-fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
+/// The ready record beside this named build, shared by install and publication admission.
+pub(crate) fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = build_dir.file_name()?.to_str()?;
     Some(build_dir.with_file_name(format!("{name}.ready")))
 }
@@ -514,10 +515,25 @@ pub fn presence(path: &Path) -> Presence {
 /// Whether `build_dir` holds a complete install for the running slice.
 #[must_use]
 pub fn build_is_complete(build_dir: &Path) -> bool {
+    let Ok(host) = aterm_toolchain::gnu_runtime::host() else {
+        return false;
+    };
+    build_is_complete_on(build_dir, host)
+}
+
+pub(crate) fn build_is_complete_on(
+    build_dir: &Path,
+    host: Option<aterm_toolchain::gnu_runtime::Host>,
+) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
     };
     if is_provably_absent(build_dir) {
+        return false;
+    }
+    if host
+        .is_some_and(|host| aterm_toolchain::gnu_runtime::admit_tree_on(build_dir, host).is_err())
+    {
         return false;
     }
     match crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024) {
@@ -597,6 +613,18 @@ pub(crate) fn build_marks_another_slice(build_dir: &Path) -> std::io::Result<boo
 
 /// Atomically and durably mark `build_dir` complete.
 pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
+    let host = aterm_toolchain::gnu_runtime::host().map_err(std::io::Error::other)?;
+    mark_build_ready_on(build_dir, host)
+}
+
+pub(crate) fn mark_build_ready_on(
+    build_dir: &Path,
+    host: Option<aterm_toolchain::gnu_runtime::Host>,
+) -> std::io::Result<()> {
+    if let Some(host) = host {
+        aterm_toolchain::gnu_runtime::admit_tree_on(build_dir, host)
+            .map_err(std::io::Error::other)?;
+    }
     let dest = ready_marker_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;

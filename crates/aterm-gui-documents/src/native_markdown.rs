@@ -1701,13 +1701,21 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
 }
 
 /// Hide HTML comments without moving a single canonical source byte.
+///
+/// A comment inside a code span is code text and stays. A backtick run opens a span only when
+/// its inline block closes it ([`has_closing_code_ticks`]), and the span closes at the first
+/// equal run that is not backslash-escaped, the pairing the inline readers use
+/// ([`find_exact_run`]); an unmatched run is literal and keeps no comment visible. Nothing is
+/// masked inside a span, so its closer stays where the readers find it, and a span is closed again
+/// before any line that starts another block.
 fn mask_html_comments(source: &str) -> Cow<'_, str> {
+    let lines = source_lines(source);
     let mut masked = None::<Vec<u8>>;
     let mut in_comment = false;
     let mut inline_code_ticks = None::<usize>;
     let mut open_fence = None::<&str>;
 
-    for line in source_lines(source) {
+    for (at, line) in lines.iter().enumerate() {
         let bytes = line.text.as_bytes();
         let trimmed = line.text.trim();
 
@@ -1738,12 +1746,12 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
 
             if bytes[index] == b'`' {
                 let run = ascii_run(bytes, index, b'`');
-                if let Some(open) = inline_code_ticks {
-                    if run == open {
-                        inline_code_ticks = None;
-                    }
-                } else if !is_backslash_escaped(bytes, index) {
-                    inline_code_ticks = Some(run);
+                if !is_backslash_escaped(bytes, index) {
+                    inline_code_ticks = match inline_code_ticks {
+                        Some(open) if open == run => None,
+                        Some(open) => Some(open),
+                        None => has_closing_code_ticks(&lines, at, index + run, run).then_some(run),
+                    };
                 }
                 index += run;
                 continue;
@@ -1760,6 +1768,52 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
     masked.map_or(Cow::Borrowed(source), |bytes| {
         Cow::Owned(String::from_utf8(bytes).expect("comment masking preserves UTF-8"))
     })
+}
+
+/// Whether a code span of `ticks` backticks opened just before byte `from` of line `at` closes
+/// in its inline block: at an equal run that is not backslash-escaped ([`find_exact_run`]) later
+/// on that line or on a later line `parse` reads into the same block ([`joins_next_line`]).
+fn has_closing_code_ticks(lines: &[SourceLine<'_>], at: usize, from: usize, ticks: usize) -> bool {
+    let (mut at, mut from) = (at, from);
+    loop {
+        if find_exact_run(lines[at].text.as_bytes(), from, b'`', ticks).is_some() {
+            return true;
+        }
+        if !joins_next_line(lines, at) {
+            return false;
+        }
+        (at, from) = (at + 1, 0);
+    }
+}
+
+/// Whether `parse` reads line `at + 1` into the inline block of line `at`: a heading, rule, list
+/// item or table header is a block of one line, a quote runs over its `>` lines, and a paragraph
+/// line is followed by any line that starts no other block.
+fn joins_next_line(lines: &[SourceLine<'_>], at: usize) -> bool {
+    let Some(next) = lines.get(at + 1) else {
+        return false;
+    };
+    let (this, next_trimmed) = (lines[at].text, next.text.trim());
+    let trimmed = this.trim();
+    if heading(trimmed).is_some()
+        || is_thematic(trimmed)
+        || is_table_separator(next_trimmed)
+        || list_item(this).is_some()
+    {
+        return false;
+    }
+    if trimmed.starts_with('>') {
+        return next_trimmed.starts_with('>');
+    }
+    !(next_trimmed.is_empty()
+        || heading(next_trimmed).is_some()
+        || fence_start(next_trimmed).is_some()
+        || list_item(next.text).is_some()
+        || next_trimmed.starts_with('>')
+        || is_thematic(next_trimmed)
+        || lines
+            .get(at + 2)
+            .is_some_and(|after| is_table_separator(after.text.trim())))
 }
 
 fn mask_source_range(masked: &mut Option<Vec<u8>>, source: &str, range: Range<usize>) {
@@ -2531,6 +2585,52 @@ mod tests {
         assert!(document.blocks.iter().all(|block| {
             block.source().start < block.source().end && block.source().end <= source.len()
         }));
+    }
+
+    /// A backtick run its block never closes is literal, so a comment after it stays hidden; a
+    /// span closes at its first unescaped equal run and never past its block, as `parse` reads
+    /// the blocks; a comment inside a real span is code text.
+    #[test]
+    fn only_a_closed_code_span_keeps_a_comment_visible() {
+        for source in [
+            "Price is `5 <!-- [bad](https://bad.example) -->",
+            "Price is `5\n\n<!-- [bad](https://bad.example) -->",
+            "`a\\` x` <!-- [bad](https://bad.example) --> `",
+            "Price is `5 <!-- [bad](https://bad.example) -->\n- item ` tick",
+            "# Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
+            "> Price `5 <!-- [bad](https://bad.example) -->\nnext ` line",
+        ] {
+            let document = parse(source);
+            assert!(
+                document.links.is_empty(),
+                "{source:?}: {:?}",
+                document.links
+            );
+            for block in &document.blocks {
+                assert!(
+                    !block_paint_text(block).contains("bad.example"),
+                    "{source:?}: {block:?}"
+                );
+            }
+        }
+
+        for (source, painted) in [
+            (
+                "`<!-- [x](https://x.example) -->`",
+                "<!-- [x](https://x.example) -->",
+            ),
+            ("Price `a\n<!-- c --> b` end", "Price a <!-- c --> b end"),
+            ("> `a\n> <!-- c --> b`", "a <!-- c --> b"),
+        ] {
+            let document = parse(source);
+            let shown = document
+                .blocks
+                .iter()
+                .map(block_paint_text)
+                .collect::<Vec<_>>();
+            assert_eq!(shown, [painted], "{source:?}");
+            assert!(document.links.is_empty(), "{source:?}");
+        }
     }
 
     #[test]

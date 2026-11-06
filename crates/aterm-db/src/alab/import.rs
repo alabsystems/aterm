@@ -933,7 +933,7 @@ struct SecretWant {
 struct RowWant {
     values: BTreeMap<&'static str, Want>,
     secrets: BTreeMap<&'static str, SecretWant>,
-    elements: BTreeMap<(&'static str, String), Coord>,
+    elements: BTreeMap<&'static str, BTreeMap<String, Coord>>,
     /// The coordinate that created the row: its `src`, and its writes' source.
     src: Option<Coord>,
     notes: Vec<Coord>,
@@ -942,7 +942,7 @@ struct RowWant {
 struct Planner<'a> {
     input: &'a Input<'a>,
     current: BTreeMap<&'static str, Projection>,
-    rows: BTreeMap<(&'static str, String), RowWant>,
+    rows: BTreeMap<&'static str, BTreeMap<String, RowWant>>,
     findings: BTreeSet<Finding>,
     /// Phone keys by their number's digits, found or minted this run, so every source naming
     /// one number names one row.
@@ -1122,11 +1122,20 @@ impl Planner<'_> {
         });
     }
 
+    fn row_get(&self, collection: &'static str, pk: &str) -> Option<&RowWant> {
+        self.rows.get(collection)?.get(pk)
+    }
+
+    fn has_row(&self, collection: &'static str, pk: &str) -> bool {
+        self.row_get(collection, pk).is_some()
+    }
+
     fn row(&mut self, collection: &'static Collection, pk: &str, at: &Coord) -> &mut RowWant {
-        let row = self
-            .rows
-            .entry((collection.name, pk.to_owned()))
-            .or_default();
+        let table = self.rows.entry(collection.name).or_default();
+        if !table.contains_key(pk) {
+            table.insert(pk.to_owned(), RowWant::default());
+        }
+        let row = table.get_mut(pk).expect("row exists");
         if row.src.is_none() {
             row.src = Some(at.clone());
         }
@@ -1174,10 +1183,14 @@ impl Planner<'_> {
         elem: &str,
         at: &Coord,
     ) {
-        self.row(collection, pk, at)
+        let elements = self
+            .row(collection, pk, at)
             .elements
-            .entry((col, elem.to_owned()))
-            .or_insert_with(|| at.clone());
+            .entry(col)
+            .or_default();
+        if !elements.contains_key(elem) {
+            elements.insert(elem.to_owned(), at.clone());
+        }
     }
 
     fn note(&mut self, collection: &'static Collection, pk: &str, at: &Coord) {
@@ -1333,8 +1346,7 @@ impl Planner<'_> {
         // later sheet listing it too is no disagreement.
         let named = self.held(&ADDRESS, &pk, "origin").is_some()
             || self
-                .rows
-                .get(&(ADDRESS.name, pk.clone()))
+                .row_get(ADDRESS.name, &pk)
                 .is_some_and(|row| row.values.contains_key("origin"));
         if !named {
             self.want(&ADDRESS, &pk, "origin", json!(kind.origin()), at);
@@ -1889,7 +1901,7 @@ impl Planner<'_> {
         kind: SheetKind,
     ) {
         let held = keys::preference_pk(machine, account)
-            .is_ok_and(|pref| self.rows.contains_key(&(PREFERENCE.name, pref)));
+            .is_ok_and(|pref| self.has_row(PREFERENCE.name, &pref));
         if !held {
             self.prefer(machine, account, rank, at, kind);
         }
@@ -1904,8 +1916,7 @@ impl Planner<'_> {
     /// sheet, the owner or an earlier import's `paused` stands on a run that reads no vault sheet.
     fn birth_status(&mut self, pk: &str, at: &Coord) {
         let wanted = self
-            .rows
-            .get(&(ACCOUNT.name, pk.to_owned()))
+            .row_get(ACCOUNT.name, pk)
             .is_some_and(|row| row.values.contains_key("status"));
         if !wanted && self.held(&ACCOUNT, pk, "status").is_none() {
             self.want(&ACCOUNT, pk, "status", json!("pending"), at);
@@ -2161,22 +2172,20 @@ impl Planner<'_> {
         let (service, code_path) = mailbox_service(domain);
         let held = self.held(&MAILBOX, &pk, "label").is_some()
             || self
-                .rows
-                .get(&(MAILBOX.name, pk.clone()))
+                .row_get(MAILBOX.name, &pk)
                 .is_some_and(|row| row.values.contains_key("label"));
         if !held {
-            let used: BTreeSet<String> = self
+            let used: BTreeSet<&str> = self
                 .current
                 .get(MAILBOX.name)
                 .into_iter()
                 .flat_map(|projection| projection.rows.values())
                 .filter_map(|row| row.get("label").and_then(Value::as_str))
-                .map(str::to_owned)
-                .chain(self.minted_labels.iter().cloned())
+                .chain(self.minted_labels.iter().map(String::as_str))
                 .collect();
             let label = (1..)
                 .map(|k| format!("{service}-{k}"))
-                .find(|label| !used.contains(label))
+                .find(|label| !used.contains(label.as_str()))
                 .ok_or_else(|| Error::new("no mailbox label could be minted"))?;
             self.minted_labels.insert(label.clone());
             self.want(&MAILBOX, &pk, "label", json!(label), at);
@@ -2245,19 +2254,18 @@ impl Planner<'_> {
                 Some(pk) => pk,
                 None => {
                     let pk = keys::random_pk(keys::Random::Phone)?;
-                    let used: BTreeSet<String> = self.current[PHONE.name]
+                    let used: BTreeSet<&str> = self.current[PHONE.name]
                         .rows
                         .values()
                         .filter_map(|row| row.get("label").and_then(Value::as_str))
-                        .map(str::to_owned)
-                        .chain(self.minted_labels.iter().cloned())
+                        .chain(self.minted_labels.iter().map(String::as_str))
                         .collect();
                     let given = label.filter(|l| !used.contains(*l)).map(str::to_owned);
                     let label = match given {
                         Some(label) => label,
                         None => (1..)
                             .map(|k| format!("phone-{k}"))
-                            .find(|label| !used.contains(label))
+                            .find(|label| !used.contains(label.as_str()))
                             .ok_or_else(|| Error::new("no phone label could be minted"))?,
                     };
                     self.minted_labels.insert(label.clone());
@@ -2628,8 +2636,7 @@ impl Planner<'_> {
                 let at = coord(sheet, n, row, col);
                 self.note(&ADDRESS, &address_pk, &at);
                 let has_note = self
-                    .rows
-                    .get(&(ADDRESS.name, address_pk.clone()))
+                    .row_get(ADDRESS.name, &address_pk)
                     .is_some_and(|r| r.values.contains_key("note"));
                 if !has_note
                     && let Some((text, note_at)) =
@@ -2644,7 +2651,7 @@ impl Planner<'_> {
 
     /// The live machine rows whose label or an alias is `label`.
     fn live_by_label(&self, label: &str) -> Vec<String> {
-        let mut found: Vec<String> = self.current[MACHINE.name]
+        self.current[MACHINE.name]
             .rows
             .iter()
             .filter(|(_, row)| row.live())
@@ -2653,12 +2660,10 @@ impl Planner<'_> {
                     || row
                         .fields
                         .get("aliases")
-                        .is_some_and(|f| f.members().contains(label))
+                        .is_some_and(|f| f.has_member(label))
             })
             .map(|(pk, _)| pk.clone())
-            .collect();
-        found.sort();
-        found
+            .collect()
     }
 
     /// The live machine rows whose fleet node is `node`: one, or a clash any writer could make,
@@ -2946,283 +2951,311 @@ impl Planner<'_> {
         // What each source found another import holding otherwise, by key and column.
         let mut differs: BTreeMap<usize, BTreeSet<(&'static str, String, String)>> =
             BTreeMap::new();
-        for (&(name, ref pk), want) in &mut rows {
+        for (&name, table_rows) in &mut rows {
             let Some(collection) = collections.iter().copied().find(|c| c.name == name) else {
                 continue;
             };
-            let (row_sheet, row_source) = want
-                .src
-                .as_ref()
-                .map_or((0, String::new()), |at| (at.sheet, at.source.clone()));
-            if let Some(at) = &want.src {
-                touched_rows.insert((at.sheet, name, pk.clone()));
-            }
-            let current_row = current[name].rows.get(pk);
-            let count = plan.counts.entry(name).or_default();
-            count.rows += 1;
-            if current_row.is_none() {
-                count.new_rows += 1;
-            }
-            // A preference an import ended and a source states again comes back; one the owner
-            // ended stays ended.
-            let revived = current_row.filter(|row| {
-                !row.live()
-                    && name == PREFERENCE.name
-                    && matches!(row.fields.get(crate::typed::LIFECYCLE),
-                        Some(Field::Value(candidate)) if candidate.value.s.is_some())
-            });
-            // One another import ended that this source only fills stays ended, and nothing of it
-            // is written: a finding, by key.
-            if let Some(row) = revived {
-                let lifecycle = row.fields.get(crate::typed::LIFECYCLE);
-                let decided = decide(
-                    lifecycle,
-                    |held| *held == json!("live"),
-                    mode_of(row_sheet),
-                    own(lifecycle, row_sheet),
-                );
-                if decided != Decided::Write {
-                    count.kept += 1;
-                    differs.entry(row_sheet).or_default().insert((
-                        name,
-                        pk.clone(),
-                        crate::typed::LIFECYCLE.to_owned(),
-                    ));
-                    plan.findings.push(Finding {
-                        kind: Kind::Differs,
-                        collection: Some(name),
-                        pk: Some(pk.clone()),
-                        column: Some(crate::typed::LIFECYCLE.to_owned()),
-                        at: Vec::new(),
-                    });
-                    continue;
+            for (pk, want) in table_rows {
+                let (row_sheet, row_source) = want
+                    .src
+                    .as_ref()
+                    .map_or((0, String::new()), |at| (at.sheet, at.source.clone()));
+                if let Some(at) = &want.src {
+                    touched_rows.insert((at.sheet, name, pk.clone()));
                 }
-            }
-            if let Some(row) = current_row
-                && !row.live()
-                && revived.is_none()
-            {
-                count.kept += 1;
-                plan.findings.push(Finding {
-                    kind: Kind::RetiredKept,
-                    collection: Some(name),
-                    pk: Some(pk.clone()),
-                    column: None,
-                    at: want.src.iter().cloned().collect(),
-                });
-                continue;
-            }
-            let mut changes = Vec::new();
-            let mut step = |changes: &mut Vec<Change>,
-                            column: &str,
-                            elem: Option<&str>,
-                            x: Value,
-                            cell_sheet: usize,
-                            cell_source: &str,
-                            field: Option<&Field>,
-                            plan: &mut Plan|
-             -> Result<()> {
-                let shown = match elem {
-                    Some(elem) => format!("{column}.{elem}"),
-                    None => column.to_owned(),
-                };
-                let mut decided = decide(
-                    field,
-                    |held| *held == x,
-                    mode_of(cell_sheet),
-                    own(field, cell_sheet),
-                );
-                // Provenance moves with a value: another source's coordinates are kept, quietly.
-                if decided == Decided::Differs && matches!(column, "src" | "notes_src") {
-                    decided = Decided::Unchanged;
-                }
+                let current_row = current[name].rows.get(pk);
                 let count = plan.counts.entry(name).or_default();
-                let outcome = match decided {
-                    Decided::Write => {
-                        count.cells += 1;
-                        touched_rows.insert((cell_sheet, name, pk.clone()));
-                        let value = CellValue::imported(collection.version, x.clone(), cell_source);
-                        changes.push(cell::change(
-                            collection,
-                            CellKey {
-                                pk,
-                                col: column,
-                                elem,
-                            },
-                            &value,
-                        )?);
-                        Step::Write
-                    }
-                    Decided::Unchanged => {
-                        count.unchanged += 1;
-                        Step::Unchanged
-                    }
-                    Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                count.rows += 1;
+                if current_row.is_none() {
+                    count.new_rows += 1;
+                }
+                // A preference an import ended and a source states again comes back; one the owner
+                // ended stays ended.
+                let revived = current_row.filter(|row| {
+                    !row.live()
+                        && name == PREFERENCE.name
+                        && matches!(row.fields.get(crate::typed::LIFECYCLE),
+                            Some(Field::Value(candidate)) if candidate.value.s.is_some())
+                });
+                // One another import ended that this source only fills stays ended, and nothing of it
+                // is written: a finding, by key.
+                if let Some(row) = revived {
+                    let lifecycle = row.fields.get(crate::typed::LIFECYCLE);
+                    let decided = decide(
+                        lifecycle,
+                        |held| *held == json!("live"),
+                        mode_of(row_sheet),
+                        own(lifecycle, row_sheet),
+                    );
+                    if decided != Decided::Write {
                         count.kept += 1;
-                        let kind = match decided {
-                            Decided::Conflicted => Kind::Conflicted,
-                            Decided::Differs => {
-                                differs.entry(cell_sheet).or_default().insert((
-                                    name,
-                                    pk.clone(),
-                                    shown.clone(),
-                                ));
-                                Kind::Differs
-                            }
-                            _ => Kind::OwnerKept,
-                        };
+                        differs.entry(row_sheet).or_default().insert((
+                            name,
+                            pk.clone(),
+                            crate::typed::LIFECYCLE.to_owned(),
+                        ));
                         plan.findings.push(Finding {
-                            kind,
+                            kind: Kind::Differs,
                             collection: Some(name),
                             pk: Some(pk.clone()),
-                            column: Some(shown.clone()),
+                            column: Some(crate::typed::LIFECYCLE.to_owned()),
                             at: Vec::new(),
                         });
-                        Step::Kept
+                        continue;
                     }
-                };
-                plan.planned.push(Planned {
-                    collection: name,
-                    pk: pk.clone(),
-                    column: shown,
-                    x,
-                    step: outcome,
-                });
-                Ok(())
-            };
-            for (column, wanted) in &want.values {
-                step(
-                    &mut changes,
-                    column,
-                    None,
-                    wanted.x.clone(),
-                    wanted.at.sheet,
-                    &wanted.at.source,
-                    current_row.and_then(|r| r.fields.get(*column)),
-                    &mut plan,
-                )?;
-            }
-            for ((column, elem), at) in &want.elements {
-                let field = current_row
-                    .and_then(|r| r.fields.get(*column))
-                    .and_then(|f| match f {
-                        Field::Set(elements) => elements.get(elem),
-                        _ => None,
-                    });
-                step(
-                    &mut changes,
-                    column,
-                    Some(elem),
-                    Value::Bool(true),
-                    at.sheet,
-                    &at.source,
-                    field,
-                    &mut plan,
-                )?;
-            }
-            // Secret cells: sealed to this cell's coordinates, compared by opening, never shown.
-            let guarded = (name == ADDRESS.name && protected.contains(pk))
-                || current_row.is_some_and(check::protected);
-            // Merged once `step` is done with them.
-            let mut secret_touched = Vec::new();
-            let mut secret_differs = Vec::new();
-            for (column, wanted) in &want.secrets {
-                let field = current_row.and_then(|r| r.fields.get(*column));
-                let count = plan.counts.entry(name).or_default();
-                if guarded {
+                }
+                if let Some(row) = current_row
+                    && !row.live()
+                    && revived.is_none()
+                {
                     count.kept += 1;
                     plan.findings.push(Finding {
-                        kind: Kind::ProtectedSecret,
+                        kind: Kind::RetiredKept,
                         collection: Some(name),
                         pk: Some(pk.clone()),
-                        column: Some((*column).to_owned()),
-                        at: vec![wanted.at.clone()],
+                        column: None,
+                        at: want.src.iter().cloned().collect(),
                     });
                     continue;
                 }
-                let holds = |held: &Value| {
-                    held.as_str().is_some_and(|token| {
-                        input.sealer.holds(name, pk, column, token, &wanted.value)
-                    })
+                let mut changes = Vec::new();
+                let mut step = |changes: &mut Vec<Change>,
+                                column: &str,
+                                elem: Option<&str>,
+                                x: Value,
+                                cell_sheet: usize,
+                                cell_source: &str,
+                                field: Option<&Field>,
+                                plan: &mut Plan|
+                 -> Result<()> {
+                    let shown = match elem {
+                        Some(elem) => format!("{column}.{elem}"),
+                        None => column.to_owned(),
+                    };
+                    let mut decided = decide(
+                        field,
+                        |held| *held == x,
+                        mode_of(cell_sheet),
+                        own(field, cell_sheet),
+                    );
+                    // Provenance moves with a value: another source's coordinates are kept, quietly.
+                    if decided == Decided::Differs && matches!(column, "src" | "notes_src") {
+                        decided = Decided::Unchanged;
+                    }
+                    let count = plan.counts.entry(name).or_default();
+                    let outcome = match decided {
+                        Decided::Write => {
+                            count.cells += 1;
+                            touched_rows.insert((cell_sheet, name, pk.clone()));
+                            let value =
+                                CellValue::imported(collection.version, x.clone(), cell_source);
+                            changes.push(cell::change(
+                                collection,
+                                CellKey {
+                                    pk,
+                                    col: column,
+                                    elem,
+                                },
+                                &value,
+                            )?);
+                            Step::Write
+                        }
+                        Decided::Unchanged => {
+                            count.unchanged += 1;
+                            Step::Unchanged
+                        }
+                        Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                            count.kept += 1;
+                            let kind = match decided {
+                                Decided::Conflicted => Kind::Conflicted,
+                                Decided::Differs => {
+                                    differs.entry(cell_sheet).or_default().insert((
+                                        name,
+                                        pk.clone(),
+                                        shown.clone(),
+                                    ));
+                                    Kind::Differs
+                                }
+                                _ => Kind::OwnerKept,
+                            };
+                            plan.findings.push(Finding {
+                                kind,
+                                collection: Some(name),
+                                pk: Some(pk.clone()),
+                                column: Some(shown.clone()),
+                                at: Vec::new(),
+                            });
+                            Step::Kept
+                        }
+                    };
+                    plan.planned.push(Planned {
+                        collection: name,
+                        pk: pk.clone(),
+                        column: shown,
+                        x,
+                        step: outcome,
+                    });
+                    Ok(())
                 };
-                let decided = decide(
-                    field,
-                    holds,
-                    mode_of(wanted.at.sheet),
-                    own(field, wanted.at.sheet),
-                );
-                let outcome = match decided {
-                    Decided::Write => {
-                        let token = input.sealer.seal(name, pk, column, &wanted.value)?;
-                        count.cells += 1;
-                        secret_touched.push(wanted.at.sheet);
-                        let value = CellValue::imported(
-                            collection.version,
-                            json!(token),
-                            &wanted.at.source,
-                        );
-                        changes.push(cell::change(
-                            collection,
-                            CellKey {
-                                pk,
-                                col: column,
-                                elem: None,
-                            },
-                            &value,
-                        )?);
-                        Step::Write
+                for (column, wanted) in &want.values {
+                    step(
+                        &mut changes,
+                        column,
+                        None,
+                        wanted.x.clone(),
+                        wanted.at.sheet,
+                        &wanted.at.source,
+                        current_row.and_then(|r| r.fields.get(*column)),
+                        &mut plan,
+                    )?;
+                }
+                for (&column, elems) in &want.elements {
+                    for (elem, at) in elems {
+                        let field = current_row
+                            .and_then(|r| r.fields.get(column))
+                            .and_then(|f| match f {
+                                Field::Set(elements) => elements.get(elem),
+                                _ => None,
+                            });
+                        step(
+                            &mut changes,
+                            column,
+                            Some(elem),
+                            Value::Bool(true),
+                            at.sheet,
+                            &at.source,
+                            field,
+                            &mut plan,
+                        )?;
                     }
-                    Decided::Unchanged => {
-                        count.unchanged += 1;
-                        Step::Unchanged
-                    }
-                    Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                }
+                // Secret cells: sealed to this cell's coordinates, compared by opening, never shown.
+                let guarded = (name == ADDRESS.name && protected.contains(pk))
+                    || current_row.is_some_and(check::protected);
+                // Merged once `step` is done with them.
+                let mut secret_touched = Vec::new();
+                let mut secret_differs = Vec::new();
+                for (column, wanted) in &want.secrets {
+                    let field = current_row.and_then(|r| r.fields.get(*column));
+                    let count = plan.counts.entry(name).or_default();
+                    if guarded {
                         count.kept += 1;
-                        let kind = match decided {
-                            Decided::Conflicted => Kind::Conflicted,
-                            Decided::Differs => {
-                                secret_differs.push((wanted.at.sheet, (*column).to_owned()));
-                                Kind::Differs
-                            }
-                            _ => Kind::OwnerKept,
-                        };
                         plan.findings.push(Finding {
-                            kind,
+                            kind: Kind::ProtectedSecret,
                             collection: Some(name),
                             pk: Some(pk.clone()),
                             column: Some((*column).to_owned()),
-                            at: Vec::new(),
+                            at: vec![wanted.at.clone()],
                         });
-                        Step::Kept
+                        continue;
                     }
-                };
-                plan.planned.push(Planned {
-                    collection: name,
-                    pk: pk.clone(),
-                    column: (*column).to_owned(),
-                    x: json!(MASK),
-                    step: outcome,
-                });
-            }
-            // What an earlier import of a kind read now wrote here and no sheet states now.
-            if let Some(row) = current_row {
-                for (column, field) in &row.fields {
-                    match field {
-                        Field::Set(elements) if RETRACT_SETS.contains(&(name, column.as_str())) => {
-                            for (elem, field) in elements {
-                                if field.present()
-                                    && retractable(field, sources, &read)
-                                    && !want
-                                        .elements
-                                        .keys()
-                                        .any(|(c, e)| *c == column.as_str() && e == elem)
-                                    && let Some((ret_sheet, ret_source)) = retract_source(field)
-                                {
+                    let holds = |held: &Value| {
+                        held.as_str().is_some_and(|token| {
+                            input.sealer.holds(name, pk, column, token, &wanted.value)
+                        })
+                    };
+                    let decided = decide(
+                        field,
+                        holds,
+                        mode_of(wanted.at.sheet),
+                        own(field, wanted.at.sheet),
+                    );
+                    let outcome = match decided {
+                        Decided::Write => {
+                            let token = input.sealer.seal(name, pk, column, &wanted.value)?;
+                            count.cells += 1;
+                            secret_touched.push(wanted.at.sheet);
+                            let value = CellValue::imported(
+                                collection.version,
+                                json!(token),
+                                &wanted.at.source,
+                            );
+                            changes.push(cell::change(
+                                collection,
+                                CellKey {
+                                    pk,
+                                    col: column,
+                                    elem: None,
+                                },
+                                &value,
+                            )?);
+                            Step::Write
+                        }
+                        Decided::Unchanged => {
+                            count.unchanged += 1;
+                            Step::Unchanged
+                        }
+                        Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                            count.kept += 1;
+                            let kind = match decided {
+                                Decided::Conflicted => Kind::Conflicted,
+                                Decided::Differs => {
+                                    secret_differs.push((wanted.at.sheet, (*column).to_owned()));
+                                    Kind::Differs
+                                }
+                                _ => Kind::OwnerKept,
+                            };
+                            plan.findings.push(Finding {
+                                kind,
+                                collection: Some(name),
+                                pk: Some(pk.clone()),
+                                column: Some((*column).to_owned()),
+                                at: Vec::new(),
+                            });
+                            Step::Kept
+                        }
+                    };
+                    plan.planned.push(Planned {
+                        collection: name,
+                        pk: pk.clone(),
+                        column: (*column).to_owned(),
+                        x: json!(MASK),
+                        step: outcome,
+                    });
+                }
+                // What an earlier import of a kind read now wrote here and no sheet states now.
+                if let Some(row) = current_row {
+                    for (column, field) in &row.fields {
+                        match field {
+                            Field::Set(elements)
+                                if RETRACT_SETS.contains(&(name, column.as_str())) =>
+                            {
+                                for (elem, field) in elements {
+                                    if field.present()
+                                        && retractable(field, sources, &read)
+                                        && !want
+                                            .elements
+                                            .get(column.as_str())
+                                            .is_some_and(|elems| elems.contains_key(elem))
+                                        && let Some((ret_sheet, ret_source)) = retract_source(field)
+                                    {
+                                        step(
+                                            &mut changes,
+                                            column,
+                                            Some(elem),
+                                            Value::Bool(false),
+                                            ret_sheet,
+                                            &ret_source,
+                                            Some(field),
+                                            &mut plan,
+                                        )?;
+                                    }
+                                }
+                            }
+                            _ if RETRACT_VALUES.contains(&(name, column.as_str()))
+                                && field.value().is_some_and(|x| !x.is_null())
+                                && retractable(field, sources, &read)
+                                && (logins_read
+                                    || name != ADDRESS.name
+                                    || !matches!(column.as_str(), "alias_of" | "kind"))
+                                && !want.values.contains_key(column.as_str()) =>
+                            {
+                                if let Some((ret_sheet, ret_source)) = retract_source(field) {
                                     step(
                                         &mut changes,
                                         column,
-                                        Some(elem),
-                                        Value::Bool(false),
+                                        None,
+                                        Value::Null,
                                         ret_sheet,
                                         &ret_source,
                                         Some(field),
@@ -3230,110 +3263,89 @@ impl Planner<'_> {
                                     )?;
                                 }
                             }
+                            _ => {}
                         }
-                        _ if RETRACT_VALUES.contains(&(name, column.as_str()))
-                            && field.value().is_some_and(|x| !x.is_null())
-                            && retractable(field, sources, &read)
-                            && (logins_read
-                                || name != ADDRESS.name
-                                || !matches!(column.as_str(), "alias_of" | "kind"))
-                            && !want.values.contains_key(column.as_str()) =>
-                        {
-                            if let Some((ret_sheet, ret_source)) = retract_source(field) {
-                                step(
-                                    &mut changes,
-                                    column,
-                                    None,
-                                    Value::Null,
-                                    ret_sheet,
-                                    &ret_source,
-                                    Some(field),
-                                    &mut plan,
-                                )?;
-                            }
-                        }
-                        _ => {}
                     }
                 }
-            }
-            let fresh = current_row.is_none();
-            if fresh {
-                step(
-                    &mut changes,
-                    crate::typed::LIFECYCLE,
-                    None,
-                    json!("live"),
-                    row_sheet,
-                    &row_source,
-                    None,
-                    &mut plan,
-                )?;
-            }
-            if let Some(row) = revived {
-                step(
-                    &mut changes,
-                    crate::typed::LIFECYCLE,
-                    None,
-                    json!("live"),
-                    row_sheet,
-                    &row_source,
-                    row.fields.get(crate::typed::LIFECYCLE),
-                    &mut plan,
-                )?;
-            }
-            // Provenance moves only with a value: a re-run of an edited file does not rewrite
-            // every row's coordinates.
-            if (fresh || !changes.is_empty()) && collection.column("src").is_some() {
-                if let Some(at) = &want.src {
+                let fresh = current_row.is_none();
+                if fresh {
                     step(
                         &mut changes,
-                        "src",
+                        crate::typed::LIFECYCLE,
                         None,
-                        at.value(),
-                        at.sheet,
-                        &at.source,
-                        current_row.and_then(|r| r.fields.get("src")),
-                        &mut plan,
-                    )?;
-                }
-                if !want.notes.is_empty() {
-                    let mut notes = std::mem::take(&mut want.notes);
-                    notes.sort();
-                    notes.dedup();
-                    if notes.len() > MAX_NOTES {
-                        plan.findings.push(Finding {
-                            kind: Kind::CoordinatesTruncated,
-                            collection: Some(name),
-                            pk: Some(pk.clone()),
-                            column: Some("notes_src".to_owned()),
-                            at: notes[MAX_NOTES..].to_vec(),
-                        });
-                        notes.truncate(MAX_NOTES);
-                    }
-                    let list: Vec<Value> = notes.iter().map(Coord::value).collect();
-                    step(
-                        &mut changes,
-                        "notes_src",
-                        None,
-                        Value::Array(list),
+                        json!("live"),
                         row_sheet,
                         &row_source,
-                        current_row.and_then(|r| r.fields.get("notes_src")),
+                        None,
                         &mut plan,
                     )?;
                 }
-            }
-            for n in secret_touched {
-                touched_rows.insert((n, name, pk.clone()));
-            }
-            for (n, column) in secret_differs {
-                differs
-                    .entry(n)
-                    .or_default()
-                    .insert((name, pk.clone(), column));
-            }
-            if !changes.is_empty() {
-                written_rows.push(changes);
+                if let Some(row) = revived {
+                    step(
+                        &mut changes,
+                        crate::typed::LIFECYCLE,
+                        None,
+                        json!("live"),
+                        row_sheet,
+                        &row_source,
+                        row.fields.get(crate::typed::LIFECYCLE),
+                        &mut plan,
+                    )?;
+                }
+                // Provenance moves only with a value: a re-run of an edited file does not rewrite
+                // every row's coordinates.
+                if (fresh || !changes.is_empty()) && collection.column("src").is_some() {
+                    if let Some(at) = &want.src {
+                        step(
+                            &mut changes,
+                            "src",
+                            None,
+                            at.value(),
+                            at.sheet,
+                            &at.source,
+                            current_row.and_then(|r| r.fields.get("src")),
+                            &mut plan,
+                        )?;
+                    }
+                    if !want.notes.is_empty() {
+                        let mut notes = std::mem::take(&mut want.notes);
+                        notes.sort();
+                        notes.dedup();
+                        if notes.len() > MAX_NOTES {
+                            plan.findings.push(Finding {
+                                kind: Kind::CoordinatesTruncated,
+                                collection: Some(name),
+                                pk: Some(pk.clone()),
+                                column: Some("notes_src".to_owned()),
+                                at: notes[MAX_NOTES..].to_vec(),
+                            });
+                            notes.truncate(MAX_NOTES);
+                        }
+                        let list: Vec<Value> = notes.iter().map(Coord::value).collect();
+                        step(
+                            &mut changes,
+                            "notes_src",
+                            None,
+                            Value::Array(list),
+                            row_sheet,
+                            &row_source,
+                            current_row.and_then(|r| r.fields.get("notes_src")),
+                            &mut plan,
+                        )?;
+                    }
+                }
+                for n in secret_touched {
+                    touched_rows.insert((n, name, pk.clone()));
+                }
+                for (n, column) in secret_differs {
+                    differs
+                        .entry(n)
+                        .or_default()
+                        .insert((name, pk.clone(), column));
+                }
+                if !changes.is_empty() {
+                    written_rows.push(changes);
+                }
             }
         }
         // A preference an earlier import wrote that no source states now ends, three-way: a row
@@ -3354,7 +3366,9 @@ impl Planner<'_> {
             let Some(field) = row.fields.get(crate::typed::LIFECYCLE) else {
                 continue;
             };
-            if rows.contains_key(&(PREFERENCE.name, pk.clone()))
+            if rows
+                .get(PREFERENCE.name)
+                .is_some_and(|table| table.contains_key(pk))
                 || !row.live()
                 || !retractable(field, sources, &read)
                 || login_unsettled(row)
@@ -3422,7 +3436,9 @@ impl Planner<'_> {
         }
         for collection in [&ACCOUNT, &ADDRESS] {
             for (pk, row) in &current[collection.name].rows {
-                if !rows.contains_key(&(collection.name, pk.clone()))
+                if !rows
+                    .get(collection.name)
+                    .is_some_and(|table| table.contains_key(pk))
                     && row.live()
                     && row
                         .fields

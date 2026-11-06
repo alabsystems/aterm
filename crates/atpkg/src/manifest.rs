@@ -217,7 +217,9 @@ pub const TRUST_EXPOSES: &[&str] = &[
 pub struct Artifact {
     /// Target triple, one of [`TARGETS`].
     pub target: String,
-    /// The payload/apply shape: `binary` | `cargo-src` | `sysroot-bundle` | `app-bundle` (§4.2/§17).
+    /// The payload/apply shape: `binary` | `elf-binary` | `cargo-src` | `sysroot-bundle` |
+    /// `app-bundle` (§4.2/§17). `elf-binary` is a GNU-only release row whose actual ELF runtime
+    /// requirements must be admitted; older clients refuse that selected kind before download.
     #[serde(default)]
     pub kind: String,
     /// Where the bytes come from: `github-release` (the default: a release asset under the account slug) or `https` (a vendor's own download, pinned by this signed row).

@@ -2965,7 +2965,7 @@ impl NativeRuntime {
     /// NEGATIVE CONTROL for the concealment tests: publish `instance`'s document as though
     /// nothing were concealed ([`EditorApp::plain_for_negative_control`]), every view touched so
     /// it recompiles. Whether `instance` is an Editor.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn publish_plain_for_negative_control(&mut self, instance: AppInstanceId) -> bool {
         let Some(NativeApp::Editor(editor)) = self.instances.get_mut(&instance) else {
             return false;

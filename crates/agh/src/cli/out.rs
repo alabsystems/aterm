@@ -158,18 +158,26 @@ fn side_effect_of(reports: &Value) -> SideEffect {
         Value::Array(items) => items.as_slice(),
         _ => one,
     };
-    let sent = |report: &&Value| report.get("dry_run") != Some(&Value::Bool(true));
-    let effect = |report: &Value| {
-        report
+    let mut unknown = false;
+    for report in all {
+        if report.get("dry_run") == Some(&Value::Bool(true)) {
+            continue;
+        }
+        let Some(effect) = report
             .get("outcome")
             .and_then(Value::as_str)
             .and_then(ReportOutcome::from_slug)
             .map(ReportOutcome::side_effect)
-    };
-    let effects: Vec<SideEffect> = all.iter().filter(sent).filter_map(effect).collect();
-    if effects.contains(&SideEffect::Applied) {
-        SideEffect::Applied
-    } else if effects.contains(&SideEffect::Unknown) {
+        else {
+            continue;
+        };
+        match effect {
+            SideEffect::Applied => return SideEffect::Applied,
+            SideEffect::Unknown => unknown = true,
+            SideEffect::None => {}
+        }
+    }
+    if unknown {
         SideEffect::Unknown
     } else {
         SideEffect::None
@@ -313,10 +321,17 @@ fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) 
     columns
 }
 
-fn raw_line(projected: &Value, plan: &Plan) -> String {
+fn raw_line_into(out: &mut String, projected: &Value, plan: &Plan) {
     let path = plan.fields.as_ref().and_then(|f| f.first());
     let value = path.map_or(Value::Null, |path| project::value_at(projected, path));
-    format!("{}\n", format::cell(&value))
+    format::cell_into(out, &value);
+    out.push('\n');
+}
+
+fn raw_line(projected: &Value, plan: &Plan) -> String {
+    let mut out = String::new();
+    raw_line_into(&mut out, projected, plan);
+    out
 }
 
 fn render_object(noun: Noun, value: &Value, plan: &Plan, opts: &OutputOpts) -> Result<Vec<u8>> {
@@ -379,7 +394,10 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
         return Ok(jq::render_results(&results).into_bytes());
     }
     if opts.raw {
-        let lines: String = projected.iter().map(|p| raw_line(p, plan)).collect();
+        let mut lines = String::new();
+        for p in &projected {
+            raw_line_into(&mut lines, p, plan);
+        }
         return Ok(lines.into_bytes());
     }
     let columns = columns(noun, plan, defaults, &projected);
@@ -411,8 +429,8 @@ pub fn write_stdout(ctx: &mut Ctx, bytes: &[u8], code: u8) -> u8 {
     }
     let safe;
     let bytes = if ctx.stdout_is_terminal {
-        safe = aterm_codec::tty::safe(bytes).into_owned().into_bytes();
-        safe.as_slice()
+        safe = aterm_codec::tty::safe(bytes);
+        safe.as_bytes()
     } else {
         bytes
     };

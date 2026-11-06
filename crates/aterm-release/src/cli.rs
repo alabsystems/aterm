@@ -32,7 +32,7 @@ USAGE
       accept the journaled artifact after all other release checks passed.
       Keeps the failed report and its digest; never writes a passing verification.
 
-  targo --unverified ship release [--bump | --commit REV]
+  targo --unverified ship release [--bump | --commit REV | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]...)
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
@@ -50,9 +50,15 @@ USAGE
       2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
       stop (run it again) · 130 interrupted.
         --bump             commit the next MINOR on origin/main's tip, push it,
-                           release it
-        --commit REV       release this commit of origin/main; replaces, out
-                           loud, a candidate this clone has not published
+                           and start a line at it
+        --commit REV       start a line at this commit of origin/main; refused
+                           while this clone holds an unpublished line at another
+        --fix COMMIT...    carry these landed, non-merge main commits onto this
+                           clone's unpublished line, one hop each (its patch onto
+                           the head, never main's movement), record the new head
+                           in main's history by a merge that keeps main's tree,
+                           and release it; a commit the line carries is skipped.
+                           A release never re-selects main after a red
         --mac-only / --linux-artifacts …
                            the Linux declaration the cut requires (see `cut`);
                            journaled, so a bare re-run keeps it
@@ -240,6 +246,13 @@ USAGE
                            version is MAJOR.MINOR, never a third part; one bump per
                            release window covers every change in it. `ship release
                            --bump` writes the same bumps into its version commit
+  targo --unverified ship inputs [--recheck]
+                           a measurement: hash this machine's release build
+                           inputs into a new seal kept in the release state, or
+                           (--recheck) recheck the kept seal by stat, hashing
+                           only on a difference; prints the `inputs:` and
+                           `release-event:` lines on stderr, the identity on
+                           stdout. A release takes its seal at step 1 itself
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
         [--update-ratchet [--reason WHY]] [--try-refused] [--obligations|--no-obligations]
@@ -455,6 +468,11 @@ pub enum Cmd {
     ProfilePilot(crate::profile_pilot::Options),
     /// `harness-bump`: the harness versions the release gate asks for ([`crate::harness_versions`]).
     HarnessBump,
+    /// `inputs [--recheck]`: take, or recheck by stat, this machine's build-inputs seal and say
+    /// how long it took ([`crate::build_inputs::measure`]).
+    Inputs {
+        recheck: bool,
+    },
     /// `trust run|judge`: the Trust lane and the judge of its stored facts ([`crate::trust_facts`]).
     Trust(crate::trust_facts::TrustCmd),
     /// `site`: alab.systems brought to a release ([`crate::site`]), which parses its flags.
@@ -866,6 +884,14 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                  with the previous public release"
             )),
         },
+        "inputs" => match (it.next(), it.next()) {
+            (None, _) => Ok(Cmd::Inputs { recheck: false }),
+            (Some("--recheck"), None) => Ok(Cmd::Inputs { recheck: true }),
+            (Some("--recheck"), Some(extra)) | (Some(extra), _) => Err(format!(
+                "inputs takes only --recheck (got {extra:?}): it takes this machine's \
+                 build-inputs seal, or rechecks the kept one by stat"
+            )),
+        },
         "trust" => crate::trust_facts::parse_cmd(&mut it).map(Cmd::Trust),
         "profile-pilot" => {
             crate::profile_pilot::parse(it.map(str::to_owned)).map(Cmd::ProfilePilot)
@@ -881,6 +907,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
 fn parse_release<'a>(
     it: &mut impl Iterator<Item = &'a str>,
 ) -> std::result::Result<crate::release::ReleaseOptions, String> {
+    let mut it = it.peekable();
     let mut opts = crate::release::ReleaseOptions::default();
     let path = |flag: &str, value: Option<&str>| match value {
         Some(v) if !v.is_empty() && !v.starts_with('-') => Ok(std::path::PathBuf::from(v)),
@@ -896,6 +923,15 @@ fn parse_release<'a>(
                     return Err("--commit given twice".into());
                 }
             }
+            "--fix" => {
+                let named = opts.fix.len();
+                while let Some(rev) = it.next_if(|r| crate::release::is_value(r)) {
+                    opts.fix.push(rev.to_string());
+                }
+                if opts.fix.len() == named {
+                    return Err("--fix needs the landed commit(s) to carry".into());
+                }
+            }
             "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
                 LinuxFlags {
                     artifacts: &mut opts.linux.artifacts,
@@ -903,7 +939,7 @@ fn parse_release<'a>(
                     workers: &mut opts.linux.workers,
                     mac_only: &mut opts.linux.mac_only,
                 }
-                .take(flag, it)?;
+                .take(flag, &mut it)?;
             }
             "--release-credentials" => {
                 let p = path(flag, it.next())?;
@@ -934,6 +970,7 @@ fn parse_release<'a>(
     if opts.abandon.is_some()
         && (opts.bump
             || opts.commit.is_some()
+            || !opts.fix.is_empty()
             || opts.dry_run
             || opts.prepare
             || opts.qualify
@@ -951,6 +988,7 @@ fn parse_release<'a>(
     if opts.forget
         && (opts.bump
             || opts.commit.is_some()
+            || !opts.fix.is_empty()
             || opts.dry_run
             || opts.prepare
             || opts.qualify
@@ -971,6 +1009,13 @@ fn parse_release<'a>(
     if opts.bump && opts.commit.is_some() {
         return Err(
             "--bump releases the bump it commits; --commit names another commit — pass one".into(),
+        );
+    }
+    if !opts.fix.is_empty() && (opts.bump || opts.commit.is_some()) {
+        return Err(
+            "--fix carries fixes onto this clone's line; --bump and --commit start a line — pass \
+             one"
+            .into(),
         );
     }
     Ok(opts)
@@ -1234,6 +1279,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),
         Cmd::HarnessBump => crate::harness_versions::run(&repo_root()?),
+        Cmd::Inputs { recheck } => crate::build_inputs::measure(recheck).map_err(Error::new),
         Cmd::Yank { build, opts } => verify::run_yank(&repo_root()?, build, &opts),
         Cmd::Trust(t) => match crate::trust_facts::run_cmd(&repo_root()?, t) {
             0 => Ok(()),
@@ -1288,6 +1334,38 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `inputs` takes a new seal, `inputs --recheck` rechecks the kept one, and any other
+    /// argument is refused by its own spelling, after `--recheck` too. CONTROL: the two forms.
+    #[test]
+    fn inputs_takes_only_recheck_and_names_the_argument_it_refuses() {
+        let parse_args = |args: &[&str]| {
+            let args: Vec<String> = std::iter::once("inputs")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect();
+            parse(&args)
+        };
+        assert!(matches!(
+            parse_args(&[]).unwrap(),
+            Cmd::Inputs { recheck: false }
+        ));
+        assert!(matches!(
+            parse_args(&["--recheck"]).unwrap(),
+            Cmd::Inputs { recheck: true }
+        ));
+        for (args, refused) in [
+            (&["--fresh"][..], "\"--fresh\""),
+            (&["--recheck", "extra"][..], "\"extra\""),
+            (&["--recheck", "--recheck"][..], "\"--recheck\""),
+        ] {
+            let error = parse_args(args).expect_err("refused");
+            assert!(
+                error.contains(&format!("(got {refused})")),
+                "{args:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn notary_only_cannot_select_other_provisioning_work() {

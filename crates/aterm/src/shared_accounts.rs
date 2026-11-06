@@ -112,30 +112,41 @@ fn project_imports(snapshot: &Snapshot) -> Catalog {
         if collection != "sources" {
             continue;
         }
+        let conflicted = cell.candidates.len() != 1;
         for candidate in &cell.candidates {
             let Some(imported) = candidate.value["rows"].as_array() else {
                 continue;
             };
+            let operation = aterm_codec::hex::encode_lower(&candidate.operation);
             for row in imported {
                 let Some(record) = row["record"].as_u64() else {
                     continue;
                 };
+                let label = format!("Source row {record}");
+                let email = row["email"].as_str().map(str::to_owned);
+                let machine_hint = row["machine_slot_hint"].as_str().map(str::to_owned);
+                let unclassified_columns: Vec<u64> = row["unclassified_columns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(aterm_json::Value::as_u64)
+                    .collect();
                 let account = |provider: Option<&aterm_json::Value>| {
                     let column = provider.and_then(|provider| provider["column"].as_u64());
                     Account {
                         key: format!("import:{source}:{record}:{}", column.unwrap_or(0)),
-                        operation: aterm_codec::hex::encode_lower(&candidate.operation),
-                        label: format!("Source row {record}"),
+                        operation: operation.clone(),
+                        label: label.clone(),
                         provider: provider
                             .and_then(|provider| provider["provider"].as_str())
                             .unwrap_or("unspecified")
                             .into(),
                         method: None,
-                        email: row["email"].as_str().map(str::to_owned),
+                        email: email.clone(),
                         realm: None,
                         secret_reference: false,
                         required_browser: false,
-                        conflicted: cell.candidates.len() != 1,
+                        conflicted,
                         stopped: cell.stopped,
                         import: Some(ImportOrigin {
                             table: table.clone(),
@@ -144,13 +155,8 @@ fn project_imports(snapshot: &Snapshot) -> Catalog {
                             provider_column: column,
                             presence: provider
                                 .and_then(|provider| provider["presence_marker"].as_bool()),
-                            machine_hint: row["machine_slot_hint"].as_str().map(str::to_owned),
-                            unclassified_columns: row["unclassified_columns"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(aterm_json::Value::as_u64)
-                                .collect(),
+                            machine_hint: machine_hint.clone(),
+                            unclassified_columns: unclassified_columns.clone(),
                         }),
                         import_link: None,
                     }

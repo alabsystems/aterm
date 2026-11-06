@@ -303,42 +303,6 @@ pub(crate) fn host_memory_bytes() -> Option<u64> {
         .filter(|&bytes: &u64| bytes > 0)
 }
 
-/// Whether the two slices may build at once: the newest complete build's recorded slice peaks, summed, fit in three quarters of `memory`.
-#[must_use]
-pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
-    let Some(memory) = memory else {
-        return true;
-    };
-    let mut records: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(store)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| {
-            let record = e.path().join(COMPLETE_FILE);
-            let when = std::fs::symlink_metadata(&record)
-                .ok()
-                .filter(|m| m.is_file())
-                .and_then(|m| m.modified().ok())?;
-            Some((when, record))
-        })
-        .collect();
-    records.sort_by_key(|(when, _)| *when);
-    let Some(complete) = records.into_iter().rev().find_map(|(_, record)| {
-        let text = crate::durable::read_regular_text(&record, 1024 * 1024).ok()?;
-        aterm_toml::from_str::<Complete>(&text).ok()
-    }) else {
-        return true;
-    };
-    let peaks: u64 = complete
-        .slices
-        .iter()
-        .filter_map(|s| s.peak_bytes)
-        .fold(0u64, u64::saturating_add);
-    peaks <= memory / 4 * 3
-}
-
 /// Build the bundle of `identity` (the one build a release makes) unless the store holds it complete, whose re-proved record is then returned.
 /// # Errors
 /// The gate's refusal, the build's, and any write of the entry.
@@ -380,7 +344,6 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         Err(e) => return Err(format!("remove the unfinished {}: {e}", dir.display())),
     }
     crate::snapshot::private_dir(&dir, "release artifact")?;
-    let memory = host_memory_bytes();
     let index_hint = crate::buildplan::index_hint_now();
     let built = crate::buildplan::run(&crate::buildplan::BuildPlan {
         repo_root: repo.to_path_buf(),
@@ -389,7 +352,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         build_number: identity.build,
         short_version: identity.version.clone(),
         expected_update_pin_sha256: expected_pin,
-        one_slice_at_a_time: !slices_fit(&store, memory),
+        sequencing: crate::buildplan::Sequencing::Parallel,
         index_hint: index_hint.clone(),
     })?;
     if built.app != app_in(&dir) {

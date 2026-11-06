@@ -17,7 +17,8 @@ pub enum CleanupFailure {
     Unknown,
     /// The common operation deadline expired.
     Deadline,
-    /// The lab's stop condition interrupted observation.
+    /// The lab's stop interrupted observation; in a cleanup under way ([`crate::stop::Grace`]),
+    /// a second signal cut it short.
     Interrupted,
 }
 
@@ -64,9 +65,11 @@ pub(super) enum Registration {
     Absent,
 }
 
-/// Collect one command under the operation's absolute deadline. The shared Unix runner
-/// bounds kill-group cleanup and reap instead of calling an unbounded Child::wait.
-/// A timeout can include its finite native kill grace and one-second reap grace.
+/// Collect one command under the operation's absolute deadline, or until a second signal cuts
+/// this thread's cleanup short ([`crate::stop::cut`]); the stop that asked for the cleanup does
+/// not end it. The shared Unix runner bounds kill-group cleanup and reap instead of calling an
+/// unbounded Child::wait. A timeout or a cut can include its finite native kill grace and
+/// one-second reap grace.
 pub(super) fn output(
     phase: &'static str,
     command: &mut Command,
@@ -75,17 +78,24 @@ pub(super) fn output(
     if Instant::now() >= deadline {
         return Err(CleanupError::expired(phase));
     }
-    aterm_uds::deadline::outputs_until(&mut [command], deadline, Duration::from_secs(1))
-        .pop()
-        .expect("one command has one result")
-        .map_err(|why| {
-            let kind = if matches!(why, aterm_uds::deadline::RunError::TimedOut) {
-                CleanupFailure::Deadline
-            } else {
-                CleanupFailure::Command
-            };
-            CleanupError::new(kind, phase, why.to_string())
-        })
+    aterm_uds::deadline::outputs_until_unless(
+        &mut [command],
+        deadline,
+        Duration::from_secs(1),
+        &mut crate::stop::cut,
+    )
+    .pop()
+    .expect("one command has one result")
+    .map_err(|why| {
+        let kind = match why {
+            aterm_uds::deadline::RunError::TimedOut if crate::stop::cut() => {
+                CleanupFailure::Interrupted
+            }
+            aterm_uds::deadline::RunError::TimedOut => CleanupFailure::Deadline,
+            _ => CleanupFailure::Command,
+        };
+        CleanupError::new(kind, phase, why.to_string())
+    })
 }
 
 fn unknown(phase: &'static str, output: &Output) -> CleanupError {
@@ -364,5 +374,80 @@ mod tests {
             CleanupFailure::Unknown
         );
         assert_eq!(refused.commands, ["print", "bootout", "print"]);
+    }
+
+    /// The role a launchctl stand-in test's re-run of this binary plays.
+    const PROBE: &str = "ATERM_LAB_BAND_CLEANUP_PROBE";
+
+    /// This binary's `test` alone as `role`, as a command.
+    fn rerun(test: &str, role: &str) -> Command {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        cmd.args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(PROBE, role);
+        cmd
+    }
+
+    /// A cleanup's command (launchctl's, here a stand-in) runs through the stop that asked for
+    /// the cleanup, and a second signal ends it, as it ends the cleanup's own waits.
+    #[test]
+    fn a_second_signal_ends_a_cleanups_command_and_the_stop_alone_does_not() {
+        const TEST: &str = "band::cleanup::tests::a_second_signal_ends_a_cleanups_command_and_the_stop_alone_does_not";
+        match std::env::var(PROBE).as_deref() {
+            Ok("probe") => {
+                crate::sys::start_signal(libc::SIGTERM, false);
+                crate::stop::install();
+                let me = i32::try_from(std::process::id()).expect("pid");
+                crate::sys::kill(me, libc::SIGTERM).expect("the stop");
+                assert_eq!(
+                    crate::stop::sleep(Duration::from_mins(1)),
+                    Err(crate::stop::Stopped(libc::SIGTERM)),
+                    "the stop is noted"
+                );
+                let _grace = crate::stop::grace();
+                let deadline = Instant::now() + Duration::from_mins(1);
+                let through = output("print", &mut rerun(TEST, "answers"), deadline);
+                println!(
+                    "PROBE through the stop: {:?}",
+                    through.map(|o| o.status.success()).map_err(|e| e.kind)
+                );
+                crate::sys::kill(me, libc::SIGTERM).expect("the cut");
+                assert_eq!(
+                    crate::stop::sleep(Duration::from_mins(1)),
+                    Err(crate::stop::Stopped(libc::SIGTERM)),
+                    "the cut is noted"
+                );
+                let cut = output("print", &mut rerun(TEST, "stalls"), deadline);
+                println!(
+                    "PROBE after the cut: {:?} before_deadline={}",
+                    cut.map(|o| o.status.success()).map_err(|e| e.kind),
+                    Instant::now() < deadline
+                );
+                std::process::exit(0);
+            }
+            Ok("answers") => std::process::exit(0),
+            Ok(_) => {
+                std::thread::sleep(Duration::from_mins(2));
+                std::process::exit(0);
+            }
+            Err(_) => {}
+        }
+        let out = aterm_uds::deadline::output_until(
+            &mut rerun(TEST, "probe"),
+            Instant::now() + Duration::from_mins(2),
+        )
+        .expect("the probe ends within the hang detector");
+        let out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.contains("PROBE through the stop: Ok(true)"),
+            "the stop that asked for the cleanup does not end its command: {out}"
+        );
+        assert!(
+            out.contains("PROBE after the cut: Err(Interrupted) before_deadline=true"),
+            "a second signal ends the cleanup's command at once, not at its deadline: {out}"
+        );
     }
 }

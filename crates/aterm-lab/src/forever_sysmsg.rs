@@ -880,9 +880,16 @@ pub fn land_on_by(seen: &Seen, resumed: i64, by: i64, t0: i64) -> Result<String,
 /// names a streak: its time and the short turns in a row it names ([`point_streak`]).
 #[must_use]
 pub fn typed_on(seen: &Seen, met: i64) -> Option<(i64, u32)> {
+    last_point_in(seen, (i64::MIN, met))
+}
+
+/// The last point record (`point@v1`) past `after` and at or before `until` that names a streak:
+/// its time and the short turns in a row it names ([`point_streak`]).
+#[must_use]
+pub fn last_point_in(seen: &Seen, (after, until): (i64, i64)) -> Option<(i64, u32)> {
     seen.ledger
         .iter()
-        .filter(|r| r.rule == RULE_POINT && r.ts <= met)
+        .filter(|r| r.rule == RULE_POINT && r.ts > after && r.ts <= until)
         .filter_map(|r| Some((r.ts, point_streak(r)?)))
         .next_back()
 }

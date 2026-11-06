@@ -299,18 +299,21 @@ fn records(paths: &Paths) -> Result<Vec<Value>, String> {
     else {
         return Ok(Vec::new());
     };
-    let value: Value = aterm_json::from_slice(raw.as_slice())
+    let mut value: Value = aterm_json::from_slice(raw.as_slice())
         .map_err(|_| "native preparation records are malformed")?;
     if value.as_object().is_none_or(|object| object.len() != 2)
         || value["schema"].as_u64() != Some(1)
     {
         return Err("unsupported native preparation record schema".into());
     }
-    let rows = value["records"]
-        .as_array()
-        .ok_or("native preparation records are not an array")?;
+    let Some(Value::Array(rows)) = value
+        .as_object_mut()
+        .and_then(|object| object.remove("records"))
+    else {
+        return Err("native preparation records are not an array".into());
+    };
     let mut seen = std::collections::BTreeSet::new();
-    for row in rows {
+    for row in &rows {
         if row.as_object().is_none_or(|object| object.len() != 12)
             || ["account", "network", "decision", "configuration"]
                 .iter()
@@ -339,7 +342,7 @@ fn records(paths: &Paths) -> Result<Vec<Value>, String> {
             return Err("native preparation record is invalid".into());
         }
     }
-    Ok(rows.clone())
+    Ok(rows)
 }
 
 fn selection_scope(paths: &Paths, deadline: Instant) -> Result<Value, String> {
@@ -368,16 +371,19 @@ fn selections(paths: &Paths) -> Result<Vec<Value>, String> {
     else {
         return Ok(Vec::new());
     };
-    let value: Value =
+    let mut value: Value =
         aterm_json::from_slice(raw.as_slice()).map_err(|_| "native selections are malformed")?;
     if value.as_object().is_none_or(|o| o.len() != 2) || value["schema"].as_u64() != Some(1) {
         return Err("native selection schema is unsupported".into());
     }
-    let rows = value["selections"]
-        .as_array()
-        .filter(|rows| rows.len() <= 2)
-        .ok_or("native selections exceed their bound")?;
-    for row in rows {
+    let Some(Value::Array(rows)) = value
+        .as_object_mut()
+        .and_then(|o| o.remove("selections"))
+        .filter(|v| v.as_array().is_some_and(|rows| rows.len() <= 2))
+    else {
+        return Err("native selections exceed their bound".into());
+    };
+    for row in &rows {
         if row.as_object().is_none_or(|o| o.len() != 2)
             || row["provider"].as_str().and_then(Provider::of).is_none()
             || row["scope"].as_object().is_none_or(|o| o.len() != 5)
@@ -402,7 +408,7 @@ fn selections(paths: &Paths) -> Result<Vec<Value>, String> {
             return Err("native selection is invalid".into());
         }
     }
-    Ok(rows.clone())
+    Ok(rows)
 }
 
 fn retain_selection(paths: &Paths, provider: Provider, scope: &Value) -> Result<(), String> {
@@ -801,6 +807,14 @@ fn own_profile(provider: Provider, profile: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `--gemini_dir=<profile>`, the profile's path byte for byte: `display()` would hand the CLI
+/// another folder for a path that is not UTF-8.
+fn gemini_dir(profile: &Path) -> OsString {
+    let mut arg = OsString::from("--gemini_dir=");
+    arg.push(profile.as_os_str());
+    arg
+}
+
 fn child_command(
     provider: Provider,
     program: &Path,
@@ -820,7 +834,7 @@ fn child_command(
     command.env("HOME", profile);
     match provider {
         Provider::Google => {
-            command.arg(format!("--gemini_dir={}", profile.display()));
+            command.arg(gemini_dir(profile));
             command.env(
                 "GOOGLE_GEMINI_BASE_URL",
                 "https://generativelanguage.googleapis.com",

@@ -75,11 +75,32 @@ fn check_home_and_walk(
     Ok(())
 }
 
-/// [`put`] for the resolved caller `me`.
+/// [`put`] for the resolved caller `me`: at most
+/// [`MAX_ARTIFACT_BYTES`](crate::controller::artifacts::MAX_ARTIFACT_BYTES), the most the
+/// controller downloads of one artifact.
 pub fn put_as(
     sys: &dyn System,
     me: &crate::model::User,
     sha: &str,
+    stdin: &mut dyn Read,
+    out: &mut dyn Write,
+) -> ExitCode {
+    put_at_most(
+        sys,
+        me,
+        sha,
+        crate::controller::artifacts::MAX_ARTIFACT_BYTES,
+        stdin,
+        out,
+    )
+}
+
+/// [`put_as`], refusing standard input longer than `cap` bytes with nothing kept.
+fn put_at_most(
+    sys: &dyn System,
+    me: &crate::model::User,
+    sha: &str,
+    cap: u64,
     stdin: &mut dyn Read,
     out: &mut dyn Write,
 ) -> ExitCode {
@@ -96,9 +117,20 @@ pub fn put_as(
     }
     let partial = dir.join(format!(".{sha}.partial"));
     let target = dir.join(sha);
-    if let Err(e) = sys.write_stream(&partial, stdin, 0o600) {
-        let _ = sys.remove(&partial);
-        return super::refuse(out, &format!("put: {}: {e}", partial.display()));
+    let mut capped = stdin.take(cap.saturating_add(1));
+    match sys.write_stream(&partial, &mut capped, 0o600) {
+        Ok(written) if written > cap => {
+            let _ = sys.remove(&partial);
+            return super::refuse(
+                out,
+                &format!("put: more than {cap} bytes on standard input"),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = sys.remove(&partial);
+            return super::refuse(out, &format!("put: {}: {e}", partial.display()));
+        }
     }
     match sys.sha256(&partial) {
         Ok(got) if got == sha => {}
@@ -308,6 +340,37 @@ mod tests {
             ),
             refused()
         );
+    }
+
+    /// A put longer than its cap keeps nothing, partial file included. NEGATIVE CONTROL:
+    /// exactly the cap is taken whole.
+    #[test]
+    fn put_refuses_more_than_its_cap_and_takes_exactly_the_cap() {
+        let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let inbox = "/Users//admin/Library/Caches/aterm-machines/inbox";
+        let fake = as_admin();
+        let mut out = Vec::new();
+        assert_eq!(
+            put_at_most(&fake, &admin(), sha, 4, &mut &b"hello"[..], &mut out),
+            refused()
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("more than 4 bytes"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(fake.written(&format!("{inbox}/{sha}")).is_none());
+        assert!(fake.written(&format!("{inbox}/.{sha}.partial")).is_none());
+
+        let fake = as_admin();
+        let mut out = Vec::new();
+        assert_eq!(
+            put_at_most(&fake, &admin(), sha, 5, &mut &b"hello"[..], &mut out),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(fake.written(&format!("{inbox}/{sha}")).unwrap(), b"hello");
     }
 
     #[test]

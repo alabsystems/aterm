@@ -2173,19 +2173,8 @@ impl Session<'_> {
         Ok(seat)
     }
 
-    /// What the unit's own processes last wrote. `-u` would add the manager's `Started <argv>`,
-    /// whose length used up the cap below and hid what the process said.
     fn unit_journal(&self, name: &str) -> String {
-        let out = self.sh(&[
-            "journalctl".into(),
-            "--user".into(),
-            "--no-pager".into(),
-            "-o".into(),
-            "cat".into(),
-            "-n".into(),
-            "3".into(),
-            format!("_SYSTEMD_USER_UNIT={name}.service"),
-        ]);
+        let out = self.sh(&guest::unit_journal(name));
         crate::util::one_line(&out.text, 300)
     }
 

@@ -621,19 +621,16 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
         aterm_secrets::client::trusted_commons_log(bootstrap.paths(), bootstrap.trust())
             .map_err(crate::table::failure)?
     {
-        use aterm_secrets::membership_log::{EpochAudience, NodeStanding};
+        use aterm_secrets::membership_log::EpochAudience;
         let actor = request.binding().actor();
         let recipient = request.binding().recipient();
         let log_roster = aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log)
             .map_err(crate::table::failure)?;
         let membership = log.membership();
         let member = membership.get(&actor);
-        let excluded_in_log = membership.removal(&actor).is_some()
-            || log.recipient_is_removed(&recipient)
-            || matches!(
-                membership.node(request.binding().writer()),
-                NodeStanding::Removed(_)
-            )
+        // The one removal predicate first; the seat scan below asks more of the seats that share
+        // the actor or recipient (a removed writer key, a roster denial) than its kin verdict does.
+        let excluded_in_log = log.seat_removed(request.binding())
             // Audience checks deny unknown actors too. Only an existing seat
             // makes that denial evidence of inactive membership.
             || (member.is_some()

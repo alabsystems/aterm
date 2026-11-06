@@ -408,7 +408,10 @@ fn run_native_host_fixture_inner(
         active,
         store,
         proxy: event_loop.create_proxy(),
-        interactive_browser: false,
+        account_services: AccountServices {
+            lifetime: Default::default(),
+            interactive_browser: false,
+        },
         token: Arc::new(token),
         sock_dir: world,
         recovery_count_admission: Arc::new(

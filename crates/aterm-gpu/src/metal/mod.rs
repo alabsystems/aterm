@@ -898,4 +898,35 @@ mod tests {
             dh
         );
     }
+
+    /// A recording of a destination with no pixels is refused when it begins, rather than
+    /// minting slots for frames that cannot hold one.
+    #[test]
+    fn a_zero_area_recording_is_refused_at_begin() {
+        let _ = device();
+        let mut armed = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        armed.arm_metal_for_test();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut win = WindowGpu::new();
+        let input = Terminal::new(ROWS as u16, COLS as u16).cell_frame(ROWS, COLS);
+        let (fw, fh) = {
+            let f = armed.render_input(&mut win, &input, None);
+            (f.width as u32, f.height as u32)
+        };
+        let opts = || crate::video_tap::CaptureOpts {
+            half_res: false,
+            budget_bytes: crate::video_tap::DEFAULT_BUDGET,
+            fps_cap: None,
+            requested_ms: 0,
+        };
+        for (w, h) in [(0, fh), (fw, 0), (0, 0)] {
+            let err = armed
+                .video_begin_metal_standin_for_test(&mut win, w, h, opts())
+                .expect_err("a recording with no pixels must not begin");
+            assert!(err.contains("zero area"), "{w}x{h}: {err}");
+        }
+        armed
+            .video_begin_metal_standin_for_test(&mut win, fw, fh, opts())
+            .expect("control: a recording of the frame's own size begins");
+    }
 }

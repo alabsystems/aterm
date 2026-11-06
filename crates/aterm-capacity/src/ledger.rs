@@ -234,6 +234,14 @@ impl Record {
         o.insert("mem".to_owned(), Value::from(self.need.mem));
         o.insert("margin".to_owned(), Value::from(self.need.margin));
         o.insert("cores".to_owned(), Value::from(self.need.cores));
+        o.insert(
+            "rank".to_owned(),
+            Value::from(match self.need.rank {
+                crate::Rank::Release => "release",
+                crate::Rank::Ordinary => "ordinary",
+                crate::Rank::Background => "background",
+            }),
+        );
         o.insert("disk".to_owned(), Value::from(self.need.disk));
         let quiet = self.need.quiet.map(|q| {
             if q.is_nan() || q < 0.0 {
@@ -381,6 +389,15 @@ impl Record {
             Some(v) => Some(v.as_f64().filter(|q| q.is_finite() && *q >= 0.0)?),
         };
         let need = Need {
+            rank: match head.get("rank") {
+                None => crate::Rank::Ordinary,
+                Some(value) => match value.as_str() {
+                    Some("ordinary") => crate::Rank::Ordinary,
+                    Some("release") => crate::Rank::Release,
+                    Some("background") => crate::Rank::Background,
+                    _ => return None,
+                },
+            },
             what: head.get("what").and_then(Value::as_str)?.to_owned(),
             mem: num(&head, "mem")?,
             margin: num(&head, "margin").unwrap_or(0),
@@ -412,35 +429,55 @@ impl Record {
         let mut malformed_after = false;
         let mut detached = false;
         let mut bad_detach = false;
-        let after: Vec<Value> = lines
-            .filter_map(|l| {
-                if l.starts_with('@') {
-                    if l.as_bytes() == &DETACHED_MEMORY[..DETACHED_MEMORY.len() - 1] && !detached {
-                        detached = true;
-                    } else {
-                        bad_detach = true;
-                    }
-                    return None;
+        let mut explicit_held: Option<Held> = None;
+        let mut next_ms: Option<u64> = None;
+        let mut credit: Vec<u32> = Vec::new();
+        let mut wrote: Option<u64> = None;
+        let mut timing: Option<crate::TimingEvidence> = None;
+        for l in lines {
+            if l.starts_with('@') {
+                if l.as_bytes() == &DETACHED_MEMORY[..DETACHED_MEMORY.len() - 1] && !detached {
+                    detached = true;
+                } else {
+                    bad_detach = true;
                 }
-                match aterm_json::from_str::<Value>(l) {
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        malformed_after = true;
-                        None
-                    }
-                }
-            })
-            .collect();
+                continue;
+            }
+            let Ok(v) = aterm_json::from_str::<Value>(l) else {
+                malformed_after = true;
+                continue;
+            };
+            if explicit_held.is_none()
+                && let Some(admitted_ms) = num(&v, "admitted_ms")
+                && let Some(cores) = num(&v, "cores").and_then(|c| u32::try_from(c).ok())
+            {
+                explicit_held = Some(Held {
+                    admitted_ms,
+                    cores,
+                    alone: v.get("alone").and_then(Value::as_bool) == Some(true),
+                });
+            }
+            if next_ms.is_none() {
+                next_ms = num(&v, "next_ms");
+            }
+            if let Some(arr) = v.get("credit").and_then(Value::as_array)
+                && let Some(parsed) = arr
+                    .iter()
+                    .map(|p| p.as_u64().and_then(|p| u32::try_from(p).ok()))
+                    .collect::<Option<Vec<u32>>>()
+            {
+                credit = parsed;
+            }
+            if wrote.is_none() {
+                wrote = num(&v, "wrote");
+            }
+            if let Some(t) = v.get("timing") {
+                timing = Some(crate::TimingEvidence::read(t));
+            }
+        }
         if bad_detach || detached != poisoned || (detached && (!held || !memory_only(&need))) {
             return None;
         }
-        let explicit_held = after.iter().find_map(|v| {
-            Some(Held {
-                admitted_ms: num(v, "admitted_ms")?,
-                cores: u32::try_from(num(v, "cores")?).ok()?,
-                alone: v.get("alone").and_then(Value::as_bool) == Some(true),
-            })
-        });
         if detached && (explicit_held.is_none() || malformed_after) {
             return None;
         }
@@ -451,29 +488,13 @@ impl Record {
                 alone: false,
             })
         });
-        let next_ms = after.iter().find_map(|v| num(v, "next_ms"));
-        let credit = after
-            .iter()
-            .filter_map(|v| {
-                v.get("credit")?
-                    .as_array()?
-                    .iter()
-                    .map(|p| p.as_u64().and_then(|p| u32::try_from(p).ok()))
-                    .collect::<Option<Vec<u32>>>()
-            })
-            .next_back()
-            .unwrap_or_default();
-        let wrote = held.and_then(|_| after.iter().find_map(|v| num(v, "wrote")));
+        let wrote = held.and(wrote);
         // Keep the live reservation even when the newest proof is malformed; never retain an
         // earlier ready proof through a later corrupt line.
         let mut timing = if malformed_after {
             crate::TimingEvidence::default()
         } else {
-            after
-                .iter()
-                .filter_map(|v| v.get("timing"))
-                .next_back()
-                .map_or_else(crate::TimingEvidence::default, crate::TimingEvidence::read)
+            timing.unwrap_or_default()
         };
         if need.quiet_policy != crate::QuietPolicy::Load {
             // The complete admission line is an independently known resource fact. A later

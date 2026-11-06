@@ -41,7 +41,7 @@ fn prepare(sys: &dyn System) -> Result<(User, bool), GithubRead> {
         }
         Asked::Scoped(_) | Asked::Default => false,
     };
-    if !Git::new(sys).installed(sys) {
+    if !Git::for_user(sys, &user).installed(sys) {
         return Err(GithubRead::Deferred(super::NEEDS_GIT.into()));
     }
     Ok((user, custom))
@@ -60,7 +60,7 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
         Ok(read) => read,
         Err(status) => return Ok(status),
     };
-    let git = Git::new(sys);
+    let git = Git::for_user(sys, &user);
     if let Some(block) = git.keychain_block(sys, &user, &|| token_here(sys, &user))? {
         return Ok(if helper(sys, &user).is_some() {
             GithubRead::Due {
@@ -111,7 +111,7 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
 pub fn sync_vault_git_credentials(sys: &dyn System, journaled: &str) -> Result<String, String> {
     let (user, _) =
         prepare(sys).map_err(|status| format!("GitHub settings changed: {status:?}"))?;
-    let git = Git::new(sys);
+    let git = Git::for_user(sys, &user);
     let Some(block) = git.keychain_block(sys, &user, &|| token_here(sys, &user))? else {
         return Ok("no keychain GitHub block is left to replace".into());
     };

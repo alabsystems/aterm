@@ -1075,8 +1075,10 @@ pub(crate) struct AckedLog {
     /// The forged-self window's floor the file names, its `floor=<n>` entry (critic item F17's
     /// review): the lowest offset the window accuses, kept apart from the offsets it holds.
     /// Every file this build writes names one (each replace, and the first append into a file
-    /// that names none); `None` for no file, or for one an older build wrote, whose reader took
-    /// the oldest offset it holds for the floor.
+    /// that names none); `None` for no file, one that cannot be read, or one an older build
+    /// wrote, whose reader took the oldest offset it holds for the floor. A window with neither
+    /// a floor nor an offset is floored at the head its next attach reads, and written so
+    /// (critic item F20, `Bridge::floor_at_the_head`).
     pub floor: Option<u64>,
     /// How many offset entries the file holds, repeats included.
     pub entries: usize,
@@ -3932,9 +3934,11 @@ impl StateDir {
         self.write(&format!("seen/{sid}"), &off.to_string())
     }
 
-    /// Every offset this bridge holds a `PublishAck` for on its own lanes.
+    /// Every offset this bridge holds a `PublishAck` for on its own lanes: a test's read of
+    /// the file; the bridge reads it whole ([`StateDir::self_acked_log`]).
+    #[cfg(test)]
     #[must_use]
-    pub fn self_acked(&self) -> std::collections::BTreeSet<u64> {
+    pub(crate) fn self_acked(&self) -> std::collections::BTreeSet<u64> {
         self.self_acked_log().offsets
     }
 

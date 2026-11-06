@@ -3,7 +3,10 @@
 
 //! Program table ([`PROGRAMS`]) defining each program's repo, coherence group, and pack shape.
 
-use crate::triple::{AARCH64_APPLE_DARWIN, Triple, X86_64_APPLE_DARWIN};
+use crate::triple::{
+    AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, Triple, X86_64_APPLE_DARWIN,
+    X86_64_UNKNOWN_LINUX_GNU,
+};
 
 /// Every program's install policy: prebuilt-only, fail-closed. Trust and trust-mc are
 /// never built from source on a user's machine.
@@ -69,8 +72,8 @@ pub enum Shape {
     /// to this row only on an explicit `--pin` (`channel::index::plan`).
     Package(PackageDef),
     /// An upstream formula bottle or release archive relocated into a self-contained store
-    /// payload by `atpkg-publish pack-bottle` (`git`, `gh`). No unattended lane reads it;
-    /// `index --pin` pins it once staged.
+    /// payload by `atpkg-publish pack-bottle` (`git`, `gh`). An explicit `index --pin`
+    /// selects the initial build; the Linux lane adds any declared GNU targets to that pin.
     Bottle(BottleDef),
 }
 
@@ -105,6 +108,8 @@ pub struct BottleDef {
     pub exposes: &'static [&'static str],
     /// The Apple targets one build carries.
     pub darwin: &'static [Triple],
+    /// The GNU/Linux targets an upstream install archive may carry.
+    pub linux: &'static [Triple],
 }
 
 /// How a sysroot bundle is packed and proven.
@@ -247,6 +252,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
         shape: Shape::Bottle(BottleDef {
             exposes: &["gh"],
             darwin: DUAL_DARWIN,
+            linux: &[],
         }),
     },
     ProgramDef {
@@ -258,6 +264,7 @@ pub static PROGRAMS: &[ProgramDef] = &[
         shape: Shape::Bottle(BottleDef {
             exposes: &["git"],
             darwin: DUAL_DARWIN,
+            linux: &[X86_64_UNKNOWN_LINUX_GNU, AARCH64_UNKNOWN_LINUX_GNU],
         }),
     },
 ];
@@ -300,9 +307,9 @@ impl ProgramDef {
         }
     }
 
-    /// Whether the unattended lanes read it at all: a [`Shape::Package`] or [`Shape::Bottle`]
-    /// row is packed and pinned only by a person (`pack-package` / `pack-bottle`, then
-    /// `index --pin`), so no lane looks for its releases, reports it owed or pins it.
+    /// Whether the Apple source-release lane tracks its repository. Package and bottle
+    /// builds enter the channel through an explicit pin; the Linux lane can subsequently
+    /// extend a bottle pin with the GNU targets its definition declares.
     #[must_use]
     pub const fn lane_tracked(&self) -> bool {
         !matches!(self.shape, Shape::Package(_) | Shape::Bottle(_))

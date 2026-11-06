@@ -22,7 +22,7 @@ pub enum ApplyStrategy {
 #[must_use]
 pub fn strategy_for(kind: &str, protocol: &str) -> ApplyStrategy {
     match (protocol, kind) {
-        ("github-release", "binary" | "cargo-src") => ApplyStrategy::Shim,
+        ("github-release", "binary" | "cargo-src" | "elf-binary") => ApplyStrategy::Shim,
         ("github-release", "sysroot-bundle") => ApplyStrategy::SysrootBundle,
         ("github-release", "app-bundle") => ApplyStrategy::AppBundle,
         ("https", "binary") => ApplyStrategy::Shim,
@@ -40,10 +40,12 @@ mod tests {
         use ApplyStrategy::{AppBundle, Shim, SysrootBundle, Unknown, VendorApp};
         for (kind, protocol, want) in [
             ("binary", "github-release", Shim),
+            ("elf-binary", "github-release", Shim),
             ("cargo-src", "github-release", Shim),
             ("sysroot-bundle", "github-release", SysrootBundle),
             ("app-bundle", "github-release", AppBundle),
             ("binary", "https", Shim),
+            ("elf-binary", "https", Unknown),
             ("app-bundle", "https", VendorApp),
             ("sysroot-bundle", "https", Unknown),
             ("cargo-src", "https", Unknown),

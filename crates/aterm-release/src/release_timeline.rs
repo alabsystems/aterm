@@ -322,6 +322,13 @@ impl Timeline {
         Ok(timeline)
     }
 
+    /// The bytes the run's slices and compiles wrote, by their own records; `None` where no
+    /// record says.
+    #[must_use]
+    pub const fn output_bytes(&self) -> Option<u64> {
+        self.output_bytes
+    }
+
     fn publish_phases(&self) -> aterm_json::Value {
         let headers: Vec<&(u64, String)> = self
             .publish_lines

@@ -10,6 +10,7 @@ use aterm_phase::{Program, ResetKind};
 use super::policy::approval::QuestionPriority;
 
 use super::memory::MemoryCeiling;
+use super::occupancy::owner_rules::OwnerTables;
 use crate::harness::accounts::Mode;
 use crate::harness::harness_mark;
 
@@ -888,6 +889,42 @@ impl SupervisorConfig {
         }
     }
 
+    /// [`Self::from_aterm_toml`] and the owner's tables ([`OwnerTables::from_doc`]) of one parse
+    /// of `text`, so the mode and the tables a window adopts are of one text: the policy's notes,
+    /// then the tables'. A text TOML refuses reads no owner table (its lines are read one by
+    /// one for the limits alone).
+    #[must_use]
+    pub fn with_owner_tables(text: &str) -> (Self, OwnerTables, Vec<String>) {
+        match aterm_toml::from_str::<aterm_toml::Value>(text) {
+            Ok(doc) => {
+                let (cfg, mut notes) = Self::from_doc_and_text(&doc, text);
+                let (tables, owner_notes) = OwnerTables::from_doc(&doc);
+                notes.extend(owner_notes);
+                (cfg, tables, notes)
+            }
+            Err(e) => {
+                let (cfg, notes) = Self::from_invalid_aterm_toml(text, &e.to_string());
+                (cfg, OwnerTables::default(), notes)
+            }
+        }
+    }
+
+    /// [`Self::with_owner_tables`] over the file at `path`, read as [`Self::from_path`] reads it.
+    #[must_use]
+    pub fn with_owner_tables_at(path: Option<&Path>) -> (Self, OwnerTables, Vec<String>) {
+        let Some(path) = path else {
+            return (Self::default(), OwnerTables::default(), Vec::new());
+        };
+        match aterm_types::dirs::read_aterm_config(path) {
+            Ok(Some(bytes)) => Self::with_owner_tables(&String::from_utf8_lossy(&bytes)),
+            Ok(None) => (Self::default(), OwnerTables::default(), Vec::new()),
+            Err(e) => {
+                let (cfg, notes) = Self::unread_config(unread_path_note(path, &e));
+                (cfg, OwnerTables::default(), notes)
+            }
+        }
+    }
+
     pub(crate) fn from_parsed_aterm_toml(
         doc: Option<&aterm_toml::Value>,
         text: &str,
@@ -958,6 +995,9 @@ impl SupervisorConfig {
                     continue;
                 }
             }
+            if OWNER_TABLES.contains(&key.as_str()) {
+                continue;
+            }
             if let Err(e) = cfg.set_value(&key, value) {
                 notes.push(e);
             }
@@ -968,6 +1008,15 @@ impl SupervisorConfig {
         }
         for (at, table) in misplaced {
             for (key, value) in entries(table) {
+                if OWNER_TABLES.contains(&key.as_str()) {
+                    notes.push(misplaced_note(
+                        &at,
+                        &key,
+                        false,
+                        Some(OWNER_TABLES_ROOT.into()),
+                    ));
+                    continue;
+                }
                 let before = cfg.clone();
                 let refused = cfg.set_value(&key, value).err();
                 let limits = cfg.limits(&before);
@@ -1077,6 +1126,18 @@ impl SupervisorConfig {
                 _ => continue,
             };
             let key = key.as_str();
+            if OWNER_TABLES.contains(&key) {
+                if !head.is_empty() {
+                    let at = head.join(".").replace(".[]", "[]");
+                    notes.push(misplaced_note(
+                        &at,
+                        key,
+                        false,
+                        Some(OWNER_TABLES_ROOT.into()),
+                    ));
+                }
+                continue;
+            }
             let quoted = value.trim_start().starts_with(['"', '\'']);
             let before = cfg.clone();
             let list = matches!(key, "trust_roots" | "hosts" | "limit_reset_kinds");
@@ -1172,12 +1233,8 @@ impl SupervisorConfig {
         let Some(path) = path else {
             return (Self::default(), Vec::new());
         };
-        Self::read_path(Some(path)).unwrap_or_else(|e| {
-            Self::unread_config(format!(
-                "{}: cannot be read ({e}); the harness is disabled",
-                path.display()
-            ))
-        })
+        Self::read_path(Some(path))
+            .unwrap_or_else(|e| Self::unread_config(unread_path_note(path, &e)))
     }
 
     /// Read admitted policy while preserving an unavailable configuration as an error.
@@ -1987,7 +2044,15 @@ fn written(value: &aterm_toml::Value) -> String {
 
 /// The root `[harness]` keys only the owner writes: the mode and the owner's own source and rule
 /// tables (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1, §3.3).
-pub const OWNER_KEYS: [&str; 3] = ["occupancy", "occupancy_source", "occupancy_rule"];
+pub const OWNER_KEYS: [&str; 3] = ["occupancy", OWNER_TABLES[0], OWNER_TABLES[1]];
+
+/// The owner's source and rule tables: [`super::occupancy::owner_rules::OwnerTables`]' to read,
+/// never [`SupervisorConfig`]'s (not keys of it, so never `unknown key` either).
+const OWNER_TABLES: [&str; 2] = super::occupancy::owner_rules::TABLES;
+
+/// Why an owner table below another table's header is read nowhere.
+const OWNER_TABLES_ROOT: &str =
+    "the owner's rule tables are read from the root [harness] table alone";
 
 /// WHAT ONE TEXT OF aterm.toml SAYS IN THE OWNER'S KEYS ([`OWNER_KEYS`]), read so two texts
 /// compare: the mode [`SupervisorConfig::from_aterm_toml`] reads off it (a misplaced limit and an
@@ -2038,6 +2103,14 @@ impl OwnerKeys {
         };
         Self { mode, written }
     }
+}
+
+/// The note of an aterm.toml at `path` that exists and cannot be read.
+fn unread_path_note(path: &Path, e: &aterm_types::dirs::AtermConfigReadError) -> String {
+    format!(
+        "{}: cannot be read ({e}); the harness is disabled",
+        path.display()
+    )
 }
 
 fn misplaced_note(at: &str, key: &str, limits: bool, refused: Option<String>) -> String {
@@ -3433,6 +3506,56 @@ mod tests {
                 "the fixture must be one the parser refuses: {text:?}"
             );
             assert_eq!(read(&text).occupancy, want, "{text:?}");
+        }
+    }
+
+    /// THE OWNER'S TABLES ARE NO KEYS OF THE POLICY: at the root they are the owner-table
+    /// reader's, so this reader leaves them with no note and no change; below another table's
+    /// header (TOML or not) they grant nothing and leave one closed note, never `unknown key`.
+    /// NEGATIVE CONTROL: [`SupervisorConfig::set_value`] called for them, as the root loop did
+    /// before, yields the `unknown key` note.
+    #[test]
+    fn the_owner_tables_are_no_policy_keys_at_the_root_or_below_another_header() {
+        let tables = "[harness.occupancy_source.trust]\nkind = \"git-ref\"\nrepo = \"$HOME/trust\"\n\
+                      [[harness.occupancy_rule]]\nname = \"r\"\nwhen = \"git(trust).moved\"\n\
+                      text = \"Re-read.\"\n";
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml(&format!("[harness]\nfacts = true\n{tables}"));
+        assert_eq!(c, SupervisorConfig::default());
+        assert!(notes.is_empty(), "{notes:?}");
+        let misplaced = format!("[theme]\n{}", tables.replace("[harness", "[theme.harness"));
+        let (c, notes) = SupervisorConfig::from_aterm_toml(&misplaced);
+        assert_eq!(c, SupervisorConfig::default());
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        for (note, key) in notes.iter().zip(["occupancy_rule", "occupancy_source"]) {
+            assert_eq!(
+                note,
+                &misplaced_note("theme", key, false, Some(OWNER_TABLES_ROOT.into()))
+            );
+            assert!(!is_unknown_key_note(note), "{note}");
+        }
+        let broken = "font_px = \n[theme]\nharness.occupancy_rule = [1]\n[harness]\n\
+                      occupancy_source = { a = 1 }\n";
+        assert!(aterm_toml::from_str::<aterm_toml::Value>(broken).is_err());
+        let (c, notes) = SupervisorConfig::from_aterm_toml(broken);
+        assert_eq!(c, SupervisorConfig::default());
+        assert_eq!(
+            notes.len(),
+            2,
+            "the parse note and the misplaced one: {notes:?}"
+        );
+        assert!(notes[1].contains(OWNER_TABLES_ROOT), "{notes:?}");
+
+        let doc: aterm_toml::Value = aterm_toml::from_str(tables).expect("TOML");
+        let root = doc
+            .get("harness")
+            .and_then(aterm_toml::Value::as_table)
+            .expect("root");
+        for key in OWNER_TABLES {
+            let refused = SupervisorConfig::default()
+                .set_value(key, root.get(key).expect("written"))
+                .expect_err("no key of the policy");
+            assert!(is_unknown_key_note(&refused), "{refused}");
         }
     }
 

@@ -332,6 +332,9 @@ pub(crate) enum MenuAction {
     PrevTab,
     /// Help — open the bundled, offline features guide (`open_help_url`).
     Help,
+    /// Change Nickname… — this Mac's nickname, from the menu bar's machine menu
+    /// (`docs/DESIGN-machine-names-2026-11-04.md` §5.4).
+    ChangeNickname,
 }
 
 impl MenuAction {
@@ -420,6 +423,7 @@ impl MenuAction {
             MenuAction::Mail => 98,
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
+            MenuAction::ChangeNickname => 102,
         }
     }
 
@@ -509,6 +513,7 @@ impl MenuAction {
             96 => MenuAction::ForgetPaneHistory,
             97 => MenuAction::ForgetAllHistory,
             101 => MenuAction::RecordUnseenKeys,
+            102 => MenuAction::ChangeNickname,
             _ => return None,
         })
     }
@@ -1081,7 +1086,8 @@ impl MenuAction {
             }
             MenuAction::ToggleStatsLens
             | MenuAction::ExportPaneHistory
-            | MenuAction::RecordUnseenKeys => PersonOnly,
+            | MenuAction::RecordUnseenKeys
+            | MenuAction::ChangeNickname => PersonOnly,
             MenuAction::ForgetAllHistory => OwnerOnly,
             MenuAction::ChooseTheme => ConfigWrite,
             MenuAction::About
@@ -1143,7 +1149,8 @@ impl MenuAction {
             | MenuAction::ExportPaneHistory
             | MenuAction::ForgetPaneHistory
             | MenuAction::ForgetAllHistory
-            | MenuAction::RecordUnseenKeys => false,
+            | MenuAction::RecordUnseenKeys
+            | MenuAction::ChangeNickname => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1386,6 +1393,9 @@ impl MenuAction {
                  asks first, and marks each such key in the recording."
             }
             MenuAction::Help => "Open the aterm guide.",
+            MenuAction::ChangeNickname => {
+                "Change this Mac's nickname, shown in the menu bar beside its number."
+            }
         }
     }
 
@@ -1394,7 +1404,9 @@ impl MenuAction {
     pub(crate) const fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
-            MenuAction::SystemState | MenuAction::RecordUnseenKeys => cfg!(target_os = "macos"),
+            MenuAction::SystemState | MenuAction::RecordUnseenKeys | MenuAction::ChangeNickname => {
+                cfg!(target_os = "macos")
+            }
             _ => true,
         }
     }
@@ -1406,6 +1418,7 @@ impl MenuAction {
             "About" => Some(MenuAction::About),
             "SoftwareUpdate" => Some(MenuAction::SoftwareUpdate),
             "Version" => Some(MenuAction::Version),
+            "ChangeNickname" => Some(MenuAction::ChangeNickname),
             "ApplyUpdate" => Some(MenuAction::ApplyUpdate),
             "Preferences" => Some(MenuAction::Preferences),
             "Quit" => Some(MenuAction::Quit),
@@ -2289,13 +2302,30 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
         title: "Version",
         entries: VERSION_MENU,
     },
+    MenuSection {
+        title: MACHINE_SECTION,
+        entries: MACHINE_MENU,
+    },
 ];
 
-/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines.
+/// The machine menu's title in [`MENU_MODEL`]; the bar shows the machine's own title instead
+/// (`m8 Heron`, [`crate::machine_title`]).
+pub(crate) const MACHINE_SECTION: &str = "Machine";
+
+/// The machine menu's actions, below its information row (§5.2).
+const MACHINE_MENU: &[MenuEntry] = &[Item {
+    label: "Change Nickname\u{2026}",
+    action: MenuAction::ChangeNickname,
+    key: "",
+    mods: MenuMods::None,
+}];
+
+/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines, leaving out a section this
+/// platform offers none of (the machine menu off macOS).
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(MENU_MODEL.len() + 1);
-    for section in MENU_MODEL {
+    for section in MENU_MODEL.iter().filter(|s| offers_any(s.entries)) {
         out.extend(chrome_lines_for(
             section.title,
             section.entries,
@@ -2304,6 +2334,15 @@ pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) 
         ));
     }
     out
+}
+
+/// Whether this platform offers any row of `entries`.
+#[cfg(any(not(target_os = "macos"), test))]
+fn offers_any(entries: &[MenuEntry]) -> bool {
+    entries
+        .iter()
+        .flat_map(MenuEntry::items)
+        .any(|(_, action, _, _)| action.offered_on_this_platform())
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -2346,8 +2385,8 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
-    defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
+    MenuHandle, ask_nickname, choose_local_file, choose_local_image, choose_save_path, confirm,
+    confirm_owner, defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
     update_machine_menu, update_version_menu,
 };
@@ -2606,7 +2645,10 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use aterm_objc::{BlockPtr, Id, Obj, RcBlock, Retained, Sel, autoreleasepool, class, sel};
+    use aterm_objc::{
+        BlockPtr, CGPoint, CGRect, CGSize, Id, Obj, RcBlock, Retained, Sel, autoreleasepool, class,
+        sel,
+    };
     use aterm_window::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
@@ -2732,7 +2774,8 @@ mod macos {
         let main = new_menu()?;
 
         for section in MENU_MODEL {
-            if section.title == "Version" {
+            // Version and the machine menu are attached after the rest, with live titles.
+            if section.title == "Version" || section.title == super::MACHINE_SECTION {
                 continue;
             }
             let _ = attach_submenu(
@@ -2770,8 +2813,8 @@ mod macos {
     }
 
     /// Title the machine's bar item `view`'s title (`m8 Heron`, §5.1 of
-    /// `docs/DESIGN-machine-names-2026-11-04.md`) over a menu whose one row says what it is
-    /// (`m8 · Heron · in a fleet`), and show it.
+    /// `docs/DESIGN-machine-names-2026-11-04.md`) over a menu whose first row says what it is
+    /// (`m8 · Heron · in a fleet`), above the machine section's actions, and show it.
     pub(crate) fn update_machine_menu(
         handle: &MenuHandle,
         view: &crate::machine_title::MachineView,
@@ -2795,8 +2838,13 @@ mod macos {
         // `-setHidden:` is `-(void)(BOOL)`: plain main-thread setters on live objects, so the
         // +1 row, title and menu may drop at the end of this frame. A row with no action is
         // disabled under the menu's default autoenabling, so it reads as information.
+        unsafe { appkit::send_v_id(menu.id(), sel!(addItem:), row.id()) };
+        add_separator(&menu);
+        if fill_section(&menu, &handle.target, super::MACHINE_MENU).is_none() {
+            return;
+        }
+        // SAFETY: as above.
         unsafe {
-            appkit::send_v_id(menu.id(), sel!(addItem:), row.id());
             appkit::send_v_id(menu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(handle.machine_item.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(handle.machine_item.id(), sel!(setSubmenu:), menu.id());
@@ -2913,6 +2961,12 @@ mod macos {
 
     fn build_section(target: &MenuTarget, entries: &[super::MenuEntry]) -> Option<Obj> {
         let menu = new_menu()?;
+        fill_section(&menu, target, entries)?;
+        Some(menu)
+    }
+
+    /// Append `entries` to `menu`, as [`build_section`] builds a section.
+    fn fill_section(menu: &Obj, target: &MenuTarget, entries: &[super::MenuEntry]) -> Option<()> {
         for entry in entries {
             match entry {
                 super::MenuEntry::Item {
@@ -2920,14 +2974,14 @@ mod macos {
                     action,
                     key,
                     mods,
-                } => add_item_mods(&menu, target, label, *action, key, mods_mask(*mods)),
+                } => add_item_mods(menu, target, label, *action, key, mods_mask(*mods)),
                 super::MenuEntry::Submenu { label, entries } => {
-                    attach_submenu(&menu, label, build_section(target, entries)?)?;
+                    attach_submenu(menu, label, build_section(target, entries)?)?;
                 }
-                super::MenuEntry::Separator => add_separator(&menu),
+                super::MenuEntry::Separator => add_separator(menu),
             }
         }
-        Some(menu)
+        Some(())
     }
 
     fn mods_mask(mods: super::MenuMods) -> usize {
@@ -3163,6 +3217,108 @@ mod macos {
     /// [`confirm`] for an owner gesture that changes this Mac.
     pub(crate) fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
         ask(title, body, proceed_label, AlertDefault::Cancel)
+    }
+
+    /// Ask for this Mac's nickname (Change Nickname…, §5.4 of
+    /// `docs/DESIGN-machine-names-2026-11-04.md`): an alert titled `title` over `body`, whose field
+    /// holds `current`, with Change (Return), Cancel (Escape) and New Random Noun, which has no key
+    /// of its own ([`crate::machine_title::NICK_BUTTONS`]). The person's ⌘X, ⌘C, ⌘V and ⌘A edit the
+    /// field ([`crate::alert_keys::watch_field_alert_keys`]); a key a control client posted does
+    /// nothing. `None` when no alert could be shown, and when a key queued before it opened would
+    /// not drain, since that key would land in the field or press Change.
+    pub(crate) fn ask_nickname(
+        title: &str,
+        body: &str,
+        current: &str,
+    ) -> Option<crate::machine_title::NickAnswer> {
+        if super::os_ui_refused(title) {
+            return None;
+        }
+        let mtm = MainThread::new()?;
+        let _park = crate::watchdog::park_modal();
+        let _up = crate::alert_keys::ConfirmationUp::hold();
+        if !crate::hwkey::fence_queued_keys(mtm) {
+            aterm_log::warn!("nickname: the key queue would not drain; not asking");
+            return None;
+        }
+        let [change, cancel, random] = crate::machine_title::NICK_BUTTONS;
+        let (Some(title), Some(body), Some(current), Some(change), Some(cancel), Some(random)) = (
+            appkit::nsstring(title),
+            appkit::nsstring(body),
+            appkit::nsstring(current),
+            appkit::nsstring(change),
+            appkit::nsstring(cancel),
+            appkit::nsstring(random),
+        ) else {
+            // Foundation refused a string, so no alert can be built.
+            return None;
+        };
+        // An alert whose icon draws with no IconServices call on the main thread.
+        let alert = crate::app_icon::alert(mtm)?;
+        // SAFETY: `+[NSTextField alloc]` then `-initWithFrame:` (`-(instancetype)(NSRect)`) is
+        // +1, adopted into `Obj`; on the main thread (`mtm` above proves it).
+        let field = unsafe {
+            Obj::from_owned(appkit::send_id_rect(
+                appkit::alloc(class(c"NSTextField")),
+                sel!(initWithFrame:),
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: 260.0,
+                        height: 24.0,
+                    },
+                },
+            ))
+        }?;
+        // SAFETY: standard `NSAlert` and `NSTextField` setters and `runModal`, on the main thread.
+        // `-setMessageText:`, `-setInformativeText:` and `-setStringValue:` are
+        // `-(void)(NSString *)` and copy their argument, so the +1 strings may drop at the end of
+        // this frame; `-setAccessoryView:` is `-(void)(NSView *)` and retains the field.
+        // `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window` is `-(NSWindow *)`,
+        // both +0, so both are retained into `Obj`, not adopted. `-layout` is `-(void)`, and
+        // `-setInitialFirstResponder:` `-(void)(NSView *)`, which the window does not retain: the
+        // alert's accessory view holds the field for the alert's life. `-runModal` is
+        // `-(NSModalResponse)`, an `NSInteger`, and `-stringValue` `-(NSString *)`, +0 and read
+        // here, nil-checked. `Obj::retain` gives the key watch its own owner of the live field.
+        unsafe {
+            appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
+            appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
+            appkit::send_v_id(field.id(), sel!(setStringValue:), current.id());
+            appkit::send_v_id(alert.id(), sel!(setAccessoryView:), field.id());
+            let accept = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                change.id(),
+            ));
+            let refuse = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                cancel.id(),
+            ));
+            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), random.id());
+            appkit::send_v(alert.id(), sel!(layout));
+            let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
+            if let Some(panel) = &panel {
+                appkit::send_v_id(panel.id(), sel!(setInitialFirstResponder:), field.id());
+            }
+            // Return presses Change and Escape Cancel, as in every aterm alert; a key a control
+            // client posted presses neither, nor types into the field.
+            let _keys = match (panel, Obj::retain(field.id()), accept, refuse) {
+                (Some(panel), Some(watched), Some(accept), Some(refuse)) => {
+                    crate::alert_keys::watch_field_alert_keys(panel, watched, accept, refuse)
+                }
+                _ => None,
+            };
+            let response = appkit::send_isize(alert.id(), sel!(runModal));
+            Some(crate::machine_title::nick_answer(response, || {
+                let typed = appkit::send_id(field.id(), sel!(stringValue));
+                if typed.is_null() {
+                    String::new()
+                } else {
+                    appkit::nsstring_to_rust(typed)
+                }
+            }))
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4354,17 +4510,24 @@ mod tests {
         assert_eq!(
             titles,
             [
-                "aterm", "File", "Edit", "View", "Agents", "Window", "Help", "Version"
+                "aterm", "File", "Edit", "View", "Agents", "Window", "Help", "Version", "Machine"
             ]
         );
+        let shown = usize::from(cfg!(target_os = "macos")) + titles.len() - 1;
         assert_eq!(
             lines.len(),
-            titles.len() + 1,
-            "sections plus the Find submenu"
+            shown + 1,
+            "sections this platform offers, plus the Find submenu"
         );
         for section in MENU_MODEL {
             let head = format!("menu {:?}: ", section.title);
-            let line = lines.iter().find(|line| line.starts_with(&head)).unwrap();
+            let Some(line) = lines.iter().find(|line| line.starts_with(&head)) else {
+                assert!(
+                    section.title == super::MACHINE_SECTION && !cfg!(target_os = "macos"),
+                    "{head} is missing"
+                );
+                continue;
+            };
             let offered = section
                 .entries
                 .iter()
@@ -4471,10 +4634,21 @@ mod tests {
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
         for section in MENU_MODEL {
             for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
-                if !matches!(
+                // The updater's rows follow the updater; the macOS-only rows are checked where
+                // they are offered.
+                let macos_only = matches!(
                     action,
-                    MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate | MenuAction::SystemState
-                ) {
+                    MenuAction::SystemState
+                        | MenuAction::RecordUnseenKeys
+                        | MenuAction::ChangeNickname
+                );
+                if macos_only {
+                    assert_eq!(
+                        action.offered_on_this_platform(),
+                        cfg!(target_os = "macos"),
+                        "{action:?}"
+                    );
+                } else if !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate) {
                     assert!(action.offered_on_this_platform(), "{action:?}");
                 }
             }

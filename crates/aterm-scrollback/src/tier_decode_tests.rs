@@ -82,13 +82,21 @@ fn cold_transfer_reuses_a_valid_noncanonical_lz4_page() {
     }
     compressed.push(u8::try_from(remaining).unwrap());
     compressed.extend_from_slice(&serialized);
-    let block = WarmBlock {
+    let mut block = WarmBlock {
         compressed: compressed.clone(),
         line_count: lines.len(),
         decompress_failures: Cell::new(2),
     };
 
-    let (cold, count) = block.to_cold_compressed().expect("valid page");
+    let original = block.compressed.as_ptr();
+    let (cold, count) = block.take_cold_compressed().expect("valid page");
+    assert_eq!(
+        cold.as_ptr(),
+        original,
+        "transfer moves the validated allocation"
+    );
+    assert!(block.compressed.is_empty());
+    assert_eq!(block.line_count(), 0);
     assert_eq!(cold, compressed);
     assert_eq!(count, lines.len());
     assert_eq!(block.failure_count(), 0);
@@ -100,7 +108,7 @@ fn cold_transfer_discards_a_logically_trimmed_prefix() {
     let lines: Vec<Line> = (0..9).map(|i| Line::from(&*format!("line {i}"))).collect();
     let mut block = WarmBlock::from_lines(&lines);
     block.line_count = 4;
-    let (cold, count) = block.to_cold_compressed().expect("valid suffix");
+    let (cold, count) = block.take_cold_compressed().expect("valid suffix");
     assert_eq!(count, 4);
     assert_eq!(
         crate::decode_cold_bounded(&cold).unwrap(),
@@ -113,13 +121,16 @@ fn cold_transfer_validates_framing_before_reusing_compressed_bytes() {
     let lines = [Line::from("one"), Line::from("two")];
     let mut serialized = serialize_lines(&lines);
     serialized.truncate(serialized.len() - 1);
-    let block = WarmBlock {
+    let mut block = WarmBlock {
         compressed: crate::lz4::compress_prepend_size(&serialized).unwrap(),
         line_count: lines.len(),
         decompress_failures: Cell::new(0),
     };
     for expected in 1..=QUARANTINE_THRESHOLD {
-        assert!(block.to_cold_compressed().is_err());
+        let original = block.compressed.clone();
+        assert!(block.take_cold_compressed().is_err());
+        assert_eq!(block.compressed, original);
+        assert_eq!(block.line_count(), lines.len());
         assert_eq!(block.failure_count(), expected);
     }
     assert!(block.is_quarantined());

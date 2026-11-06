@@ -1609,6 +1609,9 @@ mod tests {
     #[test]
     fn search_finds_a_token_in_scrollback_and_scrolls_it_into_view() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
+        for i in 0..50 {
+            t.process(format!("older line {i}\r\n").as_bytes());
+        }
         t.process(b"UNIQUE_SEARCH_TOKEN here\r\n");
         for i in 0..200 {
             t.process(format!("filler line {i}\r\n").as_bytes());
@@ -1624,12 +1627,28 @@ mod tests {
         let origin = t.search_display_origin();
         assert!(line < origin, "the match is above the live viewport");
         assert_eq!(t.display_offset(), 0, "starts at the live bottom");
+        t.scroll_lines_frac(0.5);
+        assert_ne!(t.scroll_frac_px(), 0, "a sub-row residual is banked");
         t.scroll_search_line_into_view(line);
+        assert_eq!(t.scroll_frac_px(), 0, "the jump drops the residual");
         let display_row = i64::from(line) - i64::from(origin) + t.display_offset() as i64;
         assert!(
             (0..24).contains(&display_row),
             "match landed on a visible row, got {display_row}"
         );
+
+        t.scroll_lines(5);
+        let settled = t.display_offset();
+        let shown_at = i64::from(line) - i64::from(origin) + settled as i64;
+        assert!((1..24).contains(&shown_at), "still shown, lower down");
+        t.scroll_lines_frac(0.5);
+        t.scroll_search_line_into_view(line);
+        assert_eq!(
+            t.display_offset(),
+            settled,
+            "a match already shown leaves the viewport where it is"
+        );
+        assert_eq!(t.scroll_frac_px(), 0);
     }
 
     /// The mode getters the host reads follow the program: each DECSET mode

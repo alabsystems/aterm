@@ -5,6 +5,11 @@
 
 use std::cell::Cell;
 
+#[cfg(test)]
+std::thread_local! {
+    static BYTE_READS: Cell<usize> = const { Cell::new(0) };
+}
+
 const WORD: usize = core::mem::size_of::<usize>();
 const UNROLL: usize = 8;
 const BLOCK: usize = WORD * UNROLL;
@@ -120,22 +125,35 @@ pub(crate) fn memchr2(first: u8, second: u8, haystack: &[u8]) -> Option<usize> {
 
 /// The last index in `haystack` holding `needle`: [`memchr`]'s split walked from the far end.
 #[inline]
-fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+pub(crate) fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+    memrchr_impl::<false>(needle, needle, haystack)
+}
+
+/// The last index holding either byte, scanning both alternatives in one pass.
+#[inline]
+pub(crate) fn memrchr2(first: u8, second: u8, haystack: &[u8]) -> Option<usize> {
+    memrchr_impl::<true>(first, second, haystack)
+}
+
+#[inline]
+fn memrchr_impl<const TWO: bool>(needle: u8, second: u8, haystack: &[u8]) -> Option<usize> {
     let splatted = splat(needle);
+    let second_splatted = splat(second);
     let (blocks, tail) = haystack.as_chunks::<BLOCK>();
     let (words, rest) = tail.as_chunks::<WORD>();
     let blocks_len = blocks.len().saturating_mul(BLOCK);
     let words_len = words.len().saturating_mul(WORD);
     let rest_base = blocks_len.saturating_add(words_len);
     for (i, &byte) in rest.iter().enumerate().rev() {
-        if byte == needle {
+        if byte == needle || (TWO && byte == second) {
             return Some(rest_base.saturating_add(i));
         }
     }
     for (index, word) in words.iter().enumerate().rev() {
-        if has_zero(word_at(word) ^ splatted) {
+        let read = word_at(word);
+        if has_zero(read ^ splatted) || (TWO && has_zero(read ^ second_splatted)) {
             for (i, &byte) in word.iter().enumerate().rev() {
-                if byte == needle {
+                if byte == needle || (TWO && byte == second) {
                     return Some(
                         blocks_len
                             .saturating_add(index.saturating_mul(WORD))
@@ -146,9 +164,9 @@ fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
     for (index, block) in blocks.iter().enumerate().rev() {
-        if block_mask(block, splatted) != 0 {
+        if block_mask(block, splatted) != 0 || (TWO && block_mask(block, second_splatted) != 0) {
             for (i, &byte) in block.iter().enumerate().rev() {
-                if byte == needle {
+                if byte == needle || (TWO && byte == second) {
                     return Some(index.saturating_mul(BLOCK).saturating_add(i));
                 }
             }
@@ -194,19 +212,32 @@ const COMMONNESS: [u8; 256] = {
     table
 };
 
-/// The needle byte to skip on.
+/// The needle byte to skip on, normalized for the selected comparison mode.
 #[inline]
-fn rare_byte(needle: &[u8]) -> Option<(u8, usize)> {
+fn rare_byte<const FOLD: bool>(needle: &[u8]) -> Option<(u8, usize)> {
     let mut best_at = 0usize;
     let mut best_score = u8::MAX;
     for (at, &byte) in needle.iter().enumerate() {
-        let score = COMMONNESS.get(byte as usize).copied().unwrap_or(0);
+        let folded = if FOLD {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        };
+        let score = COMMONNESS.get(folded as usize).copied().unwrap_or(0);
         if score < best_score {
             best_score = score;
             best_at = at;
         }
     }
-    Some((needle.get(best_at).copied()?, best_at))
+    let byte = needle.get(best_at).copied()?;
+    Some((
+        if FOLD {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        },
+        best_at,
+    ))
 }
 
 const PROBE: u32 = 8;
@@ -240,7 +271,11 @@ impl Skip {
 
     /// The first position at or after `at` where the skip byte lines up.
     #[inline]
-    fn advance<const REV: bool>(&mut self, haystack: &View<'_, REV>, at: usize) -> Option<usize> {
+    fn advance<const REV: bool, const FOLD: bool>(
+        &mut self,
+        haystack: &View<'_, REV, FOLD>,
+        at: usize,
+    ) -> Option<usize> {
         if !self.on {
             return Some(at);
         }
@@ -257,12 +292,12 @@ impl Skip {
     }
 }
 
-struct View<'a, const REV: bool> {
+struct View<'a, const REV: bool, const FOLD: bool = false> {
     /// The underlying bytes, in physical order.
     bytes: &'a [u8],
 }
 
-impl<'a, const REV: bool> View<'a, REV> {
+impl<'a, const REV: bool, const FOLD: bool> View<'a, REV, FOLD> {
     /// A view of `bytes`.
     #[inline]
     const fn new(bytes: &'a [u8]) -> Self {
@@ -275,26 +310,55 @@ impl<'a, const REV: bool> View<'a, REV> {
         self.bytes.len()
     }
 
-    /// The byte at logical index `i`.
+    /// The byte at logical index `i`, normalized by the selected ASCII-fold mode.
     #[inline]
     fn get(&self, i: usize) -> Option<u8> {
+        #[cfg(test)]
+        BYTE_READS.with(|reads| reads.set(reads.get() + 1));
         let at = if REV {
             self.bytes.len().checked_sub(1)?.checked_sub(i)?
         } else {
             i
         };
-        self.bytes.get(at).copied()
+        self.bytes.get(at).copied().map(|byte| {
+            if FOLD {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            }
+        })
     }
 
-    /// The first logical index at or after `from` whose byte is `byte`.
+    /// The first logical index at or after `from` whose byte matches under the selected mode.
     #[inline]
     fn scan(&self, byte: u8, from: usize) -> Option<usize> {
+        let lower = if FOLD {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        };
+        let upper = if FOLD {
+            byte.to_ascii_uppercase()
+        } else {
+            byte
+        };
         if REV {
             let end = self.bytes.len().checked_sub(from)?;
-            let hit = memrchr(byte, self.bytes.get(..end)?)?;
+            let eligible = self.bytes.get(..end)?;
+            let hit = if lower == upper {
+                memrchr(lower, eligible)
+            } else {
+                memrchr2(lower, upper, eligible)
+            }?;
             self.bytes.len().checked_sub(1)?.checked_sub(hit)
         } else {
-            memchr(byte, self.bytes.get(from..)?)?.checked_add(from)
+            let eligible = self.bytes.get(from..)?;
+            let hit = if lower == upper {
+                memchr(lower, eligible)
+            } else {
+                memchr2(lower, upper, eligible)
+            }?;
+            hit.checked_add(from)
         }
     }
 }
@@ -310,7 +374,10 @@ struct Factorization {
     periodic: bool,
 }
 
-fn maximal_suffix<const REV: bool>(needle: &View<'_, REV>, reversed: bool) -> (usize, usize) {
+fn maximal_suffix<const REV: bool, const FOLD: bool>(
+    needle: &View<'_, REV, FOLD>,
+    reversed: bool,
+) -> (usize, usize) {
     let n = needle.len();
     let mut suffix = 0usize; // real suffix start + 1
     let mut probe = 1usize; // real probe position + 1
@@ -344,7 +411,7 @@ fn maximal_suffix<const REV: bool>(needle: &View<'_, REV>, reversed: bool) -> (u
     (suffix, period)
 }
 
-fn factorize<const REV: bool>(needle: &View<'_, REV>) -> Factorization {
+fn factorize<const REV: bool, const FOLD: bool>(needle: &View<'_, REV, FOLD>) -> Factorization {
     let (cut_less, period_less) = maximal_suffix(needle, false);
     let (cut_more, period_more) = maximal_suffix(needle, true);
     let (cut, period) = if cut_less >= cut_more {
@@ -365,12 +432,17 @@ fn factorize<const REV: bool>(needle: &View<'_, REV>) -> Factorization {
     }
 }
 
-fn two_way<const REV: bool>(
-    haystack: &View<'_, REV>,
-    needle: &View<'_, REV>,
+struct ScanState {
+    at: usize,
+    memory: usize,
+}
+
+fn two_way<const REV: bool, const FOLD: bool>(
+    haystack: &View<'_, REV, FOLD>,
+    needle: &View<'_, REV, FOLD>,
     factored: &Factorization,
     skip: &mut Skip,
-    from: usize,
+    state: &mut ScanState,
 ) -> Option<usize> {
     let n = haystack.len();
     let m = needle.len();
@@ -379,9 +451,9 @@ fn two_way<const REV: bool>(
         period,
         periodic,
     } = *factored;
-    let mut at = from;
+    let mut at = state.at;
     if periodic {
-        let mut memory = 0usize;
+        let mut memory = state.memory;
         while at.saturating_add(m) <= n {
             let mut i = cut.max(memory);
             while i < m && needle.get(i) == haystack.get(at.saturating_add(i)) {
@@ -401,6 +473,9 @@ fn two_way<const REV: bool>(
                 j = j.saturating_sub(1);
             }
             if j <= memory {
+                // Shifting a full match by its period preserves this suffix as a known prefix.
+                state.at = at.saturating_add(period);
+                state.memory = m.saturating_sub(period);
                 return Some(at);
             }
             at = at.saturating_add(period);
@@ -425,6 +500,7 @@ fn two_way<const REV: bool>(
                     j = j.saturating_sub(1);
                 }
                 if j == 0 {
+                    state.at = at.saturating_add(shift);
                     return Some(at);
                 }
                 at = at.saturating_add(shift);
@@ -435,8 +511,77 @@ fn two_way<const REV: bool>(
     }
 }
 
+/// Resumable overlapping byte matches, retaining Two-Way's known periodic prefix.
+pub(crate) struct Matches<'h, 'n, const REV: bool, const FOLD: bool = false> {
+    haystack: View<'h, REV, FOLD>,
+    needle: View<'n, REV, FOLD>,
+    factored: Factorization,
+    skip: Skip,
+    state: ScanState,
+    done: bool,
+}
+
+impl<const REV: bool, const FOLD: bool> Iterator for Matches<'_, '_, REV, FOLD> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.done {
+            return None;
+        }
+        let logical = if self.needle.len() == 1 {
+            let found = self.haystack.scan(self.needle.get(0)?, self.state.at);
+            if let Some(at) = found {
+                self.state.at = at.saturating_add(1);
+            }
+            found
+        } else if FOLD && self.needle.len() == 2 {
+            // Filter on the physical first needle byte in either direction.
+            let scan_offset = if REV { 1 } else { 0 };
+            let first = self.needle.get(scan_offset)?;
+            let other_offset = 1usize.saturating_sub(scan_offset);
+            let other = self.needle.get(other_offset)?;
+            loop {
+                let Some(hit) = self
+                    .haystack
+                    .scan(first, self.state.at.saturating_add(scan_offset))
+                else {
+                    break None;
+                };
+                let at = hit.checked_sub(scan_offset)?;
+                self.state.at = at.saturating_add(1);
+                if at.saturating_add(2) > self.haystack.len() {
+                    break None;
+                }
+                if Some(other) == self.haystack.get(at.saturating_add(other_offset)) {
+                    break Some(at);
+                }
+            }
+        } else {
+            two_way(
+                &self.haystack,
+                &self.needle,
+                &self.factored,
+                &mut self.skip,
+                &mut self.state,
+            )
+        };
+        let Some(logical) = logical else {
+            self.done = true;
+            return None;
+        };
+        if REV {
+            self.haystack
+                .len()
+                .checked_sub(logical)?
+                .checked_sub(self.needle.len())
+        } else {
+            Some(logical)
+        }
+    }
+}
+
 /// Prepared needle for repeated forward and reverse substring searches.
-pub(crate) struct Searcher<'n> {
+pub(crate) struct Searcher<'n, const FOLD: bool = false> {
     /// The bytes being searched for.
     needle: &'n [u8],
     /// The factorization used reading forwards.
@@ -448,9 +593,64 @@ pub(crate) struct Searcher<'n> {
 }
 
 impl<'n> Searcher<'n> {
-    /// Prepare `needle`.
+    /// Prepare a case-sensitive byte needle.
     #[inline]
     pub(crate) const fn new(needle: &'n [u8]) -> Self {
+        Self::with_mode(needle)
+    }
+}
+
+impl<'n> Searcher<'n, true> {
+    /// Prepare an ASCII case-insensitive byte needle without copying it.
+    #[inline]
+    pub(crate) const fn new_ascii(needle: &'n [u8]) -> Self {
+        Self::with_mode(needle)
+    }
+}
+
+impl<'n, const FOLD: bool> Searcher<'n, FOLD> {
+    /// Walk all overlapping occurrences of a nonempty needle, in the selected direction.
+    pub(crate) fn matches_in<'h, const REV: bool>(
+        &self,
+        bytes: &'h [u8],
+    ) -> Matches<'h, 'n, REV, FOLD> {
+        let haystack = View::<REV, FOLD>::new(bytes);
+        let needle = View::<REV, FOLD>::new(self.needle);
+        let mut done = needle.len() == 0 || needle.len() > haystack.len();
+        let mut skip = Skip::new(0, 0);
+        let mut factored = Factorization {
+            cut: 0,
+            period: 1,
+            periodic: false,
+        };
+        let mut state = ScanState { at: 0, memory: 0 };
+        if !done && needle.len() > 1 && (!FOLD || needle.len() > 2) {
+            let (byte, physical) = self.rare().unwrap_or((0, 0));
+            let offset = if REV {
+                needle.len().saturating_sub(1).saturating_sub(physical)
+            } else {
+                physical
+            };
+            skip = Skip::new(byte, offset);
+            if let Some(at) = skip.advance(&haystack, 0) {
+                state.at = at;
+                factored = self.factorization::<REV>();
+            } else {
+                done = true;
+            }
+        }
+        Matches {
+            haystack,
+            needle,
+            factored,
+            skip,
+            state,
+            done,
+        }
+    }
+    /// Prepare `needle`.
+    #[inline]
+    const fn with_mode(needle: &'n [u8]) -> Self {
         Self {
             needle,
             forward: Cell::new(None),
@@ -465,7 +665,7 @@ impl<'n> Searcher<'n> {
         match self.rare.get() {
             Some(ready) => Some(ready),
             None => {
-                let chosen = rare_byte(self.needle)?;
+                let chosen = rare_byte::<FOLD>(self.needle)?;
                 self.rare.set(Some(chosen));
                 Some(chosen)
             }
@@ -485,7 +685,7 @@ impl<'n> Searcher<'n> {
         match slot.get() {
             Some(ready) => ready,
             None => {
-                let computed = factorize(&View::<REV>::new(self.needle));
+                let computed = factorize(&View::<REV, FOLD>::new(self.needle));
                 slot.set(Some(computed));
                 computed
             }
@@ -493,6 +693,7 @@ impl<'n> Searcher<'n> {
     }
 
     /// The first index at which the needle occurs in `haystack`.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn find_in(&self, haystack: &[u8]) -> Option<usize> {
         let m = self.needle.len();
@@ -502,23 +703,14 @@ impl<'n> Searcher<'n> {
         if m > haystack.len() {
             return None;
         }
-        if m == 1 {
+        if m == 1 && !FOLD {
             return memchr(first, haystack);
         }
-        let (byte, offset) = self.rare()?;
-        let haystack = View::<false>::new(haystack);
-        let mut skip = Skip::new(byte, offset);
-        let from = skip.advance(&haystack, 0)?;
-        two_way(
-            &haystack,
-            &View::<false>::new(self.needle),
-            &self.factorization::<false>(),
-            &mut skip,
-            from,
-        )
+        self.matches_in::<false>(haystack).next()
     }
 
     /// The last index at which the needle occurs in `haystack`.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn rfind_in(&self, haystack: &[u8]) -> Option<usize> {
         let n = haystack.len();
@@ -529,27 +721,117 @@ impl<'n> Searcher<'n> {
         if m > n {
             return None;
         }
-        if m == 1 {
+        if m == 1 && !FOLD {
             return memrchr(first, haystack);
         }
-        let (byte, at) = self.rare()?;
-        let haystack = View::<true>::new(haystack);
-        let mut skip = Skip::new(byte, m.checked_sub(1)?.checked_sub(at)?);
-        let from = skip.advance(&haystack, 0)?;
-        let logical = two_way(
-            &haystack,
-            &View::<true>::new(self.needle),
-            &self.factorization::<true>(),
-            &mut skip,
-            from,
-        )?;
-        n.checked_sub(logical)?.checked_sub(m)
+        self.matches_in::<true>(haystack).next()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Searcher, memchr};
+
+    #[test]
+    fn ascii_folded_cursors_match_a_byte_reference_in_both_directions() {
+        use aterm_spec::rng::XorShift;
+        let mut rng = XorShift::new(0xA5C1_1F01_DE00_0001);
+        let alphabet = b"aAbBcC .\0\xff";
+        for case in 0..8192 {
+            let len = rng.index(257);
+            let haystack: Vec<_> = (0..len).map(|_| *rng.pick(alphabet)).collect();
+            let needle_len = rng.index(33);
+            let needle: Vec<_> = if case % 2 == 0 && needle_len < len {
+                let at = rng.index(len - needle_len + 1);
+                haystack[at..at + needle_len]
+                    .iter()
+                    .map(u8::to_ascii_uppercase)
+                    .collect()
+            } else {
+                (0..needle_len).map(|_| *rng.pick(alphabet)).collect()
+            };
+            let expected = (0..len).filter(|&at| {
+                !needle.is_empty()
+                    && haystack
+                        .get(at..at + needle.len())
+                        .is_some_and(|part| part.eq_ignore_ascii_case(&needle))
+            });
+            let searcher = Searcher::new_ascii(&needle);
+            assert!(searcher.matches_in::<false>(&haystack).eq(expected.clone()));
+            assert!(searcher.matches_in::<true>(&haystack).eq(expected.rev()));
+        }
+        let haystack = b"aA".repeat(8192);
+        let needle = vec![b'A'; 256];
+        for backward in [false, true] {
+            let before = super::BYTE_READS.with(std::cell::Cell::get);
+            let searcher = Searcher::new_ascii(&needle);
+            let expected = 0..=haystack.len() - needle.len();
+            if backward {
+                assert!(searcher.matches_in::<true>(&haystack).eq(expected.rev()));
+            } else {
+                assert!(searcher.matches_in::<false>(&haystack).eq(expected));
+            }
+            let reads = super::BYTE_READS.with(std::cell::Cell::get) - before;
+            assert!(reads <= 20 * (haystack.len() + needle.len()));
+        }
+    }
+
+    #[test]
+    fn reverse_two_byte_scans_match_a_reference_across_word_and_block_edges() {
+        for len in 0..=200 {
+            for first in [0, 1, b'a', b'A', 0xff] {
+                let second = first.wrapping_add(1);
+                let mut haystack = vec![first.wrapping_add(2); len];
+                for at in 0..len {
+                    haystack[at] = if at % 2 == 0 { first } else { second };
+                    let expected = haystack.iter().rposition(|&b| b == first || b == second);
+                    assert_eq!(super::memrchr2(first, second, &haystack), expected);
+                    assert_eq!(super::memrchr2(second, first, &haystack), expected);
+                }
+                assert_eq!(
+                    super::memrchr2(first, second, &vec![first.wrapping_add(2); len]),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_periodic_matches_reuse_prefix_facts_in_both_directions() {
+        for unit in [&b"a"[..], &b"ab"[..], &b"abacaba"[..]] {
+            let haystack = unit.repeat(8192);
+            let needle = unit.repeat(256);
+            for backward in [false, true] {
+                let before = super::BYTE_READS.with(std::cell::Cell::get);
+                let searcher = Searcher::new(&needle);
+                let count = if backward {
+                    searcher.matches_in::<true>(&haystack).count()
+                } else {
+                    searcher.matches_in::<false>(&haystack).count()
+                };
+                let reads = super::BYTE_READS.with(std::cell::Cell::get) - before;
+                assert_eq!(count, 8192 - 256 + 1);
+                assert!(
+                    reads <= 20 * (haystack.len() + needle.len()),
+                    "unit={unit:?} backward={backward}: {reads} byte reads"
+                );
+            }
+        }
+        // Negative control: discarding the known prefix recreates the repeated work.
+        let haystack = vec![b'a'; 8192];
+        let needle = vec![b'a'; 256];
+        let searcher = Searcher::new(&needle);
+        let before = super::BYTE_READS.with(std::cell::Cell::get);
+        let mut cursor = searcher.matches_in::<false>(&haystack);
+        while cursor.next().is_some() {
+            cursor.state.memory = 0;
+        }
+        let reads = super::BYTE_READS.with(std::cell::Cell::get) - before;
+        assert!(
+            reads > 20 * (haystack.len() + needle.len()),
+            "the bound must detect a discarded periodic prefix"
+        );
+    }
 
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).find_in(haystack)
@@ -640,6 +922,18 @@ mod oracle {
     }
 
     fn check_pair(haystack: &[u8], needle: &[u8]) {
+        let searcher = Searcher::new(needle);
+        let expected = (0..haystack.len()).filter(|&at| {
+            !needle.is_empty() && haystack.get(at..at + needle.len()) == Some(needle)
+        });
+        assert!(
+            searcher.matches_in::<false>(haystack).eq(expected.clone()),
+            "overlapping forward {haystack:?} / {needle:?}"
+        );
+        assert!(
+            searcher.matches_in::<true>(haystack).eq(expected.rev()),
+            "overlapping backward {haystack:?} / {needle:?}"
+        );
         assert_eq!(
             ours::find(haystack, needle),
             naive::memmem::find(haystack, needle),

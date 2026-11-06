@@ -25,6 +25,20 @@ pub fn parse(bytes: &[u8]) -> Result<Message, String> {
     })
 }
 
+fn is_relevant_header(name: &str) -> bool {
+    [
+        "from",
+        "to",
+        "subject",
+        "date",
+        "content-type",
+        "content-disposition",
+        "content-transfer-encoding",
+    ]
+    .iter()
+    .any(|wanted| name.eq_ignore_ascii_case(wanted))
+}
+
 fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
     let (raw, body) = if let Some(body) = bytes.strip_prefix(b"\r\n") {
         (&[][..], body)
@@ -38,14 +52,18 @@ fn split(bytes: &[u8]) -> (Vec<(String, String)>, &[u8]) {
         (bytes, &[][..])
     };
     let mut headers: Vec<(String, String)> = Vec::new();
+    let mut keep_last = false;
     for line in String::from_utf8_lossy(raw).lines() {
         if line.starts_with([' ', '\t']) {
-            if let Some((_, value)) = headers.last_mut() {
+            if keep_last && let Some((_, value)) = headers.last_mut() {
                 value.push(' ');
                 value.push_str(line.trim());
             }
         } else if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.to_owned(), value.trim().to_owned()));
+            keep_last = is_relevant_header(name);
+            if keep_last {
+                headers.push((name.to_owned(), value.trim().to_owned()));
+            }
         }
     }
     (headers, body)
@@ -121,8 +139,9 @@ fn body_with_split(
         if boundary.is_empty() || boundary.len() > 200 || boundary.chars().any(char::is_control) {
             return Err("Invalid MIME boundary".into());
         }
-        let delimiter = format!("--{boundary}");
-        let close_delimiter = format!("{delimiter}--");
+        let close_delimiter = format!("--{boundary}--");
+        let close_bytes = close_delimiter.as_bytes();
+        let delimiter_bytes = &close_bytes[..close_bytes.len() - 2];
         let mut parts = Vec::new();
         let mut start = None;
         let mut offset = 0usize;
@@ -135,7 +154,7 @@ fn body_with_split(
                     break;
                 }
             }
-            if trimmed == delimiter.as_bytes() || trimmed == close_delimiter.as_bytes() {
+            if trimmed == delimiter_bytes || trimmed == close_bytes {
                 if let Some(at) = start.take() {
                     let raw_part = &content[at..offset];
                     let part = raw_part
@@ -144,7 +163,7 @@ fn body_with_split(
                         .unwrap_or(raw_part);
                     parts.push(part);
                 }
-                if trimmed == close_delimiter.as_bytes() {
+                if trimmed == close_bytes {
                     break;
                 }
                 start = Some(offset + line.len());
@@ -275,24 +294,38 @@ fn parse_encoded_word(after_open: &str) -> Option<(&str, Vec<u8>, &str)> {
 }
 
 pub fn words(mut input: &str) -> String {
-    let mut output = String::new();
-    let mut pending: Option<(String, Vec<u8>)> = None;
-    let flush = |output: &mut String, pending: &mut Option<(String, Vec<u8>)>| {
+    let Some(mut first_start) = input.find("=?") else {
+        return input.to_owned();
+    };
+    let mut output = String::with_capacity(input.len());
+    let mut pending: Option<(&str, Vec<u8>)> = None;
+    let flush = |output: &mut String, pending: &mut Option<(&str, Vec<u8>)>| {
         if let Some((enc, bytes)) = pending.take() {
-            output.push_str(&charset(&bytes, &enc));
+            output.push_str(&charset(&bytes, enc));
         }
     };
-    while let Some(start) = input.find("=?") {
-        if start > 0 {
-            flush(&mut output, &mut pending);
-            output.push_str(&input[..start]);
-        }
-        let rest = &input[start + 2..];
-        let Some((enc, decoded, remaining)) = parse_encoded_word(rest) else {
-            flush(&mut output, &mut pending);
-            output.push_str("=?");
-            input = rest;
-            continue;
+    let mut predecoded: Option<(&str, Vec<u8>, &str)> = None;
+    loop {
+        let (enc, decoded, remaining) = if let Some(next) = predecoded.take() {
+            next
+        } else {
+            let start = first_start;
+            if start > 0 {
+                flush(&mut output, &mut pending);
+                output.push_str(&input[..start]);
+            }
+            let rest = &input[start + 2..];
+            let Some(parsed) = parse_encoded_word(rest) else {
+                flush(&mut output, &mut pending);
+                output.push_str("=?");
+                input = rest;
+                let Some(next_start) = input.find("=?") else {
+                    break;
+                };
+                first_start = next_start;
+                continue;
+            };
+            parsed
         };
         match &mut pending {
             Some((prev_enc, bytes)) if prev_enc.eq_ignore_ascii_case(enc) => {
@@ -300,16 +333,23 @@ pub fn words(mut input: &str) -> String {
             }
             _ => {
                 flush(&mut output, &mut pending);
-                pending = Some((enc.to_owned(), decoded));
+                pending = Some((enc, decoded));
             }
         }
         let trimmed = remaining.trim_start_matches([' ', '\t', '\r', '\n']);
-        if trimmed.starts_with("=?") && parse_encoded_word(&trimmed[2..]).is_some() {
+        if let Some(after_open) = trimmed.strip_prefix("=?")
+            && let Some(next_parsed) = parse_encoded_word(after_open)
+        {
+            predecoded = Some(next_parsed);
             input = trimmed;
-        } else {
-            flush(&mut output, &mut pending);
-            input = remaining;
+            continue;
         }
+        flush(&mut output, &mut pending);
+        input = remaining;
+        let Some(next_start) = input.find("=?") else {
+            break;
+        };
+        first_start = next_start;
     }
     flush(&mut output, &mut pending);
     output.push_str(input);

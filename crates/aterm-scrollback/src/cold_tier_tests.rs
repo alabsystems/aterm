@@ -13,12 +13,12 @@ fn push_block_returns_zero_for_corrupt_block() {
     let mut cold = ColdTier::new();
 
     let valid_lines: Vec<Line> = (0..5).map(|i| Line::from(&*format!("V{i}"))).collect();
-    let valid_block = WarmBlock::from_lines(&valid_lines);
-    let accepted = cold.push_block(&valid_block);
+    let mut valid_block = WarmBlock::from_lines(&valid_lines);
+    let accepted = cold.push_block(&mut valid_block);
     assert_eq!(accepted, 5);
 
-    let corrupt_block = WarmBlock::with_corrupt_data(10);
-    let accepted = cold.push_block(&corrupt_block);
+    let mut corrupt_block = WarmBlock::with_corrupt_data(10);
+    let accepted = cold.push_block(&mut corrupt_block);
 
     assert_eq!(accepted, 0, "corrupt block should return 0 accepted lines");
     assert_eq!(cold.line_count(), 5, "line_count should be unchanged");
@@ -38,7 +38,7 @@ fn truncate_back_lines_aborts_on_corrupt_boundary_page() {
         let lines: Vec<Line> = (0..5)
             .map(|line_idx| Line::from(&*format!("P{page_idx}-L{line_idx}")))
             .collect();
-        cold.push_block(&WarmBlock::from_lines(&lines));
+        cold.push_block(&mut WarmBlock::from_lines(&lines));
     }
 
     let line_count_before = cold.line_count();
@@ -100,8 +100,8 @@ fn cold_tier_find_page_logarithmic_scaling() {
         let mut cold = ColdTier::new();
 
         for i in 0..page_count {
-            let block = WarmBlock::from_lines(&[Line::from(&*format!("Cold-line-{i}"))]);
-            cold.push_block(&block);
+            let mut block = WarmBlock::from_lines(&[Line::from(&*format!("Cold-line-{i}"))]);
+            cold.push_block(&mut block);
         }
 
         assert_eq!(cold.page_count(), page_count);
@@ -140,7 +140,7 @@ fn pop_front_batch_with_nonzero_front_offset() {
         let lines: Vec<Line> = (0..10)
             .map(|j| Line::from(&*format!("P{i}-L{j}")))
             .collect();
-        cold.push_block(&WarmBlock::from_lines(&lines));
+        cold.push_block(&mut WarmBlock::from_lines(&lines));
     }
 
     cold.truncate_front_lines(3);
@@ -170,7 +170,7 @@ fn truncate_front_lines_updates_compressed_size() {
         let lines: Vec<Line> = (0..10)
             .map(|j| Line::from(&*format!("P{i}-L{j}")))
             .collect();
-        cold.push_block(&WarmBlock::from_lines(&lines));
+        cold.push_block(&mut WarmBlock::from_lines(&lines));
     }
     let size_before = cold.compressed_size();
     assert!(size_before > 0);
@@ -202,8 +202,8 @@ fn cold_tier_rotation_interleave_matches_oracle() {
         let block_lines: Vec<Line> = (0..lines)
             .map(|i| Line::from(&*format!("{prefix}-L{i}")))
             .collect();
-        let block = WarmBlock::from_lines(&block_lines);
-        assert_eq!(cold.push_block(&block), lines);
+        let mut block = WarmBlock::from_lines(&block_lines);
+        assert_eq!(cold.push_block(&mut block), lines);
         for i in 0..lines {
             oracle.push(format!("{prefix}-L{i}"));
         }

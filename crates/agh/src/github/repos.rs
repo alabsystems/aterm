@@ -9,7 +9,6 @@ use crate::error::{Error, Forbid, Kind, Result, Sub};
 use crate::github::{How, limit_after_sort, repo_root};
 use crate::model::{Permissions, RepoObject, UserObject, from_json};
 use crate::page::{LinkScope, ListOpts, Listing};
-use crate::path;
 use crate::policy::{Access, Decision, RouteTarget};
 use crate::slug::Slug;
 
@@ -164,14 +163,14 @@ impl<'a> Repos<'a> {
             &self
                 .how
                 .as_read()
-                .get(format!("/users/{}", path::segment(owner)), target.clone()),
+                .get(format!("/users/{owner}"), target.clone()),
         )?;
         let user: UserObject = from_json(&who.json()?)?;
         let walk_opts = opts.with_limit(None);
         let listing = if user.kind == "Organization" {
             let first = self
                 .how
-                .get(format!("/orgs/{}/repos", path::segment(owner)), target)
+                .get(format!("/orgs/{owner}/repos"), target)
                 .query("type", kind.slug());
             crate::page::walk(
                 self.gh,
@@ -193,7 +192,7 @@ impl<'a> Repos<'a> {
         } else {
             let first = self
                 .how
-                .get(format!("/users/{}/repos", path::segment(owner)), target)
+                .get(format!("/users/{owner}/repos"), target)
                 .query("type", "owner");
             crate::page::walk(
                 self.gh,
@@ -204,9 +203,12 @@ impl<'a> Repos<'a> {
         };
         let mut listing = listing.map(|value| from_json::<RepoObject>(&value))?;
         listing.items.retain(|repo| kind.keeps(repo));
-        listing
-            .items
-            .sort_by_cached_key(|repo| repo.full_name.to_ascii_lowercase());
+        listing.items.sort_by(|a, b| {
+            a.full_name
+                .bytes()
+                .map(|c| c.to_ascii_lowercase())
+                .cmp(b.full_name.bytes().map(|c| c.to_ascii_lowercase()))
+        });
         limit_after_sort(&mut listing, opts.limit);
         Ok(listing)
     }

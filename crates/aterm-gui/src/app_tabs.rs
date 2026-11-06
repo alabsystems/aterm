@@ -3342,6 +3342,13 @@ impl App {
             .collect();
         glance.system_state = self.system_state_menu_line();
         glance.network = crate::net_place::menu_line();
+        #[cfg(target_os = "macos")]
+        {
+            glance.machine = self
+                .machine_view
+                .as_ref()
+                .map(crate::machine_title::machine_menu_bar_title);
+        }
         glance
     }
 

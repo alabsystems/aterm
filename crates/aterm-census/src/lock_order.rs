@@ -616,6 +616,13 @@ pub(crate) fn mask_cfg_test_items(text: &str) -> String {
     mask_gated_items(text, &["#[cfg(test)]"])
 }
 
+/// The graph reads Rust code, not diagnostic strings or quoted source fixtures.
+/// Lex before the line-shaped fn parser: stripping `//` inside a URL literal
+/// first can destroy its closing quote and hide real code in a later lexical pass.
+fn lock_graph_code(text: &str) -> String {
+    crate::lex::blank_non_code(&mask_cfg_test_items(text))
+}
+
 /// Blank every item whose immediately preceding attribute line matches one of `gates`.
 pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
     mask_items_where(text, &|attr| gates.contains(&attr))
@@ -636,14 +643,18 @@ pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> St
 
 /// Per line of `text`, whether [`mask_items_where`] keeps it.
 pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<bool> {
-    let lines: Vec<&str> = text.lines().collect();
-    let code_of = |line: &str| mask_literals(strip_line_comment(line));
+    // Literal/comment state spans physical lines. A fixture's column-zero `}`
+    // or `#[cfg(test)]` is data, never an item boundary or an attribute. Keep
+    // attribute values in the text view for value-aware target predicates.
+    let lexed = crate::lex::lex(text);
+    let lines: Vec<&str> = lexed.code.lines().collect();
+    let attrs: Vec<&str> = lexed.text.lines().collect();
     let indent_of = |line: &str| line.len() - line.trim_start().len();
     let mut keep = vec![true; lines.len()];
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
-        if !is_gate(t) {
+        if !t.starts_with("#[") || !is_gate(attrs[i].trim()) {
             i += 1;
             continue;
         }
@@ -661,7 +672,7 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
         let mut opened = false;
         let mut terminated = false;
         while k < lines.len() {
-            let item = code_of(lines[k]);
+            let item = lines[k];
             if k > j && !item.trim().is_empty() && indent_of(lines[k]) < indent {
                 k -= 1;
                 terminated = true;
@@ -687,12 +698,12 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
             break;
         }
         if opened {
-            let first = code_of(lines[k]);
+            let first = lines[k];
             let single = first.matches('{').count() == first.matches('}').count();
             if !single {
                 let pad = " ".repeat(indent);
                 let end = (k + 1..lines.len()).find(|m| {
-                    let c = code_of(lines[*m]);
+                    let c = lines[*m];
                     lines[*m].starts_with(&pad)
                         && c.as_bytes().get(indent) == Some(&b'}')
                         && !c.contains('{')
@@ -1947,7 +1958,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 continue;
             };
             let rel = crate::rel_path(root, &file);
-            let masked = mask_cfg_test_items(&text);
+            let masked = lock_graph_code(&text);
             field_types.harvest(&masked);
             let impls = impl_spans(&masked);
             let ctx = FileCtx {
@@ -1985,7 +1996,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     .any(|p| in_crate == *p || in_crate.starts_with(&format!("{p}/")))
             });
             let rel = crate::rel_path(root, &file);
-            let masked = mask_cfg_test_items(&text);
+            let masked = lock_graph_code(&text);
             let impls = impl_spans(&masked);
             let ctx = FileCtx {
                 rel: &rel,
@@ -3212,6 +3223,43 @@ mod tests {
     }
 
     #[test]
+    fn gated_item_boundaries_ignore_multiline_literals_and_comments() {
+        let source = r####"
+const QUOTED: &str = r###"
+#[cfg(test)]
+mod quoted_gate {
+}
+"###;
+#[cfg(test)]
+mod tests {
+    const EXAMPLE: &str = r##"
+}
+fn dims(term: &Mutex<Terminal>) {
+    (term_lock(term).rows(), term_lock(term).cols())
+}
+"##;
+    /*
+}
+    */
+}
+fn shipped() {
+    let guard = real.lock();
+}
+"####;
+        let masked = mask_cfg_test_items(source);
+        assert!(masked.contains("mod quoted_gate"), "a quoted gate is data");
+        assert!(
+            !masked.contains("fn dims"),
+            "the whole actual test module is masked"
+        );
+        assert!(
+            masked.contains("fn shipped") && masked.contains("real.lock()"),
+            "real code after the test module survives"
+        );
+        assert_eq!(masked.lines().count(), source.lines().count());
+    }
+
+    #[test]
     fn synthetic_diamond_without_cycle_is_green() {
         let out = run_synth(
             "diamond",
@@ -3593,6 +3641,32 @@ mod tests {
             "log:\n{}",
             out.log
         );
+    }
+
+    #[test]
+    fn synthetic_multiline_lock_tokens_are_data_but_real_locks_remain() {
+        let out = run_synth(
+            "multiline-lock-data",
+            r###"
+fn quoted() {
+    let raw = r##"
+    .lock()
+fn invented() { term_lock(term).resize(1, 1); }
+"##;
+    let cooked = "quoted
+    .lock()
+    ";
+    let guard = quoted_real_lock.lock().unwrap();
+}
+"###,
+        );
+        assert!(out.ok, "{}", out.log);
+        assert!(
+            out.log.contains("0 UNKNOWN-identity site(s)"),
+            "{}",
+            out.log
+        );
+        assert!(out.log.contains("quoted_real_lock"), "{}", out.log);
     }
 
     #[test]
@@ -4508,6 +4582,118 @@ mod tests {
             "test-mod edges must be masked; log:\n{}",
             out.log
         );
+    }
+
+    #[test]
+    fn synthetic_raw_test_fixtures_cannot_end_the_cfg_module_mask() {
+        // This source contains multiline raw fixtures with column-zero braces,
+        // including the exact dims() double-acquire that must stay test-only.
+        let fixtures = include_str!("held_guard.rs");
+        let quiet = run_synth("raw-test-fixtures", fixtures);
+        assert!(
+            quiet.ok,
+            "test fixture text is not shipped code:\n{}",
+            quiet.log
+        );
+        let live = format!(
+            "{fixtures}\nfn shipped_reentrant() {{\n    let g = alpha_lock.lock().unwrap();\n    let h = alpha_lock.lock().unwrap();\n}}\n"
+        );
+        let red = run_synth("raw-test-fixtures-live-control", &live);
+        assert!(
+            !red.ok && red.log.contains("RE-ENTRANCY SUSPECT"),
+            "real production acquisition must still fire:\n{}",
+            red.log
+        );
+        assert!(red.log.contains("fn `shipped_reentrant`"), "{}", red.log);
+        assert!(
+            !red.log.contains("fn `dims`"),
+            "raw fixture escaped its test module:\n{}",
+            red.log
+        );
+    }
+
+    #[test]
+    fn synthetic_literal_and_comment_attributes_cannot_hide_shipped_locks() {
+        for (name, fixture) in [
+            ("raw", "const NOTE: &str = r##\"\n#[cfg(test)]\n\"##;"),
+            ("raw-byte", "const NOTE: &[u8] = br#\"\n#[cfg(test)]\n\"#;"),
+            ("raw-c", "const NOTE: &CStr = cr###\"\n#[cfg(test)]\n\"###;"),
+            ("comment", "/* outer\n/* nested */\n#[cfg(test)]\n*/"),
+        ] {
+            let raw = format!(
+                "{fixture}\nfn shipped_reentrant() {{\n    let g = alpha_lock.lock().unwrap();\n    let h = alpha_lock.lock().unwrap();\n}}\n"
+            );
+            let out = run_synth(name, &raw);
+            assert!(
+                !out.ok && out.log.contains("RE-ENTRANCY SUSPECT"),
+                "{name}: data must not hide production code:\n{}",
+                out.log
+            );
+            assert!(out.log.contains("fn `shipped_reentrant`"), "{}", out.log);
+        }
+    }
+
+    #[test]
+    fn synthetic_diagnostic_literals_are_not_lock_code_and_hide_no_real_code() {
+        for (name, prefix) in [
+            (
+                "cooked-diagnostic",
+                "fn logs() {\n    emit(\"a multiline diagnostic\n.lock() is mentioned here\nfinished\");\n",
+            ),
+            (
+                "url-diagnostic",
+                "fn logs() {\n    emit(\"https://example.test/.lock()\");\n",
+            ),
+            (
+                "raw-function-diagnostic",
+                "fn logs() {\n    emit(r##\"\nfn phantom_reentrant() {\n    let g = alpha_lock.lock();\n    let h = alpha_lock.lock();\n}\n\"##);\n",
+            ),
+        ] {
+            let quiet = run_synth(name, &format!("{prefix}}}\n"));
+            assert!(
+                quiet.ok,
+                "{name}: diagnostic text is not code:\n{}",
+                quiet.log
+            );
+            let live = format!(
+                "{prefix}    let g = alpha_lock.lock().unwrap();\n    let h = alpha_lock.lock().unwrap();\n}}\n"
+            );
+            let red = run_synth(&format!("{name}-live-control"), &live);
+            assert!(
+                !red.ok && red.log.contains("RE-ENTRANCY SUSPECT"),
+                "{name}: real code after the literal must fire:\n{}",
+                red.log
+            );
+            assert!(red.log.contains("fn `logs`"), "{}", red.log);
+            assert!(!red.log.contains("fn `phantom_reentrant`"), "{}", red.log);
+        }
+    }
+
+    #[test]
+    fn synthetic_trailing_close_comment_keeps_real_reentrancy_visible() {
+        let source = "fn shipped_reentrant() {\n    let g = alpha_lock.lock().unwrap();\n    let h = alpha_lock.lock().unwrap();\n} // the function still ends here\n";
+        let out = run_synth("trailing-close-comment", source);
+        assert!(
+            !out.ok && out.log.contains("RE-ENTRANCY SUSPECT"),
+            "a closing-brace comment must not hide the function body:\n{}",
+            out.log
+        );
+        assert!(out.log.contains("fn `shipped_reentrant`"), "{}", out.log);
+    }
+
+    #[test]
+    fn gated_item_predicates_keep_quoted_values_and_ignore_trailing_comments() {
+        let raw = "#[cfg(target_os = \"macos\")] // target-only\nfn hidden() {\n    alpha_lock.lock();\n}\nfn shipped() {\n    beta_lock.lock();\n}\n";
+        let masked = mask_items_where(raw, &|attr| attr == "#[cfg(target_os = \"macos\")]");
+        assert!(
+            !masked.contains("hidden") && !masked.contains("alpha_lock"),
+            "target value was lost:\n{masked}"
+        );
+        assert!(
+            masked.contains("fn shipped") && masked.contains("beta_lock"),
+            "following production code was masked:\n{masked}"
+        );
+        assert_eq!(masked.lines().count(), raw.lines().count());
     }
 
     #[test]

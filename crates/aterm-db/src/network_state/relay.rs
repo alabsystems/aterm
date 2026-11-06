@@ -577,11 +577,11 @@ fn live_decode_parts(
         if !slots.insert(slot) {
             return Err(refused_at("snapshot-slots"));
         }
-        let peer = observation
+        let peer_idx = observation
             .peers
-            .iter_mut()
-            .find(|p| p.slot == slot)
-            .ok_or_else(|| refused_at("snapshot-slots"))?;
+            .binary_search_by_key(&slot, |p| p.slot)
+            .map_err(|_| refused_at("snapshot-slots"))?;
+        let peer = &mut observation.peers[peer_idx];
         peer.reachability = state(row.get("state").ok_or_else(|| refused_at("peer-state"))?)
             .map_err(|_| refused_at("peer-state"))?;
         let contact_age = match row.get("contact_age_ms") {

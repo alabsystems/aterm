@@ -97,18 +97,23 @@ fn state(paths: &Paths) -> Result<Vec<Value>, String> {
     else {
         return Ok(Vec::new());
     };
-    let value: Value = aterm_json::from_slice(bytes.as_slice())
+    let mut value: Value = aterm_json::from_slice(bytes.as_slice())
         .map_err(|_| "native allocation queue is malformed")?;
-    let rows = value["queues"]
-        .as_array()
-        .filter(|rows| rows.len() <= 2)
-        .ok_or("native allocation queue is invalid")?;
+    if value["queues"].as_array().is_none_or(|rows| rows.len() > 2) {
+        return Err("native allocation queue is invalid".into());
+    }
     if value.as_object().is_none_or(|object| object.len() != 2)
         || value["schema"].as_u64() != Some(1)
     {
         return Err("native allocation queue schema is invalid".into());
     }
-    for row in rows {
+    let Some(Value::Array(rows)) = value
+        .as_object_mut()
+        .and_then(|object| object.remove("queues"))
+    else {
+        return Err("native allocation queue is invalid".into());
+    };
+    for row in &rows {
         if row.as_object().is_none_or(|object| object.len() != 5)
             || row["provider"].as_str().and_then(Provider::of).is_none()
             || row["key"]
@@ -149,7 +154,7 @@ fn state(paths: &Paths) -> Result<Vec<Value>, String> {
             }
         }
     }
-    Ok(rows.clone())
+    Ok(rows)
 }
 
 fn save(paths: &Paths, rows: &[Value]) -> Result<(), String> {
@@ -410,19 +415,19 @@ pub(super) fn step_at(
             );
             rows.len() - 1
         };
-        // Preserve newly observed ticket order even while the rate limit holds.
-        let mut due = DUE
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let at_time = due
-            .entry((paths.dir.clone(), provider.name().into()))
-            .or_insert_with(|| now + COOLDOWN);
-        let ready = now >= *at_time;
-        if ready {
-            *at_time = now + COOLDOWN;
-        }
-        drop(due);
+        // Preserve newly observed ticket order even while the rate limit holds. Only a
+        // publication starts the next cooldown: a ready sweep that changes nothing leaves the
+        // next one free to publish.
+        let ready = {
+            let mut due = DUE
+                .get_or_init(|| Mutex::new(BTreeMap::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let at_time = due
+                .entry((paths.dir.clone(), provider.name().into()))
+                .or_insert_with(|| now + COOLDOWN);
+            now >= *at_time
+        };
         let warm = choose(
             &mut rows[at],
             &assignment.warm,
@@ -489,6 +494,10 @@ pub(super) fn step_at(
             deadline,
         )
         .map_err(|e| e.to_string())?;
+        DUE.get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((paths.dir.clone(), provider.name().into()), now + COOLDOWN);
         save(paths, &rows)?;
         return Ok(1);
     }

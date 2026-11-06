@@ -26,10 +26,9 @@ impl World {
         crate::platform::set_mode(&artifact, 0o700).unwrap();
         crate::platform::set_mode(&artifact.join("bin"), 0o700).unwrap();
         #[cfg(target_os = "macos")]
-        let magic = b"\xcf\xfa\xed\xfe";
+        let mut bytes = b"\xcf\xfa\xed\xfe".to_vec();
         #[cfg(not(target_os = "macos"))]
-        let magic = b"\x7fELF";
-        let mut bytes = magic.to_vec();
+        let mut bytes = crate::testdir::elf_fixture();
         bytes.extend_from_slice(b"mock bytes, never executed");
         let exe = artifact.join("bin").join(COMMAND);
         std::fs::write(&exe, &bytes).unwrap();

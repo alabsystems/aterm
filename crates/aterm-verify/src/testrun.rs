@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::exec::{self, Cmd, Run};
-use crate::ladder::Report;
+use crate::ladder::{Outcome, Report, Severity};
 
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
@@ -327,14 +327,7 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
 /// Build the serial `--tests` command with the recording runner and current target metadata.
 #[must_use]
 pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
-    let mut c = serial.clone();
-    let args_end = c
-        .args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(c.args.len());
-    c.args
-        .insert(args_end, "--message-format=json-render-diagnostics".into());
+    let mut c = crate::compile_account::with_message_format(serial.clone());
     c.args
         .splice(0..0, [OsString::from("--config"), OsString::from(config)]);
     c
@@ -437,10 +430,10 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     }
 }
 
-/// Read Cargo's artifact prelude without treating a test's own JSON as metadata.
-fn take_recording_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
-    let prelude_len = log
-        .split_inclusive('\n')
+/// The bytes of a recording pass's log before cargo's first `Running` header: its compile's
+/// prelude, where cargo's own messages are, and no test's output.
+fn recording_prelude_len(log: &str) -> usize {
+    log.split_inclusive('\n')
         .take_while(|line| {
             let line = line.trim_end_matches(['\r', '\n']);
             if line.contains('\x1b') {
@@ -450,8 +443,12 @@ fn take_recording_executables(log: &mut String) -> Result<Vec<TestExe>, String> 
             }
         })
         .map(str::len)
-        .sum();
-    let tail = log.split_off(prelude_len);
+        .sum()
+}
+
+/// Read Cargo's artifact prelude without treating a test's own JSON as metadata.
+fn take_recording_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
+    let tail = log.split_off(recording_prelude_len(log));
     let exes = take_test_executables(log);
     log.push_str(&tail);
     exes
@@ -562,6 +559,7 @@ where
                 output: "aterm-verify: this test binary was never run (a gate defect)\n".into(),
                 code: None,
                 spawn_error: None,
+                usage: None,
             };
             (run, Duration::ZERO)
         })
@@ -569,7 +567,20 @@ where
     .collect()
 }
 
-fn binary_event(binary: &Binary, run: &Run, waiting: Duration, execution: Duration) -> String {
+/// A finished binary's outcome (ok, NOT RUN when its machine or the run's end kept it from
+/// running, else FAIL, the proven red that ends a halted run), its `test-binary-finished` event,
+/// and the sample of it its history keeps ([`crate::test_history`]) when its run measured what it
+/// takes ([`measured`]; `started`: the run's ceiling left it time to start): its outcome, its
+/// waits, its tree's usage (`null` where unread), the test threads it ran at (`width`) and the
+/// tests libtest said it runs.
+fn binary_event(
+    binary: &Binary,
+    run: &Run,
+    started: bool,
+    waiting: Duration,
+    execution: Duration,
+    width: u32,
+) -> (Outcome, String, Option<crate::test_history::Sample>) {
     // The child has no cargo rerun footer. Classify it with the same known-binary
     // context as the final report, so passing fixture output cannot own a failure.
     let combined =
@@ -591,22 +602,51 @@ fn binary_event(binary: &Binary, run: &Run, waiting: Duration, execution: Durati
         combined.as_ref().and_then(Run::environment_failure)
     };
     let outcome = if run.ok {
-        "ok"
+        Outcome::Ok
     } else if unavailable.is_some() {
-        "NOT RUN"
+        Outcome::Fail(Severity::CouldNotRun)
     } else {
-        "FAIL"
+        Outcome::Fail(Severity::GateFailed)
     };
-    format!(
+    let tests = crate::libtest::tests_run(&run.output);
+    let usage = run.usage;
+    let event = format!(
         "verify-event: {}",
         aterm_json::json!({
             "schema": 1, "event": "test-binary-finished", "test": binary.spec,
-            "outcome": outcome, "exit_code": run.code,
+            "outcome": crate::report::word(outcome), "exit_code": run.code,
             "waiting_s": waiting.as_secs_f64(), "execution_s": execution.as_secs_f64(),
+            "cpu_s": usage.map(|u| u.cpu.as_secs_f64()),
+            "starved_s": usage.map(|u| u.starved.as_secs_f64()),
+            "peak_bytes": usage.map(|u| u.peak_bytes),
+            "width": width, "tests": tests,
             "failures": failures,
             "detail": if run.ok { String::new() } else { unavailable.unwrap_or_else(|| first_error(&run.output)) },
         })
-    )
+    );
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let sample = measured(run, started).then(|| crate::test_history::Sample {
+        at_ms: aterm_time::unix_millis().unwrap_or(0),
+        outcome: crate::report::word(outcome).to_owned(),
+        wall_ms: ms(execution),
+        cpu_ms: usage.map(|u| ms(u.cpu)),
+        starved_ms: usage.map(|u| ms(u.starved)),
+        peak_bytes: usage.map(|u| u.peak_bytes),
+        width,
+        tests,
+    });
+    (outcome, event, sample)
+}
+
+/// Whether a binary's run measured what it takes, so its history keeps a sample of it: it was
+/// `started` (the run's ceiling left it time: [`not_started`]), nothing outside it ended it (no
+/// [`Run::spawn_error`]: a spawn refused, an interrupt that came before it started, a stuck
+/// holder it waited behind, a wait for it that failed) and no interrupt was ending the run as it
+/// ended ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it.
+/// A binary the run's ceiling ended keeps its sample, a lower bound of what it takes; one that
+/// never ran would keep a wall of about 0 ms, and push a measured sample out of its row.
+fn measured(run: &Run, started: bool) -> bool {
+    started && run.spawn_error.is_none() && !crate::exec::ending()
 }
 
 /// The run's long poles: its own wall, then its slowest binaries by their own
@@ -736,6 +776,7 @@ pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
         output,
         code: Some(if failed.is_empty() { 0 } else { 101 }),
         spawn_error: None,
+        usage: None,
     }
 }
 
@@ -766,6 +807,7 @@ pub fn not_started(b: &Binary, limit: Duration) -> Run {
         ),
         code: None,
         spawn_error: None,
+        usage: None,
     }
 }
 
@@ -877,8 +919,18 @@ fn binary_features(bins: &mut [Binary], features: &str) {
     }
 }
 
-/// Record Cargo's current test invocations and run them with the admitted parallelism.
-pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
+/// Record Cargo's current test invocations and run them with the admitted parallelism. The first
+/// binary that fails ends the run when its halt is armed ([`crate::Ctx::halt`], named for `check`):
+/// no binary starts after it, and those it stopped are one NOT RUN row with the halt's words. A
+/// binary's `test … FAILED` line sets nothing while it runs: that case may yet read as its
+/// machine's refusal or a full disk, which libtest's report of it says only at the binary's end.
+pub fn run_tests(
+    ctx: &crate::Ctx,
+    r: &mut Report,
+    label: &str,
+    serial: &Cmd,
+    check: crate::checks::Check,
+) {
     let mut cores = None;
     let mut host_cores = || *cores.get_or_insert_with(|| ctx.cores());
     let managed_share = match crate::test_workers::admitted_share(&ctx.env) {
@@ -895,6 +947,13 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
             aterm_capacity::Admit::Wait,
         ) {
             Ok(claim) => Some(claim),
+            Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
+                r.cannot_run(format!(
+                    "{label} — {}; no test was run",
+                    ctx.halted().unwrap_or_default()
+                ));
+                return;
+            }
             Err(why) => {
                 r.cannot_run(format!(
                     "subprocess CPU admission refused: {why}; no test was run"
@@ -973,7 +1032,9 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
         serially(r, "verify could not name itself as the recording runner");
         return;
     };
+    let began = Instant::now();
     let mut pass = exec::run(&recording_cmd(serial, &config), ctx.exec_env());
+    let pass_wall = began.elapsed();
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
@@ -1010,6 +1071,15 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
         decide(ctx, r, &pass, label, &env);
         return;
     }
+    let account = crate::compile_account::Account::of(
+        crate::stages::step_of(r),
+        &format!("{label} (recording pass)"),
+        Some(&pass.output[..recording_prelude_len(&pass.output)]),
+        pass.usage,
+        pass_wall,
+    );
+    r.raw(format!("  {}", account.line()));
+    eprintln!("{}", account.event());
     let exes = take_recording_executables(&mut pass.output);
     let bins = if pass.ok {
         records
@@ -1031,15 +1101,31 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
     binary_features(&mut bins, &features);
     let ceiling = ctx.exec_env().child_ceiling;
     let started = Instant::now();
+    let samples = Mutex::new(Vec::with_capacity(bins.len()));
+    // The binaries the ceiling left no time to start, by spec: their samples are not kept.
+    let unstarted = Mutex::new(std::collections::BTreeSet::new());
     let timed = run_all(
         &bins,
         jobs,
         threads,
         |b, t| {
+            if let Some(words) = ctx.halted() {
+                return Run {
+                    ok: false,
+                    output: String::new(),
+                    code: None,
+                    spawn_error: Some(words.to_owned()),
+                    usage: None,
+                };
+            }
             let mut env = ctx.exec_env();
             if let Some(limit) = ceiling {
                 let left = limit.saturating_sub(started.elapsed());
                 if left.is_zero() {
+                    unstarted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(b.spec.clone());
                     return not_started(b, limit);
                 }
                 env.child_ceiling = Some(left);
@@ -1047,11 +1133,66 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
             exec::run(&binary_cmd(b, t), env)
         },
         |binary, run, waiting, execution| {
-            eprintln!("{}", binary_event(binary, run, waiting, execution));
+            let never_started = unstarted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&binary.spec);
+            let (outcome, event, sample) =
+                binary_event(binary, run, !never_started, waiting, execution, threads);
+            eprintln!("{event}");
+            if outcome == Outcome::Fail(Severity::GateFailed) {
+                ctx.halt.red(check.name());
+            }
+            if let Some(sample) = sample {
+                samples
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((binary.spec.clone(), sample));
+            }
         },
     );
     let total = started.elapsed();
+    let samples = samples
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept = ctx
+        .test_history
+        .as_deref()
+        .map(|path| crate::test_history::keep(path, samples));
     let (runs, walls): (Vec<Run>, Vec<Duration>) = timed.into_iter().unzip();
+    if let Some(words) = ctx.halted()
+        && runs
+            .iter()
+            .any(|run| run.spawn_error.as_deref() == Some(words))
+    {
+        let (stopped, done): (Vec<_>, Vec<_>) = bins
+            .iter()
+            .zip(&runs)
+            .partition(|(_, run)| run.spawn_error.as_deref() == Some(words));
+        r.raw(summary(&bins, jobs, threads));
+        r.raw(poles(&bins, &walls, total));
+        if let Some(Err(why)) = &kept {
+            r.raw(format!(
+                "  test binaries' history not kept (planning data only): {why}"
+            ));
+        }
+        if !done.is_empty() {
+            let (bins, runs): (Vec<Binary>, Vec<Run>) = done
+                .into_iter()
+                .map(|(b, run)| (b.clone(), run.clone()))
+                .unzip();
+            let all = combined(&bins, &runs);
+            r.raw(all.output.as_str());
+            // The golden test may be among those stopped, and the run is red already.
+            r.decide_test_child(&all, label, &env);
+        }
+        r.cannot_run(format!(
+            "{label} — {} of {} test binaries not run: {words}",
+            stopped.len(),
+            bins.len()
+        ));
+        return;
+    }
     let preface: String = pass
         .output
         .lines()
@@ -1063,6 +1204,11 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
     let all = combined(&bins, &runs);
     r.raw(all.output.as_str());
     r.raw(poles(&bins, &walls, total));
+    if let Some(Err(why)) = kept {
+        r.raw(format!(
+            "  test binaries' history not kept (planning data only): {why}"
+        ));
+    }
     decide(ctx, r, &all, label, &env);
 }
 
@@ -1097,6 +1243,7 @@ mod tests {
             &mut report,
             "fixture",
             &Cmd::new("must-not-be-dispatched"),
+            crate::checks::Check::Test,
         );
         assert!(
             matches!(&report.entries[..], [crate::ladder::Entry::Ladder {
@@ -1142,7 +1289,13 @@ mod tests {
                 tmp.path().to_path_buf(),
             ));
             let mut report = Report::new("the test run");
-            run_tests(&ctx, &mut report, "fixture", &Cmd::new(&targo));
+            run_tests(
+                &ctx,
+                &mut report,
+                "fixture",
+                &Cmd::new(&targo),
+                crate::checks::Check::Test,
+            );
             let raw: Vec<_> = report.entries.iter().map(|e| format!("{e:?}")).collect();
             assert!(
                 raw.iter()
@@ -1251,6 +1404,7 @@ mod tests {
                     output: String::new(),
                     code: Some(i32::from(binary.spec != "slow")),
                     spawn_error: None,
+                    usage: None,
                 }
             },
             |binary, _, _, _| {
@@ -1278,9 +1432,10 @@ mod tests {
             output: "test counterfeit ... FAILED".into(),
             code: Some(0),
             spawn_error: None,
+            usage: None,
         };
         let parse = |run: &Run| -> aterm_json::Value {
-            let line = binary_event(&binary, run, Duration::ZERO, Duration::ZERO);
+            let (_, line, _) = binary_event(&binary, run, true, Duration::ZERO, Duration::ZERO, 1);
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
         };
         assert_eq!(parse(&run)["outcome"].as_str(), Some("ok"));
@@ -1627,6 +1782,7 @@ mod tests {
                         output: format!("{}\nran {}\n", b.header, b.spec),
                         code: Some(0),
                         spawn_error: None,
+                        usage: None,
                     }
                 },
                 |_, _, _, _| {},
@@ -1724,6 +1880,7 @@ mod tests {
             ),
             code: Some(0),
             spawn_error: None,
+            usage: None,
         };
         let fail = |b: &Binary| Run {
             ok: false,
@@ -1736,6 +1893,7 @@ mod tests {
             ),
             code: Some(101),
             spawn_error: None,
+            usage: None,
         };
         let runs = [pass(&bins[0]), fail(&bins[1]), pass(&bins[2])];
         let all = combined(&bins, &runs);
@@ -1744,7 +1902,9 @@ mod tests {
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].spec, "-p x --test b");
         assert_eq!(tests[0].name, "t::broke");
-        let event = binary_event(&bins[1], &runs[1], Duration::ZERO, Duration::ZERO);
+        let (outcome, event, _) =
+            binary_event(&bins[1], &runs[1], true, Duration::ZERO, Duration::ZERO, 1);
+        assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "a proven red");
         let event: aterm_json::Value =
             aterm_json::from_str(event.strip_prefix("verify-event: ").unwrap()).unwrap();
         assert_eq!(event["failures"][0]["case"].as_str(), Some("t::broke"));
@@ -1797,6 +1957,7 @@ mod tests {
             output: format!("{}\n\nrunning 1 test\n", bins[1].header),
             code: None,
             spawn_error: None,
+            usage: None,
         };
         let all = combined(&bins, &[pass(&bins[0]), crashed, pass(&bins[2])]);
         assert!(all.output.contains(
@@ -1817,6 +1978,7 @@ mod tests {
                 .replace("assertion failed: false", &format!("{sentinel} — strays")),
             code: Some(101),
             spawn_error: None,
+            usage: None,
         };
         let all = combined(&bins, &[pass(&bins[0]), refused, pass(&bins[2])]);
         let why = all

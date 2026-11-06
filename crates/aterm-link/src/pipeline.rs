@@ -846,6 +846,7 @@ mod tests {
         let (a, b) = ("/f/f/order/a", "/f/f/order/b");
 
         broker.inject_faults(astream_broker::InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });
@@ -922,6 +923,7 @@ mod tests {
         let (a, b) = ("/f/f/order/a", "/f/f/order/b");
 
         broker.inject_faults(astream_broker::InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });

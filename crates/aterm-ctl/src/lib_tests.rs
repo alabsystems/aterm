@@ -2599,6 +2599,36 @@ fn token_reader_rejects_oversized_symlink_and_fifo_without_parking() {
     );
 }
 
+/// Windows: a token path is judged by the handle opened on its final component itself, so a
+/// symlink to a real token is refused, never followed, and a directory there is refused as
+/// `InvalidData` (which stops discovery), not failed as an open. NEGATIVE CONTROL: the real token
+/// reads.
+#[cfg(windows)]
+#[test]
+fn a_symlinked_token_file_is_refused_on_windows() {
+    let scratch = test_scratch_dir("tok-reparse");
+    let dir = scratch.path();
+    let target = dir.join("real.token");
+    std::fs::write(&target, "deadbeef\n").expect("real token");
+    assert_eq!(
+        read_control_token_file(&target).expect("a regular token reads"),
+        "deadbeef"
+    );
+    let folder = dir.join("folder.token");
+    std::fs::create_dir(&folder).expect("a directory at a token path");
+    let error = read_control_token_file(&folder).expect_err("a directory is refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    let link = dir.join("aterm.token");
+    if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+        aterm_uds::host::could_not_run(format!(
+            "this process may not make a symlink ({e}): Developer Mode is off and it is not \
+             elevated, so no unelevated process can plant one here either"
+        ));
+    }
+    let error = read_control_token_file(&link).expect_err("a symlinked token is refused");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+}
+
 /// The server's words before its hang-up, not the write's error: a listener
 /// that cannot admit a connection writes its busy line and drops it, often
 /// before the client writes, so the write fails (`EPIPE`) while the line waits

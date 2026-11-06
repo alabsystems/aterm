@@ -186,6 +186,50 @@ const fn linear_projection(dx: f32, dy: f32, rx: f32, ry: f32) -> Option<(f32, f
     }
 }
 
+/// The two-circle radial gradient from circle `(x0, y0, r0)` to `(x1, y1, r1)`, or `None` for
+/// one that cannot paint: a parameter or delta that is not finite (a font's variation deltas can
+/// make one), or two equal circles.
+fn radial_kind(
+    (x0, y0, r0): (f32, f32, f32),
+    (x1, y1, r1): (f32, f32, f32),
+) -> Option<GradientKind> {
+    let (dx, dy, dr) = (x1 - x0, y1 - y0, r1 - r0);
+    if ![x0, y0, r0, dx, dy, dr].into_iter().all(f32::is_finite)
+        || (dx == 0.0 && dy == 0.0 && dr == 0.0)
+    {
+        return None;
+    }
+    Some(GradientKind::Radial {
+        x0,
+        y0,
+        r0,
+        dx,
+        dy,
+        dr,
+    })
+}
+
+/// The sweep gradient around `(cx, cy)` from `start_angle` to `end_angle` (half-turns, as COLR
+/// stores them), or `None` for one that cannot paint: a centre or angle that is not finite, or
+/// no sweep.
+fn sweep_kind((cx, cy): (f32, f32), start_angle: f32, end_angle: f32) -> Option<GradientKind> {
+    let start_deg = start_angle * 180.0 + 180.0;
+    let sweep_deg = (end_angle - start_angle) * 180.0;
+    if ![cx, cy, start_deg, sweep_deg]
+        .into_iter()
+        .all(f32::is_finite)
+        || sweep_deg == 0.0
+    {
+        return None;
+    }
+    Some(GradientKind::Sweep {
+        cx,
+        cy,
+        start_deg,
+        sweep_deg,
+    })
+}
+
 struct ColorRamp {
     extend: GradientExtend,
     /// (offset, straight-alpha color), ascending by offset, never empty.
@@ -488,39 +532,12 @@ impl ColrCanvas<'_> {
                 )
             }
             Paint::RadialGradient(g) => {
-                let (dx, dy, dr) = (g.x1 - g.x0, g.y1 - g.y0, g.r1 - g.r0);
-                if dx == 0.0 && dy == 0.0 && dr == 0.0 {
-                    return None;
-                }
-                (
-                    g.extend,
-                    collect_stops(g.stops(self.palette, &[])),
-                    GradientKind::Radial {
-                        x0: g.x0,
-                        y0: g.y0,
-                        r0: g.r0,
-                        dx,
-                        dy,
-                        dr,
-                    },
-                )
+                let kind = radial_kind((g.x0, g.y0, g.r0), (g.x1, g.y1, g.r1))?;
+                (g.extend, collect_stops(g.stops(self.palette, &[])), kind)
             }
             Paint::SweepGradient(g) => {
-                let start_deg = g.start_angle * 180.0 + 180.0;
-                let sweep_deg = (g.end_angle - g.start_angle) * 180.0;
-                if sweep_deg == 0.0 || !sweep_deg.is_finite() {
-                    return None;
-                }
-                (
-                    g.extend,
-                    collect_stops(g.stops(self.palette, &[])),
-                    GradientKind::Sweep {
-                        cx: g.center_x,
-                        cy: g.center_y,
-                        start_deg,
-                        sweep_deg,
-                    },
-                )
+                let kind = sweep_kind((g.center_x, g.center_y), g.start_angle, g.end_angle)?;
+                (g.extend, collect_stops(g.stops(self.palette, &[])), kind)
             }
         };
         let Some(&(_, first)) = stops.first() else {
@@ -1128,6 +1145,51 @@ mod tests {
         assert_eq!(g.sample_at(10.0, 0.0).expect("defined").red, 0);
         assert_eq!(g.sample_at(0.0, 10.0).expect("defined").red, 100);
         assert_eq!(g.sample_at(-10.0, 1e-4).expect("defined").red, 200);
+    }
+
+    /// A radial or sweep paint with a parameter that is not finite builds no gradient (the
+    /// glyph's fill is dropped) instead of one whose every sample is the first stop; the same
+    /// paints with finite parameters build and sample as before.
+    #[test]
+    fn a_gradient_with_a_non_finite_parameter_builds_nothing() {
+        let red_at = |kind, x: f32, y: f32| {
+            GradientFill {
+                kind,
+                ramp: ramp(
+                    GradientExtend::Pad,
+                    &[(0.0, (0, 0, 0, 255)), (1.0, (200, 0, 0, 255))],
+                ),
+                inv: IDENTITY,
+            }
+            .sample_at(x, y)
+            .map(|c| c.red)
+        };
+        let radial = radial_kind((0.0, 0.0, 0.0), (0.0, 0.0, 10.0)).expect("a finite radial");
+        assert_eq!(red_at(radial, 5.0, 0.0), Some(100));
+        let sweep = sweep_kind((0.0, 0.0), -1.0, 0.0).expect("a finite sweep");
+        assert_eq!(red_at(sweep, 0.0, 10.0), Some(100));
+        assert!(radial_kind((1.0, 2.0, 3.0), (1.0, 2.0, 3.0)).is_none());
+        assert!(sweep_kind((0.0, 0.0), 0.5, 0.5).is_none());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let base = [0.0, 0.0, 0.0, 0.0, 0.0, 10.0];
+            for i in 0..base.len() {
+                let mut p = base;
+                p[i] = bad;
+                assert!(
+                    radial_kind((p[0], p[1], p[2]), (p[3], p[4], p[5])).is_none(),
+                    "radial parameter {i} = {bad}"
+                );
+            }
+            let base = [0.0, 0.0, -1.0, 0.0];
+            for i in 0..base.len() {
+                let mut p = base;
+                p[i] = bad;
+                assert!(
+                    sweep_kind((p[0], p[1]), p[2], p[3]).is_none(),
+                    "sweep parameter {i} = {bad}"
+                );
+            }
+        }
     }
 
     /// Counts multi-colour gradient layers vs solid layers (and the last solid colour)

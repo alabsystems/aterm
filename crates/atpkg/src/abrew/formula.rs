@@ -524,7 +524,7 @@ impl Formula {
     }
 
     /// Apply the variation for `machine`, mirroring cask selection.
-    pub(super) fn resolve_variations(&mut self, machine: &Machine) -> bool {
+    pub fn resolve_variations(&mut self, machine: &Machine) -> bool {
         if self.variations.is_empty() {
             return true;
         }

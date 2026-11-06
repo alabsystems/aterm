@@ -62,6 +62,7 @@
 //! `unsettled` file, written before the first incarnation is taken), so a restart before any
 //! neighbour answered still waits. `REUSED_INCARNATION` is the rule's negative control.
 
+use crate::inventory::Reason;
 use crate::logs::{Me, Mesh, MeshLog, Wall};
 use astream_broker::{
     AnyClient, Broker, Capability, FederationBridge, FederationBridgeCloser, FederationConfig,
@@ -186,6 +187,49 @@ pub enum Event {
     Retired {
         /// The removed Mac's principal.
         principal: String,
+    },
+    /// A relay read that its neighbour's cursor fell below what the log keeps: records
+    /// `from..to` cannot reach it by the relay.
+    Gap {
+        /// The neighbour's principal.
+        peer: String,
+        /// The log.
+        log: MeshLog,
+        /// The first offset given up.
+        from: u64,
+        /// One past the last.
+        to: u64,
+    },
+    /// An `Inventory` exchange with `peer` ended: this Mac started it for `reason`, or with
+    /// `None` the neighbour did.
+    Inventory {
+        /// The neighbour's principal.
+        peer: String,
+        /// Why this Mac started it.
+        reason: Option<crate::inventory::Reason>,
+        /// Records this Mac sent.
+        sent: usize,
+        /// Records this Mac received and applied.
+        received: usize,
+    },
+    /// An `Inventory` with `peer` was asked, and not run: the last one moved nothing and this
+    /// Mac's digest has not changed since.
+    InventorySkipped {
+        /// The neighbour's principal.
+        peer: String,
+        /// Why it was asked.
+        reason: crate::inventory::Reason,
+    },
+    /// The ingest consumer handed records to a store.
+    Ingested {
+        /// The membership log's, or a table's.
+        members: bool,
+        /// Records the store applied (or held already).
+        applied: usize,
+        /// Records that wait for a membership record.
+        waiting: usize,
+        /// Records refused for good.
+        refused: usize,
     },
     /// A rebuilt Mac's lease settled on its first neighbour's high water.
     Settled {
@@ -548,6 +592,17 @@ impl Relayed {
         self.write(peer, now_ms);
     }
 
+    /// The neighbours this Mac relayed to within [`CURSOR_KEPT`] of `now_ms`: the cursors the
+    /// tables cut keeps.
+    pub(crate) fn recent(&self, now_ms: u64) -> Vec<String> {
+        let kept = u64::try_from(CURSOR_KEPT.as_millis()).unwrap_or(u64::MAX);
+        self.at
+            .iter()
+            .filter(|(_, (at, _))| now_ms.saturating_sub(*at) < kept)
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
     /// This Mac still relays to `peer` at `now_ms`, to the log it relayed to.
     pub(crate) fn touch(&mut self, peer: &str, now_ms: u64) {
         let Some(entry) = self.at.get_mut(peer) else {
@@ -642,15 +697,6 @@ pub(crate) fn read_grants(stream: &LinkStream) -> io::Result<(Vec<Capability>, V
     let mut chunk = [0u8; 1024];
     stream.set_read_timeout(Some(IO_WITHIN));
     let end = loop {
-        let start = scanned.saturating_sub(4);
-        if let Some(at) = held[start..]
-            .windows(5)
-            .position(|w| w == b"\nend\n")
-            .map(|at| start + at + 5)
-        {
-            break at;
-        }
-        scanned = held.len();
         if held.len() > GRANTS_MAX {
             stream.set_read_timeout(None);
             return Err(damaged("they run past their bound"));
@@ -669,7 +715,16 @@ pub(crate) fn read_grants(stream: &LinkStream) -> io::Result<(Vec<Capability>, V
                 return Err(e);
             }
         };
+        let start = scanned.saturating_sub(4);
         held.extend_from_slice(&chunk[..n]);
+        if let Some(at) = held[start..]
+            .windows(5)
+            .position(|w| w == b"\nend\n")
+            .map(|at| start + at + 5)
+        {
+            break at;
+        }
+        scanned = held.len();
     };
     stream.set_read_timeout(None);
     let ahead = held.split_off(end);
@@ -678,12 +733,12 @@ pub(crate) fn read_grants(stream: &LinkStream) -> io::Result<(Vec<Capability>, V
     if lines.next() != Some(GRANTS_HEAD) {
         return Err(damaged("they speak another version"));
     }
-    let grants = lines
-        .take_while(|line| *line != "end")
-        .map(grant_of)
-        .collect::<io::Result<Vec<_>>>()?;
-    if grants.len() > GRANTS_COUNT_MAX {
-        return Err(damaged("there are too many"));
+    let mut grants = Vec::with_capacity(GRANTS_COUNT_MAX);
+    for line in lines.take_while(|line| *line != "end") {
+        if grants.len() >= GRANTS_COUNT_MAX {
+            return Err(damaged("there are too many"));
+        }
+        grants.push(grant_of(line)?);
     }
     Ok((grants, ahead))
 }
@@ -693,6 +748,7 @@ pub(crate) fn read_grants(stream: &LinkStream) -> io::Result<(Vec<Capability>, V
 /// shutdown from other threads go on meanwhile, and a shutdown wakes a parked read.
 pub struct BusLink {
     stream: LinkStream,
+    has_ahead: AtomicBool,
     ahead: Mutex<Vec<u8>>,
 }
 
@@ -702,6 +758,7 @@ impl BusLink {
     pub const fn new(stream: LinkStream, ahead: Vec<u8>) -> Self {
         Self {
             stream,
+            has_ahead: AtomicBool::new(!ahead.is_empty()),
             ahead: Mutex::new(ahead),
         }
     }
@@ -709,14 +766,18 @@ impl BusLink {
 
 impl StreamLink for BusLink {
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        {
+        if self.has_ahead.load(Ordering::Acquire) {
             let mut ahead = self.ahead.lock_or_recover();
             if !ahead.is_empty() {
                 let n = buf.len().min(ahead.len());
                 buf[..n].copy_from_slice(&ahead[..n]);
                 ahead.drain(..n);
+                if ahead.is_empty() {
+                    self.has_ahead.store(false, Ordering::Release);
+                }
                 return Ok(n);
             }
+            self.has_ahead.store(false, Ordering::Release);
         }
         self.stream.read_some(buf)
     }
@@ -877,26 +938,18 @@ fn newest_rows(mesh: &Mesh, log: MeshLog) -> io::Result<Vec<Row>> {
         let mut reader = client_over(hosted.adopt(mesh.me.key)?, &grant)?;
         let (last, _) = reader.last_all(filter)?;
         let wanted: BTreeSet<u64> = last.iter().map(|(offset, _, _)| *offset).collect();
-        rows.extend(stamped(mesh, log, filter, &wanted)?);
+        rows.extend(stamped(reader, filter, &wanted)?);
     }
     Ok(rows)
 }
 
-/// The records at `wanted` offsets of `log` under `filter`, each with its origin's key: an offset
-/// that holds no such record (a commit, a subject outside `filter`) yields nothing.
-fn stamped(
-    mesh: &Mesh,
-    log: MeshLog,
-    filter: &str,
-    wanted: &BTreeSet<u64>,
-) -> io::Result<Vec<Row>> {
+/// The records at `wanted` offsets of `client`'s log under `filter`, each with its origin's key:
+/// an offset that holds no such record (a commit, a subject outside `filter`) yields nothing.
+fn stamped(mut client: AnyClient, filter: &str, wanted: &BTreeSet<u64>) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let (Some(from), Some(upto)) = (wanted.first().copied(), wanted.last().copied()) else {
         return Ok(rows);
     };
-    let hosted = mesh.hosted(log);
-    let grant = [hosted.mint(&format!("ro:{filter}"))?];
-    let mut client = client_over(hosted.adopt(mesh.me.key)?, &grant)?;
     client.origin_stamps()?;
     client.burst_marks()?;
     let mut sub = client.subscribe(from, filter)?;
@@ -991,6 +1044,36 @@ impl Slot {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+}
+
+/// A tables relay that follows now: its neighbour speaks `Bus` with this Mac while one does
+/// ([`Mesh::speaks_bus`]), and a push waits for its ack ([`Mesh::push_table`]).
+struct Live<'a> {
+    mesh: &'a Mesh,
+    peer: &'a str,
+}
+
+impl<'a> Live<'a> {
+    fn new(mesh: &'a Mesh, peer: &'a str, key: [u8; 32]) -> Self {
+        mesh.heard
+            .lock_or_recover()
+            .entry(peer.to_owned())
+            .or_insert((key, 0))
+            .1 += 1;
+        Self { mesh, peer }
+    }
+}
+
+impl Drop for Live<'_> {
+    fn drop(&mut self) {
+        let mut heard = self.mesh.heard.lock_or_recover();
+        if let Some((_, count)) = heard.get_mut(self.peer) {
+            *count -= 1;
+            if *count == 0 {
+                heard.remove(self.peer);
+            }
+        }
     }
 }
 
@@ -1141,9 +1224,41 @@ fn relay_once(mesh: &Arc<Mesh>, slot: &Slot) -> io::Result<()> {
         peer: slot.peer.clone(),
         log: slot.log,
     });
+    let inventory = (slot.log == MeshLog::Tables)
+        .then(|| mesh.inventory())
+        .flatten();
+    let _live = inventory
+        .is_some()
+        .then(|| Live::new(mesh, &slot.peer, *slot.link.peer().key.bytes()));
+    if let Some(inventory) = &inventory {
+        inventory.linked(&slot.peer, &slot.link);
+        // What the relay cannot carry: the records before the head it starts at (no cursor), or
+        // the last ones a later generation of the neighbour's log may have lost.
+        match cursor {
+            Cursor::Kept => {}
+            Cursor::Moved => inventory.request(&slot.peer, &slot.link, Reason::Lineage),
+            Cursor::Gone => inventory.request(&slot.peer, &slot.link, Reason::NewLink),
+        }
+    }
     let mut held = 0;
     bridge
         .run(BURST, &mut |report| {
+            if let Some(inventory) = &inventory {
+                if report.mirrored > 0 {
+                    mesh.acked();
+                }
+                for gap in &report.gaps {
+                    mesh.report(&Event::Gap {
+                        peer: slot.peer.clone(),
+                        log: slot.log,
+                        from: gap.from,
+                        to: gap.to,
+                    });
+                }
+                if !report.gaps.is_empty() {
+                    inventory.request(&slot.peer, &slot.link, Reason::Gap);
+                }
+            }
             hosted
                 .relayed
                 .lock_or_recover()

@@ -139,20 +139,32 @@ pub fn valid_slug(slug: &str) -> bool {
 /// # Errors
 /// Text that is not JSON, or a top-level value that is not an array or an object.
 pub fn parse_releases(text: &str) -> Result<Vec<Release>, String> {
-    let mut values = Vec::new();
+    let mut out = Vec::new();
+    let mut push_item = |item: Value| {
+        if let Some(r) = release(&item) {
+            out.push(r);
+        }
+    };
     for doc in top_level_values(text)? {
         let value: Value = aterm_json::from_str(doc).map_err(|e| e.to_string())?;
         match value {
-            Value::Array(items) => values.extend(items),
-            Value::Object(_) => values.push(value),
+            Value::Array(items) => {
+                for page in items {
+                    match page {
+                        Value::Array(nested) => {
+                            for item in nested {
+                                push_item(item);
+                            }
+                        }
+                        other => push_item(other),
+                    }
+                }
+            }
+            Value::Object(_) => push_item(value),
             _ => return Err("release API must return an array or object".into()),
         }
     }
-    let flat = values.into_iter().flat_map(|page| match page {
-        Value::Array(items) => items,
-        other => vec![other],
-    });
-    Ok(flat.filter_map(|r| release(&r)).collect())
+    Ok(out)
 }
 
 /// The top-level JSON texts in `text`, each an array or an object.
@@ -444,26 +456,22 @@ fn complete_mac_app(r: &Release) -> bool {
     .all(|n| r.named(n).is_some())
 }
 
-/// The macOS download.
-///
-/// # Errors
-/// An invalid slug, no stable release, or none that carries a complete app.
-pub fn elect_mac<'r>(
-    releases: &'r [Release],
+fn stable_minor_releases(releases: &[Release]) -> Vec<&Release> {
+    stable(releases)
+        .into_iter()
+        .filter(|r| r.version_key().is_some_and(|k| k.2 == 0))
+        .collect()
+}
+
+fn elect_mac_from_stable<'r>(
+    stable: &[&'r Release],
     slug: &str,
     notes: &mut Vec<Note>,
 ) -> Result<(MacDownload, &'r Release), Refused> {
-    if !valid_slug(slug) {
-        return Err(Refused::BadSlug);
-    }
-    let stable: Vec<&Release> = stable(releases)
-        .into_iter()
-        .filter(|r| r.version_key().is_some_and(|k| k.2 == 0))
-        .collect();
     if stable.is_empty() {
         return Err(Refused::NoStable { slug: slug.into() });
     }
-    for candidate in stable {
+    for &candidate in stable {
         let name = dmg_name(candidate.version());
         match candidate.named(&name) {
             Some(dmg) if complete_mac_app(candidate) => {
@@ -486,6 +494,22 @@ pub fn elect_mac<'r>(
         }
     }
     Err(Refused::NothingInstallable)
+}
+
+/// The macOS download.
+///
+/// # Errors
+/// An invalid slug, no stable release, or none that carries a complete app.
+pub fn elect_mac<'r>(
+    releases: &'r [Release],
+    slug: &str,
+    notes: &mut Vec<Note>,
+) -> Result<(MacDownload, &'r Release), Refused> {
+    if !valid_slug(slug) {
+        return Err(Refused::BadSlug);
+    }
+    let stable = stable_minor_releases(releases);
+    elect_mac_from_stable(&stable, slug, notes)
 }
 
 /// The appcast a release's Linux executable is proved by: its current one, or a tag-bound archived
@@ -523,7 +547,11 @@ pub fn elect(
     prover: &mut dyn LinuxProver,
     notes: &mut Vec<Note>,
 ) -> Result<Facts, Refused> {
-    let (mac, chosen) = elect_mac(releases, slug, notes)?;
+    if !valid_slug(slug) {
+        return Err(Refused::BadSlug);
+    }
+    let stable = stable_minor_releases(releases);
+    let (mac, chosen) = elect_mac_from_stable(&stable, slug, notes)?;
     let probe = intel_probe_name(chosen.version());
     let intel_proof = chosen
         .named(&probe)
@@ -534,10 +562,6 @@ pub fn elect(
             name: probe,
         });
     }
-    let stable: Vec<&Release> = stable(releases)
-        .into_iter()
-        .filter(|r| r.version_key().is_some_and(|k| k.2 == 0))
-        .collect();
     let authority = stable
         .iter()
         .copied()

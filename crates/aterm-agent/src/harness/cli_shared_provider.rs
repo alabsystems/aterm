@@ -58,13 +58,15 @@ pub enum Execution {
     Completed,
     NotStarted(String),
     Unknown(String),
+    /// Work may have started, but an authenticated service cannot currently continue it.
+    Deferred(String),
 }
 
 impl Execution {
     fn into_result(self) -> Result<(), String> {
         match self {
             Self::Completed => Ok(()),
-            Self::NotStarted(why) | Self::Unknown(why) => Err(why),
+            Self::NotStarted(why) | Self::Unknown(why) | Self::Deferred(why) => Err(why),
         }
     }
 }
@@ -147,8 +149,10 @@ impl ClaudeOauth {
             .host
             .renew_outcome_with_inputs(path, email, browser, staged.path())
         {
+            Ok(exit) if exit.is_deferred() => Execution::Deferred(exit.failure_words()),
             Ok(exit) if exit.code == 0 => Execution::Completed,
             Ok(exit) => Execution::Unknown(exit.failure_words()),
+            Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),
             Err(why) => Execution::Unknown(why.to_string()),
         }
     }
@@ -236,6 +240,27 @@ impl LoginProof for ClaudeProof {
 }
 
 impl Provider for ClaudeOauth {
+    fn execute_attempt(
+        &self,
+        context: &Context<'_>,
+        row: &accounts::Row,
+        staging: &Path,
+        browser: &RenewBrowser,
+    ) -> Execution {
+        let Some(path) = staging.to_str() else {
+            return Execution::Unknown("staging path is not UTF-8".into());
+        };
+        let Some(email) = row.email.as_deref() else {
+            return Execution::Unknown("approved account has no sign-in email".into());
+        };
+        match context.host.renew_outcome(path, email, browser) {
+            Ok(exit) if exit.is_deferred() => Execution::Deferred(exit.failure_words()),
+            Ok(exit) if exit.code == 0 => Execution::Completed,
+            Ok(exit) => Execution::Unknown(exit.failure_words()),
+            Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),
+            Err(why) => Execution::Unknown(why.to_string()),
+        }
+    }
     fn execute(
         &self,
         context: &Context<'_>,
@@ -243,19 +268,8 @@ impl Provider for ClaudeOauth {
         staging: &Path,
         browser: &RenewBrowser,
     ) -> Result<(), String> {
-        let path = staging.to_str().ok_or("staging path is not UTF-8")?;
-        let email = row
-            .email
-            .as_deref()
-            .ok_or("approved account has no sign-in email")?;
-        let exit = context
-            .host
-            .renew_outcome(path, email, browser)
-            .map_err(|failure| failure.to_string())?;
-        if exit.code != 0 {
-            return Err(exit.failure_words());
-        }
-        Ok(())
+        self.execute_attempt(context, row, staging, browser)
+            .into_result()
     }
     fn observe(
         &self,

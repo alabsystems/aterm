@@ -402,7 +402,12 @@ by_slug!(
 
 /// One line of a taped text: `Redactor::shapes`, with a CR or LF written as a space.
 fn one_line(text: &str) -> String {
-    Redactor::shapes(text).replace(['\r', '\n'], " ")
+    let shaped = Redactor::shapes(text);
+    if shaped.contains(['\r', '\n']) {
+        shaped.replace(['\r', '\n'], " ")
+    } else {
+        shaped
+    }
 }
 
 /// `Replay::Format`: bytes `route_reply` or `git_reply` did not write.
@@ -538,9 +543,9 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
 
 /// One stream's pieces for `git_reply`: `{name} {n}`, then each piece, shaped.
 fn git_stream(out: &mut Vec<u8>, name: &str, bytes: &[u8]) {
-    let pieces: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
-    out.extend_from_slice(format!("\n{name} {}", pieces.len()).as_bytes());
-    for piece in pieces {
+    let count = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
+    out.extend_from_slice(format!("\n{name} {count}").as_bytes());
+    for piece in bytes.split(|&b| b == b'\n') {
         out.push(b'\n');
         out.extend_from_slice(&super::tape::shaped(piece));
     }
@@ -697,9 +702,9 @@ pub(crate) fn stream_decode(bytes: &[u8]) -> Result<std::result::Result<StreamHe
         return decode_failure(rest).map(Err);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| not_a_reply("a stream's head not UTF-8"))?;
-    let mut lines: Vec<&str> = text.split('\n').collect();
+    let mut lines = text.split('\n');
     let last = lines
-        .pop()
+        .next_back()
         .and_then(|line| line.strip_prefix(BODY_FILE))
         .and_then(|rest| rest.strip_prefix(" sha256:"))
         .ok_or_else(|| not_a_reply("a streamed answer without its body-file line"))?;
@@ -710,7 +715,6 @@ pub(crate) fn stream_decode(bytes: &[u8]) -> Result<std::result::Result<StreamHe
     let len = crate::path::digits(len)
         .filter(|_| well_formed)
         .ok_or_else(|| not_a_reply("a body-file line that is not a sha256 digest and a length"))?;
-    let mut lines = lines.into_iter();
     let status = lines
         .next()
         .and_then(|line| line.strip_prefix("status "))
@@ -819,21 +823,11 @@ pub fn decode(bytes: &[u8]) -> Result<std::result::Result<Reply, WireError>> {
     if !bytes.starts_with(b"status ") {
         return Err(not_a_reply("its first line is neither status nor failed"));
     }
-    let mut lines = Vec::new();
-    let mut at = 0;
-    let body_at = loop {
-        let rest = bytes.get(at..).unwrap_or_default();
-        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-            return Err(not_a_reply("no empty line ends its headers"));
-        };
-        let line = rest.get(..end).unwrap_or_default();
-        at += end + 1;
-        if line.is_empty() {
-            break at;
-        }
-        lines.push(line);
+    let Some(sep) = bytes.windows(2).position(|pair| pair == b"\n\n") else {
+        return Err(not_a_reply("no empty line ends its headers"));
     };
-    let mut lines = lines.into_iter();
+    let body_at = sep + 2;
+    let mut lines = bytes.get(..sep).unwrap_or_default().split(|&b| b == b'\n');
     let status = lines
         .next()
         .and_then(|line| line.strip_prefix(b"status "))

@@ -116,9 +116,16 @@
 //! [`Stop::PowerLoss`] on a weak tier keeps a prefix of at least the durable
 //! head (P2, P3) drawn from [`State::allowed_cuts`], and a loss moves the
 //! generation with lineage `(g + 1, kept)` (P4, P7). [`law_check`] holds every
-//! restart to the law. Not modelled: P1 (the model always opens), P8 (no byte
-//! rots), batch boundaries, and a move after a crash on a log off the boot
-//! volume.
+//! restart to the law, and admits too what astream settles for a log that kept
+//! no record: ANOTHER LOG, a fresh id that continues nothing
+//! ([`Restart::another_log`]), which the model never mints. `conform_broker`'s
+//! refinement arm holds the real store's recoveries at each power loss, from
+//! the images astream's simulated device could be left in (every one while an
+//! epoch's subsets fit 64 images, a seeded sample of 64 past that), to
+//! [`State::allowed_cuts`] and [`law_check`] (critic item F10). Not modelled:
+//! P1 (the model always opens), P8 (no byte rots), batch boundaries, and a
+//! move after a crash on a log off the boot volume or opened in a boot it
+//! cannot name (astream takes either crash for a power loss).
 //!
 //! ## Held acks, rolled-back batches and determinism
 //!
@@ -538,6 +545,11 @@ pub(crate) struct State {
     /// thread writes it the moment it lands ([`State::catch_up_tails`]): the differential's
     /// model, held to a real broker's tails; a world explores the tail that has yet to read.
     pub(crate) eager_tails: bool,
+    /// The Ordered tier keeps NO HORIZON (`Ordered { horizon: None }`: only an escalation and an
+    /// open flush in full), as its `Hello` says, and [`Broker::horizon`] flushes nothing: the
+    /// differential's refinement arm (critic item F10), whose real broker keeps none, so what an
+    /// Ordered power-loss image loses is the script's doing alone, never the wall clock's.
+    pub(crate) no_horizon: bool,
     /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s).
     pub(crate) mutant: ArmMutant,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
@@ -735,6 +747,11 @@ pub(crate) enum ArmMutant {
     None,
     /// A power loss may cut below the durable head (breaks P3/P3e).
     CutBelowDurable,
+    /// A power loss keeps every acked record on every tier: a model that takes an Ordered
+    /// barrier or a Relaxed write to the page cache for a full flush, so its allowed cuts
+    /// omit every image a real device leaves below the head (`conform_broker`'s refinement
+    /// arm must find the real store outside them).
+    AckIsDurable,
     /// A power loss that loses acked records moves nothing (breaks P4).
     LoseWithoutMove,
     /// A move whose lineage claims the whole old log (breaks P7).
@@ -847,6 +864,11 @@ pub(crate) enum Event {
     Tick(u64),
     /// A cut at this offset ([`Broker::cut_to`]).
     Cut(u64),
+    /// The broker was set to roll back the next this-many of a node's publishes and group
+    /// commits ([`Broker::refuse_next`]).
+    Refuse(u32),
+    /// The model was told a producer's principal ([`Broker::name_producer`]).
+    Name(u64, String),
 }
 
 /// The simulated broker every connection of a world reaches.
@@ -866,6 +888,11 @@ pub(crate) struct Restart {
     pub(crate) generation_before: u64,
     pub(crate) generation_after: u64,
     pub(crate) lineage_after: Vec<(u64, u64)>,
+    /// The open settled ANOTHER LOG: a fresh log id, as astream mints for a log that kept no
+    /// record, so no offset a reader kept continues (`LogIdentity::continues` answers none)
+    /// and no lineage is owed. The model's own stops never mint one: it moves the generation
+    /// with a step to the records kept, which continues nothing either at a cut to 0.
+    pub(crate) another_log: bool,
 }
 
 impl Broker {
@@ -906,6 +933,7 @@ impl Broker {
                 retain: None,
                 ret: Retained::default(),
                 eager_tails: false,
+                no_horizon: false,
                 mutant: ArmMutant::None,
                 race: None,
                 journal: None,
@@ -1058,9 +1086,9 @@ impl Broker {
 
     /// Tell the model which principal a producer id is (the principal rule).
     pub(crate) fn name_producer(&self, producer: u64, principal: &str) {
-        lock(&self.state)
-            .principals
-            .insert(producer, principal.to_string());
+        let mut s = lock(&self.state);
+        s.note_event(|| Event::Name(producer, principal.to_string()));
+        s.principals.insert(producer, principal.to_string());
     }
 
     /// The trace lines the broker noted since the last take.
@@ -1176,10 +1204,19 @@ impl Broker {
             .collect()
     }
 
-    /// The Ordered horizon's full flush (and nothing on another tier).
+    /// ROLL BACK the next `n` of a node's publishes and group commits, each refused as a batch
+    /// astream could not commit ([`State::refuse_next`]).
+    pub(crate) fn refuse_next(&self, n: u32) {
+        let mut s = lock(&self.state);
+        s.note_event(|| Event::Refuse(n));
+        s.refuse_next = n;
+    }
+
+    /// The Ordered horizon's full flush (and nothing on another tier, or with
+    /// [`State::no_horizon`]).
     pub(crate) fn horizon(&self) {
         let mut s = lock(&self.state);
-        if s.up && s.tier == Tier::Ordered {
+        if s.up && s.tier == Tier::Ordered && !s.no_horizon {
             s.flushed_in_full();
             let line = format!("horizon durable={}", s.durable);
             s.notes.push(line);
@@ -1295,6 +1332,7 @@ impl Broker {
             generation_before,
             generation_after: s.generation,
             lineage_after: s.lineage.clone(),
+            another_log: false,
         }
     }
 
@@ -1469,7 +1507,11 @@ impl State {
     pub(crate) fn allowed_cuts(&self, stop: Stop) -> Vec<u64> {
         let head = self.log.len() as u64;
         match (stop, self.tier) {
-            (Stop::PowerLoss, Tier::Ordered | Tier::Relaxed) => (self.durable..=head).collect(),
+            (Stop::PowerLoss, Tier::Ordered | Tier::Relaxed)
+                if self.mutant != ArmMutant::AckIsDurable =>
+            {
+                (self.durable..=head).collect()
+            }
             _ => vec![head],
         }
     }
@@ -2523,7 +2565,7 @@ impl State {
                     requested: tier,
                     served: tier,
                     reason: ServedReason::None,
-                    horizon_ms: (self.tier == Tier::Ordered).then(|| {
+                    horizon_ms: (self.tier == Tier::Ordered && !self.no_horizon).then(|| {
                         u32::try_from(crate::durability::ORDERED_HORIZON.as_millis())
                             .unwrap_or(u32::MAX - 1)
                     }),
@@ -3479,6 +3521,7 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
         bad.push(format!("P2: kept {} of a {head}-record log", r.kept));
     }
     let lost_acked = r.kept < head;
+    let moved = r.another_log || r.generation_after != r.generation_before;
     match r.stop {
         Stop::Clean | Stop::Crash => {
             if lost_acked {
@@ -3489,8 +3532,8 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
                     r.kept
                 ));
             }
-            if r.generation_after != r.generation_before {
-                bad.push(format!("P5/P6: a {:?} moved the generation", r.stop));
+            if moved {
+                bad.push(format!("P5/P6: a {:?} moved the identity", r.stop));
             }
         }
         Stop::PowerLoss => {
@@ -3513,10 +3556,19 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
                     bad.push(format!("P3e: escalated record @{i} {} lost", rec.subject));
                 }
             }
-            if lost_acked && r.generation_after == r.generation_before {
+            if lost_acked && !moved {
                 bad.push("P4: acked records lost and the identity did not move".to_string());
             }
-            if r.generation_after != r.generation_before {
+            // Another log continues nothing a reader kept, so no lineage is owed (P7); and it
+            // is astream's answer to a log that kept no record, since a reader that forgets its
+            // offsets would take each kept record again.
+            if r.another_log && r.kept > 0 {
+                bad.push(format!(
+                    "P7: another log, {} records kept a reader would take again",
+                    r.kept
+                ));
+            }
+            if moved && !r.another_log {
                 match r.lineage_after.last() {
                     Some(&(g, common)) if g == r.generation_after => {
                         if common > r.kept {

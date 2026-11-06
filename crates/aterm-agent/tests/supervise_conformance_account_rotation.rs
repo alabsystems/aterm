@@ -767,6 +767,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         rules: None,
         pending_input: false,
         interrupted: false,
+        fault: None,
         restartable: true,
         relaunch_off: false,
         resume: None,

@@ -1065,10 +1065,21 @@ fn resolve_cells(
         return Vec::new();
     };
     let mut resolved = vec![resolve_one(first)];
+    // Each cell's thread runs its commands through the caller's executor, as this thread does, so
+    // a caller that owns them (verify's bounded walk) can stop and reap them.
+    let executor = aterm_uds::output::current();
     std::thread::scope(|scope| {
         let running: Vec<_> = rest
             .iter()
-            .map(|cell| scope.spawn(move || resolve_one(cell)))
+            .map(|cell| {
+                let executor = executor.clone();
+                scope.spawn(move || match executor {
+                    Some(executor) => {
+                        aterm_uds::output::with_executor(executor, || resolve_one(cell))
+                    }
+                    None => resolve_one(cell),
+                })
+            })
             .collect();
         resolved.extend(running.into_iter().map(|cell| {
             cell.join()
@@ -1328,6 +1339,42 @@ fn describe(finding: &crate::deny::Finding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every cell's commands go through the executor the caller installed on its thread, the
+    /// cells the walk resolves on threads of its own included, so a caller that owns them (verify's
+    /// bounded walk) can stop and reap each. NEGATIVE CONTROL: a thread that does not inherit the
+    /// executor spawns its `tree` itself, which the executor never counts.
+    #[test]
+    fn every_cells_commands_stay_in_the_callers_custody() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        let executor: std::sync::Arc<aterm_uds::output::Executor> =
+            std::sync::Arc::new(move |_: &mut aterm_uds::spawnfd::Command| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other("refused by the caller"))
+            });
+        let cells: Vec<Cell> = ["one", "two", "three"]
+            .into_iter()
+            .map(|name| Cell {
+                name: name.into(),
+                triple: format!("{name}-unknown-none"),
+                package: "aterm".into(),
+            })
+            .collect();
+        let cargo = resolve::Cargo::pinned("/nonexistent/targo", "/nonexistent");
+        let resolved = aterm_uds::output::with_executor(executor, || {
+            resolve_cells(&cargo, Path::new(env!("CARGO_MANIFEST_DIR")), &cells)
+        });
+        assert_eq!(resolved.len(), cells.len());
+        for (log, cell) in &resolved {
+            let Err(why) = cell else {
+                panic!("the caller refused its command: {log}");
+            };
+            assert!(why.contains("refused by the caller"), "{why}\n{log}");
+        }
+        assert!(asked.load(Ordering::SeqCst) >= cells.len());
+    }
 
     /// A GREEN run whose attest could not diff a fork says so instead of "provenance attested";
     /// the control, with nothing unverified, keeps the plain words.

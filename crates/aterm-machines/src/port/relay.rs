@@ -130,8 +130,7 @@ impl Relaying for Live {
         let stopped = accepter.join();
         let runs = std::mem::take(&mut *self.runs.lock().unwrap_or_else(PoisonError::into_inner));
         for mut run in runs {
-            let _ = run.kill();
-            let _ = run.wait();
+            aterm_uds::deadline::kill_within(&mut run, super::REAP_HANG);
         }
         match stopped {
             Ok(None) => Ok(()),

@@ -239,7 +239,8 @@ fn c1(x: f32) -> String {
 
 /// Cores-worth to two decimals with `c`: `4.13c`.
 pub(super) fn c2(x: f32) -> String {
-    format!("{:.2}c", x.max(0.0))
+    let x = if x.is_finite() { x.max(0.0) } else { 0.0 };
+    format!("{x:.2}c")
 }
 
 fn mc(x: f32) -> u64 {
@@ -255,21 +256,34 @@ const GPU_LANE_OFF: &str = "lane_off:gpu_clients";
 
 /// A share of the device (`1.0` the whole GPU) in per-mille.
 fn gpu_pm(share: f32) -> u64 {
-    (share.max(0.0) * 1000.0).round() as u64
+    if share.is_finite() && share > 0.0 {
+        (f64::from(share) * 1000.0).round() as u64
+    } else {
+        0
+    }
 }
 
 /// A share of the device in parts per million.
 fn gpu_ppm(share: f32) -> u64 {
-    (share.max(0.0) * 1e6).round() as u64
+    if share.is_finite() && share > 0.0 {
+        (f64::from(share) * 1e6).round() as u64
+    } else {
+        0
+    }
 }
 
 /// A share of the device as a sentence says it: `1.5%`.
 fn gpu_share(share: f32) -> String {
-    format!("{:.1}%", share.max(0.0) * 100.0)
+    let s = if share.is_finite() {
+        share.max(0.0)
+    } else {
+        0.0
+    };
+    format!("{:.1}%", s * 100.0)
 }
 
 fn bps_word(b: f64) -> String {
-    let b = b.max(0.0);
+    let b = if b.is_finite() { b.max(0.0) } else { 0.0 };
     if b >= 1e9 {
         format!("{:.1} GB/s", b / 1e9)
     } else if b >= 1e6 {
@@ -1464,6 +1478,10 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 unavailable(jobs_view::missing_why(s))
             ),
         ));
+        lines.push(line(
+            "machine",
+            jobs_view::capacity_text(s, ctx.as_of_unix_ms, ctx.age_ms),
+        ));
         return;
     };
     let rows = if scope == ScopeArg::Global {
@@ -1474,6 +1492,10 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line(
         "jobs",
         format!("jobs  {who} · {}", jobs_view::summary(&rows)),
+    ));
+    lines.push(line(
+        "machine",
+        jobs_view::capacity_text(s, ctx.as_of_unix_ms, ctx.age_ms),
     ));
     let wide = !matches!(scope, ScopeArg::Pane | ScopeArg::Tab);
     let findings = jobs_view::findings_in(&v.findings, &keys, scope == ScopeArg::Global);
@@ -1508,6 +1530,10 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         ScopeArg::Global => "",
     };
     let left = jobs_view::overflow(rows.len(), q.top).map_or_else(String::new, |w| w + " · ");
+    lines.push(note(
+        "scheduling",
+        "Use the job CPU and wait state with these machine readings to choose independent work. Free slots are observations, not reservations; run heavy work through build-slot in its own worktree. Keep one waiter per job.",
+    ));
     lines.push(note(
         "more",
         format!(
@@ -1905,13 +1931,19 @@ fn program_scope_word(scope: ProcScope) -> &'static str {
 /// A program's bytes per hour over the hour's covered time; `None` under a minute of it
 /// ([`ProgramHour::per_hour`]).
 fn program_per_hour(p: &ProgramHour, covered_s: f64) -> Option<u64> {
-    p.per_hour(covered_s).map(|b| b.round() as u64)
+    p.per_hour(covered_s)
+        .filter(|b| b.is_finite() && *b >= 0.0)
+        .map(|b| b.round() as u64)
 }
 
 /// The hour's covered time in whole seconds, rounded down, so `covered_s=60` never stands
 /// beside a figure still warming toward its minute.
 fn covered_whole_s(covered_s: f64) -> u64 {
-    covered_s.floor() as u64
+    if covered_s.is_finite() && covered_s > 0.0 {
+        covered_s.floor() as u64
+    } else {
+        0
+    }
 }
 
 fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
@@ -2791,6 +2823,10 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             }
         }
         View::Jobs => {
+            o.set(
+                "machine",
+                jobs_view::capacity_json(s, ctx.as_of_unix_ms, ctx.age_ms),
+            );
             o.set(
                 "tab",
                 ctx.target

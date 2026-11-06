@@ -59,9 +59,17 @@ verify_island! {
     #[rustfmt::skip]
     #[path = "revocation_binding_island.rs"]
     mod revocation_binding;
+    #[rustfmt::skip]
+    #[path = "capacity_binding_island.rs"]
+    mod capacity_binding;
 }
 verify_island! {
     #[rustfmt::skip]
     #[path = "relay_binding_island.rs"]
     mod relay_binding;
+}
+verify_island! {
+    #[rustfmt::skip]
+    #[path = "no_lost_edit_binding_island.rs"]
+    mod no_lost_edit_binding;
 }

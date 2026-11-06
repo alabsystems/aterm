@@ -15,9 +15,10 @@
 //! * REAL: `Broker::open_opts` on a scratch directory, opened as aterm opens
 //!   its own: [`crate::durability::Durability::options`] (the tier, the
 //!   100 ms Ordered horizon, the escalation table on the weak tiers, aterm's
-//!   16 MiB residency budget), a fixed
-//!   `Boot::Known` and `Volume::Boot` (so a same-boot unclean stop keeps the
-//!   generation), unguarded, and aterm's rules set at every open (the
+//!   16 MiB residency budget), `Boot::Known` (a new boot after each power
+//!   loss; `Boot::Unknown` after a [`Step::RebootUnnamed`]) and `Volume::Boot`
+//!   (so a same-boot unclean stop in a named boot keeps the generation),
+//!   unguarded, and aterm's rules set at every open (the
 //!   world's, `Opts::rules`), or for the journal of a world whose broker was
 //!   unretained, never: what `aterm link broker` serves when setting the rules
 //!   fails. Its retention tick's interval is a year, and the tick setting the
@@ -29,11 +30,11 @@
 //!   back from the file through astream's paged cold tier, as most of the
 //!   history the shipped broker serves does.
 //! * MODEL: `bus::Broker::new` with the same table, retained as the real arm
-//!   is, each connection a raw [`bus::SimStream`]. No held acks, refused
-//!   batches, race or mutant; its tails write what they match before a
-//!   retention lands (`bus::State::eager_tails`), as astream's tail thread
-//!   does, and an open that sets the rules takes astream's first tick
-//!   (`bus::Broker::open_tick`).
+//!   is, each connection a raw [`bus::SimStream`]. No held acks, race or
+//!   mutant, and a rolled-back batch only on the refinement arm (below); its
+//!   tails write what they match before a retention lands
+//!   (`bus::State::eager_tails`), as astream's tail thread does, and an open
+//!   that sets the rules takes astream's first tick (`bus::Broker::open_tick`).
 //!
 //! ## Retention's steps (sim item B05)
 //!
@@ -80,6 +81,41 @@
 //! a told reader's `Fetch` refused as any other or read without its notice
 //! ([`drift`]).
 //!
+//! ## The refinement arm (critic item F10)
+//!
+//! The model is the bridge's adversary: a seed picks any cut at or above the
+//! durable head that P2-P7 allow (`bus::State::allowed_cuts`,
+//! [`bus::law_check`]) and rolls back the node's batches when a world says so
+//! (`bus::State::refuse_next`). The file arms cannot check that the real store
+//! stays inside that law, as a file keeps every record at a power loss and no
+//! write of one fails. The REFINEMENT ARM ([`run_refining`]) replays the
+//! door's journal of each world of [`REFINED`] (power cuts, bus losses and
+//! rolled-back batches on, unretained) on a real broker whose log is on
+//! astream's simulated device (`Broker::open_sim`, a test seam of astream's),
+//! every answer compared as above, and adds three checks:
+//!
+//! * at each power loss, the images the device could be left in
+//!   (`SimDevice::power_loss_images`: every one while an epoch's subsets fit
+//!   [`IMAGES`], a seeded sample of them past that) are opened as the next boot
+//!   opens it, and each must keep a head among the model's allowed cuts, the
+//!   model's records below it, and an identity and lineage `law_check` admits
+//!   ([`refine`]);
+//! * each batch the model rolls back, a publish's, a group commit's or a will's
+//!   a connection's end fires, is one whose real write fails half-way
+//!   (`InjectedFaults::write`), answered as the model answers it
+//!   ([`answer_refused`], [`end`]);
+//! * after every step the real head is the model's, so nothing of a rolled-back
+//!   batch is visible.
+//!
+//! Ordered keeps no horizon there, on both arms (`bus::State::no_horizon`): a
+//! horizon's full flush is the wall clock's, and the model's replay never runs
+//! one, so it could only make the real store keep more than the law asks; with
+//! none, what an image loses is the script's doing alone and the same each run.
+//! Its control ([`ArmMutant::AckIsDurable`]) is a model whose allowed cuts keep
+//! every acked record: on Ordered (a barrier taken for a full flush) and on
+//! Relaxed (a page-cache write taken for one) the images below the head must
+//! fall outside it.
+//!
 //! ## WHAT IT DOES NOT COVER
 //!
 //! * A GUARDED broker: `Attach` is a `Mark` on both arms and nothing is
@@ -94,11 +130,34 @@
 //!   aterm makes no uncarried cut.
 //! * A TAIL THAT HAS YET TO READ WHEN A CUT LANDS: the worlds explore it (told
 //!   the gap instead of handed the records); both arms here write eagerly.
-//! * POWER-LOSS CUTS: [`bus::law_check`]'s (P2-P7). The one power loss here
-//!   keeps the whole log.
-//! * A BATCH ASTREAM ROLLS BACK (a failed commit): the model's is the seeded
-//!   worlds' (`bus::State::refuse_next`), and a journalled world rolls back
-//!   none.
+//! * POWER-LOSS CUTS ON A REAL DISK: the file arms' power loss keeps the whole log;
+//!   the cuts are the refinement arm's, on astream's simulated device, whose images
+//!   are a block-level contract (fcntl(2)'s barrier order, a volatile block landing
+//!   as it reads at the loss, never as an earlier write of it left it), at most
+//!   [`IMAGES`] for each prefix of the barrier epochs and a seeded sample past
+//!   that (none and all always among it), so a loss that needs particular blocks
+//!   among many is tried only if the sample lands on it. Nor the Ordered horizon's
+//!   full flush between batches: the refinement arm keeps none (above). A recovery
+//!   astream settles as ANOTHER LOG (no record kept: a fresh id at generation 0)
+//!   is one [`bus::law_check`] admits (`Restart::another_log`); the model never
+//!   mints one, so no seeded world explores the bridge's answer to it
+//!   (`LogIdentity::continues` answers none for another log, and the reader
+//!   forgets its offsets).
+//! * AN UNCLEAN STOP IN A BOOT THE OPEN CANNOT NAME: aterm opens in
+//!   `Boot::Unknown` on a host whose kernel names no boot
+//!   (`durability::open_with`), and astream then takes every unclean stop of a
+//!   weak tier for a power loss ('it served in a boot it could not name') and
+//!   moves the generation. P6 admits no move at a crash, so that is outside the
+//!   model's law: a script follows a [`Step::RebootUnnamed`] with clean stops
+//!   alone until the next power loss (the runner refuses another), and the
+//!   worlds' power losses reopen in a named boot. The two unnamed reopens of
+//!   `scripts::restarts` are compared.
+//! * A BATCH ASTREAM ROLLS BACK THAT NO FAULT CAN NAME: the refinement arm fails the
+//!   real write of each batch the model rolls back that a script sends alone or a
+//!   connection's end fires; never a will an open fires (astream fires them inside
+//!   its open, before a fault can be armed: [`held_over_the_open`]), and a script
+//!   pipelining a write while one is owed is refused. A failed FULL FLUSH (on a
+//!   weak tier it poisons the log) is astream's own test (`poisoned_log`), not here.
 //! * A WILL LIVE AT A RESTART: astream's connection threads race its
 //!   shutdown; the model fires each producer's latest will at the next open,
 //!   one outcome the race allows, and the scripts end every connection first.
@@ -144,8 +203,28 @@ use crate::durability::Durability;
 /// The hang detector: a wait for what must happen.
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// The boot both arms run in, until a [`Step::Reboot`].
+/// The boot both arms run in until the first power loss ([`Step::PowerLoss`], [`Step::Reboot`]).
 const BOOT: [u8; 16] = *b"aterm-sim-B01-bt";
+
+/// The boot the real arm serves in after `losses` power losses: [`BOOT`], then a new one after each,
+/// which its open names as `aterm link broker`'s does (`Boot::Detect`, the kernel's boot session):
+/// an unclean stop in the boot it served in keeps the generation, one across a power loss moves it
+/// on a weak tier, as the model's do.
+fn boot_after(losses: u64) -> Boot {
+    let mut id = BOOT;
+    if losses > 0 {
+        id[8..].copy_from_slice(&losses.to_be_bytes());
+    }
+    Boot::Known(id)
+}
+
+/// The refinement arm's device blocks, in bytes: the smallest the crash simulation sweeps, so a
+/// write tears at the most places.
+const BLOCK: usize = 16;
+
+/// The images [`refine`] reopens at most for each prefix of a loss's barrier epochs: every subset
+/// of up to six blocks, a sample past that (`SimDevice::power_loss_images`).
+const IMAGES: usize = 64;
 
 /// The connection a world producer's writes ride ([`Event::Publish`]): the
 /// journal's connections count from 1.
@@ -173,8 +252,27 @@ pub(crate) enum Step {
     Stop(Stop),
     /// The broker opens again.
     Start,
-    /// Every connection ends, the broker stops uncleanly, and it opens again in a boot it cannot name, every record kept.
+    /// Every connection ends, the machine loses power, and the broker opens again in the next boot,
+    /// every record kept.
     Reboot,
+    /// A [`Step::Reboot`] whose open cannot name its boot (`Boot::Unknown`: aterm's open on a host
+    /// whose kernel names none, `durability::open_with`), nor can any open after it until the next
+    /// power loss. Astream then takes every unclean stop for a power loss, so a script follows it
+    /// with clean stops alone until that loss (WHAT IT DOES NOT COVER).
+    RebootUnnamed,
+    /// A [`Step::Reboot`]'s stop alone, a [`Step::Start`] to follow (a journal's `Stop(PowerLoss)`): every
+    /// connection ends and the machine loses power, the model keeping every record. On a simulated
+    /// device the images the loss could leave (at most [`IMAGES`] for each prefix of its barrier
+    /// epochs, a seeded sample past that) are first reopened and held to the model's law
+    /// ([`refine`]).
+    PowerLoss,
+    /// The model is told producer `p` is a node's (`bus::Broker::name_producer`), which its
+    /// rolled-back batches pick by; the real arm binds no principal.
+    Name(u64, String),
+    /// The model rolls back the next this-many of a node's publishes and group commits
+    /// (`bus::State::refuse_next`), and the real arm's write fails for each one it refuses
+    /// (`astream_broker::InjectedFaults::write`, [`answer_refused`]).
+    Refuse(u32),
     /// The broker opens again setting no rules: what `aterm link broker` serves when setting them fails.
     StartUnretained,
     /// The broker opens again setting these rules, not its own: a change no aterm build makes
@@ -273,13 +371,38 @@ struct Real {
     /// moves between runs of one script; the cold test holds it only to not being 0.
     answered_cold: u64,
     boot: Boot,
+    /// The power losses so far ([`boot_after`]).
+    losses: u64,
     /// Producers whose `/a/will` record the log holds: what an open fires,
     /// one firing each.
     will_producers: BTreeSet<u64>,
     /// Wills queued to this broker's writer since its open: what
     /// `wills_settled` must reach before the log is read again.
     queued: u64,
+    /// The REFINEMENT ARM's device (critic item F10): the log lives on astream's simulated
+    /// device in place of the scratch directory, and each power loss's images are reopened
+    /// and held to the model's law ([`refine`]). `None`: the log is a file.
+    device: Option<astream_broker::SimDevice>,
+    /// What the refinement arm found so far.
+    refined: Refined,
     dir: Scratch,
+}
+
+/// What the refinement arm saw over one run ([`refine`], [`answer_refused`]).
+#[derive(Debug, Default)]
+struct Refined {
+    /// Power losses whose images were reopened.
+    losses: u64,
+    /// Images reopened, every one a restart the model's law admits.
+    images: u64,
+    /// Images that lost acked records (the generation moved, or another log).
+    lost: u64,
+    /// Images astream opened as ANOTHER LOG (a fresh id: none of the old one's records kept).
+    another_log: u64,
+    /// Losses whose images were a sample, not every image the device allows.
+    sampled: u64,
+    /// Publishes and group commits the model rolled back and the real arm's write failed.
+    refused: u64,
 }
 
 struct RealConn {
@@ -366,18 +489,30 @@ impl Real {
         at_rest: Option<[u8; 32]>,
         resident_budget: Option<usize>,
     ) -> Self {
+        let mut real = Self::new_unopened(tier, retain, at_rest, resident_budget);
+        real.open();
+        real
+    }
+
+    fn new_unopened(
+        tier: Tier,
+        retain: Option<astream_broker::Retention>,
+        at_rest: Option<[u8; 32]>,
+        resident_budget: Option<usize>,
+    ) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
             .tempdir_in("/tmp")
             .expect("a scratch dir");
-        let mut real = Self {
+        Self {
             dir: Scratch {
                 dir: Some(dir),
                 keep: Arc::new(AtomicBool::new(false)),
             },
             durability: durability(tier),
             retain,
-            boot: Boot::Known(BOOT),
+            boot: boot_after(0),
+            losses: 0,
             at_rest,
             resident_budget,
             cold_before: 0,
@@ -386,7 +521,17 @@ impl Real {
             conns: BTreeMap::new(),
             will_producers: BTreeSet::new(),
             queued: 0,
-        };
+            device: None,
+            refined: Refined::default(),
+        }
+    }
+
+    /// The REFINEMENT ARM (critic item F10): aterm's broker of `tier` with its log on a fresh
+    /// simulated device of [`BLOCK`]-byte blocks, its socket in a scratch directory; unretained,
+    /// since retention's rewrite is a file's and refused on the device.
+    fn on_device(tier: Tier) -> Self {
+        let mut real = Self::new_unopened(tier, None, None, None);
+        real.device = Some(astream_broker::SimDevice::new(BLOCK));
         real.open();
         real
     }
@@ -421,21 +566,36 @@ impl Real {
         holding
     }
 
-    /// Open again setting `rules`, or none.
-    fn open_setting(&mut self, rules: Option<astream_broker::Retention>) {
+    /// What every open of this arm takes in `boot`: aterm's options ([`Durability::options`])
+    /// with this arm's budget and seal, and on the refinement arm an Ordered tier with no
+    /// horizon (`bus::State::no_horizon`).
+    fn options(&self, boot: Boot) -> astream_broker::OpenOptions {
         let mut opts = self.durability.options();
         if let Some(budget) = self.resident_budget {
             opts.resident_budget = Some(budget);
         }
-        opts.boot = self.boot;
+        if self.device.is_some() && self.durability == Durability::Ordered {
+            opts.durability = astream_broker::Durability::Ordered { horizon: None };
+        }
+        opts.boot = boot;
         opts.volume = Volume::Boot;
         opts.require_bound_at_rest = self.at_rest.is_some();
         opts.at_rest_key = self.at_rest;
-        let broker =
-            astream_broker::Broker::open_opts(self.dir.path().join("bus.log"), opts, || {
-                Ok(astream_broker::Prepared::Nothing)
-            })
-            .expect("the real broker opens");
+        opts
+    }
+
+    /// Open again setting `rules`, or none.
+    fn open_setting(&mut self, rules: Option<astream_broker::Retention>) {
+        let opts = self.options(self.boot);
+        let broker = match &self.device {
+            Some(device) => astream_broker::Broker::open_sim(device, opts),
+            None => {
+                astream_broker::Broker::open_opts(self.dir.path().join("bus.log"), opts, || {
+                    Ok(astream_broker::Prepared::Nothing)
+                })
+            }
+        }
+        .expect("the real broker opens");
         // The tick's own clock is the wall clock: a year between its ticks, so the only
         // ones it takes by itself are the one setting the rules asks for at once and the ones
         // a batch past a class's room asks for (none under aterm's rules at their bytes).
@@ -548,13 +708,24 @@ impl Real {
             .expect("write to the real broker");
     }
 
+    /// The next answer on `c`. A simulated device shares no device with any file, so the
+    /// refinement arm's `Hello` names none (astream's `Backing::device`), where the model's
+    /// names the Apple device it simulates: that arm's `Hello` is read as naming one, every
+    /// other word of it compared as the file arms' are.
     fn read(&mut self, c: u64) -> Response {
         let conn = self.conns.get_mut(&c).expect("a live real connection");
-        match read_frame(&mut conn.stream) {
+        let mut resp = match read_frame(&mut conn.stream) {
             Ok(Some(frame)) => decode_response(&frame).expect("a frame astream decodes"),
             Ok(None) => panic!("the real broker closed connection {c}"),
             Err(e) => panic!("no answer from the real broker on {c} in {HANG:?}: {e}"),
+        };
+        if let (Some(_), Response::Nonce { ext, .. }) = (&self.device, &mut resp) {
+            ext.device.get_or_insert(astream_broker::LogDevice {
+                dev: 0,
+                flush_drains_device: true,
+            });
         }
+        resp
     }
 
     /// `c` is a tail now: a thread reads its frames.
@@ -636,10 +807,18 @@ impl Real {
         drop(broker);
     }
 
-    fn reboot(&mut self) {
+    /// The machine loses power: the broker stops as a killed process does, and its next open
+    /// is in the next boot ([`boot_after`]), or, not `named`, in one it cannot name
+    /// ([`Step::RebootUnnamed`]). The device keeps every record, as a file does; the images a
+    /// power loss could leave are [`refine`]'s.
+    fn lose_power(&mut self, named: bool) {
         self.stop(Stop::Crash);
-        self.boot = Boot::Unknown;
-        self.open();
+        self.losses += 1;
+        self.boot = if named {
+            boot_after(self.losses)
+        } else {
+            Boot::Unknown
+        };
     }
 
     /// A retention tick at `now_ms`; the log's base after it.
@@ -737,11 +916,10 @@ impl Model {
         self.core.broker.stop(how, &mut super::Rng::new(0));
     }
 
-    fn reboot(&mut self) {
+    /// The machine loses power, every record kept.
+    fn lose_power(&mut self) {
         self.end_all();
         self.core.broker.stop_keeping_all(Stop::PowerLoss);
-        self.core.broker.start();
-        self.core.broker.open_tick();
     }
 
     /// A retention tick at `now_ms`; the log's base after it.
@@ -947,10 +1125,34 @@ fn run_keeping(
     mutant: ArmMutant,
     steps: &[Step],
 ) -> Result<Real, String> {
+    let real = Real::new(tier, retain.clone(), at_rest, resident_budget);
+    run_arms(tier, real, retain, mutant, steps)
+}
+
+/// THE REFINEMENT ARM'S RUN (critic item F10): `steps` on aterm's broker of `tier` with its log
+/// on a simulated device ([`Real::on_device`]) and on the model, unretained, compared answer by
+/// answer as every run is, Ordered keeping no horizon on both (`bus::State::no_horizon`); at
+/// each power loss the images the device could be left in (at most [`IMAGES`] for each prefix
+/// of the barrier epochs, a sample past that) are reopened and held to the model's law
+/// ([`refine`]), and each batch the model rolls back is a write the real arm fails
+/// ([`answer_refused`]). What it found.
+fn run_refining(tier: Tier, mutant: ArmMutant, steps: &[Step]) -> Result<Refined, String> {
+    run_arms(tier, Real::on_device(tier), None, mutant, steps).map(|real| real.refined)
+}
+
+/// The steps of a run on `real` and on the model retained by `retain`, or not.
+fn run_arms(
+    tier: Tier,
+    mut real: Real,
+    retain: Option<astream_broker::Retention>,
+    mutant: ArmMutant,
+    steps: &[Step],
+) -> Result<Real, String> {
     let table = table(tier);
     let clock = Clock::new();
-    let mut real = Real::new(tier, retain.clone(), at_rest, resident_budget);
     let mut model = Model::new(tier, retain, mutant);
+    // The refinement arm's Ordered keeps no horizon, as its real broker does ([`Real::options`]).
+    lock(&model.core.broker.state).no_horizon = real.device.is_some();
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
     for (i, step) in steps.iter().enumerate() {
@@ -973,19 +1175,35 @@ fn run_keeping(
                 model.dial(*c);
             }
             Step::Send(c, req) => {
-                answer(
-                    &mut real,
-                    &mut model,
-                    *c,
-                    std::slice::from_ref(req),
-                    &table,
-                    &mut laws,
-                    tier,
-                )
+                let refusing = owed(&model) > 0
+                    && matches!(req, Request::Publish { .. } | Request::Commit { .. });
+                if refusing {
+                    answer_refused(&mut real, &mut model, *c, req, &table, &mut laws, tier)
+                } else {
+                    answer(
+                        &mut real,
+                        &mut model,
+                        *c,
+                        std::slice::from_ref(req),
+                        &table,
+                        &mut laws,
+                        tier,
+                    )
+                }
                 .map_err(|e| at(&e))?;
                 answers += 1;
             }
             Step::Pipeline(c, reqs) => {
+                if owed(&model) > 0
+                    && reqs
+                        .iter()
+                        .any(|r| matches!(r, Request::Publish { .. } | Request::Commit { .. }))
+                {
+                    return Err(at(
+                        "a pipelined write while the model owes a rolled-back batch: no fault \
+                         the real arm arms fails one write of a pipeline",
+                    ));
+                }
                 answer(&mut real, &mut model, *c, reqs, &table, &mut laws, tier)
                     .map_err(|e| at(&e))?;
                 answers += reqs.len() as u64;
@@ -1008,33 +1226,47 @@ fn run_keeping(
                     answers += 1;
                 }
             }
-            Step::End(c) => {
-                real.end(*c);
-                model.end(*c);
-            }
+            Step::End(c) => end(&mut real, &mut model, *c),
             Step::Stop(how) => {
-                assert_ne!(*how, Stop::PowerLoss, "a power loss is a Reboot step");
+                assert_ne!(*how, Stop::PowerLoss, "a power loss is a PowerLoss step");
+                assert!(
+                    *how == Stop::Clean || !matches!(real.boot, Boot::Unknown),
+                    "an unclean stop in a boot the open cannot name moves a weak tier's \
+                     generation, which the model's law does not admit (WHAT IT DOES NOT COVER)"
+                );
+                end_all(&mut real, &mut model);
                 real.stop(*how);
                 model.stop(*how);
             }
-            Step::Start => {
+            Step::Start => held_over_the_open(&model, || {
                 real.open();
                 model.core.broker.start();
                 model.core.broker.open_tick();
+            }),
+            Step::PowerLoss | Step::Reboot | Step::RebootUnnamed => {
+                let named = !matches!(step, Step::RebootUnnamed);
+                lose_power(&mut real, &mut model, tier, i, named).map_err(|e| at(&e))?;
+                if !matches!(step, Step::PowerLoss) {
+                    held_over_the_open(&model, || {
+                        real.open();
+                        model.core.broker.start();
+                        model.core.broker.open_tick();
+                    });
+                }
             }
-            Step::Reboot => {
-                real.reboot();
-                model.reboot();
+            Step::Refuse(n) => model.core.broker.refuse_next(*n),
+            Step::Name(producer, principal) => {
+                model.core.broker.name_producer(*producer, principal);
             }
-            Step::StartUnretained => {
+            Step::StartUnretained => held_over_the_open(&model, || {
                 real.open_setting(None);
                 model.core.broker.start_unretained();
-            }
-            Step::StartWith(rules) => {
+            }),
+            Step::StartWith(rules) => held_over_the_open(&model, || {
                 real.open_setting(Some(rules.clone()));
                 model.core.broker.start_with(rules.clone());
                 model.core.broker.open_tick();
-            }
+            }),
             Step::Tick(rel) => {
                 let now = clock.at(*rel);
                 let (r, m) = (real.tick(now), model.tick(now));
@@ -1074,6 +1306,17 @@ fn run_keeping(
         if let Some(cold) = compared {
             real.answered_cold += real.cold_reads() - cold;
         }
+        // Between steps the refinement arm's log holds what the model's does, so nothing of a
+        // rolled-back batch (a publish's, a commit's, a fired will's) is visible past one.
+        if real.device.is_some() && real.up.is_some() {
+            let (r, m) = (
+                real.broker().head(),
+                lock(&model.core.broker.state).log.len() as u64,
+            );
+            if r != m {
+                return Err(at(&format!("the real head is {r}, the model's {m}")));
+            }
+        }
     }
     assert!(answers > 0, "a script that compared nothing");
     Ok(real)
@@ -1099,37 +1342,303 @@ fn answer(
         loop {
             let r = real.read(c);
             let m = model.read(c);
-            let (rp, rd) = project(tier, &r);
-            let (mp, md) = project(tier, &m);
-            if rp != mp {
-                return Err(format!("{req:?}: real {rp}, model {mp}"));
-            }
-            for (who, (law, d)) in ["real", "model"]
-                .into_iter()
-                .zip(laws.iter_mut().zip([rd, md]))
-            {
-                if let Some((durable, head)) = d {
-                    law.judge(durable, head)
-                        .map_err(|e| format!("{req:?}: the {who} arm's {e}"))?;
-                }
-            }
-            if let Response::PublishAck { offset, .. } = r {
-                if escalated(table, req) {
-                    for law in laws.iter_mut() {
-                        law.floor = law.floor.max(offset + 1);
-                    }
-                }
-            }
-            if let (Request::Will { producer_id, .. }, Response::Mark { .. }) = (req, &r) {
-                if let Some(conn) = real.conns.get_mut(&c) {
-                    conn.will = Some(*producer_id);
-                }
-                real.will_producers.insert(*producer_id);
-            }
+            compare(real, c, req, &r, &m, table, laws, tier)?;
             if ends(req, &r) {
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+/// A BATCH THE MODEL ROLLS BACK, ON BOTH ARMS (critic item F10): `req` goes to the model first,
+/// and when the model spends one of its `refuse_next` on it the real arm's next write fails
+/// half-way (`InjectedFaults::write`) while `req` is served there, as a disk that fills does;
+/// then every answer is compared as [`answer`] compares them, and after a refusal the real
+/// head must be the model's: nothing of the rolled-back batch visible.
+fn answer_refused(
+    real: &mut Real,
+    model: &mut Model,
+    c: u64,
+    req: &Request,
+    table: &Escalation,
+    laws: &mut [Law; 2],
+    tier: Tier,
+) -> Result<(), String> {
+    let before = owed(model);
+    model.write(c, std::slice::from_ref(req));
+    let mut modelled = Vec::new();
+    loop {
+        let m = model.read(c);
+        let end = ends(req, &m);
+        modelled.push(m);
+        if end {
+            break;
+        }
+    }
+    let refused = owed(model) < before;
+    if refused {
+        real.broker().inject_faults(astream_broker::InjectedFaults {
+            write: true,
+            sync: false,
+            truncate: false,
+        });
+    }
+    real.write(c, std::slice::from_ref(req));
+    let mut answered = Vec::new();
+    loop {
+        let r = real.read(c);
+        let end = ends(req, &r);
+        answered.push(r);
+        if end {
+            break;
+        }
+    }
+    if refused {
+        real.broker()
+            .inject_faults(astream_broker::InjectedFaults::default());
+        real.refined.refused += 1;
+    }
+    if answered.len() != modelled.len() {
+        return Err(format!(
+            "{req:?}: real {answered:?}, model {modelled:?} (refused={refused})"
+        ));
+    }
+    for (r, m) in answered.iter().zip(&modelled) {
+        compare(real, c, req, r, m, table, laws, tier)?;
+    }
+    let (real_head, model_head) = (
+        real.broker().head(),
+        lock(&model.core.broker.state).log.len() as u64,
+    );
+    if refused && real_head != model_head {
+        return Err(format!(
+            "{req:?}: rolled back, the real head is {real_head} and the model's {model_head}"
+        ));
+    }
+    Ok(())
+}
+
+/// One answer `r` of the real arm and `m` of the model to `req` on `c`, compared ([`project`]),
+/// each `Mark`'s durable head held to its arm's [`Law`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two answers, the request, its connection and the run's table, laws and tier"
+)]
+fn compare(
+    real: &mut Real,
+    c: u64,
+    req: &Request,
+    r: &Response,
+    m: &Response,
+    table: &Escalation,
+    laws: &mut [Law; 2],
+    tier: Tier,
+) -> Result<(), String> {
+    let (rp, rd) = project(tier, r);
+    let (mp, md) = project(tier, m);
+    if rp != mp {
+        return Err(format!("{req:?}: real {rp}, model {mp}"));
+    }
+    for (who, (law, d)) in ["real", "model"]
+        .into_iter()
+        .zip(laws.iter_mut().zip([rd, md]))
+    {
+        if let Some((durable, head)) = d {
+            law.judge(durable, head)
+                .map_err(|e| format!("{req:?}: the {who} arm's {e}"))?;
+        }
+    }
+    if let Response::PublishAck { offset, .. } = r {
+        if escalated(table, req) {
+            for law in laws.iter_mut() {
+                law.floor = law.floor.max(offset + 1);
+            }
+        }
+    }
+    if let (Request::Will { producer_id, .. }, Response::Mark { .. }) = (req, r) {
+        if let Some(conn) = real.conns.get_mut(&c) {
+            conn.will = Some(*producer_id);
+        }
+        real.will_producers.insert(*producer_id);
+    }
+    Ok(())
+}
+
+/// The rolled-back batches the model still owes (`bus::State::refuse_next`).
+fn owed(model: &Model) -> u32 {
+    lock(&model.core.broker.state).refuse_next
+}
+
+/// The connection `c` ends on both arms, the model first: when the will it fires there is a batch
+/// the model rolls back, the real arm's write fails while its will fires (critic item F10).
+fn end(real: &mut Real, model: &mut Model, c: u64) {
+    let before = owed(model);
+    model.end(c);
+    let refused = owed(model) < before;
+    if refused {
+        real.broker().inject_faults(astream_broker::InjectedFaults {
+            write: true,
+            sync: false,
+            truncate: false,
+        });
+    }
+    real.end(c);
+    if refused {
+        real.broker()
+            .inject_faults(astream_broker::InjectedFaults::default());
+        real.refined.refused += 1;
+    }
+}
+
+/// Every connection ends on both arms, in order ([`end`]).
+fn end_all(real: &mut Real, model: &mut Model) {
+    let ids: BTreeSet<u64> = real
+        .conns
+        .keys()
+        .chain(model.conns.keys())
+        .copied()
+        .collect();
+    for c in ids {
+        end(real, model, c);
+    }
+}
+
+/// `open` opens both arms, a rolled-back batch the model owes held over it: astream fires the
+/// wills a log holds inside its open, before any fault can be armed on the broker, so no will an
+/// open fires is one the model rolls back here (critic item F10), as the worlds' own model may.
+fn held_over_the_open(model: &Model, open: impl FnOnce()) {
+    let owed = std::mem::take(&mut lock(&model.core.broker.state).refuse_next);
+    open();
+    lock(&model.core.broker.state).refuse_next = owed;
+}
+
+/// The machine loses power on both arms: every connection ends, the real broker stops as a
+/// killed process does and the model keeps every record, each to open again in another boot
+/// (one the real arm's open cannot name unless `named`). On the refinement arm the images its
+/// device could be left in ([`refine`]: at most [`IMAGES`] for each prefix of the barrier epochs,
+/// a sample past that) are first held to the model's law.
+fn lose_power(
+    real: &mut Real,
+    model: &mut Model,
+    tier: Tier,
+    step: usize,
+    named: bool,
+) -> Result<(), String> {
+    end_all(real, model);
+    let before = real.broker().log_identity();
+    let head = real.broker().head();
+    real.lose_power(named);
+    if let Some(device) = real.device.clone() {
+        let opts = real.options(real.boot);
+        refine(
+            &device,
+            opts,
+            before,
+            head,
+            model,
+            tier,
+            step,
+            &mut real.refined,
+        )?;
+    }
+    model.lose_power();
+    Ok(())
+}
+
+/// THE REFINEMENT AT ONE POWER LOSS (critic item F10): the real store's recoveries stay inside
+/// the model's law. The model is the bridge's adversary, a spec-level over-approximation whose
+/// seed chooses any cut at or above the durable head P2-P7 allow (`bus::State::allowed_cuts`,
+/// [`bus::law_check`]); here the direction it cannot check itself: the images astream's
+/// simulated device could be left in after this loss (`SimDevice::power_loss_images`: every
+/// one while they fit [`IMAGES`] for each prefix of the barrier epochs since the last full
+/// flush, a sample seeded by the step beyond that, none and all always among it) are each
+/// opened as the next boot opens it (`BrokerLog::open_sim`, aterm's options, in the boot it
+/// opens in next), and each must
+///
+/// * open (P1: the model always opens);
+/// * keep a head among the model's allowed cuts;
+/// * hold, below it, the model's records: each subject, and each visible record's body;
+/// * be a restart [`bus::law_check`] admits, its identity and lineage as astream settled them.
+///
+/// The arms must agree before the loss on the head and the generation, as their answers did.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the device and how it opens, what the real arm told, the model, and the tally"
+)]
+fn refine(
+    device: &astream_broker::SimDevice,
+    opts: astream_broker::OpenOptions,
+    before: astream_broker::LogIdentity,
+    head: u64,
+    model: &Model,
+    tier: Tier,
+    step: usize,
+    refined: &mut Refined,
+) -> Result<(), String> {
+    let (cuts, oracle, mut restart) = {
+        let s = lock(&model.core.broker.state);
+        let restart = bus::Restart {
+            stop: Stop::PowerLoss,
+            tier,
+            before: s.log.clone(),
+            durable_before: s.durable,
+            kept: 0,
+            generation_before: s.generation,
+            generation_after: s.generation,
+            lineage_after: Vec::new(),
+            another_log: false,
+        };
+        (s.allowed_cuts(Stop::PowerLoss), s.oracle.clone(), restart)
+    };
+    let modelled = restart.before.len() as u64;
+    if head != modelled || before.generation != restart.generation_before {
+        return Err(format!(
+            "before the loss the real arm stood at head {head} under {before}, the model at \
+             head {modelled} in generation {}",
+            restart.generation_before
+        ));
+    }
+    let (images, every) = device.power_loss_images(IMAGES, 0xF10 ^ step as u64);
+    refined.losses += 1;
+    refined.sampled += u64::from(!every);
+    for (n, image) in images.iter().enumerate() {
+        let log = astream_broker::BrokerLog::open_sim(image, opts.clone())
+            .map_err(|e| format!("P1: the next boot refused power-loss image {n}: {e}"))?;
+        let kept = log.head().0;
+        let now = log.identity();
+        let at =
+            |what: String| format!("power-loss image {n} (kept {kept} of {head}, {now}): {what}");
+        if !cuts.contains(&kept) {
+            return Err(at(format!(
+                "no cut the model's law allows ({:?}..={:?})",
+                cuts.first(),
+                cuts.last()
+            )));
+        }
+        for rec in log.read_from(astream_wire::Offset::ZERO) {
+            let at_off = usize::try_from(rec.seq.0).unwrap_or(usize::MAX);
+            let Some(m) = restart.before.get(at_off) else {
+                return Err(at(format!("a record @{} past the model's log", rec.seq.0)));
+            };
+            if rec.subject != m.subject || (!m.hidden() && rec.body != m.body) {
+                return Err(at(format!(
+                    "@{}: {} {:?}, the model's {} {:?}",
+                    rec.seq.0, rec.subject, rec.body, m.subject, m.body
+                )));
+            }
+        }
+        restart.kept = kept;
+        restart.generation_after = now.generation;
+        restart.lineage_after = log.lineage().steps().to_vec();
+        restart.another_log = now.id != before.id;
+        let bad = bus::law_check(&restart, &oracle);
+        if !bad.is_empty() {
+            return Err(at(format!("the model's law: {bad:?}")));
+        }
+        refined.images += 1;
+        refined.lost += u64::from(kept < head);
+        refined.another_log += u64::from(restart.another_log);
     }
     Ok(())
 }
@@ -1179,8 +1688,21 @@ fn replay(journal: &[Event]) -> Vec<Step> {
             }
             Event::Stop(how) => {
                 steps.push(Step::Tick(last));
-                steps.push(Step::Stop(*how));
+                steps.push(if *how == Stop::PowerLoss {
+                    Step::PowerLoss
+                } else {
+                    Step::Stop(*how)
+                });
                 world_dialled = false;
+            }
+            Event::Refuse(n) => steps.push(Step::Refuse(*n)),
+            // A node's name alone: the real arm binds no principal (it is unguarded), so the model
+            // learns none its table's principal rule reads (`h-`); a node's is what its rolled-back
+            // batches are picked by (`bus::State::refuse_next`).
+            Event::Name(producer, principal) => {
+                if principal.starts_with("n-") {
+                    steps.push(Step::Name(*producer, principal.clone()));
+                }
             }
             Event::Start => steps.push(Step::Start),
             Event::StartUnretained => steps.push(Step::StartUnretained),
@@ -1823,7 +2345,10 @@ pub(crate) mod scripts {
         s
     }
 
-    /// RESTARTS: a clean close, an unclean stop in the same boot, and a reopen in a boot the open cannot name.
+    /// RESTARTS: a clean close, an unclean stop in the same boot, a reopen after a power loss in the
+    /// next boot, and two in boots the open cannot name ([`Step::RebootUnnamed`]): the first over a
+    /// log a named boot's open recorded, the second over one an unnamed boot's open recorded, which
+    /// astream must take for another boot too.
     pub(crate) fn restarts() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
@@ -1854,8 +2379,21 @@ pub(crate) mod scripts {
             Step::Send(5, Request::Hello),
         ];
         s.extend(look(5));
-        s.extend([Step::Reboot, Step::Dial(6), Step::Send(6, Request::Hello)]);
-        s.extend(look(6));
+        s.extend([
+            Step::RebootUnnamed,
+            Step::Dial(6),
+            Step::Send(6, Request::Hello),
+            Step::Send(6, publish(P, seq(3, 2), LANE, "m4")),
+            Step::Stop(super::Stop::Clean),
+            Step::Start,
+            Step::Dial(7),
+            Step::Send(7, Request::Hello),
+            Step::Send(7, publish(P, seq(3, 3), LANE, "m5")),
+            Step::RebootUnnamed,
+            Step::Dial(8),
+            Step::Send(8, Request::Hello),
+        ]);
+        s.extend(look(8));
         s
     }
 
@@ -2515,6 +3053,109 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// THE WORLDS whose journals the refinement arm replays (critic item F10), `(seed, tier)`: two a
+/// tier, each with power cuts, bus losses and rolled-back batches, on an unretained broker
+/// ([`refined_opts`]).
+const REFINED: &[(u64, Tier)] = &[
+    (1, Tier::Strict),
+    (5, Tier::Strict),
+    (2, Tier::Ordered),
+    (6, Tier::Ordered),
+    (3, Tier::Relaxed),
+    (7, Tier::Relaxed),
+];
+
+/// A world of [`REFINED`]: [`journalled_opts`]' with what the refinement arm holds the real store
+/// to switched on — the machine losing power, the broker alone losing it, batches the model rolls
+/// back — and unretained (retention's rewrite is a file's, refused on a simulated device).
+fn refined_opts(seed: u64, tier: Tier) -> super::world::Opts {
+    super::world::Opts {
+        power_cuts: true,
+        bus_losses: true,
+        refused_batches: true,
+        retained: false,
+        ..journalled_opts(seed, tier)
+    }
+}
+
+/// **THE REAL STORE'S RECOVERIES AND ROLLED-BACK BATCHES STAY INSIDE THE MODEL'S LAW** (critic
+/// item F10): the door's journal of each of the [`REFINED`] worlds, replayed on the refinement arm
+/// ([`run_refining`]): every answer compared as every run's are, the images each power loss could
+/// leave on astream's simulated device (at most [`IMAGES`] for each prefix of its barrier epochs, a
+/// seeded sample past that) reopened and held to the model's law ([`refine`]), and each batch the
+/// model rolled back a write the real arm failed, nothing of it visible ([`answer_refused`]). Not
+/// vacuous: every world loses power, an Ordered and a Relaxed log (neither keeps a horizon there,
+/// so their losses are the journal's alone) each lose acked records in some image, and some batch
+/// is refused.
+#[test]
+fn the_real_stores_recoveries_and_rolled_back_batches_stay_inside_the_models_law() {
+    let worlds: Vec<(u64, Tier)> = REFINED.to_vec();
+    let refined = aterm_spec::check::each(&worlds, |&(seed, tier)| {
+        let out = super::world::run(&refined_opts(seed, tier));
+        assert!(
+            out.violations.is_empty(),
+            "seed {seed}'s world broke a law: {:?}",
+            out.violations
+        );
+        let steps = replay(&out.journal);
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Cut(_))),
+            "seed {seed}: an unretained world cut its log"
+        );
+        let verdict = run_refining(tier, ArmMutant::None, &steps)
+            .map_err(|e| format!("seed {seed} at {tier}: {e}"));
+        (seed, tier, verdict)
+    });
+    let mut failed = Vec::new();
+    let mut lost = BTreeMap::<String, u64>::new();
+    let mut refused = 0u64;
+    for (seed, tier, verdict) in &refined {
+        match verdict {
+            Ok(r) => {
+                eprintln!("seed {seed} at {tier}: {r:?}");
+                assert!(r.losses > 0, "seed {seed} at {tier}: no power loss");
+                *lost.entry(tier.to_string()).or_default() += r.lost;
+                refused += r.refused;
+            }
+            Err(e) => failed.push(e.as_str()),
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "the real store stepped outside the model:\n{}",
+        failed.join("\n")
+    );
+    for tier in [Tier::Ordered, Tier::Relaxed] {
+        assert!(
+            lost.get(&tier.to_string()).is_some_and(|&n| n > 0),
+            "no {tier} image lost an acked record: the refinement judged no cut there"
+        );
+    }
+    assert!(refused > 0, "no batch was rolled back on the real arm");
+}
+
+/// CONTROL for the refinement arm: a model whose allowed cuts keep every acked record
+/// ([`ArmMutant::AckIsDurable`]) omits the images a real device leaves below the head, and on the
+/// first world of each weak tier the refinement arm must find the real store outside it: on
+/// Ordered a barrier taken for a full flush, on Relaxed a page-cache write taken for one.
+#[test]
+fn control_a_model_that_takes_every_ack_for_durable_has_the_real_store_outside_it() {
+    for weak in [Tier::Ordered, Tier::Relaxed] {
+        let &(seed, tier) = REFINED
+            .iter()
+            .find(|(_, tier)| *tier == weak)
+            .expect("a world of each weak tier");
+        let steps = replay(&super::world::run(&refined_opts(seed, tier)).journal);
+        let Err(err) = run_refining(tier, ArmMutant::AckIsDurable, &steps) else {
+            panic!("CONTROL AckIsDurable at {tier}: the real store stayed inside a model that loses nothing");
+        };
+        assert!(
+            err.contains("no cut the model's law allows"),
+            "CONTROL AckIsDurable at {tier} failed for another reason: {err}"
+        );
+    }
 }
 
 /// **WHAT A RECLAIMING BRIDGE SENT, ASTREAM ANSWERS AS THE MODEL DID** (sim item B02):

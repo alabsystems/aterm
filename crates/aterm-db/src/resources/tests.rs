@@ -645,6 +645,26 @@ fn cli_proposals_do_not_activate_and_reservations_do_not_execute_provider_work()
     );
 }
 
+/// A share whose debits ran past its limit (which `Ledger::read` refuses to read) reports nothing
+/// left, never a wrapped count or an overflow panic; a share with room left reports exactly it.
+#[test]
+fn a_share_status_never_reports_room_past_its_limit() {
+    let actor = [7; 48];
+    let past = command::share_status(&actor, 2, 3);
+    assert_eq!(past["unreserved_upper_bound"].as_u64(), Some(0));
+    assert_eq!(past["reserved_lower_bound"].as_u64(), Some(3));
+    assert_eq!(
+        command::share_status(&actor, 2, u64::MAX)["unreserved_upper_bound"].as_u64(),
+        Some(0)
+    );
+    let within = command::share_status(&actor, 5, 3);
+    assert_eq!(within["unreserved_upper_bound"].as_u64(), Some(2));
+    assert_eq!(
+        within["actor"].as_str(),
+        Some(hex::encode_lower(&actor).as_str())
+    );
+}
+
 pub(crate) fn reservation_transition(
     state: &aterm_spec::interp::State,
     action: &str,

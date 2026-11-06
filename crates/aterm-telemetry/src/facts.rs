@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::row::{Digest, SCHEMA, find, host_word, seal, word_of};
+use crate::row::{Digest, SCHEMA, find, host_word, push_word_of, seal};
 
 /// The machine and the build a row was measured on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,20 +49,24 @@ impl HostFacts {
         }
     }
 
-    /// The facts as the log spells them: each text a word ([`word_of`]).
+    /// The facts as the log spells them: each text a word ([`crate::row::word_of`]).
     fn fields(&self) -> String {
         let mut s = String::with_capacity(128);
-        let _ = write!(
-            s,
-            "host={} model={} cpu={} cores={} mem_mib={} os={} aterm={}",
-            host_word(&self.host),
-            word_of(&self.model, 64),
-            word_of(&self.cpu, 64),
-            self.cores,
-            self.mem_mib,
-            word_of(&self.os, 64),
-            word_of(&self.aterm, 64),
-        );
+        s.push_str("host=");
+        let first = self.host.trim().split('.').next().unwrap_or("");
+        if first.is_empty() {
+            s.push('-');
+        } else {
+            push_word_of(&mut s, first, 63);
+        }
+        s.push_str(" model=");
+        push_word_of(&mut s, &self.model, 64);
+        s.push_str(" cpu=");
+        push_word_of(&mut s, &self.cpu, 64);
+        let _ = write!(s, " cores={} mem_mib={} os=", self.cores, self.mem_mib);
+        push_word_of(&mut s, &self.os, 64);
+        s.push_str(" aterm=");
+        push_word_of(&mut s, &self.aterm, 64);
         s
     }
 
@@ -77,10 +81,12 @@ impl HostFacts {
     pub fn line(&self, at_ms: u64) -> String {
         let fields = self.fields();
         let digest = Digest::of("facts/1", &[fields.as_bytes()]);
-        seal(format!(
-            "schema={SCHEMA} at={at_ms} kind=host facts={} {fields}",
-            digest.hex(),
-        ))
+        let mut out = String::with_capacity(64 + fields.len());
+        let _ = write!(out, "schema={SCHEMA} at={at_ms} kind=host facts=");
+        crate::row::push_hex(&mut out, &digest.0);
+        out.push(' ');
+        out.push_str(&fields);
+        seal(out)
     }
 }
 

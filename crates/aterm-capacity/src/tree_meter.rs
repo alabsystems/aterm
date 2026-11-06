@@ -769,18 +769,21 @@ fn read_into(root: u32, tally: &Mutex<Tally>) {
     // Survivors are narrower than leftovers: an old anchor that was reparented
     // while the root lived must not replace a current chain to the original root.
     let no_anchors = HashSet::new();
-    let within: HashSet<u32> = members
-        .iter()
-        .filter(|m| {
-            root_state == RootState::Live
-                && (tally.seen.get(&(m.pid, m.start)) == Some(&true)
-                    || verdicts.get(&m.pid) == Some(&Some(true)))
-        })
-        .filter(|m| {
-            ancestry_verdict(m.pid, root, root_state, &no_anchors, &mut parent_of) == Some(true)
-        })
-        .map(|m| m.pid)
-        .collect();
+    let within: HashSet<u32> = if root_state == RootState::Live {
+        members
+            .iter()
+            .filter(|m| {
+                tally.seen.get(&(m.pid, m.start)) == Some(&true)
+                    || verdicts.get(&m.pid) == Some(&Some(true))
+            })
+            .filter(|m| {
+                ancestry_verdict(m.pid, root, root_state, &no_anchors, &mut parent_of) == Some(true)
+            })
+            .map(|m| m.pid)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let (after, _) = if root_state == RootState::Ended {
         (RootState::Ended, birth)
     } else {

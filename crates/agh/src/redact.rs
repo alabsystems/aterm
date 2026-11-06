@@ -226,26 +226,31 @@ impl Redactor {
     #[inline]
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
-        Redactor::shapes(&self.learned(text))
+        scan(self.learned(text), true)
     }
 
     /// Redacts learned values and context-free token prefixes (rule 1) without cross-field rules 2/3.
     #[inline]
     #[must_use]
     pub fn learned_and_tokens(&self, text: &str) -> String {
-        scan(&self.learned(text), false)
+        scan(self.learned(text), false)
     }
 
-    fn learned(&self, text: &str) -> String {
+    fn learned<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         let exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
+        let has_match = exact
+            .iter()
+            .flat_map(|learned| std::iter::once(&learned.exact).chain(learned.basic.as_ref()))
+            .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
+            .any(|value| text.contains(value));
+        if !has_match {
+            return std::borrow::Cow::Borrowed(text);
+        }
         let mut known: Vec<&str> = exact
             .iter()
             .flat_map(|learned| std::iter::once(&learned.exact).chain(learned.basic.as_ref()))
             .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
             .collect();
-        if known.is_empty() {
-            return text.to_string();
-        }
         known.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
@@ -265,7 +270,7 @@ impl Redactor {
                 rest = &rest[ch.len_utf8()..];
             }
         }
-        out
+        std::borrow::Cow::Owned(out)
     }
 
     /// Redacts into `[redacted]`: token shapes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/
@@ -277,7 +282,7 @@ impl Redactor {
     #[inline]
     #[must_use]
     pub fn shapes(text: &str) -> String {
-        scan(text, true)
+        scan(std::borrow::Cow::Borrowed(text), true)
     }
 }
 
@@ -299,30 +304,37 @@ fn basic_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     (run.len() >= BASIC_MIN && run.iter().any(|b| !b.is_ascii_alphabetic())).then_some((start, end))
 }
 
-fn scan(text: &str, context: bool) -> String {
+fn scan(text: std::borrow::Cow<'_, str>, context: bool) -> String {
     let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Vec::new();
+    let mut flushed = 0;
     let mut at = 0;
     while let Some(&b) = bytes.get(at) {
-        if let Some(end) = token_at(bytes, at) {
+        let matched = if b == b'g' {
+            token_at(bytes, at).map(|end| (at, end))
+        } else if context && matches!(b, b'a' | b'A') {
+            header_at(bytes, at)
+        } else if context && matches!(b, b'b' | b'B') {
+            bearer_at(bytes, at).or_else(|| basic_at(bytes, at))
+        } else {
+            None
+        };
+        if let Some((keep, end)) = matched {
+            if flushed == 0 {
+                out.reserve(bytes.len());
+            }
+            out.extend_from_slice(&bytes[flushed..keep]);
             out.extend_from_slice(REDACTED);
-            at = end;
-        } else if let Some((keep, end)) = context
-            .then(|| {
-                header_at(bytes, at)
-                    .or_else(|| bearer_at(bytes, at))
-                    .or_else(|| basic_at(bytes, at))
-            })
-            .flatten()
-        {
-            out.extend_from_slice(&bytes[at..keep]);
-            out.extend_from_slice(REDACTED);
+            flushed = end;
             at = end;
         } else {
-            out.push(b);
             at += 1;
         }
     }
+    if flushed == 0 {
+        return text.into_owned();
+    }
+    out.extend_from_slice(&bytes[flushed..]);
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 

@@ -111,19 +111,28 @@ fn bold(t: &str) -> String {
 
 /// Escape everything, then recognise `code`, [links](https://…) and **bold**.
 fn inline(text: &str) -> String {
-    let text = text.replace('\0', "");
+    use std::borrow::Cow;
+    use std::fmt::Write as _;
+    let text: Cow<'_, str> = if text.contains('\0') {
+        Cow::Owned(text.replace('\0', ""))
+    } else {
+        Cow::Borrowed(text)
+    };
     let mut codes = Vec::new();
-    let mut parts = String::new();
+    let mut parts = String::with_capacity(text.len());
     for piece in code_split(&text) {
         if piece.len() >= 2 && piece.starts_with('`') && piece.ends_with('`') {
             codes.push(format!("<code>{}</code>", esc(&piece[1..piece.len() - 1])));
-            parts.push_str(&format!("\0{}\0", codes.len() - 1));
+            let _ = write!(parts, "\0{}\0", codes.len() - 1);
         } else {
             parts.push_str(&esc(piece));
         }
     }
     let t = bold(&links(&parts));
-    let mut out = String::new();
+    if codes.is_empty() {
+        return t;
+    }
+    let mut out = String::with_capacity(t.len());
     let mut rest = t.as_str();
     while let Some(at) = rest.find('\0') {
         out.push_str(&rest[..at]);
@@ -205,6 +214,7 @@ fn quote(line: &str) -> Option<&str> {
 
 /// `items` (indent, ordered, text) → nested `<ul>`/`<ol>`.
 fn render_list(items: &[(usize, bool, String)]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     let mut stack: Vec<(usize, &str)> = Vec::new();
     for (indent, ordered, text) in items {
@@ -213,23 +223,23 @@ fn render_list(items: &[(usize, bool, String)]) -> String {
             Some((top, _)) if *indent <= *top => {
                 while stack.last().is_some_and(|(i, _)| i > indent) {
                     let (_, t) = stack.pop().unwrap_or_default();
-                    out.push_str(&format!("</li></{t}>"));
+                    let _ = write!(out, "</li></{t}>");
                 }
                 if stack.is_empty() {
-                    out.push_str(&format!("<{tag}><li>{}", inline(text)));
+                    let _ = write!(out, "<{tag}><li>{}", inline(text));
                     stack.push((*indent, tag));
                 } else {
-                    out.push_str(&format!("</li><li>{}", inline(text)));
+                    let _ = write!(out, "</li><li>{}", inline(text));
                 }
             }
             _ => {
-                out.push_str(&format!("<{tag}><li>{}", inline(text)));
+                let _ = write!(out, "<{tag}><li>{}", inline(text));
                 stack.push((*indent, tag));
             }
         }
     }
     while let Some((_, t)) = stack.pop() {
-        out.push_str(&format!("</li></{t}>"));
+        let _ = write!(out, "</li></{t}>");
     }
     out
 }
@@ -238,7 +248,12 @@ fn render_list(items: &[(usize, bool, String)]) -> String {
 /// block quotes and rules; inline `code`, **bold** and links; everything else escaped text.
 #[must_use]
 pub fn render_markdown(md: &str) -> String {
-    let md = md.replace("\r\n", "\n").replace('\r', "\n");
+    use std::borrow::Cow;
+    let md: Cow<'_, str> = if md.contains('\r') {
+        Cow::Owned(md.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(md)
+    };
     let lines: Vec<&str> = md.split('\n').collect();
     let mut blocks = Vec::new();
     let mut i = 0;
@@ -320,11 +335,13 @@ pub fn render_markdown(md: &str) -> String {
 fn changelog_head(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix("## [")?;
     let (version, rest) = rest.split_once(']')?;
-    let parts: Vec<&str> = version.split('.').collect();
-    let numeric = parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let mut parts = version.split('.');
+    let seg_ok =
+        |p: Option<&str>| p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    let numeric = seg_ok(parts.next())
+        && seg_ok(parts.next())
+        && seg_ok(parts.next())
+        && parts.next().is_none();
     let date = rest.trim_start().strip_prefix('-')?.trim();
     let date_ok = date.len() == 10
         && date.bytes().enumerate().all(|(k, b)| {
@@ -340,7 +357,12 @@ fn changelog_head(line: &str) -> Option<(&str, &str)> {
 /// The `## [X.Y.Z] - YYYY-MM-DD` sections of a changelog, newest version first.
 #[must_use]
 pub fn from_changelog(text: &str) -> Vec<Section> {
-    let text = text.replace("\r\n", "\n");
+    use std::borrow::Cow;
+    let text: Cow<'_, str> = if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    };
     let mut sections: Vec<(Section, Vec<&str>)> = Vec::new();
     let mut open = false;
     for line in text.split('\n') {
@@ -443,17 +465,19 @@ pub const CSS: &str = "\
 /// `releases.html` for `sections` (at most [`LIMIT`] of them are given).
 #[must_use]
 pub fn render_page(slug: &str, sections: &[Section]) -> String {
+    use std::fmt::Write as _;
     let releases_url = format!("https://github.com/{slug}/releases");
-    let mut out = String::new();
+    let esc_slug = esc(slug);
+    let mut out = String::with_capacity(2048 + sections.len() * 512);
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
     out.push_str("<meta charset=\"utf-8\" />\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n");
     out.push_str("<title>Releases — ALab</title>\n");
-    out.push_str(&format!(
+    let _ = writeln!(
+        out,
         "<meta name=\"description\" content=\"Release notes for aterm, the ALab terminal: the \
-         newest releases, rendered from the notes published with each release on github.com/{}.\" />\n",
-        esc(slug)
-    ));
+         newest releases, rendered from the notes published with each release on github.com/{esc_slug}.\" />"
+    );
     out.push_str("<link rel=\"canonical\" href=\"https://alab.systems/releases\" />\n");
     out.push_str(
         "<meta name=\"theme-color\" content=\"#F5F3EC\" media=\"(prefers-color-scheme: light)\" />\n",
@@ -484,37 +508,40 @@ pub fn render_page(slug: &str, sections: &[Section]) -> String {
          aria-hidden=\"true\">&#9612;</span>ALab</a></p>\n\n",
     );
     out.push_str("    <h1>Releases</h1>\n");
-    out.push_str(&format!(
+    let _ = writeln!(
+        out,
         "    <p class=\"what\">Release notes for <a href=\"/aterm\">aterm</a>, newest first. Each \
          entry links its tag;\n      the current download is on <a href=\"/aterm\">/aterm</a>, \
          and every release with its assets and\n      <code>.sha256</code> sidecars is on <a \
-         href=\"{}\">github.com/{}/releases</a>.</p>\n",
-        esc(&releases_url),
-        esc(slug)
-    ));
+         href=\"{}\">github.com/{esc_slug}/releases</a>.</p>",
+        esc(&releases_url)
+    );
     if sections.is_empty() {
         out.push_str("    <p class=\"install-note\">No release notes yet.</p>\n");
     } else {
         out.push_str("    <nav class=\"releases-index\" aria-label=\"releases on this page\">");
-        let index: Vec<String> = sections
-            .iter()
-            .map(|s| format!("<a href=\"#{0}\">{0}</a>", esc(&s.tag)))
-            .collect();
-        out.push_str(&index.join(" &middot; "));
+        for (idx, s) in sections.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(" &middot; ");
+            }
+            let esc_tag = esc(&s.tag);
+            let _ = write!(out, "<a href=\"#{esc_tag}\">{esc_tag}</a>");
+        }
         out.push_str("</nav>\n");
     }
     for s in sections {
         let tag_url = format!("https://github.com/{slug}/releases/tag/{}", s.tag);
-        out.push_str(&format!(
-            "\n    <section class=\"lane release\" id=\"{}\">\n",
-            esc(&s.tag)
-        ));
-        out.push_str(&format!(
-            "      <h2><a href=\"{}\">{}</a><span class=\"release-date\">{}</span></h2>\n",
+        let esc_tag = esc(&s.tag);
+        let _ = writeln!(
+            out,
+            "\n    <section class=\"lane release\" id=\"{esc_tag}\">"
+        );
+        let _ = writeln!(
+            out,
+            "      <h2><a href=\"{}\">{esc_tag}</a><span class=\"release-date\">{}</span></h2>",
             esc(&tag_url),
-            esc(&s.tag),
             esc(&s.date)
-        ));
+        );
         let body = if s.body.trim().is_empty() {
             "<p>No notes were written for this release.</p>".to_string()
         } else {

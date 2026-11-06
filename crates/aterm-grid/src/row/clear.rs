@@ -236,7 +236,7 @@ impl Row {
         col > 0 && self.cells[col - 1].flags().contains(CellFlags::WIDE)
     }
 
-    /// Selectively clears unprotected cells in `start..end` to `fill` (DECSEL/DECSED), returning `true` if any cell remained protected.
+    /// Selectively clears unprotected cells in `start..end` to `fill` (DECSEL/DECSED), returning the columns it covered (`start..start` for an empty range), widened to any wide-character half cleared with them.
     #[inline]
     pub(crate) fn selective_clear_range(
         &mut self,

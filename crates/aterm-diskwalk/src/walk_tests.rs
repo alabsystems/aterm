@@ -704,3 +704,90 @@ fn directory_identity_keeps_the_walkers_path_and_privacy_fences() {
         Err(Refusal::Protected)
     );
 }
+
+/// A cloud placeholder (`SF_DATALESS`, forced here by inode: a scratch tree cannot make one) is
+/// never looked into on the way to a root, nor is a name looked up in one: a walk or count of a
+/// folder under it, a file root in it and a marker or link look into it are each refused. A
+/// file root that is a directory by its look is handed back to be walked as one. Controls: with
+/// another folder forced, each of these opens and answers.
+#[test]
+fn a_cloud_placeholder_is_never_looked_into_on_the_way_or_at_the_end() {
+    struct Unforce;
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            crate::walk::imp::force_dataless_ino_for_test(None);
+        }
+    }
+    let (_tmp, root, _outside) = scratch();
+    let policy = scratch_policy(ListerChoice::Native);
+    let ino = |dir: &str| {
+        crate::directory_identity(&root.join(dir), &policy)
+            .expect("identity")
+            .1
+    };
+    let (a, e, x) = (ino("a"), ino("e"), ino("x"));
+    let _unforce = Unforce;
+    let mut clock = tick_clock(Duration::from_micros(10));
+    let mut size_of = |path: PathBuf| {
+        diskwalk_size_full(
+            &RootSpec::new(path),
+            &policy,
+            Duration::from_secs(60),
+            &mut clock,
+        )
+    };
+
+    // Controls: a placeholder elsewhere leaves this chain alone.
+    crate::walk::imp::force_dataless_ino_for_test(Some(x));
+    assert!(Walk::begin(&RootSpec::new(root.join("a/b")), &policy).is_ok());
+    assert_eq!(entry_count_of(&root.join("a/b"), &policy), Ok(2));
+    assert_eq!(
+        crate::look::markers_at(&root.join("a"), ["b"], &policy),
+        Ok([Some(crate::Marker::Dir)])
+    );
+    assert_eq!(
+        size_of(root.join("a/one.bin")).map(|full| full.sums.logical),
+        Ok(5_000)
+    );
+    assert!(matches!(
+        crate::look::link_target(&root.join("e"), "to-outside", &policy),
+        Ok(Some(_))
+    ));
+
+    // `a` a placeholder: nothing below it is looked up, and nothing in it is read.
+    crate::walk::imp::force_dataless_ino_for_test(Some(a));
+    assert_eq!(
+        Walk::begin(&RootSpec::new(root.join("a/b")), &policy).err(),
+        Some(Refusal::Dataless)
+    );
+    assert_eq!(
+        entry_count_of(&root.join("a/b"), &policy),
+        Err(Refusal::Dataless)
+    );
+    assert_eq!(
+        crate::look::markers_at(&root.join("a"), ["b"], &policy),
+        Err(Refusal::Dataless)
+    );
+    assert_eq!(size_of(root.join("a/one.bin")), Err(Refusal::Dataless));
+    crate::walk::imp::force_dataless_ino_for_test(Some(e));
+    assert_eq!(
+        crate::look::link_target(&root.join("e"), "to-outside", &policy),
+        Err(Refusal::Dataless)
+    );
+
+    crate::walk::imp::force_dataless_ino_for_test(None);
+    assert_eq!(
+        crate::walk::file_root(&RootSpec::new(root.join("a")), &policy),
+        Ok(None),
+        "a file root that is a directory now is walked as one"
+    );
+    assert_eq!(
+        crate::walk::file_root(&RootSpec::new(root.join("e/to-outside")), &policy),
+        Err(Refusal::Link)
+    );
+    assert_eq!(
+        crate::walk::file_root(&RootSpec::new(root.join("a/one.bin")), &policy)
+            .map(|full| full.map(|full| full.sums.logical)),
+        Ok(Some(5_000))
+    );
+}

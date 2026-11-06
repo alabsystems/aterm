@@ -228,6 +228,7 @@ pub mod fdpass;
 /// Exclusive file-lock waits with bounded contention backoff and deadline rechecks.
 #[cfg(any(unix, windows))]
 pub mod file_lock;
+
 /// Test support (test and debug builds): the `git` a fixture runs, isolated from this machine.
 #[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
 pub mod fixture_git;
@@ -242,6 +243,8 @@ pub mod latest;
 /// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends with the process that started it — both ends.
 #[cfg(unix)]
 pub mod lifeline;
+/// Framed log appends coordinated with atomic replacement by a stable sibling lock.
+pub mod line_log;
 /// Which listening socket a path names, so a hang-up is judged by the listener that accepted the stream and never by the pid alone.
 pub mod listener;
 /// Local interface addresses for retry decisions, read without connecting a socket.

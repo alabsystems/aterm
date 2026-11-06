@@ -5384,7 +5384,8 @@ fn an_open_settled_page_owes_no_wake() {
 #[test]
 fn the_vault_rows_phrase_joins_on_the_worker_and_the_page_hears_how() {
     use crate::system_state::{
-        PHRASE_FIELD, PHRASE_JOIN, PHRASE_NOT_REACHED, PHRASE_REFUSED, PHRASE_STOPPED,
+        PHRASE_DROPPED, PHRASE_FIELD, PHRASE_JOIN, PHRASE_NOT_REACHED, PHRASE_REFUSED,
+        PHRASE_STOPPED,
     };
     let phrase_help = |app: &App, instance: AppInstanceId| match app.native_runtime.app(instance) {
         Some(NativeApp::SystemState(page)) => page.phrase_help(),
@@ -5436,6 +5437,19 @@ fn the_vault_rows_phrase_joins_on_the_worker_and_the_page_hears_how() {
         calls(),
         ["join phrase amber cloud pine"],
         "the kept words go again"
+    );
+    // A Mac a rotation dropped (one-mesh E2, f299) hears how it comes back, not to press Allow
+    // again, and the rows are read again.
+    PHRASE_RECEIPTS
+        .with(|receipts| receipts.borrow_mut().pop())
+        .expect("the Join reached its worker")
+        .finished(PhraseOutcome::Dropped);
+    app.system_state_host.next_status = None;
+    app.resolve_system_state_phrase_join();
+    assert_eq!(phrase_help(&app, instance), PHRASE_DROPPED);
+    assert!(
+        app.system_state_host.next_status.is_some(),
+        "the rows are read again"
     );
 }
 

@@ -1032,6 +1032,38 @@ fn read_ready_classifies_all_states() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A `ready` marker that is a dangling link is one the stage could not read, not one that is
+/// gone: it is corrupt, a hand-off names it unreadable, and the staged app beside it stays.
+/// The same readers with no marker at all are the control.
+#[test]
+fn a_dangling_ready_link_is_a_marker_present_not_one_gone() {
+    const COMMIT: &str = "0000000000000000000000000000000000000020";
+    let (s, root) = temp_staging();
+    std::fs::create_dir_all(&s.staged_app).unwrap();
+
+    assert!(matches!(read_ready(&s, 10), ReadyState::Absent));
+    let gone = handoff_cached_pass_refusal_at(&s, 20, COMMIT).unwrap();
+    assert!(gone.contains("no longer staged"), "{gone}");
+
+    std::os::unix::fs::symlink("missing-ready.toml", &s.ready).unwrap();
+    assert!(matches!(read_ready(&s, 10), ReadyState::Corrupt));
+    let unreadable = handoff_cached_pass_refusal_at(&s, 20, COMMIT).unwrap();
+    assert!(unreadable.contains("unreadable"), "{unreadable}");
+    reclaim_swapped_out_orphan(&s);
+    assert!(
+        s.staged_app.is_dir(),
+        "a marker that may still name it keeps the staged app"
+    );
+
+    std::fs::remove_file(&s.ready).unwrap();
+    reclaim_swapped_out_orphan(&s);
+    assert!(
+        !s.staged_app.exists(),
+        "with no marker the swapped-out app is reclaimed"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The shared stage's state is a moment, not a verdict on the build.
 #[test]
 fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {

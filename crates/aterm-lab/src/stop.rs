@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 static STOPPED: AtomicI32 = AtomicI32::new(0);
 
-/// The cleanups under way on every thread ([`Grace`]).
+/// The cleanups under way on every thread ([`Grace`]), and those a stop of the run will start
+/// ([`Ahead`]).
 static GRACES: AtomicUsize = AtomicUsize::new(0);
 
 /// The second interrupt, which cut the run's cleanups short ([`Grace`]); 0 while none has.
@@ -37,10 +38,10 @@ static CAUGHT: AtomicBool = AtomicBool::new(false);
 static HARD_EXIT: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
 /// Run `undo` when an interrupt ends the process at once, before it exits: a second one, or a
-/// third while a cleanup is under way ([`Grace`]). Every act
-/// registered is held, none replaces another: they run newest first, as `atexit` runs its
-/// functions, each once per registration, so a caller that registers once per run registers
-/// once (behind a `Once` or a `OnceLock`'s first `set`).
+/// third while a cleanup is under way or ahead ([`Grace`], [`Ahead`]). Every act registered is
+/// held, none replaces another: they run newest first, as `atexit` runs its functions, each once
+/// per registration, so a caller that registers once per run registers once (behind a `Once` or
+/// a `OnceLock`'s first `set`).
 pub fn at_hard_exit(undo: fn()) {
     HARD_EXIT
         .lock()
@@ -70,8 +71,9 @@ pub fn install() {
         loop {
             for sig in pipe.wait() {
                 let again = STOPPED.swap(sig, Ordering::SeqCst) != 0;
-                // A second interrupt while a cleanup is under way cuts that cleanup's waits
-                // short, so it can still say what it left; any other, or a third, ends the run.
+                // A second interrupt while a cleanup is under way or ahead cuts that cleanup's
+                // waits short, so it can still say what it left; any other, or a third, ends the
+                // run.
                 let cuts = again
                     && GRACES.load(Ordering::SeqCst) > 0
                     && CUT
@@ -164,6 +166,34 @@ impl Drop for Grace {
     }
 }
 
+/// Whether a second interrupt has cut this thread's cleanup short ([`Grace`]); never outside one.
+/// A command a cleanup runs ends on this, where the stop that asked for the cleanup must not end
+/// it.
+pub fn cut() -> bool {
+    HELD.with(Cell::get) > 0 && CUT.load(Ordering::SeqCst) != 0
+}
+
+/// A cleanup the run's stop will start ([`Grace`]), from [`cleanup_ahead`] until it drops: a
+/// second interrupt cuts that cleanup short even when it comes before the cleanup has begun (two
+/// signals at once, or a second while the run has yet to act on the first), instead of ending the
+/// run at once. It sees through no stop itself; only a [`Grace`] does.
+#[must_use = "a second interrupt cuts the cleanup ahead short only while this is held"]
+pub struct Ahead {
+    _noted: (),
+}
+
+/// Note a cleanup the run's stop will start ([`Ahead`]).
+pub fn cleanup_ahead() -> Ahead {
+    GRACES.fetch_add(1, Ordering::SeqCst);
+    Ahead { _noted: () }
+}
+
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        GRACES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Compute `Instant::now() + d`, saturating at one year if `d` would overflow.
 pub(crate) fn deadline_after(d: Duration) -> Instant {
     let now = Instant::now();
@@ -251,7 +281,11 @@ mod tests {
                 .expect("the probe ends within the hang detector");
         (
             out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
         )
     }
 
@@ -356,41 +390,143 @@ mod tests {
         assert!(!out.contains("PROBE still running"), "{out}");
     }
 
+    /// The stop, a cleanup's grace, then a second interrupt: `held` sends it with the grace held,
+    /// where it cuts the cleanup short and a third ends the run; `released` once the grace is
+    /// dropped, where it ends the run itself. Each interrupt is a different signal from the one
+    /// before it, so each wait says which one ended it.
     #[test]
     fn a_cleanup_waits_through_the_stop_on_its_own_thread_and_a_third_interrupt_ends_the_run() {
         const TEST: &str = "stop::tests::a_cleanup_waits_through_the_stop_on_its_own_thread_and_a_third_interrupt_ends_the_run";
-        if std::env::var_os(PROBE).is_some() {
+        if let Some(mode) = std::env::var_os(PROBE) {
             crate::sys::start_signal(libc::SIGINT, false);
+            crate::sys::start_signal(libc::SIGTERM, false);
             super::install();
             super::at_hard_exit(earlier_act);
             super::at_hard_exit(later_act);
             let me = i32::try_from(std::process::id()).expect("pid");
-            let interrupt = |what| crate::sys::kill(me, libc::SIGINT).expect(what);
-            interrupt("the stop");
+            let signal = |sig, what| crate::sys::kill(me, sig).expect(what);
+            signal(libc::SIGINT, "the stop");
             assert_eq!(
                 super::sleep(Duration::from_mins(1)),
-                Err(super::Stopped(libc::SIGINT))
+                Err(super::Stopped(libc::SIGINT)),
+                "the stop is noted"
             );
             let grace = super::grace();
-            assert_eq!(super::sleep(Duration::from_millis(30)), Ok(()));
-            let elsewhere = std::thread::spawn(super::check).join().expect("thread");
-            assert_eq!(elsewhere, Err(super::Stopped(libc::SIGINT)));
-            interrupt("the cut");
             assert_eq!(
-                super::sleep(Duration::from_mins(1)),
-                Err(super::Stopped(libc::SIGINT))
+                super::sleep(Duration::from_millis(30)),
+                Ok(()),
+                "a cleanup's wait sees through the stop that asked for it"
             );
-            drop(grace);
-            println!("PROBE the second interrupt cut the cleanup short");
-            interrupt("the end");
+            assert!(!super::cut(), "the stop cuts no cleanup short");
+            let elsewhere = std::thread::spawn(super::check).join().expect("thread");
+            assert_eq!(
+                elsewhere,
+                Err(super::Stopped(libc::SIGINT)),
+                "another thread's wait still ends on the stop"
+            );
+            if mode == "released" {
+                drop(grace);
+                assert_eq!(
+                    super::check(),
+                    Err(super::Stopped(libc::SIGINT)),
+                    "once its grace is dropped, the thread's waits end on the stop again"
+                );
+                assert!(!super::cut(), "outside a cleanup nothing is cut");
+                println!("PROBE the grace was released");
+                signal(libc::SIGTERM, "the second, with no cleanup under way");
+            } else {
+                signal(libc::SIGTERM, "the cut");
+                assert_eq!(
+                    super::sleep(Duration::from_mins(1)),
+                    Err(super::Stopped(libc::SIGTERM)),
+                    "the second interrupt ends the cleanup's wait and names itself"
+                );
+                assert!(super::cut(), "the cleanup reads its cut");
+                println!("PROBE the second interrupt cut the cleanup short");
+                signal(libc::SIGINT, "the third, with the cleanup still under way");
+            }
             std::thread::sleep(Duration::from_mins(1));
             println!("PROBE still running");
             std::process::exit(0);
         }
-        let (code, out) = probe(TEST, "thrice");
-        assert_eq!(code, Some(128 + libc::SIGINT), "{out}");
+        let (code, out) = probe(TEST, "held");
+        assert_eq!(
+            code,
+            Some(128 + libc::SIGINT),
+            "a third interrupt ends the run while its cleanup is under way: {out}"
+        );
         assert!(
             out.contains("PROBE the second interrupt cut the cleanup short")
+                && out.contains("PROBE the earlier act ran")
+                && out.contains("PROBE the later act ran"),
+            "{out}"
+        );
+        let (code, out) = probe(TEST, "released");
+        assert_eq!(
+            code,
+            Some(128 + libc::SIGTERM),
+            "a second interrupt after the cleanup's grace is dropped ends the run: {out}"
+        );
+        assert!(
+            out.contains("PROBE the grace was released")
+                && out.contains("PROBE the earlier act ran")
+                && out.contains("PROBE the later act ran"),
+            "{out}"
+        );
+    }
+
+    /// A second interrupt before the run has acted on the first: with a cleanup ahead, it cuts
+    /// that cleanup short once it begins, and a third ends the run. Each is a signal of its own
+    /// and is sent once the one before it was read, since a signal sent while the same one is
+    /// pending is not delivered twice.
+    #[test]
+    fn a_second_interrupt_before_the_cleanup_ahead_begins_cuts_it_short() {
+        const TEST: &str =
+            "stop::tests::a_second_interrupt_before_the_cleanup_ahead_begins_cuts_it_short";
+        if std::env::var_os(PROBE).is_some() {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                crate::sys::start_signal(sig, false);
+            }
+            super::install();
+            super::at_hard_exit(earlier_act);
+            super::at_hard_exit(later_act);
+            let me = i32::try_from(std::process::id()).expect("pid");
+            let ahead = super::cleanup_ahead();
+            crate::sys::kill(me, libc::SIGINT).expect("the stop");
+            assert_eq!(
+                super::sleep(Duration::from_mins(1)),
+                Err(super::Stopped(libc::SIGINT)),
+                "the stop is noted"
+            );
+            crate::sys::kill(me, libc::SIGTERM).expect("the second");
+            // Read before the cleanup begins: it has cut the cleanup ahead, or ended the run.
+            let hang = Instant::now() + Duration::from_mins(1);
+            while super::CUT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < hang, "the second interrupt was never read");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let grace = super::grace();
+            assert_eq!(
+                super::sleep(Duration::from_mins(1)),
+                Err(super::Stopped(libc::SIGTERM)),
+                "the cleanup begins already cut short"
+            );
+            println!("PROBE the cleanup ahead was cut short");
+            drop(grace);
+            drop(ahead);
+            crate::sys::kill(me, libc::SIGHUP).expect("the third");
+            std::thread::sleep(Duration::from_mins(1));
+            println!("PROBE still running");
+            std::process::exit(0);
+        }
+        let (code, out) = probe(TEST, "twice");
+        assert_eq!(
+            code,
+            Some(128 + libc::SIGHUP),
+            "the second interrupt cut the cleanup ahead short and the third ended the run: {out}"
+        );
+        assert!(
+            out.contains("PROBE the cleanup ahead was cut short")
                 && out.contains("PROBE the earlier act ran")
                 && out.contains("PROBE the later act ran"),
             "{out}"

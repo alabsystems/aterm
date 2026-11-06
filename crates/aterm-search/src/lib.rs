@@ -23,7 +23,6 @@ mod cells;
 mod grapheme;
 mod index;
 mod iterators;
-mod literal;
 mod types;
 
 pub use bloom::BloomFilter;
@@ -313,8 +312,11 @@ impl TerminalSearch {
         let find = |line: usize, col: usize, include: bool| {
             if case_sensitive {
                 let found = match direction {
-                    SearchDirection::Forward => {
-                        self.index.search_from_line(query, line).find(|m| {
+                    SearchDirection::Forward => self
+                        .index
+                        .search_from_line(query, line)
+                        .with_anchor(line, col, include)
+                        .find(|m| {
                             m.line > line
                                 || (m.line == line
                                     && if include {
@@ -322,11 +324,11 @@ impl TerminalSearch {
                                     } else {
                                         m.start_col > col
                                     })
-                        })
-                    }
+                        }),
                     SearchDirection::Backward => self
                         .index
                         .search_before_line(query, line.saturating_add(1))
+                        .with_anchor(line, col, include)
                         .find(|m| {
                             m.line < line
                                 || (m.line == line

@@ -532,7 +532,16 @@ impl Request {
     /// # Errors
     /// Its payload is over [`MAX_MESSAGE`].
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        let mut p = Put::new(64);
+        let cap = match self {
+            Self::State | Self::Detach => 0,
+            Self::Keep(_) => 1,
+            Self::Connect { .. } => 4,
+            Self::Release { .. } | Self::Stop { .. } => 8,
+            Self::Attach(a) => 17 + a.helper_sha256.len() + a.agent_sha256.len(),
+            Self::Boot(_) => 256,
+            Self::Share(entries) => 4 + entries.len() * 32,
+        };
+        let mut p = Put::new(cap);
         let kind = match self {
             Self::Attach(a) => {
                 p.u32(a.proto);
@@ -628,7 +637,23 @@ impl Reply {
     /// # Errors
     /// Its payload is over [`MAX_MESSAGE`].
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        let mut p = Put::new(64);
+        let cap = match self {
+            Self::Started | Self::Done | Self::Stopping => 0,
+            Self::Attached { .. } => 3,
+            Self::Connected { .. } => 12,
+            Self::Refused(s) | Self::Booting(s) | Self::Error(s) => 4 + s.len(),
+            Self::Ready(h) => 52 + h.boot_id.len() + h.kernel.len(),
+            Self::Lost { why, tail } | Self::Failed { error: why, tail } => {
+                8 + why.len() + tail.len()
+            }
+            Self::State(s) => {
+                64 + s.helper_sha256.len()
+                    + s.boot_id.len()
+                    + s.agent_sha256.len()
+                    + s.console_tail.len()
+            }
+        };
+        let mut p = Put::new(cap);
         let kind = match self {
             Self::Attached {
                 phase,

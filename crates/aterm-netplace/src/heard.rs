@@ -911,8 +911,16 @@ fn strong_word(word: &str) -> Option<NetworkId> {
 
 /// Adds the entry `line` holds to `days`; `false` where this build cannot read it.
 fn parse_days_line(line: &str, days: &mut HomeDays) -> bool {
-    let words: Vec<&str> = line.split(' ').collect();
-    match words.as_slice() {
+    let mut words = [""; 5];
+    let mut count = 0;
+    for word in line.split(' ') {
+        let Some(slot) = words.get_mut(count) else {
+            return false;
+        };
+        *slot = word;
+        count += 1;
+    }
+    match &words[..count] {
         ["s", at] if days.seeded_ms.is_none() => at.parse().is_ok_and(|at| {
             days.seeded_ms = Some(at);
             true
@@ -933,14 +941,20 @@ fn parse_days_line(line: &str, days: &mut HomeDays) -> bool {
             let (Some(network), Ok(day)) = (strong_word(network), day.parse()) else {
                 return false;
             };
-            let members: Vec<String> = members.split(',').map(str::to_owned).collect();
-            if members.len() > DAY_MEMBERS || !members.iter().all(|member| is_lower_hex16(member)) {
-                return false;
+            let mut parsed = Vec::with_capacity(DAY_MEMBERS);
+            for member in members.split(',') {
+                if parsed.len() >= DAY_MEMBERS || !is_lower_hex16(member) {
+                    return false;
+                }
+                parsed.push(member.to_owned());
             }
             days.networks.push(NetworkDays {
                 network,
                 credited: 0,
-                days: vec![HeardDay { day, members }],
+                days: vec![HeardDay {
+                    day,
+                    members: parsed,
+                }],
             });
             true
         }
@@ -1048,21 +1062,31 @@ pub fn compact_days(days: HomeDays) -> HomeDays {
 /// The [`DAYS_FILE`] text of `days`: the seed's line, then each network's credit and days.
 #[must_use]
 pub fn format_days(days: &HomeDays) -> String {
-    let mut text = String::new();
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(
+        days.networks
+            .iter()
+            .map(|entry| 32 + entry.days.len().saturating_mul(48))
+            .sum::<usize>()
+            .saturating_add(32),
+    );
     if let Some(at) = days.seeded_ms {
-        text.push_str(&format!("s {at}\n"));
+        let _ = writeln!(text, "s {at}");
     }
     for entry in &days.networks {
         let network = entry.network.as_str();
         if entry.credited > 0 {
-            text.push_str(&format!("c {network} {}\n", entry.credited));
+            let _ = writeln!(text, "c {network} {}", entry.credited);
         }
         for day in entry.days.iter().filter(|day| !day.members.is_empty()) {
-            text.push_str(&format!(
-                "d {network} {} {}\n",
-                day.day,
-                day.members.join(",")
-            ));
+            let _ = write!(text, "d {network} {} ", day.day);
+            for (idx, member) in day.members.iter().enumerate() {
+                if idx > 0 {
+                    text.push(',');
+                }
+                text.push_str(member);
+            }
+            text.push('\n');
         }
     }
     text
@@ -1113,7 +1137,7 @@ fn change_days(
 type Booking = (NetworkId, u64, String);
 
 /// The bookings this process wrote, per directory: [`note_days`] writes each once.
-static BOOKED: Mutex<Option<HashSet<(PathBuf, Booking)>>> = Mutex::new(None);
+static BOOKED: Mutex<Option<HashMap<PathBuf, HashSet<Booking>>>> = Mutex::new(None);
 
 /// BOOKS THE DAYS `answers` WERE HEARD ON into the home-day ledger in `dir` (the place's directory,
 /// [`crate::record::dir`]): each logged fleet answer booked on a strong network
@@ -1137,11 +1161,9 @@ pub fn note_days(dir: &Path, answers: &[Answer]) {
         .collect();
     {
         let guard = BOOKED.lock().unwrap_or_else(PoisonError::into_inner);
-        wanted.retain(|booking| {
-            guard
-                .as_ref()
-                .is_none_or(|booked| !booked.contains(&(dir.to_path_buf(), booking.clone())))
-        });
+        if let Some(set) = guard.as_ref().and_then(|booked| booked.get(dir)) {
+            wanted.retain(|booking| !set.contains(booking));
+        }
     }
     wanted.sort();
     wanted.dedup();
@@ -1170,15 +1192,18 @@ pub fn note_days(dir: &Path, answers: &[Answer]) {
     match written {
         Ok(_) => {
             let mut guard = BOOKED.lock().unwrap_or_else(PoisonError::into_inner);
-            let booked = guard.get_or_insert_with(HashSet::new);
+            let booked = guard.get_or_insert_with(HashMap::new);
             let newest = wanted.iter().map(|(_, day, _)| *day).max().unwrap_or(0);
             // Only today's and yesterday's bookings can come again; older ones are let go.
-            booked.retain(|(_, (_, day, _))| day.saturating_add(1) >= newest);
-            booked.extend(
-                wanted
-                    .into_iter()
-                    .map(|booking| (dir.to_path_buf(), booking)),
-            );
+            booked.retain(|_, set| {
+                set.retain(|(_, day, _)| day.saturating_add(1) >= newest);
+                !set.is_empty()
+            });
+            if let Some(set) = booked.get_mut(dir) {
+                set.extend(wanted);
+            } else {
+                booked.insert(dir.to_path_buf(), wanted.into_iter().collect());
+            }
         }
         Err(e) => aterm_log::debug!("network place: a home-day booking waits for the next ({e})"),
     }

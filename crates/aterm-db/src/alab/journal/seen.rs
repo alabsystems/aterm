@@ -270,6 +270,9 @@ impl Seen {
     /// Add the batches of this Mac's heard archive from `since` on (§7: the log reaches past the
     /// ring's window, labelled "heard by this Mac"): every event no window batch already holds.
     pub(crate) fn hear(&mut self, batches: &[super::heard::Batch]) {
+        if batches.is_empty() {
+            return;
+        }
         let mut added = Vec::new();
         {
             let held: std::collections::BTreeSet<(&str, u64)> = self
@@ -290,6 +293,9 @@ impl Seen {
                     });
                 }
             }
+        }
+        if added.is_empty() {
+            return;
         }
         self.events.extend(added);
         self.sort_events();
@@ -319,26 +325,36 @@ impl Seen {
     }
 
     fn sign(&mut self, account: &str, uuid: &str, state: &'static str, t: u64, cli: &str) {
-        let held = self
-            .signins
-            .entry(account.to_owned())
-            .or_default()
-            .entry(uuid.to_owned());
-        let next = SignedIn {
-            state,
-            t,
-            cli: cli.to_owned(),
-        };
-        match held {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(next);
-            }
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                if slot.get().t <= t {
-                    slot.insert(next);
+        if let Some(by_mac) = self.signins.get_mut(account) {
+            if let Some(held) = by_mac.get_mut(uuid) {
+                if held.t <= t {
+                    held.state = state;
+                    held.t = t;
+                    held.cli.clear();
+                    held.cli.push_str(cli);
                 }
+                return;
             }
+            by_mac.insert(
+                uuid.to_owned(),
+                SignedIn {
+                    state,
+                    t,
+                    cli: cli.to_owned(),
+                },
+            );
+            return;
         }
+        let mut by_mac = BTreeMap::new();
+        by_mac.insert(
+            uuid.to_owned(),
+            SignedIn {
+                state,
+                t,
+                cli: cli.to_owned(),
+            },
+        );
+        self.signins.insert(account.to_owned(), by_mac);
     }
 
     fn read(&mut self, pk: &str, window: Window, reading: Reading) {
@@ -363,24 +379,25 @@ impl Seen {
             self.sign(account.as_str(), uuid, state, event.t, event.cli.as_str());
         }
         // A workspace's figures are its sub-account's (§4.13's derivation, no lookup).
-        let pk = match &event.sub {
+        let sub_pk = match &event.sub {
             Some(sub) => match keys::subaccount_pk(account.as_str(), sub.as_str()) {
                 Ok(pk) => {
                     self.sub_of.insert(pk.clone(), account.as_str().to_owned());
-                    pk
+                    Some(pk)
                 }
                 Err(_) => return,
             },
-            None => account.as_str().to_owned(),
+            None => None,
         };
         let Some(window) = event.window else {
             return;
         };
+        let pk = sub_pk.as_deref().unwrap_or(account.as_str());
         match event.kind {
             Kind::Quota => {
                 if let Some(pct_x10) = event.pct_x10 {
                     self.read(
-                        &pk,
+                        pk,
                         window,
                         Reading {
                             uuid: uuid.to_owned(),
@@ -394,7 +411,7 @@ impl Seen {
                 }
             }
             Kind::Wall => self.wall(
-                &pk,
+                pk,
                 window,
                 Wall {
                     uuid: uuid.to_owned(),
@@ -403,7 +420,7 @@ impl Seen {
                 },
             ),
             Kind::WallCleared => {
-                let key = (pk, window);
+                let key = (pk.to_owned(), window);
                 if self.walls.get(&key).is_some_and(|held| held.t <= event.t) {
                     self.walls.remove(&key);
                 }

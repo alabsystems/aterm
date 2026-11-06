@@ -68,24 +68,11 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
     hash.update(&[4, 255]);
     hash.update(&(end as u32).to_be_bytes());
     let digest = hash.finish();
-    if &digest.as_ref()[..2] != prefix {
+    if !aterm_digest::ct_eq(&digest.as_ref()[..2], prefix) {
         return Err("SRP modulus digest mismatch".into());
     }
-    let key = armor(KEY, "PUBLIC KEY BLOCK")?;
-    let (tag, key, _) = packet(&key)?;
-    const CURVE: &[u8] = &[9, 43, 6, 1, 4, 1, 218, 71, 15, 1];
-    if tag != 6
-        || key.len() != 51
-        || key[0] != 4
-        || key[5] != 22
-        || key.get(6..16) != Some(CURVE)
-        || key[18] != 64
-    {
-        return Err("Invalid pinned Proton modulus key".into());
-    }
-    if !<&[u8; 32]>::try_from(&key[19..])
-        .is_ok_and(|key| astream_aead::signature::verify(key, digest.as_ref(), &raw_signature))
-    {
+    let key = pinned_modulus_key()?;
+    if !astream_aead::signature::verify(key, digest.as_ref(), &raw_signature) {
         return Err("Proton modulus signature did not verify".into());
     }
     let modulus = aterm_codec::base64::decode(text).map_err(|_| "Invalid SRP modulus encoding")?;
@@ -93,6 +80,30 @@ pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
         return Err("Invalid SRP modulus length".into());
     }
     Ok(modulus)
+}
+
+fn pinned_modulus_key() -> Result<&'static [u8; 32], String> {
+    static PINNED: std::sync::OnceLock<Result<[u8; 32], String>> = std::sync::OnceLock::new();
+    PINNED
+        .get_or_init(|| {
+            let key = armor(KEY, "PUBLIC KEY BLOCK")?;
+            let (tag, key, _) = packet(&key)?;
+            const CURVE: &[u8] = &[9, 43, 6, 1, 4, 1, 218, 71, 15, 1];
+            if tag != 6
+                || key.len() != 51
+                || key[0] != 4
+                || key[5] != 22
+                || key.get(6..16) != Some(CURVE)
+                || key[18] != 64
+            {
+                return Err("Invalid pinned Proton modulus key".into());
+            }
+            key[19..]
+                .try_into()
+                .map_err(|_| "Invalid pinned Proton modulus key".into())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub(super) fn armor(text: &str, label: &str) -> Result<Vec<u8>, String> {
@@ -109,19 +120,27 @@ fn armor_body(text: &str, label: &str) -> Result<Vec<u8>, String> {
     if !trailing.trim().is_empty() {
         return Err("Trailing data in PGP armor".into());
     }
-    let body: std::borrow::Cow<'_, str> = if body.contains('\r') {
-        std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
-    } else {
-        std::borrow::Cow::Borrowed(body)
-    };
-    let (_, body) = body
-        .split_once("\n\n")
-        .ok_or("Missing PGP armor separator")?;
+    let body = split_armor_header(body).ok_or("Missing PGP armor separator")?;
     let mut encoded = zeroize::Zeroizing::new(String::with_capacity(body.len()));
     for line in body.lines().take_while(|line| !line.starts_with('=')) {
         encoded.push_str(line);
     }
     aterm_codec::base64::decode(encoded.trim()).map_err(|_| "Invalid PGP armor encoding".into())
+}
+
+fn split_armor_header(body: &str) -> Option<&str> {
+    let bytes = body.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'\n' {
+            if bytes[i + 1] == b'\n' {
+                return Some(&body[i + 2..]);
+            }
+            if bytes.get(i + 1..i + 3) == Some(b"\r\n") {
+                return Some(&body[i + 3..]);
+            }
+        }
+    }
+    None
 }
 
 fn split_armor_end<'a>(text: &'a str, label: &str) -> Option<(&'a str, &'a str)> {

@@ -73,11 +73,13 @@ contract! {
     { taken_out && !holder_after }
 }
 contract! {
-    /// An epoch keeps a row's recipient out when the row does not revoke or every `Remove` that
-    /// took it lies in the epoch's causal past.
-    pub fn gate_row(revokes: bool, every_taker_before: bool) -> bool
-    clauses [ensures result == spec_gate_row(revokes, every_taker_before) by gate_row_is_exact]
-    { !revokes || every_taker_before }
+    /// An epoch keeps a row's recipient out when the row does not revoke; or every `Remove` that
+    /// took it lies in the epoch's causal past; or no row that is not out binds the recipient and
+    /// some `Remove` that took it lies there (no Mac that holds the epoch can then read the
+    /// recipient as current: the island's `restorer_is_unseen`).
+    pub fn gate_row(revokes: bool, every_taker_before: bool, recipient_live: bool, some_taker_before: bool) -> bool
+    clauses [ensures result == spec_gate_row(revokes, every_taker_before, recipient_live, some_taker_before) by gate_row_is_exact]
+    { !revokes || (every_taker_before || (!recipient_live && some_taker_before)) }
 }
 contract! {
     /// A recipient is current when a row that is not out binds it and nothing revokes it.
@@ -184,6 +186,13 @@ impl<'a, B: Fn(usize, usize) -> bool> Table<'a, B> {
         })
     }
 
+    /// Whether some `Remove` that took row `i` lies in record `x`'s causal past.
+    pub fn some_taker_before(&self, i: usize, x: usize) -> bool {
+        any_n(self.removes.len(), |j| {
+            self.takes(j, i) && (self.before)(self.removes[j].record, x)
+        })
+    }
+
     /// Whether row `m` restores row `i`'s recipient.
     pub fn restores(&self, i: usize, m: usize) -> bool {
         restores(
@@ -227,12 +236,18 @@ impl<'a, B: Fn(usize, usize) -> bool> Table<'a, B> {
         current(self.bound_live(r), self.revoked(r))
     }
 
-    /// Whether epoch record `e` keeps every revoked recipient out: every `Remove` that took out a
-    /// row whose recipient stays revoked lies in `e`'s causal past. A writer seals only under an
-    /// epoch whose gate is open, and an epoch whose gate is shut is due a rotation.
+    /// Whether epoch record `e` keeps every revoked recipient out: for each row whose recipient
+    /// stays revoked, every `Remove` that took it lies in `e`'s causal past, or one does and no
+    /// row that is not out binds the recipient. A writer seals only under an epoch whose gate is
+    /// open, and an epoch whose gate is shut is due a rotation.
     pub fn gate(&self, e: usize) -> bool {
         all_n(self.rows.len(), |i| {
-            gate_row(self.revoking[i], self.takers_before(i, e))
+            gate_row(
+                self.revoking[i],
+                self.takers_before(i, e),
+                self.bound_live(self.rows[i].recipient),
+                self.some_taker_before(i, e),
+            )
         })
     }
 }

@@ -1161,20 +1161,15 @@ impl TerminalHandler<'_> {
         tag: KittyPlacementTag,
     ) {
         self.admit_live_image(image, Some(tag));
-        for cell_row in 0..image.rows {
+        let cols = kitty_floating::visible_cell_range(left, image.cols, self.grid.cols());
+        for cell_row in kitty_floating::visible_cell_range(top, image.rows, self.grid.rows()) {
             let Ok(row) = u16::try_from(top.saturating_add(i32::from(cell_row))) else {
                 continue;
             };
-            if row >= self.grid.rows() {
-                break;
-            }
-            for cell_col in 0..image.cols {
+            for cell_col in cols.clone() {
                 let Ok(col) = u16::try_from(left.saturating_add(i32::from(cell_col))) else {
                     continue;
                 };
-                if col >= self.grid.cols() {
-                    break;
-                }
                 self.grid.stack_cell_image(
                     row,
                     col,
@@ -4132,6 +4127,44 @@ mod kitty_display_tests {
             .filter_map(|(_, image)| image.kitty)
             .map(|tag| (tag.image_id, tag.placement_id))
             .collect()
+    }
+
+    #[test]
+    fn a_placement_hanging_off_the_top_left_shows_exactly_its_on_screen_cells() {
+        let mut term = Terminal::new(6, 20);
+        term.set_cell_pixel_size(10, 20);
+        for id in 1..=2 {
+            term.process(&apc_g(
+                &format!("a=t,f=32,s=10,v=20,i={id},q=2"),
+                &one_cell_rgba(),
+            ));
+        }
+        term.process(&apc_g("a=p,U=1,i=1,p=7,q=2", b""));
+        term.process(b"\x1b[1;1H");
+        term.process(&placeholder(1, 7, 0, 0));
+        term.process(&apc_g("a=p,i=2,p=5,P=1,Q=7,H=-3,V=-2,c=10,r=4", b""));
+        assert_eq!(reply(&mut term), "\x1b_Gi=2,p=5;OK\x1b\\");
+        let shown: Vec<(usize, usize, u16, u16)> = (0..6)
+            .flat_map(|row| {
+                term.images_row(row)
+                    .into_iter()
+                    .filter(|(_, image)| image.kitty.is_some_and(|tag| tag.image_id == 2))
+                    .map(move |(col, image)| (row, col, image.cell_row, image.cell_col))
+            })
+            .collect();
+        let want: Vec<(usize, usize, u16, u16)> = (0..2)
+            .flat_map(|row| (0..7).map(move |col| (row, col, row as u16 + 2, col as u16 + 3)))
+            .collect();
+        assert_eq!(shown, want, "rows 2..4 and columns 3..10 of the footprint");
+
+        term.process(&apc_g("a=p,i=2,p=5,P=1,Q=7,H=-20,V=-2,c=10,r=4,q=2", b""));
+        assert!(
+            (0..6).all(|row| term
+                .images_row(row)
+                .iter()
+                .all(|(_, image)| image.kitty.is_none_or(|tag| tag.image_id != 2))),
+            "a footprint wholly off the left edge shows nowhere"
+        );
     }
 
     #[test]

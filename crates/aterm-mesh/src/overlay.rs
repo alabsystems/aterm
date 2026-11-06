@@ -177,7 +177,7 @@ impl Overlay {
             self.chosen.clone_from(sight.seats);
             self.next_swap = None;
         } else {
-            let dead: BTreeSet<String> = self
+            let dead: Vec<String> = self
                 .chosen
                 .iter()
                 .filter(|node| {
@@ -192,8 +192,8 @@ impl Overlay {
             for node in &dead {
                 self.chosen.remove(node);
             }
-            while self.chosen.len() < K {
-                let candidates: Vec<&String> = sight
+            if self.chosen.len() < K {
+                let mut candidates: Vec<&String> = sight
                     .seats
                     .iter()
                     .filter(|node| {
@@ -203,21 +203,25 @@ impl Overlay {
                             && usable(node)
                     })
                     .collect();
-                let linked: Vec<&String> = candidates
+                let mut linked: Vec<&String> = candidates
                     .iter()
                     .copied()
                     .filter(|node| sight.up.contains(*node))
                     .collect();
-                let pick = if linked.is_empty() {
-                    self.pick(&candidates)
-                } else {
-                    self.pick(&linked)
-                };
-                match pick {
-                    Some(node) => {
-                        self.chosen.insert(node.clone());
+                while self.chosen.len() < K {
+                    let pick = if linked.is_empty() {
+                        self.pick(&candidates)
+                    } else {
+                        self.pick(&linked)
+                    };
+                    match pick {
+                        Some(node) => {
+                            self.chosen.insert(node.clone());
+                            candidates.retain(|&cand| cand != node);
+                            linked.retain(|&cand| cand != node);
+                        }
+                        None => break,
                     }
-                    None => break,
                 }
             }
             if self.chosen.len() < K {
@@ -387,11 +391,10 @@ pub(crate) fn stands_for_its_node(key: &[u8; 32], seats: &BTreeMap<String, [u8; 
 /// Whether `link`'s peer proved a current seat's key ([`Mesh::seats`]), not merely its principal:
 /// what a dial to a seat, for its relays or its mail, must reach.
 pub(crate) fn proves_a_seat(mesh: &Mesh, link: &Link) -> bool {
-    mesh.seats()
-        .is_some_and(|seats| seats.contains(link.peer().key.bytes()))
+    mesh.admits(link.peer().key.bytes()) == Some(true)
 }
 
-type Relays = BTreeMap<(String, MeshLog), (Arc<Slot>, JoinHandle<()>)>;
+type Relays = BTreeMap<String, BTreeMap<MeshLog, (Arc<Slot>, JoinHandle<()>)>>;
 
 impl Runtime {
     fn stopped(&self) -> bool {
@@ -416,12 +419,7 @@ impl Runtime {
                     overlay.failed(&node, now);
                 }
             }
-            let seats: BTreeMap<String, [u8; 32]> = mesh
-                .seats()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|key| (astream_broker::identity_principal(&key), key))
-                .collect();
+            let seats = mesh.seats_by_principal().unwrap_or_default();
             let links: BTreeMap<String, Arc<Link>> = self
                 .table
                 .links()
@@ -488,11 +486,15 @@ impl Runtime {
             }
             mesh.clock.park(next, &self.bell);
         }
-        for (slot, _) in relays.values() {
-            slot.stop();
+        for by_log in relays.values() {
+            for (slot, _) in by_log.values() {
+                slot.stop();
+            }
         }
-        for (_, (_, handle)) in relays {
-            let _ = handle.join();
+        for (_, by_log) in relays {
+            for (_, (_, handle)) in by_log {
+                let _ = handle.join();
+            }
         }
         for handle in ending {
             let _ = handle.join();
@@ -539,35 +541,51 @@ impl Runtime {
     ) {
         let wall = relay::wall_ms(&self.mesh.wall);
         let kept = std::mem::take(relays);
-        for ((peer, log), (slot, handle)) in kept {
-            let keep = !handle.is_finished()
-                && seats.contains_key(&peer)
-                && links
-                    .get(&peer)
-                    .is_some_and(|link| Arc::ptr_eq(link, &slot.link));
-            if !keep {
-                slot.stop();
-                ending.push(handle);
-                continue;
+        for (peer, by_log) in kept {
+            let seat_key = seats.get(&peer);
+            let live_link = links.get(&peer);
+            let kick_peer = kick_all || seat_key.is_some_and(|key| arrived.contains(key));
+            let mut kept_logs = BTreeMap::new();
+            for (log, (slot, handle)) in by_log {
+                let keep = !handle.is_finished()
+                    && seat_key.is_some()
+                    && live_link.is_some_and(|link| Arc::ptr_eq(link, &slot.link));
+                if !keep {
+                    slot.stop();
+                    ending.push(handle);
+                    continue;
+                }
+                if kick_peer {
+                    slot.kick();
+                }
+                if slot.following.load(Ordering::Acquire) {
+                    self.mesh
+                        .hosted(log)
+                        .relayed
+                        .lock_or_recover()
+                        .touch(&peer, wall);
+                }
+                kept_logs.insert(log, (slot, handle));
             }
-            if kick_all || seats.get(&peer).is_some_and(|key| arrived.contains(key)) {
-                slot.kick();
+            if !kept_logs.is_empty() {
+                relays.insert(peer, kept_logs);
             }
-            if slot.following.load(Ordering::Acquire) {
-                self.mesh
-                    .hosted(log)
-                    .relayed
-                    .lock_or_recover()
-                    .touch(&peer, wall);
-            }
-            relays.insert((peer, log), (slot, handle));
         }
         for (peer, link) in links {
             if !seats.contains_key(peer) {
                 continue;
             }
+            if relays
+                .get(peer)
+                .is_some_and(|by_log| by_log.len() == MeshLog::ALL.len())
+            {
+                continue;
+            }
             for log in MeshLog::ALL {
-                if relays.contains_key(&(peer.clone(), log)) {
+                if relays
+                    .get(peer)
+                    .is_some_and(|by_log| by_log.contains_key(&log))
+                {
                     continue;
                 }
                 let slot = Slot::new(peer.clone(), log, Arc::clone(link));
@@ -578,7 +596,10 @@ impl Runtime {
                     .spawn(move || relay::run(&mesh, &running));
                 match started {
                     Ok(handle) => {
-                        relays.insert((peer.clone(), log), (slot, handle));
+                        relays
+                            .entry(peer.clone())
+                            .or_default()
+                            .insert(log, (slot, handle));
                     }
                     Err(e) => aterm_log::warn!(
                         "mesh: the {} relay to {peer} could not start: {e}",
@@ -592,18 +613,18 @@ impl Runtime {
     /// Dial `node` at the addresses `hinted` gives it, on a thread of its own. `false` where no
     /// address is known or the thread could not start.
     fn dial(self: &Arc<Self>, node: &str, hinted: &[(String, SocketAddr)]) -> bool {
-        let addrs: Vec<SocketAddr> = hinted
-            .iter()
-            .filter(|(named, _)| named == node)
-            .map(|(_, addr)| *addr)
-            .collect();
-        if addrs.is_empty() {
+        if !hinted.iter().any(|(named, _)| named == node) {
             return false;
         }
         let mut dials = self.dials.lock_or_recover();
         if !dials.dialing.insert(node.to_owned()) {
             return true;
         }
+        let addrs: Vec<SocketAddr> = hinted
+            .iter()
+            .filter(|(named, _)| named == node)
+            .map(|(_, addr)| *addr)
+            .collect();
         let runtime = Arc::clone(self);
         let named = node.to_owned();
         let started = std::thread::Builder::new()

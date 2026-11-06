@@ -133,11 +133,16 @@ pub(super) fn run_at(
         "resource":hex::encode_lower(&allocation.terms().resource),"window":hex::encode_lower(&allocation.terms().window),
         "unit":allocation.terms().unit,"limit":allocation.terms().limit,"retained_records":snapshot.retained,
         "observation":"locally-retained","shares":allocation.terms().shares.iter().map(|(actor,limit)| {
-            let used=snapshot.used.get(actor).copied().unwrap_or(0);
-            json!({"actor":hex::encode_lower(actor),"limit":limit,"reserved_lower_bound":used,
-                "unreserved_upper_bound":limit-used})
+            share_status(actor, *limit, snapshot.used.get(actor).copied().unwrap_or(0))
         }).collect::<Vec<_>>()}),
     )
+}
+/// One share's row of a status report. `Ledger::read` admits no debit that takes its writer past
+/// the share, so `used` stays within `limit` for every share it read; were it ever past, the row
+/// says nothing is left rather than a wrapped count (a release build) or a panic (a debug one).
+pub(super) fn share_status(actor: &[u8], limit: u64, used: u64) -> Value {
+    json!({"actor":hex::encode_lower(actor),"limit":limit,"reserved_lower_bound":used,
+        "unreserved_upper_bound":limit.saturating_sub(used)})
 }
 fn take<'a>(options: &mut BTreeMap<&str, &'a str>, key: &str) -> Result<&'a str> {
     options

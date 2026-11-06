@@ -859,8 +859,9 @@ fn judge_landed(
     }
 }
 
-/// O2 past its resume `r`, `later` the acts after it but a cut's answer: Cruise's own act by its
-/// back-off's due and a grace, ledgered.
+/// O2 past its resume `r`, `later` the acts after it but a cut's answer: Cruise's own act by the
+/// due of the back-off named before it and a grace (none named: within [`cruise_within_ms`]),
+/// ledgered.
 fn judge_went_on(
     seen: &Seen,
     r: &Act<'_>,
@@ -869,7 +870,8 @@ fn judge_went_on(
     unread: Option<&str>,
     (scale, t0): (f64, i64),
 ) -> Verdict {
-    let backoff = named_backoff(seen, r.at);
+    let own = later.iter().find(|a| a.rule != RULE_OUTAGE_RESUME);
+    let backoff = named_backoff(seen, (r.at, own.map_or(i64::MAX, |a| a.at)));
     let deadline = backoff.map_or(r.at + cruise_within_ms(scale), |(due, _)| {
         due + PERSISTENCE_GRACE_MS
     });
@@ -885,7 +887,7 @@ fn judge_went_on(
             )
         },
     );
-    let Some(own) = later.iter().find(|a| a.rule != RULE_OUTAGE_RESUME) else {
+    let Some(own) = own else {
         if seen.end_ms >= deadline {
             return Verdict::Fail(format!(
                 "{said}; PERSISTENCE LOST: Cruise typed nothing of its own in the {} after the resume ({named})",

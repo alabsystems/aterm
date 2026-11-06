@@ -1067,6 +1067,87 @@ fn dir_bytes_counts_a_tree_and_does_not_follow_a_symlink() {
 }
 
 #[test]
+fn byte_walk_preserves_read_failures_as_lower_bounds_and_continues() {
+    use std::io::{Error, ErrorKind};
+
+    let tmp = Tmp::new("bytes-read-failure");
+    let file = tmp.path().join("readable");
+    std::fs::write(&file, b"counted").expect("file");
+    for root_failed in [false, true] {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+        ] {
+            let result = walk_bytes_with(
+                tmp.path(),
+                |_| true,
+                std::fs::Metadata::len,
+                None,
+                |_| {
+                    if root_failed {
+                        Err(Error::from(kind))
+                    } else {
+                        Ok([
+                            Err(Error::from(kind)),
+                            std::fs::read_dir(tmp.path())
+                                .expect("readable root")
+                                .next()
+                                .expect("readable file"),
+                        ])
+                    }
+                },
+            );
+            assert_eq!(
+                result,
+                (if root_failed { 0 } else { 7 }, kind != ErrorKind::NotFound),
+                "root_failed={root_failed} kind={kind:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn byte_walk_bounds_a_stream_of_unreadable_entries() {
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    let read = Cell::new(0);
+    let entries = std::iter::repeat_with(|| {
+        read.set(read.get() + 1);
+        Err::<std::fs::DirEntry, _>(Error::from(ErrorKind::PermissionDenied))
+    })
+    .take(MAX_WALK_ENTRIES + 2);
+    let mut entries = Some(entries);
+    assert_eq!(
+        walk_bytes_with(
+            Path::new("unreadable"),
+            |_| true,
+            std::fs::Metadata::len,
+            None,
+            |_| Ok(entries.take().expect("one root")),
+        ),
+        (0, true)
+    );
+    assert_eq!(read.get(), MAX_WALK_ENTRIES + 1);
+}
+
+#[test]
+fn byte_walk_saturation_is_a_lower_bound_but_the_maximum_exact_total_is_not() {
+    let tmp = Tmp::new("bytes-saturation");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::fs::write(&a, b"a").expect("a");
+    std::fs::write(&b, b"b").expect("b");
+    let count = || walk_bytes(tmp.path(), |_| true, |_| u64::MAX);
+    assert_eq!(count(), (u64::MAX, true));
+    std::fs::remove_file(&b).expect("remove b");
+    assert_eq!(count(), (u64::MAX, false));
+    std::fs::remove_file(&a).expect("remove a");
+    assert_eq!(count(), (0, false));
+}
+
+#[test]
 fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
     let tmp = Tmp::new("scan");
     let versions = tmp.path().join("versions");

@@ -13,7 +13,7 @@ use aterm_capacity::floor::GIB;
 use aterm_capacity::{Admit, Fixed, Footprints, Ledger, Pace, Reading, Volume};
 use aterm_spec::wait::MUST_HAPPEN;
 
-use super::{Reclaim, Run, admit_on, dirs_tag, scope_tag};
+use super::{Reclaim, Run, admit_on, dirs_tag, scope_tag, size};
 
 /// The scratch image's volume: `total` GiB, `free` of it free, a 4 GiB floor.
 fn image(total: u64, free: u64) -> Reading {
@@ -1643,4 +1643,156 @@ fn a_run_that_did_not_pass_is_kept_for_its_own_directories_alone() {
     let e = admit_with_room(two, &ledger).estimate;
     assert_eq!(e.bytes, took.peak - holds, "the run finished whole: {e}");
     assert!((3 << 20..(3 << 20) + (64 << 10)).contains(&e.bytes), "{e}");
+}
+
+/// A noop relief: no pass, no window, no holders.
+fn no_relief() -> Reclaim {
+    Reclaim::of(
+        Box::new(|_, _| (0, Vec::new(), Vec::new())),
+        Box::new(|_, _, _| None),
+        Box::new(|_, _| Vec::new()),
+    )
+}
+
+/// A release's whole disk claim, sized by its caller.
+fn release_claim(dir: &Path, bytes: u64) -> super::SizedClaim {
+    super::SizedClaim {
+        what: "release 0.156.0".to_owned(),
+        bytes,
+        on: PathBuf::from("/Volumes/scratch"),
+        keep: vec![dir.join("clone-build")],
+        checkout: Some(dir.join("clone").display().to_string()),
+        stuck_ends: None,
+    }
+}
+
+/// A CLAIM OF A KNOWN SIZE IS HELD WITHOUT A WALK, AND KEEPS NOTHING ([`super::admit_sized_on`]):
+/// on a volume with room it is admitted at once, saying nothing, for exactly what its caller
+/// sized, its checkout named; its marker is the name the ledger holds it by, which covers its
+/// holder's run ([`aterm_capacity::covering_disk`]); what the work says it wrote is the claim's
+/// progress; dropped, it leaves the ledger, and nothing was written beside the directories it
+/// keeps. NEGATIVE CONTROL: a need more than the volume holds above its floor is refused at once,
+/// saying first what it claims.
+#[test]
+fn a_sized_claim_is_held_unwalked_and_keeps_nothing() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-sized-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let m = Fixed::new(image(400, 300));
+    let run = release_claim(dir.path(), 39 * GIB);
+    let checkout = run.checkout.clone();
+    let mut said = Vec::new();
+    let mut held = super::admit_sized_on(
+        run,
+        &ledger,
+        &m,
+        Admit::Wait,
+        Pace::default(),
+        &mut no_relief(),
+        &mut |l| said.push(l.to_owned()),
+    )
+    .expect("admitted");
+    assert!(said.is_empty(), "{said:?}");
+    let listed = ledger.list().expect("listed");
+    assert_eq!(listed.len(), 1);
+    let r = &listed[0];
+    assert_eq!(
+        (r.need.what.as_str(), r.need.disk, Some(&r.checkout)),
+        ("release 0.156.0", 39 * GIB, checkout.as_ref())
+    );
+    assert!(r.held.is_some());
+    assert_eq!(held.marker(), r.cover_marker());
+    assert_eq!(held.record().cover_marker(), held.marker());
+    let covered = aterm_capacity::covering_disk(
+        &ledger,
+        &m,
+        std::process::id(),
+        &held.marker(),
+        Path::new("/Volumes/scratch/clone"),
+    )
+    .expect("read");
+    assert_eq!(covered.map(|r| r.need.disk), Some(39 * GIB));
+    held.wrote(5 * GIB).expect("wrote");
+    assert_eq!(ledger.list().expect("listed")[0].wrote, Some(5 * GIB));
+    drop(held);
+    assert!(ledger.list().expect("listed").is_empty());
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("scratch")
+            .flatten()
+            .all(|e| e.file_name() == "ledger"),
+        "nothing kept beside it"
+    );
+
+    let mut said = Vec::new();
+    let never = super::admit_sized_on(
+        release_claim(dir.path(), 500 * GIB),
+        &ledger,
+        &m,
+        Admit::Wait,
+        Pace::default(),
+        &mut no_relief(),
+        &mut |l| said.push(l.to_owned()),
+    );
+    assert!(matches!(never, Err(super::Error::Never(_))), "{never:?}");
+    assert_eq!(said.len(), 1, "{said:?}");
+    names(&said[0], &[&size(500 * GIB), "release 0.156.0"]);
+    assert!(ledger.list().expect("listed").is_empty());
+}
+
+/// A SIZED CLAIM ON A SHORT VOLUME IS RELIEVED, THEN WAITS, saying first what it claims: the
+/// pass is asked for the short volume, and once room comes the claim is admitted, having
+/// waited. NEGATIVE CONTROL: the claim admitted at once ([`a_sized_claim_is_held_unwalked_and_keeps_nothing`])
+/// asks no relief.
+#[test]
+fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-sized-short-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let m = Arc::new(Fixed::new(image(100, 30)));
+    let passes = Arc::new(Mutex::new(0usize));
+    let (theirs, their_passes, their_ledger) =
+        (Arc::clone(&m), Arc::clone(&passes), ledger.clone());
+    let run = release_claim(dir.path(), 39 * GIB);
+    let (tx, rx) = mpsc::channel::<String>();
+    let waiting = std::thread::spawn(move || {
+        let freed = Arc::clone(&theirs);
+        let mut relief = Reclaim::of(
+            Box::new(move |room: super::Room<'_>, _stopped| {
+                assert_eq!(room.mount, Path::new("/Volumes/scratch"));
+                *their_passes.lock().expect("passes") += 1;
+                (0, Vec::new(), Vec::new())
+            }),
+            Box::new(|_, _, _| None),
+            Box::new(|_, _| Vec::new()),
+        );
+        let held = super::admit_sized_on(
+            run,
+            &their_ledger,
+            freed.as_ref(),
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(5),
+                ..Pace::default()
+            },
+            &mut relief,
+            &mut |l| {
+                let _ = tx.send(l.to_owned());
+            },
+        );
+        held.map(|h| h.waited)
+    });
+    let first = rx.recv_timeout(MUST_HAPPEN).expect("its first line");
+    names(&first, &[&size(39 * GIB), "release 0.156.0"]);
+    aterm_spec::wait::until_within(MUST_HAPPEN, "the claim to wait", || {
+        (ledger.list().ok()?.first()?.held.is_none()).then_some(())
+    });
+    m.set(image(100, 80));
+    let waited = joined(waiting, "the sized claim to be admitted").expect("admitted");
+    assert!(waited > Duration::ZERO);
+    assert_eq!(*passes.lock().expect("passes"), 1, "relieved once");
 }

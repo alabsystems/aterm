@@ -3,7 +3,7 @@
 
 use crate::harness::acts::TaskFace;
 use crate::supervise::policy::turn_end::{
-    RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK, RULE_LAND_NUDGE, RULE_LEFT,
+    RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK, RULE_LAND_NUDGE, RULE_LEFT,
 };
 
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all of \
@@ -3309,6 +3309,262 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
     assert_eq!(turns, 2, "{lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
     assert_eq!(typed.len(), 2, "{typed:#?}");
+}
+
+/// A landed worker switched from Land to Cruise: Cruise unlands the books and types, every act it
+/// types goes into a record that is open, and the landing after the switch back to Land is
+/// published as a result of its own. At rest on the landed screen the switch opens the record
+/// again before Cruise's act, though the act its point last followed is Land's own check. Made
+/// while the check runs, the switch is the word the check's `LANDED` is folded under once it has
+/// stood its settle, so that landing is never Land's to publish; one still inside its settle at
+/// the turn's end leaves the landing to Land until the settle's end, which opens it again before
+/// Cruise types, and so does one made after the turn's last wait, which the point's own read of
+/// the check's `LANDED` shows and only the decision reads. Control: the landing left under Land
+/// marks nothing more.
+#[test]
+fn a_landed_worker_switched_to_cruise_reopens_and_publishes_its_next_landing() {
+    const MORE: &str = "Tidied the parser's error messages; pushing them next.";
+    // The screen whose read switches the word to Cruise: inside the check's turn (5, which a wait
+    // in the turn then wakes on), the check's `LANDED` (6, which no wait sees before the point is
+    // folded), or the landed screen at rest (7, a read of 6 past the one that landed it); `None`
+    // leaves it Land. `settle` is how long a switch stands before the loop decides on it.
+    let go = |switch: Option<usize>, settle: Duration| {
+        let (dir, ledger) = files(&format!("unland-{switch:?}-{}", settle.as_secs()), &[], &[]);
+        let host = Arc::new(Faces {
+            finished: Some(true),
+            ..Faces::default()
+        });
+        // The landing, its check's turn two frames long (0-6), Cruise's turn (7-8), Land's
+        // second landing (9-12).
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        let [defense, check, landed] = landing();
+        screens.extend([defense, check.clone(), check, landed]);
+        screens.extend([busy_screen(), ended(MORE), busy_screen()]);
+        screens.extend(landing());
+        let mut m = Mock::new(screens);
+        m.history_served();
+        m.autopilot = Some("land");
+        m.takes_word = true;
+        // Each point held until its act is typed: the instruction, the check, Cruise's act on
+        // the landed screen, then the instruction and the check again.
+        m.turn_gates = vec![1, 3, 6, 8, 10];
+        if let Some(at) = switch {
+            // To Cruise, and back to Land on Cruise's turn's end.
+            m.autopilot_on.insert(at, Some("cruise"));
+            m.autopilot_on.insert(8, Some("land"));
+        }
+        m.vanish_after = Some(12);
+        m.stall_sleep = Some(Duration::from_millis(20));
+        m.task = Some((
+            1,
+            "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+        ));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            journal: Some(crate::supervise::approvals::journal_beside(&ledger)),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            tasks: Some(dir.join("tasks")),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_word_settle(settle);
+            s.set_turn_end_timing(TurnEndTiming {
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let marks: Vec<String> = m
+            .task_requests
+            .iter()
+            .filter(|r| r.starts_with("task mark"))
+            .cloned()
+            .collect();
+        // Whether the record read `done` as each act was typed, by the marks served before it.
+        let mut done = false;
+        let mut done_at_acts = Vec::new();
+        for (r, ok) in &m.order {
+            if r.starts_with("task mark done") && *ok {
+                done = true;
+            } else if r.starts_with("task mark working") && *ok {
+                done = false;
+            } else if r.starts_with("turn") {
+                done_at_acts.push(done);
+            }
+        }
+        let acts: Vec<String> = lines
+            .iter()
+            .filter(|l| l.starts_with("CONTINUED "))
+            .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("rule=")))
+            .map(str::to_string)
+            .collect();
+        let log = format!("{marks:#?}\n{:#?}\n{lines:#?}", m.order);
+        (marks, acts, done_at_acts, host.told(), log)
+    };
+    let landing_of = |mark: &str| {
+        mark.strip_prefix("task mark done why=landed ")
+            .and_then(|rest| rest.split_once("result_path="))
+            .map(|(_, path)| path.to_string())
+    };
+    let land = [RULE_LAND, RULE_LAND_CHECK];
+    let now = Duration::ZERO;
+    let later = Duration::from_secs(5);
+    // Where the word turns, the switch's settle, and whether Land's first landing is published
+    // (then opened again) before Cruise's act. Every reading is read at its first read, the
+    // check's `LANDED` included (`land_check::land_check_answer`).
+    for (at, settle, published) in [
+        (7, now, true),
+        (5, now, false),
+        (5, later, true),
+        (6, now, true),
+    ] {
+        let case = format!("at {at}, settle {settle:?}");
+        let (marks, acts, done_at_acts, told, log) = go(Some(at), settle);
+        // Cruise's act: its done check on a landing it unlanded, else its continuation.
+        assert!(
+            acts.len() == 5
+                && acts[..2] == land
+                && [RULE_DONE_CHECK, RULE_CONTINUE].contains(&acts[2].as_str())
+                && acts[3..] == land,
+            "{case}: Land's two, Cruise's act, Land's two again: {log}"
+        );
+        let last = marks.last().and_then(|m| landing_of(m));
+        assert!(
+            last.is_some(),
+            "{case}: the second landing published: {log}"
+        );
+        if published {
+            assert_eq!(marks.len(), 3, "{case}: {log}");
+            let first = landing_of(&marks[0]).expect("the first landing published");
+            assert_eq!(marks[1], "task mark working why=turn", "{case}: {log}");
+            assert_ne!(Some(first), last, "{case}: a result of its own: {log}");
+            assert_eq!(
+                told,
+                [
+                    TaskFace::Open,
+                    TaskFace::Landed,
+                    TaskFace::Open,
+                    TaskFace::Landed
+                ],
+                "{case}: {log}"
+            );
+        } else {
+            assert_eq!(marks.len(), 1, "{case}: only the landing Land keeps: {log}");
+            assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{case}: {log}");
+        }
+        assert_eq!(
+            done_at_acts, [false; 5],
+            "{case}: every act typed into an open record: {log}"
+        );
+    }
+    let (marks, acts, done_at_acts, told, log) = go(None, now);
+    assert_eq!(acts, land, "the instruction and the check: {log}");
+    assert_eq!(done_at_acts, [false; 2], "{log}");
+    assert_eq!(marks.len(), 1, "{log}");
+    assert!(landing_of(&marks[0]).is_some(), "{log}");
+    assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{log}");
+}
+
+/// CRUISE'S UNLANDING OPENS A LANDING, NEVER A FAILED RECORD: a landed worker whose record
+/// another writer then marked `failed` (`why=expired`), switched to Cruise at rest, keeps that
+/// record as Cruise types, since a failed one is the switch's own to open (the window's task
+/// record, Cruise set after it failed); the landing after the switch back to Land opens and
+/// publishes it as ever. Control: the record left `done`, the unlanding opens it before Cruise
+/// types.
+#[test]
+fn cruises_unlanding_leaves_a_failed_record_to_the_switch() {
+    const MORE: &str = "Tidied the parser's error messages; pushing them next.";
+    let go = |fails: bool| {
+        let (dir, ledger) = files(&format!("unland-failed-{fails}"), &[], &[]);
+        let host = Arc::new(Faces {
+            finished: Some(true),
+            ..Faces::default()
+        });
+        // The landing (0-5), Cruise's turn (6-7), Land's second landing (8-11).
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
+        screens.extend([busy_screen(), ended(MORE), busy_screen()]);
+        screens.extend(landing());
+        let mut m = Mock::new(screens);
+        m.history_served();
+        m.autopilot = Some("land");
+        m.takes_word = true;
+        m.turn_gates = vec![1, 3, 5, 7, 9];
+        // To Cruise at rest on the landed screen, past the reading that landed it; back to Land
+        // on Cruise's turn's end.
+        m.autopilot_on.insert(6, Some("cruise"));
+        m.autopilot_on.insert(7, Some("land"));
+        if fails {
+            m.task_fails_at = Some(6);
+        }
+        m.vanish_after = Some(11);
+        m.stall_sleep = Some(Duration::from_millis(20));
+        m.task = Some((
+            1,
+            "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+        ));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            journal: Some(crate::supervise::approvals::journal_beside(&ledger)),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            tasks: Some(dir.join("tasks")),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_word_settle(Duration::ZERO);
+            s.set_turn_end_timing(TurnEndTiming {
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        // The acts typed before the record was first marked `working`.
+        let acts_before_open = m
+            .order
+            .iter()
+            .take_while(|(r, ok)| !(r.starts_with("task mark working") && *ok))
+            .filter(|(r, _)| r.starts_with("turn"))
+            .count();
+        let marks: Vec<String> = m
+            .task_requests
+            .iter()
+            .filter(|r| r.starts_with("task mark"))
+            .cloned()
+            .collect();
+        let log = format!("{marks:#?}\n{:#?}\n{lines:#?}", m.order);
+        (acts_before_open, marks, count(&m, "turn"), log)
+    };
+    let (acts_before_open, marks, turns, log) = go(true);
+    assert_eq!(
+        turns, 5,
+        "Land's two, Cruise's act, Land's two again: {log}"
+    );
+    assert_eq!(
+        acts_before_open, 5,
+        "the failed record stands through Cruise's act, opened by the next landing: {log}"
+    );
+    assert!(
+        marks
+            .last()
+            .is_some_and(|m| m.starts_with("task mark done why=landed ")),
+        "the second landing published: {log}"
+    );
+    let (acts_before_open, _, turns, log) = go(false);
+    assert_eq!(turns, 5, "{log}");
+    assert_eq!(
+        acts_before_open, 2,
+        "the landing opened before Cruise's act: {log}"
+    );
 }
 
 /// What a client says where nothing serves the control socket yet, as a seamless update's

@@ -95,6 +95,26 @@ pub trait Packer {
     /// # Errors
     /// Any gate's refusal.
     fn pack(&self, ctx: &Ctx, request: &PackRequest) -> Result<PackOutcome>;
+
+    /// Whether the upstream GNU target's C compiler, SDK and execution route work.
+    /// # Errors
+    /// An unsupported packer or unavailable target SDK.
+    fn can_pack_bottle(&self, _triple: Triple) -> std::result::Result<(), String> {
+        Err("this packer cannot build upstream source archives".into())
+    }
+
+    /// Acquire and qualify an upstream GNU bottle, always unsigned and without upload.
+    /// # Errors
+    /// An unsupported packer or any upstream/qualification refusal.
+    fn pack_bottle(
+        &self,
+        _ctx: &Ctx,
+        _request: &crate::artifact::bottle::upstream::Request,
+    ) -> Result<crate::artifact::bottle::BottleOutcome> {
+        Err(crate::error::Error::cannot_run(
+            "this packer cannot acquire upstream bottles",
+        ))
+    }
 }
 
 /// The hello-world probe switch and the Trust sysroot that admits the packed compiler.

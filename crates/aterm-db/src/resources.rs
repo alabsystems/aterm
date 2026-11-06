@@ -82,7 +82,8 @@ impl Resources {
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.observe_store(|session, store, _| {
             self.pin(session, store, false)?;
-            Ok(ledger::Ledger::read(&self.allocation, session, store)?.snapshot(&self.allocation))
+            Ok(ledger::Ledger::read(&self.allocation, session, store)?
+                .into_snapshot(&self.allocation))
         })
     }
 
@@ -176,7 +177,6 @@ impl Resources {
             ));
         }
         self.with_store(false, |session, store, _| {
-            self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
             if let Some(old) = ledger.request(&session.actor(), &request) {
@@ -253,7 +253,9 @@ impl Resources {
             descriptor(bootstrap, &self.allocation)
         };
         let apply = |session: &Session<'_>, store: &mut Store, scope: Scope| {
-            if let Some(pinned) = self.check_existing_pin()?
+            let name = self.pin_name();
+            let existing = self.check_existing_pin_named(&name)?;
+            if let Some(pinned) = existing
                 && pinned != store.primary_custody_id(session)?
             {
                 return Err(Error::new(
@@ -266,6 +268,12 @@ impl Resources {
                 .observe_store_if_exists(session, scope)?
             {
                 store.reconcile_recovery(session, recovery)?;
+            }
+            if !create && existing.is_none() {
+                store.primary_custody_id(session)?;
+                return Err(Error::new(
+                    "resource activation pin is not retained locally",
+                ));
             }
             action(session, store, scope)
         };

@@ -1948,17 +1948,26 @@ impl Journal {
                 header.commit,
             )));
         }
-        let journal: Journal = aterm_toml::from_str(&text)
+        Self::parse_loaded(&text, path).map(Some)
+    }
+
+    fn parse_loaded(text: &str, path: &Path) -> Result<Journal> {
+        let journal: Journal = aterm_toml::from_str(text)
             .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
         journal.validate()?;
-        Ok(Some(journal))
+        Ok(journal)
     }
 
     /// This cutter's journal, or `Ok(None)` for no journal and for another cutter's format.
     pub fn load_if_ours(path: &Path) -> Result<Option<Journal>> {
-        match JournalHeader::read(path)? {
-            Some(header) if header.format == JOURNAL_FORMAT => Self::load(path),
-            _ => Ok(None),
+        let Some(text) = read_journal_text(path)? else {
+            return Ok(None);
+        };
+        let header = JournalHeader::parse(&text, path)?;
+        if header.format == JOURNAL_FORMAT {
+            Self::parse_loaded(&text, path).map(Some)
+        } else {
+            Ok(None)
         }
     }
 
@@ -2382,8 +2391,9 @@ fn github_refusal_summary(response: &[u8]) -> Option<String> {
 }
 
 fn release_post_failure_detail(out: &RunOut, posted_body_chars: usize) -> String {
-    let mut detail = out.stderr_utf8().trim().to_string();
-    if http_status_from_curl_failure(&out.stderr_utf8()) == Some(HTTP_UNPROCESSABLE_CONTENT) {
+    let stderr = out.stderr_utf8();
+    let mut detail = stderr.trim().to_string();
+    if http_status_from_curl_failure(&stderr) == Some(HTTP_UNPROCESSABLE_CONTENT) {
         let limit = changelog::GITHUB_RELEASE_BODY_LIMIT;
         detail.push_str(&format!(
             " — {HTTP_UNPROCESSABLE_CONTENT} is GitHub understanding the request and refusing \
@@ -5658,21 +5668,13 @@ fn published_manifest_signature_pubkey(
         download_release_asset_for_release_id(slug, release_id, roster::ROSTER_ASSET)?;
     let roster_sig =
         download_release_asset_for_release_id(slug, release_id, roster::ROSTER_SIG_ASSET)?;
-    let _asset_generation = machines::verify_published_roster(
+    let parsed = machines::verify_published_roster_parsed(
         aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-        roster_bytes.clone(),
+        roster_bytes,
         &roster_sig,
         machine_id,
         manifest.roster_seq,
     )?;
-    let verified = roster::verify_roster(
-        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-        roster_bytes,
-        &roster_sig,
-    )
-    .map_err(|e| Error::new(format!("published machine roster does not verify ({e:?})")))?;
-    let parsed = roster::Roster::parse(&verified)
-        .map_err(|e| Error::new(format!("published machine roster is unusable ({e:?})")))?;
     let machine = parsed
         .machines
         .iter()
@@ -6158,6 +6160,23 @@ pub(crate) fn verified_release_bundle_with_inputs(
             "this clone's release of {} is v{}, not v{version}",
             short(source),
             journal.version
+        )));
+    }
+    let line = journal.line();
+    if line.head() != source {
+        return Err(refuse(format!(
+            "this clone's release journal names {} and its line's head {}: they must be one \
+             commit",
+            short(source),
+            short(line.head())
+        )));
+    }
+    if !line.hops.is_empty()
+        && let Err(stop) = crate::line::verify(operator, &line)
+    {
+        return Err(refuse(format!(
+            "the line's meaning check (line::verify) refuses its head {}: {stop}",
+            short(source)
         )));
     }
     if !journal.has(crate::release::COMMIT_GATES) {
@@ -7592,10 +7611,10 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
             let fingerprint = ctx
                 .expected_embedded_pin()?
                 .ok_or_else(|| Error::new("signed channel has no pinned paper master"))?;
-            let provenance = gates::read_bounded_string(&ctx.provenance_path(), 16 << 20)
-                .map_err(|error| Error::new(format!("read update-pin provenance: {error}")))?;
+            let provenance_text = std::str::from_utf8(&provenance)
+                .map_err(|_| Error::new("release provenance is not UTF-8"))?;
             let expected = format!("update_pubkey_fingerprint_sha256={fingerprint}");
-            if !provenance.lines().any(|line| line == expected) {
+            if !provenance_text.lines().any(|line| line == expected) {
                 return Err(Error::new(format!(
                     "release provenance is missing exact update-pin field {expected:?}"
                 )));
@@ -8154,9 +8173,9 @@ fn prove_roster_on_disk_at(
     };
     let roster_bytes = read(roster::ROSTER_ASSET)?;
     let roster_sig = read(roster::ROSTER_SIG_ASSET)?;
-    machines::verify_published_roster(
+    let parsed = machines::verify_published_roster_parsed(
         master_pubkeys,
-        roster_bytes.clone(),
+        roster_bytes,
         &roster_sig,
         machine_id,
         manifest.roster_seq,
@@ -8170,15 +8189,6 @@ fn prove_roster_on_disk_at(
             ctx.version
         ))
     })?;
-    let verified =
-        roster::verify_roster(master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
-            Error::new(format!(
-                "dist/{} failed master verification ({e:?})",
-                roster::ROSTER_ASSET
-            ))
-        })?;
-    let parsed = roster::Roster::parse(&verified)
-        .map_err(|e| Error::new(format!("dist/{} is unusable ({e:?})", roster::ROSTER_ASSET)))?;
     parsed.admit(0, now_unix).map_err(|e| {
         Error::new(format!(
             "dist/{} is not a fresh roster at publish time ({e:?}); refusing to publish a \
@@ -8375,8 +8385,7 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
 
     fn artifacts(&mut self) -> Result<Vec<PathBuf>> {
         let ctx = &*self.ctx;
-        let manifest = prove_publication_on_disk(ctx)?;
-        prove_roster_on_disk(ctx, &manifest)?;
+        let _manifest = prove_publication_on_disk(ctx)?;
         let files = ctx.channel_asset_paths();
         if let Some(missing) = files.iter().find(|file| !file.is_file()) {
             return Err(Error::new(format!(

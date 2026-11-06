@@ -215,10 +215,10 @@ impl Scrollback {
 
     /// Evict the oldest warm block to cold.
     fn evict_warm_to_cold(&mut self) -> bool {
-        let Some(block) = self.warm.pop_front() else {
+        let Some(mut block) = self.warm.pop_front() else {
             return false;
         };
-        let accepted = self.cold.push_block(&block);
+        let accepted = self.cold.push_block(&mut block);
         if accepted == 0 && block.line_count() > 0 {
             // Page validation already incremented the failure counter when
             // cold.push_block could not convert the warm block.
@@ -227,8 +227,9 @@ impl Scrollback {
                 self.pressure_evicted_lines =
                     self.pressure_evicted_lines.saturating_add(lost as u64);
                 let kept = self.cold.line_count() > 0 && {
-                    let blank = super::tier::WarmBlock::from_lines(&vec![Line::default(); lost]);
-                    self.cold.push_lost_block(&blank) != 0
+                    let mut blank =
+                        super::tier::WarmBlock::from_lines(&vec![Line::default(); lost]);
+                    self.cold.push_lost_block(&mut blank) != 0
                 };
                 if !kept {
                     self.line_count = self.line_count.saturating_sub(lost);

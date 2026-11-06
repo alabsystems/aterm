@@ -23,15 +23,21 @@ use crate::wire::{Method, Origin};
 use crate::write::{Outcome as WriteOutcome, WriteOp};
 
 fn method(inv: &Invocation) -> Result<Method> {
-    let text = inv.flag("--method").unwrap_or("GET").to_ascii_uppercase();
-    match text.as_str() {
-        "GET" => Ok(Method::Get),
-        "HEAD" => Ok(Method::Head),
-        "POST" => Ok(Method::Post),
-        "PATCH" => Ok(Method::Patch),
-        "PUT" => Ok(Method::Put),
-        "DELETE" => Ok(Method::Delete),
-        _ => Err(inv.usage("-X wants GET, HEAD, POST, PATCH, PUT or DELETE")),
+    let text = inv.flag("--method").unwrap_or("GET");
+    if text.eq_ignore_ascii_case("GET") {
+        Ok(Method::Get)
+    } else if text.eq_ignore_ascii_case("HEAD") {
+        Ok(Method::Head)
+    } else if text.eq_ignore_ascii_case("POST") {
+        Ok(Method::Post)
+    } else if text.eq_ignore_ascii_case("PATCH") {
+        Ok(Method::Patch)
+    } else if text.eq_ignore_ascii_case("PUT") {
+        Ok(Method::Put)
+    } else if text.eq_ignore_ascii_case("DELETE") {
+        Ok(Method::Delete)
+    } else {
+        Err(inv.usage("-X wants GET, HEAD, POST, PATCH, PUT or DELETE"))
     }
 }
 
@@ -131,31 +137,33 @@ fn target(
     path: &str,
     router: &Router,
 ) -> Result<(RouteTarget, Named, Option<String>)> {
-    let decoded: Vec<String> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(aterm_codec::pct::decode)
-        .collect();
-    let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
+    let mut segs = path.split('/').filter(|s| !s.is_empty()).map(|s| {
+        if s.contains('%') {
+            std::borrow::Cow::Owned(aterm_codec::pct::decode(s))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    });
+    let first = segs.next();
+    let second = segs.next();
+    let third = segs.next();
     let given = match &inv.global.repo {
         Some(_) => Some(inv.repo(router)?),
         None => None,
     };
-    let (target, named) = match segs.as_slice() {
-        ["repositories", id, ..] => {
+    let (target, named) = match (first.as_deref(), second.as_deref(), third.as_deref()) {
+        (Some("repositories"), Some(id), _) => {
             return match given {
-                Some((slug, named)) => {
-                    Ok((RouteTarget::Repo(slug), named, Some((*id).to_string())))
-                }
+                Some((slug, named)) => Ok((RouteTarget::Repo(slug), named, Some(id.to_string()))),
                 None => {
                     Err(inv.usage("repositories/{id} paths need -R OWNER/NAME, which routes them"))
                 }
             };
         }
-        ["repos", owner, repo, ..] => match Slug::new(owner, repo) {
+        (Some("repos"), Some(owner), Some(repo)) => match Slug::new(owner, repo) {
             Ok(slug) => {
                 if let Some((given, _)) = &given
-                    && given.key() != slug.key()
+                    && given != &slug
                 {
                     return Err(inv.usage(format!(
                         "-R {given} and the path's {slug} name different repositories"
@@ -166,10 +174,14 @@ fn target(
             }
             Err(_) => (RouteTarget::Unscoped, Named::Default),
         },
-        ["orgs" | "users", owner, ..] => (RouteTarget::Owner((*owner).to_string()), Named::Default),
+        (Some("orgs" | "users"), Some(owner), _) => {
+            (RouteTarget::Owner(owner.to_string()), Named::Default)
+        }
         // `/user/{account_id}…` names another account by numeric id, not the profile's own.
-        ["user", id, ..] if crate::path::is_digits(id) => (RouteTarget::Unscoped, Named::Default),
-        ["user", ..] => (RouteTarget::Identity, Named::Default),
+        (Some("user"), Some(id), _) if crate::path::is_digits(id) => {
+            (RouteTarget::Unscoped, Named::Default)
+        }
+        (Some("user"), ..) => (RouteTarget::Identity, Named::Default),
         _ => (RouteTarget::Unscoped, Named::Default),
     };
     Ok((target, named, None))

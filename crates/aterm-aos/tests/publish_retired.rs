@@ -284,6 +284,60 @@ fn the_registry_lists_each_slot_once_in_order_with_its_timeline_rows() {
     }
 }
 
+/// A value with whitespace or a control in it stays one word of its row, and the row one line;
+/// an empty value is `-`.
+#[test]
+fn every_registry_value_is_one_word_of_one_line() {
+    assert_eq!(
+        Row::Detached {
+            why: "line\nbreak\there"
+        }
+        .words(),
+        "detached why=line_break_here"
+    );
+    assert_eq!(
+        Row::Unseen { on: false, why: "" }.words(),
+        "unseen=off why=-"
+    );
+    let segment = Row::Segment {
+        cause: Retire::Full,
+        code: "two\r\nwords".into(),
+        log_epoch: 1,
+        from: 0,
+        to: 4,
+        judged: Judged::Fail {
+            law: "a\u{85}law",
+            cursor: 3,
+        },
+        kept: None,
+    };
+    assert_eq!(
+        segment.words(),
+        "segment cause=full code=two__words log_epoch=1 range=0..4 judged=fail:a_law@3 kept=no"
+    );
+    assert_eq!(Judged::Unjudged("no log\u{7}").token(), "unjudged:no_log_");
+    let line = Listing {
+        slot: 1,
+        kind: TaskKind::Effect,
+        task: "a\tb".into(),
+        code: String::new(),
+        attached: false,
+        paused: false,
+        revision: 0,
+        log_epoch: 0,
+        log_len: 0,
+        waiting: 0,
+        kept: 0,
+        timeline: Timeline::default(),
+    }
+    .line();
+    assert!(
+        line.starts_with("slot=1 kind=effect task=a_b code=- "),
+        "{line}"
+    );
+    assert!(!line.contains(['\n', '\t']), "{line}");
+}
+
 #[test]
 fn zero_capacity_attach_breaks_without_reanchoring_or_evicting_retired_segments() {
     let mut b = boundary_over(Variant::Good, ToyState::default(), 4);

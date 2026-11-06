@@ -69,9 +69,8 @@ impl<'a> Refs<'a> {
     pub fn get(&self, reference: &str) -> Result<RefObject> {
         self.check_reference(reference)?;
         let name = reference.strip_prefix("refs/").unwrap_or(reference);
-        let encoded: Vec<String> = name.split('/').map(path::segment).collect();
         let call = self.how.get(
-            format!("{}/git/ref/{}", repo_root(&self.slug), encoded.join("/")),
+            format!("{}/git/ref/{}", repo_root(&self.slug), path::ref_path(name)),
             RouteTarget::Repo(self.slug.clone()),
         );
         let answered = self

@@ -122,7 +122,7 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Bring another aterm instance's windows to the front by pid (the status menu's sibling rows). macOS only.
+    /// Bring another running app's windows to the front by pid: another aterm instance (the status menu's sibling rows) or Apple's Command Line Tools installer (System State's Go to installer). `false` for this process, a pid no running app has, or an app macOS did not activate; the default brings nothing forward. macOS only.
     #[cfg(target_os = "macos")]
     fn activate_instance(&self, _pid: u32) -> bool {
         false

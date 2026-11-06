@@ -1234,36 +1234,124 @@ impl Instance {
                 self.kept,
                 self.gui,
             )
-            .map_err(|why| format!("{why}; {}", standing(self.pid, self.kept, self.gui)))
+            .map_err(|why| {
+                format!(
+                    "{why}; {}",
+                    standing(&mut self.child, self.pid, self.kept, self.gui)
+                )
+            })
         })
     }
 }
 
-/// What the kernel says now of an instance whose stop did not establish its end: its process
-/// and, for a windowed one (`kept`), whose process is its keeper, its aterm (`gui`).
-fn standing(pid: i32, kept: bool, gui: Option<aterm_uds::process::Identity>) -> String {
-    use aterm_uds::process::{ProcessPresence, process_presence};
-    let one = |what: &str, pid: i32| match process_presence(pid) {
-        ProcessPresence::Present => format!("{what} pid {pid} still runs"),
-        ProcessPresence::Exited => format!("{what} pid {pid} has exited, not yet reaped"),
-        ProcessPresence::Absent => format!("{what} pid {pid} has ended"),
-        ProcessPresence::Unknown => format!("{what} pid {pid} is neither seen nor seen gone"),
+/// What one of an instance's processes is now ([`standing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Now {
+    Runs,
+    /// It has exited and is not yet reaped.
+    Exited,
+    /// The kernel knows no process by its pid.
+    Ended,
+    /// Its pid now names another process: it has ended.
+    Reused,
+    /// Its pid is present, and its identity could not be read.
+    Unreadable,
+    /// The kernel neither showed its pid nor showed it gone.
+    Unseen,
+}
+
+impl std::fmt::Display for Now {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Now::Runs => "still runs",
+            Now::Exited => "has exited, not yet reaped",
+            Now::Ended => "has ended",
+            Now::Reused => "has ended, its pid now another process's",
+            Now::Unreadable => "is present, its identity unreadable",
+            Now::Unseen => "is neither seen nor seen gone",
+        })
+    }
+}
+
+/// What `presence` says of a process, with `same`: whether its pid still names it (`None`: its
+/// identity could not be read). A pid no other process can take (this run's unreaped child), or
+/// one the stop's own end check reads by number (a launchd job's process), is `Some(true)`.
+fn now_of(presence: aterm_uds::process::ProcessPresence, same: Option<bool>) -> Now {
+    use aterm_uds::process::ProcessPresence;
+    match (presence, same) {
+        (ProcessPresence::Absent, _) => Now::Ended,
+        (ProcessPresence::Unknown, _) => Now::Unseen,
+        (_, Some(false)) => Now::Reused,
+        (ProcessPresence::Exited, _) => Now::Exited,
+        (ProcessPresence::Present, Some(true)) => Now::Runs,
+        (ProcessPresence::Present, None) => Now::Unreadable,
+    }
+}
+
+/// What a windowed instance's aterm (`gui`, as the stop knew it) is now, from what the kernel
+/// says of its pid (`presence`) and the identity that pid has now (`now`).
+fn aterm_now(
+    gui: aterm_uds::process::Identity,
+    presence: aterm_uds::process::ProcessPresence,
+    now: Option<aterm_uds::process::Identity>,
+) -> Now {
+    now_of(presence, now.map(|now| now == gui))
+}
+
+/// What the kernel says now of an instance whose stop did not establish its end, judged by what
+/// the stop holds of each process: its own (`pid`, a windowed one's keeper, `kept`) by the
+/// child's reaped status where it is this run's child, and a windowed one's aterm (`gui`) by its
+/// identity, so a pid the kernel has since given another process is not said to be the
+/// instance's.
+fn standing(
+    child: &mut Proc,
+    pid: i32,
+    kept: bool,
+    gui: Option<aterm_uds::process::Identity>,
+) -> String {
+    use aterm_uds::process::{process_presence, read_identity};
+    let what = if kept {
+        "its keeper's"
+    } else {
+        "the instance's"
+    };
+    let own = match child {
+        Proc::Child(child) => match child.try_wait() {
+            Ok(Some(status)) => format!("{what} pid {pid} has ended ({status})"),
+            Ok(None) => format!(
+                "{what} pid {pid} {}",
+                now_of(process_presence(pid), Some(true))
+            ),
+            Err(why) => format!("{what} pid {pid} cannot be observed: {why}"),
+        },
+        Proc::Job(_) => format!(
+            "{what} pid {pid} {}",
+            now_of(process_presence(pid), Some(true))
+        ),
     };
     if !kept {
-        return one("the instance's", pid);
+        return own;
     }
-    let keeper = one("its keeper's", pid);
     match gui {
-        Some(gui) => format!("{keeper}, {}", one("its aterm's", gui.pid)),
-        None => format!("{keeper}, its aterm's pid was never read"),
+        Some(gui) => {
+            let now = aterm_now(gui, process_presence(gui.pid), read_identity(gui.pid));
+            format!("{own}, its aterm's pid {} {now}", gui.pid)
+        }
+        None => format!("{own}, its aterm's pid was never read"),
     }
 }
 
-/// A cleanup wait's error once a second signal cut it short ([`stop::Grace`]).
-fn cut_short(phase: &'static str) -> impl Fn(Stopped) -> String {
-    move |Stopped(sig)| format!("signal {sig} cut the {phase} short")
+/// A cleanup wait's error once a second signal cut it short ([`stop::Grace`]) and a last look
+/// did not find the end it waited for.
+fn cut_short(phase: &str, Stopped(sig): Stopped) -> String {
+    format!("signal {sig} cut the {phase} short")
 }
 
+/// Cut the instance's lifeline and wait, under one one-minute deadline, for the end of its
+/// process (signalled after its graces when it is this run's child, its job removed when it is a
+/// launchd job's) and of a windowed one's aterm (`kept`, `gui`). A second signal cuts a wait
+/// short ([`stop::Grace`]); each wait then looks once more before it gives up, so an end that
+/// came with the cut is still established.
 fn stop_process(
     child: &mut Proc,
     lifeline: &mut Option<aterm_uds::lifeline::Lifeline>,
@@ -1278,11 +1366,14 @@ fn stop_process(
     }
     if let Proc::Job(job) = child {
         job.cut();
+        // A cut here leaves the job's registration to remove, which no last look can establish.
         let grace = (Instant::now() + Duration::from_secs(8)).min(deadline);
         while Instant::now() < grace && job.running() {
-            stop::sleep(Duration::from_millis(20)).map_err(cut_short("job lifeline grace"))?;
+            stop::sleep(Duration::from_millis(20))
+                .map_err(|cut| cut_short("job lifeline grace", cut))?;
         }
         job.remove_until(deadline).map_err(|why| why.to_string())?;
+        let mut cut = None;
         loop {
             match process_presence(pid) {
                 ProcessPresence::Absent => return wait_gui_absent(kept, gui, deadline),
@@ -1291,10 +1382,13 @@ fn stop_process(
                 }
                 ProcessPresence::Present | ProcessPresence::Exited => {}
             }
+            if let Some(cut) = cut {
+                return Err(cut_short("job's native absence", cut));
+            }
             if Instant::now() >= deadline {
                 return Err("one-minute hang detector: original job native absence".into());
             }
-            stop::sleep(Duration::from_millis(20)).map_err(cut_short("job's native absence"))?;
+            cut = stop::sleep(Duration::from_millis(20)).err();
         }
     }
     let Proc::Child(child) = child else {
@@ -1302,6 +1396,7 @@ fn stop_process(
     };
     for (grace, signal) in [(8, libc::SIGTERM), (5, libc::SIGKILL)] {
         let until = (Instant::now() + Duration::from_secs(grace)).min(deadline);
+        let mut cut = None;
         loop {
             if child
                 .try_wait()
@@ -1310,10 +1405,13 @@ fn stop_process(
             {
                 return wait_gui_absent(kept, gui, deadline);
             }
+            if let Some(cut) = cut {
+                return Err(cut_short("child grace", cut));
+            }
             if Instant::now() >= until {
                 break;
             }
-            stop::sleep(Duration::from_millis(20)).map_err(cut_short("child grace"))?;
+            cut = stop::sleep(Duration::from_millis(20)).err();
         }
         if let Err(error) = crate::sys::kill_group(pid, signal) {
             if child.try_wait().map_err(|why| why.to_string())?.is_some() {
@@ -1322,6 +1420,7 @@ fn stop_process(
             return Err(format!("cannot signal original child group: {error}"));
         }
     }
+    let mut cut = None;
     loop {
         if child
             .try_wait()
@@ -1330,10 +1429,13 @@ fn stop_process(
         {
             return wait_gui_absent(kept, gui, deadline);
         }
+        if let Some(cut) = cut {
+            return Err(cut_short("child reap", cut));
+        }
         if Instant::now() >= deadline {
             return Err("one-minute hang detector: original child reap".into());
         }
-        stop::sleep(Duration::from_millis(20)).map_err(cut_short("child reap"))?;
+        cut = stop::sleep(Duration::from_millis(20)).err();
     }
 }
 
@@ -1365,6 +1467,7 @@ fn wait_gui_absent(
     deadline: Instant,
 ) -> Result<(), String> {
     use aterm_uds::process::{ProcessPresence, process_presence, read_identity};
+    let mut cut = None;
     loop {
         let presence = gui.map_or(ProcessPresence::Unknown, |gui| process_presence(gui.pid));
         if gui_closed(required, gui.is_some(), presence)? {
@@ -1379,22 +1482,23 @@ fn wait_gui_absent(
                     .into(),
             );
         }
+        if let Some(cut) = cut {
+            return Err(cut_short("GUI's native absence", cut));
+        }
         if Instant::now() >= deadline {
             return Err(
                 "one-minute hang detector: original GUI native absence after keeper closure".into(),
             );
         }
-        stop::sleep(Duration::from_millis(20)).map_err(cut_short("GUI's native absence"))?;
+        cut = stop::sleep(Duration::from_millis(20)).err();
     }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
-            // stop records evidence once; a prior explicit failure must not trigger another
-            // full cleanup operation from this destructor.
-            eprintln!("aterm-lab: instance cleanup unresolved: {error}");
-        }
+        // stop records evidence once and says so as it does; a prior explicit failure must not
+        // trigger another full cleanup operation from this destructor, nor say it again.
+        let _ = self.stop();
     }
 }
 
@@ -1612,19 +1716,56 @@ pub fn cmd_instance(args: &[String]) -> Res {
         },
         band,
     )?;
+    // From here the instance's end is this verb's to wait for and say: a second signal, even
+    // one that comes with the first, cuts that wait short instead of ending the run unsaid.
+    let _ahead = stop::cleanup_ahead();
+    let work = drive(
+        &mut inst,
+        &world,
+        &Drive {
+            pre: &pre,
+            image,
+            post: &post,
+            band,
+            window,
+            cold: cold.as_ref(),
+        },
+    );
+    end(&mut inst, work)
+}
+
+/// What `lab instance` does with its instance once it has started.
+struct Drive<'a> {
+    pre: &'a [String],
+    image: Option<String>,
+    post: &'a [String],
+    band: Band,
+    window: bool,
+    cold: Option<&'a ColdCopy>,
+}
+
+/// Bring `inst` up and use it as `run` says: one frame (`--image`), or hold it until a signal.
+/// # Errors
+/// It did not come up or the frame failed, it exited while held, or a signal came first
+/// ([`Stopped`]).
+fn drive(inst: &mut Instance, world: &World, run: &Drive<'_>) -> Res {
     inst.await_socket(BOOT)?;
     let ready = terminal_request(|args| inst.ctl(args), &["ready"]);
+    // A signal can end the client too (Ctrl-C reaches its group): its reply then says nothing.
+    stop::check()?;
     if ready.code != 0 {
         return Err(Fail::die(format!("instance: not ready: {}", ready.first())));
     }
-    run_verbs(&inst, &pre);
-    if let Some(dest) = image {
-        await_band(&inst)?;
+    run_verbs(inst, run.pre)?;
+    if let Some(dest) = &run.image {
+        await_band(inst)?;
         let _ = terminal_request(
             |args| inst.ctl(args),
             &["await", "idle", "500", "timeout=60000"],
         );
+        stop::check()?;
         let shot = inst.ctl(&["image", "frame.png"]);
+        stop::check()?;
         let path = shot
             .stdout
             .split_whitespace()
@@ -1634,10 +1775,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
         if shot.code != 0 || path.is_empty() {
             return Err(Fail::die(format!("instance: image: {}", shot.first())));
         }
-        crate::util::copy_regular_file(&path, &dest)
+        crate::util::copy_regular_file(&path, dest)
             .map_err(|e| format!("instance: cannot write {dest}: {e}"))?;
         println!("{} -> {dest}", shot.first());
-        run_verbs(&inst, &post);
+        run_verbs(inst, run.post)?;
         return Ok(0);
     }
     let aterm_pid = inst.aterm_pid();
@@ -1653,31 +1794,32 @@ pub fn cmd_instance(args: &[String]) -> Res {
             .and_then(crate::sys::main_thread_priority)
             .map(|p| p.to_string()),
     );
-    let kept = if window {
+    let kept = if run.window {
         format!(" aterm_pid={}", read(aterm_pid.map(|p| p.to_string())))
     } else {
         String::new()
     };
-    let pages = cold.as_ref().map_or_else(String::new, |c| {
+    let pages = run.cold.map_or_else(String::new, |c| {
         crate::sys::resident_pages(&c.root).map_or_else(
             |e| format!(" pages=cold resident_at_ready=? ({e})"),
             |(resident, pages)| format!(" pages=cold resident_at_ready={resident}/{pages}"),
         )
     });
     // asked after the resident pages are read, so the question touches none of them
-    let build = read({
-        let said = inst.ctl(&["version"]);
-        (said.code == 0)
-            .then(|| crate::lab::build_named(&said.stdout))
-            .flatten()
-    });
+    let version = inst.ctl(&["version"]);
+    stop::check()?;
+    let build = read(
+        (version.code == 0)
+            .then(|| crate::lab::build_named(&version.stdout))
+            .flatten(),
+    );
     println!(
         "instance pid={} sock={} build={build} band={} coalition={coalition} role={role} main_pri={main_pri}{kept}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
          world:    {}{}\n  it ends when this command does: Ctrl-C or SIGTERM ends it and waits for its end \
          (a second signal cuts that wait short)",
         inst.pid,
         inst.sock.display(),
-        band.name(),
+        run.band.name(),
         inst.aterm.display(),
         inst.sock.display(),
         world.dir.display(),
@@ -1687,6 +1829,13 @@ pub fn cmd_instance(args: &[String]) -> Res {
             " (removed once the instance has ended)"
         }
     );
+    hold(inst)
+}
+
+/// Hold a running instance until it exits or a signal asks for its end: `Ok(0)` on the signal.
+/// # Errors
+/// It exited by itself (its log's tail says why).
+fn hold(inst: &mut Instance) -> Res {
     loop {
         if !inst.running() {
             return Err(Fail::die(format!(
@@ -1694,18 +1843,40 @@ pub fn cmd_instance(args: &[String]) -> Res {
                 inst.log_tail(20)
             )));
         }
-        if let Err(Stopped(sig)) = stop::sleep(Duration::from_millis(500)) {
-            // The signal asks for the instance's end: end it, wait for that end under the
-            // stop's own bounds, and say what came of it.
-            return match inst.stop() {
-                Ok(()) => {
-                    println!("instance: ended (signal {sig})");
-                    Ok(0)
-                }
-                Err(why) => Err(Fail::die(format!(
-                    "instance: signal {sig}, and its end is not established: {why}"
-                ))),
-            };
+        if stop::sleep(Duration::from_millis(500)).is_err() {
+            return Ok(0);
+        }
+    }
+}
+
+/// `lab instance`'s end once its instance has started: the instance stopped, and `work`'s
+/// outcome with what came of that. A signal during `work` asked for the stop, which waits through
+/// it for the instance's end ([`Instance::stop`]): the end said when it came, else the run fails
+/// saying what still stands. Without a signal, a stop that fails fails the run ([`after_stop`]).
+/// # Errors
+/// `work`'s, or the stop's.
+fn end(inst: &mut Instance, work: Res) -> Res {
+    // Read on this thread before the stop takes its grace: the run's own stop, if one came.
+    let signal = stop::check().err();
+    let stopped = inst.stop();
+    let Some(Stopped(sig)) = signal else {
+        return after_stop(work, stopped);
+    };
+    match stopped {
+        Ok(()) => {
+            println!("instance: ended (signal {sig})");
+            work
+        }
+        Err(why) => {
+            let said = format!("instance: signal {sig}, and its end is not established: {why}");
+            Err(Fail::die(match work {
+                Err(Fail {
+                    msg: Some(msg),
+                    stopped: None,
+                    ..
+                }) => format!("{msg}; {said}"),
+                _ => said,
+            }))
         }
     }
 }
@@ -1884,11 +2055,14 @@ fn reveal_pending(rows: &str) -> bool {
 
 /// The band settled: no live row still in its reveal's grace, read through `messages live`.
 /// # Errors
-/// A row still pending after a minute, or the run interrupted.
-pub(crate) fn await_band(inst: &Instance) -> Result<(), Fail> {
+/// A row still pending after a minute, or the run interrupted ([`Stopped`]).
+fn await_band(inst: &Instance) -> Result<(), Fail> {
     let start = Instant::now();
     loop {
         let rows = inst.ctl(&["messages", "live"]);
+        // A signal can end the client too (Ctrl-C reaches its group): its reply then says
+        // nothing of the band.
+        stop::check()?;
         if rows.code != 0 || !reveal_pending(&rows.stdout) {
             return Ok(());
         }
@@ -1899,20 +2073,22 @@ pub(crate) fn await_band(inst: &Instance) -> Result<(), Fail> {
                 rows.first()
             )));
         }
-        stop::sleep(Duration::from_millis(100)).map_err(|Stopped(sig)| {
-            Fail::die(format!("instance: signal {sig} before the band settled"))
-        })?;
+        stop::sleep(Duration::from_millis(100))?;
     }
 }
 
 /// Runs each control verb against `inst` and prints its reply.
-fn run_verbs(inst: &Instance, verbs: &[String]) {
+/// # Errors
+/// A signal came ([`Stopped`]): the verbs after it are not run, and the reply of the one it
+/// came during, which it may have ended, is not printed.
+fn run_verbs(inst: &Instance, verbs: &[String]) -> Result<(), Stopped> {
     for verb in verbs {
         let words: Vec<&str> = verb.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
         let reply = inst.ctl(&words);
+        stop::check()?;
         let answer = if reply.stdout.trim().is_empty() {
             reply.stderr.trim_end()
         } else {
@@ -1920,6 +2096,7 @@ fn run_verbs(inst: &Instance, verbs: &[String]) {
         };
         println!("ctl {verb} -> {answer}");
     }
+    Ok(())
 }
 
 /// Why a keeper ends its aterm.

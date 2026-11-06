@@ -22,6 +22,10 @@ pub(crate) mod framed;
 #[path = "store/writer_tests.rs"]
 mod writer_tests;
 
+#[cfg(test)]
+#[path = "store/classified_tests.rs"]
+pub(crate) mod classified_tests;
+
 /// Largest concatenated record stream [`decode_records`] reads (`64 MiB`).
 pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
 
@@ -1034,6 +1038,174 @@ impl Store {
             return Err(e);
         }
         Ok(added)
+    }
+
+    /// Ingest `records` (causal order as [`Store::ingest_records`]), and say per record: held
+    /// now or before ([`MemberVerdict::Applied`]); held waiting, or refused for a parent or seat
+    /// this view lacks, or capacity ([`MemberVerdict::Waiting`]); refused for good
+    /// ([`MemberVerdict::Refused`]). One entry per offered record, in the order offered.
+    ///
+    /// A record of another network is refused for good. A refused record with a parent this
+    /// store does not hold complete waits, whatever [`Store::insert`] said: its parents (and a
+    /// seat its signer takes in one) can still arrive, and then the same record lands. A refused
+    /// record whose parents are all held complete was judged on its whole causal past, which
+    /// never changes, so it is refused for good.
+    pub fn ingest_classified(&mut self, records: Vec<Record>) -> Vec<(RecordId, MemberVerdict)> {
+        let offered: Vec<(RecordId, RecordId, Vec<RecordId>)> = records
+            .iter()
+            .map(|r| (r.id, *r.network_id(), r.parents().to_vec()))
+            .collect();
+        let mut refused: BTreeMap<RecordId, Error> = BTreeMap::new();
+        for record in causal(records, |id| self.holds(id)) {
+            let id = record.id;
+            if let Err(e) = self.insert(record) {
+                refused.insert(id, e);
+            }
+        }
+        offered
+            .into_iter()
+            .map(|(id, network, parents)| {
+                let verdict = self.classify(&id, &network, &parents, refused.get(&id));
+                (id, verdict)
+            })
+            .collect()
+    }
+
+    /// [`Store::ingest_classified`]'s verdict on record `id` of `network` with `parents`, after
+    /// the ingest, where [`Store::insert`] answered it `refused`.
+    fn classify(
+        &self,
+        id: &RecordId,
+        network: &RecordId,
+        parents: &[RecordId],
+        refused: Option<&Error>,
+    ) -> MemberVerdict {
+        if self.complete_bytes(id).is_some() {
+            return MemberVerdict::Applied;
+        }
+        if self.contains(id) {
+            return MemberVerdict::Waiting(
+                if self.log.is_some() {
+                    "held waiting on a parent"
+                } else {
+                    "held before a genesis"
+                }
+                .to_owned(),
+            );
+        }
+        let foreign = self.compiled.is_some_and(|c| c != *network)
+            || self.network.is_some_and(|n| n != *network);
+        let why = refused.map_or_else(|| "let go for another record".to_owned(), Error::to_string);
+        if foreign {
+            return MemberVerdict::Refused(why);
+        }
+        if refused.is_some_and(|e| e.kind() == crate::ErrorKind::MembershipCapacity)
+            || parents.iter().any(|p| self.complete_bytes(p).is_none())
+        {
+            return MemberVerdict::Waiting(why);
+        }
+        MemberVerdict::Refused(why)
+    }
+}
+
+/// What became of one record a [`Store::ingest_classified`] call offered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberVerdict {
+    /// Held complete, now or before.
+    Applied,
+    /// Held waiting, or refused for a parent or seat this view lacks, or for capacity: offer it
+    /// again after a membership change.
+    Waiting(String),
+    /// Refused for good.
+    Refused(String),
+}
+
+/// The membership log's records made durable: called after every write of a client's records
+/// file ([`crate::client::Paths::records_file`]), with the store as written. Not blocking. A vault
+/// server's records files are not this hook's, and a writer that ends between the durable write
+/// and the call (a crash) calls nothing.
+pub struct Written<'a> {
+    /// The vault folder whose records file was written ([`crate::client::Paths::dir`]).
+    pub paths_dir: &'a std::path::Path,
+    /// The store the file now holds.
+    pub store: &'a Store,
+}
+
+/// The process's [`Written`] hook ([`on_written`]).
+type WrittenHook = Box<dyn Fn(&Written<'_>) + Send + Sync>;
+
+static WRITTEN: std::sync::OnceLock<WrittenHook> = std::sync::OnceLock::new();
+
+/// Install the process's hook for records-file writes ([`Written`]); false where one is installed
+/// already. The hook runs on the writing thread under the writer's lock, after the durable
+/// write: it must not block (no I/O round trip).
+pub fn on_written(hook: impl Fn(&Written<'_>) + Send + Sync + 'static) -> bool {
+    WRITTEN.set(Box::new(hook)).is_ok()
+}
+
+/// A thread's override of the process's [`Written`] hook ([`with_written`]).
+#[cfg(any(test, debug_assertions))]
+type WrittenHere = std::rc::Rc<dyn Fn(&Written<'_>)>;
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// This thread's override of the process's hook ([`with_written`]).
+    static WRITTEN_HERE: std::cell::RefCell<Option<WrittenHere>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// MUTANT ([`without_written_call`]): the writer's hook call removed.
+    static WRITTEN_CALL_REMOVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `run` with `hook` in place of the process's [`on_written`] hook for writes on this
+/// thread, so tests in one binary do not share one hook.
+#[cfg(any(test, debug_assertions))]
+pub fn with_written<T>(hook: impl Fn(&Written<'_>) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<WrittenHere>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            WRITTEN_HERE.with(|here| *here.borrow_mut() = before);
+        }
+    }
+    let hook: WrittenHere = std::rc::Rc::new(hook);
+    let _restore = Restore(WRITTEN_HERE.with(|here| here.borrow_mut().replace(hook)));
+    run()
+}
+
+/// Run `run` with the writer's hook call removed on this thread: the negative control of the
+/// hook's tests.
+#[cfg(test)]
+pub(crate) fn without_written_call<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRITTEN_CALL_REMOVED.with(|removed| removed.set(self.0));
+        }
+    }
+    let _restore = Restore(WRITTEN_CALL_REMOVED.with(|removed| removed.replace(true)));
+    run()
+}
+
+/// Hand `w` to this thread's [`with_written`] override, or else the process's [`on_written`]
+/// hook, if any. Its writers are the Unix client's records-file write ([`crate::client`]) and the
+/// tests.
+#[cfg(any(unix, test))]
+pub(crate) fn written(w: &Written<'_>) {
+    #[cfg(test)]
+    if WRITTEN_CALL_REMOVED.with(std::cell::Cell::get) {
+        return;
+    }
+    #[cfg(any(test, debug_assertions))]
+    if let Some(hook) = WRITTEN_HERE.with(|here| here.borrow().clone()) {
+        hook(w);
+        return;
+    }
+    if let Some(hook) = WRITTEN.get() {
+        hook(w);
     }
 }
 

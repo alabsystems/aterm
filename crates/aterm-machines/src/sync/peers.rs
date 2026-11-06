@@ -87,7 +87,8 @@ pub const NOT_LOOKED: &str = "no vault is configured: the aterm window's pass lo
 /// `sync.peers`' read over `ops`, the vault as System State's Secrets stage reads it. A vault
 /// configured here reads joined once it let this Mac in, and deferred while it has not (it waits
 /// for a member's Allow, a join password or an admin's approval, which a pass never gives;
-/// [`not_let_in`]) or once this Mac was removed from it: a pass never joins it again.
+/// [`not_let_in`]) or once this Mac was removed from it, or a rotation dropped it (its words say
+/// to set the vault folder aside and come back as a new Mac): a pass never joins it again.
 /// With none, the person's turn-off or `gate`'s choice reads off, and a run of System State's
 /// that owes its Secrets stage, or Local Network refused or untold, reads deferred without a
 /// look; only then is `look` asked (`None`: this pass does not look), and the ALab vault
@@ -115,10 +116,14 @@ pub fn read(
                 (waits_for(&status), &|| ops.join_place()),
                 "no pass joins it again",
             )),
-            Membership::Revoked { seq } => PeersRead::Deferred(format!(
-                "this Mac was removed from vault {name} at seq {seq}: to rejoin, run aterm \
-                 members join and press Allow on any Mac in ALab; no pass joins it again"
-            )),
+            Membership::Revoked { seq } => PeersRead::Deferred(match ops.dropped(seq) {
+                Some(words) => format!("vault {name}: {words}; no pass joins it again"),
+                None => format!(
+                    "this Mac was removed from vault {name}{}: to rejoin, run aterm members join \
+                     and press Allow again on any Mac in ALab; no pass joins it again",
+                    aterm_secrets::client::out_since(seq)
+                ),
+            }),
             // The configuration went between the two reads: the next pass reads it again.
             Membership::Unconfigured => PeersRead::Deferred(format!(
                 "vault {name}'s configuration went while this pass read it; the next pass reads \
@@ -258,7 +263,7 @@ fn not_let_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init_secrets::tests::{Scripted, configured, unconfigured};
+    use crate::init_secrets::tests::{DROPPED, Scripted, configured, unconfigured};
     use crate::items::defaults::tests::{ctx, user};
     use aterm_secrets::alab_join::JoinPlace;
     use aterm_secrets::client::JoinOutcome;
@@ -409,6 +414,25 @@ mod tests {
         );
     }
 
+    /// A Mac a rotation dropped from its vault with no `Remove` (one-mesh E2) reads deferred with
+    /// its words, the way back as a new Mac, not the removal's "press Allow again": no pass joins
+    /// it again, and none looks.
+    /// NEGATIVE CONTROL: a `Revoked` arm that ignores `SecretsOps::dropped` tells it to press
+    /// Allow again, which every member that read the rotation refuses for its key.
+    #[test]
+    fn a_dropped_mac_reads_deferred_with_how_it_comes_back() {
+        let ops = Scripted::new(vec![Ok(configured(Membership::Revoked { seq: 9 }))]);
+        ops.drops(DROPPED);
+        let looks = Cell::new(0);
+        assert_eq!(
+            looked(&ops, &ALLOWED, &Heard::Found, &looks),
+            PeersRead::Deferred(format!("vault alab: {DROPPED}; no pass joins it again"))
+        );
+        assert_eq!(ops.dropped_asks(), [9]);
+        assert_eq!(looks.get(), 0, "a vault configured here is not looked for");
+        assert!(ops.joins().is_empty(), "no pass joins it");
+    }
+
     /// A Mac removed from its vault reads deferred, naming the removal, not joined: no
     /// pass joins it again, and none reports it in.
     /// NEGATIVE CONTROL: a read that takes every membership but a pending one for joined reads
@@ -422,7 +446,7 @@ mod tests {
             panic!("{read:?}");
         };
         assert!(
-            why.contains("this Mac was removed from vault alab at seq 9"),
+            why.contains("this Mac was removed from vault alab"),
             "{why}"
         );
         assert_eq!(looks.get(), 0, "a vault configured here is not looked for");

@@ -282,6 +282,7 @@ impl Fx {
                 fail: Mutex::new(held.pack_fail.clone()),
                 unproven: AtomicBool::new(held.unproven),
                 lacks: Mutex::new(held.lacks.clone()),
+                upstream: AtomicBool::new(false),
             },
             indexer: FakeIndexer {
                 requests: Mutex::new(indexes),
@@ -529,6 +530,8 @@ pub struct FakePacker {
     /// What this machine lacks to pack at all ([`Packer::can_pack`]), if anything: every
     /// pack fails on it, as the real one does at its end.
     pub lacks: Mutex<Option<String>>,
+    /// The fixture owns the complete C source SDK.
+    pub upstream: AtomicBool,
 }
 
 impl FakePacker {
@@ -558,6 +561,13 @@ impl FakePacker {
 }
 
 impl Packer for FakePacker {
+    fn can_pack_bottle(&self, _triple: Triple) -> std::result::Result<(), String> {
+        if self.upstream.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("fixture has no upstream SDK".into())
+        }
+    }
     fn can_pack(&self) -> std::result::Result<(), String> {
         self.lacks
             .lock()
@@ -636,6 +646,38 @@ impl Packer for FakePacker {
             exposes: vec![req.program.clone()],
             lineage: atpkg_publish::api::Lineage::Lineage,
             uploaded: req.upload,
+        })
+    }
+
+    fn pack_bottle(
+        &self,
+        ctx: &Ctx,
+        req: &atpkg_publish::artifact::bottle::upstream::Request,
+    ) -> Result<atpkg_publish::artifact::bottle::BottleOutcome> {
+        let outcome = self.pack(
+            ctx,
+            &PackRequest {
+                program: req.program.clone(),
+                checkout: PathBuf::new(),
+                triple: req.triple,
+                build: Some(req.build),
+                merge_from: req.merge_from.clone(),
+                toolchain: None,
+                out: req.out.clone(),
+                signing: Signing::Unsigned,
+                upload: false,
+                env: Vec::new(),
+            },
+        )?;
+        Ok(atpkg_publish::artifact::bottle::BottleOutcome {
+            program: outcome.program,
+            build: outcome.build,
+            version: req.version.clone(),
+            triple: outcome.triple,
+            asset: outcome.asset,
+            manifest: outcome.manifest,
+            signature: outcome.signature,
+            uploaded: false,
         })
     }
 }

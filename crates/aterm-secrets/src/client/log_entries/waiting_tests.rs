@@ -94,12 +94,14 @@ struct TakeBack {
 /// `shared` = v2, which waits. It opens the vault again, changes `shared` to v3 and writes
 /// `fresh`, a name the log does not hold; then opens it again and takes both back: `shared` to
 /// the log's v1, `fresh` removed. Then the rotation arrives, m22's passes run, and every Mac takes
-/// its records. `control` sets [`log_entries::VIEW_WITHOUT_WAITING`] for the edits.
-fn take_back(control: bool) -> TakeBack {
+/// its records. `control` names the negative control set for the edits, if any.
+fn take_back(control: Option<&'static std::thread::LocalKey<Cell<bool>>>) -> TakeBack {
     let lab = convergence::six_with(true);
     let chain = held_remove(&lab);
     let m22 = &lab.all[0];
-    log_entries::VIEW_WITHOUT_WAITING.with(|cell| cell.set(control));
+    if let Some(switch) = control {
+        switch.with(|cell| cell.set(true));
+    }
     let first = publish_edit(m22, |doc| set(doc, "shared", b"v2")).waiting;
     let admin = admin_open(m22).expect("an admin");
     let shown = (admin.waiting(), shows(&admin, "shared"));
@@ -118,7 +120,9 @@ fn take_back(control: bool) -> TakeBack {
     let _ = doc.unset_entry(&Audience::Everyone, "fresh");
     admin_publish(m22, &admin, &doc).expect("the take-back");
     let after = admin_open(m22).expect("an admin").waiting();
-    log_entries::VIEW_WITHOUT_WAITING.with(|cell| cell.set(false));
+    if let Some(switch) = control {
+        switch.with(|cell| cell.set(false));
+    }
 
     save_records(m22, &encode_records(&chain)).unwrap();
     let signed = two_passes(m22);
@@ -139,14 +143,17 @@ fn take_back(control: bool) -> TakeBack {
 /// removing a name only the waiting write added, takes it back: once the rotation arrives the
 /// passes sign nothing, nothing waits, and every Mac reads `shared` = v1 and no `fresh`.
 ///
-/// NEGATIVE CONTROL: [`log_entries::VIEW_WITHOUT_WAITING`] (the view shows the log alone, as
-/// before W3), run in the test: the view shows nothing waiting, the take-back is no change, and
-/// the passes sign the change the person took back, so every Mac reads `shared` = v3, as the
-/// CONTROL asserts say; with the switch set for the first run too, the test fails "the view
-/// shows the waiting write".
+/// NEGATIVE CONTROLS, run in the test: [`log_entries::VIEW_WITHOUT_WAITING`] (the view shows the
+/// log alone, as before W3): the view shows nothing waiting, the take-back is no change, and the
+/// passes sign the change the person took back, so every Mac reads `shared` = v3; and
+/// [`log_entries::NAMES_UNMERGED`] (the edit reviews only its own entries' names, not the view's
+/// waiting writes and the ones that stand now merged in): `fresh`, which the take-back removes
+/// and the log never held, is no name of the edit's entries, so no write takes it back and the
+/// passes sign `fresh` = f1, as the CONTROL asserts say. With either switch set for the first run
+/// too, the test fails.
 #[test]
 fn a_waiting_write_shows_in_the_view_and_a_save_changes_it_or_takes_it_back() {
-    let run = take_back(false);
+    let run = take_back(None);
     let m22 = &run.lab.all[0];
     assert_eq!(
         run.first,
@@ -188,7 +195,7 @@ fn a_waiting_write_shows_in_the_view_and_a_save_changes_it_or_takes_it_back() {
     }
     run.lab.macs.server.stop();
 
-    let control = take_back(true);
+    let control = take_back(Some(&log_entries::VIEW_WITHOUT_WAITING));
     assert!(
         control.shown.0.is_empty(),
         "CONTROL: the view without waiting writes shows none"
@@ -197,6 +204,24 @@ fn a_waiting_write_shows_in_the_view_and_a_save_changes_it_or_takes_it_back() {
         reads(&control.lab.all[1], true, "shared"),
         Some(b"v3".to_vec()),
         "CONTROL: the take-back the person could not see is lost"
+    );
+    control.lab.macs.server.stop();
+
+    let control = take_back(Some(&log_entries::NAMES_UNMERGED));
+    assert_eq!(
+        control.after,
+        vec!["fresh".to_owned()],
+        "CONTROL: unmerged, the take-back of fresh writes nothing, so its write still waits"
+    );
+    assert_eq!(
+        reads(&control.lab.all[1], true, "fresh"),
+        Some(b"f1".to_vec()),
+        "CONTROL: unmerged, the passes sign the fresh the person removed"
+    );
+    assert_eq!(
+        reads(&control.lab.all[1], true, "shared"),
+        Some(b"v1".to_vec()),
+        "CONTROL: a name the edit's entries hold is taken back either way"
     );
     control.lab.macs.server.stop();
 }
@@ -869,23 +894,24 @@ fn a_waiting_write_a_pending_set_rewrites_waits_for_that_set() {
     control.lab.macs.server.stop();
 }
 
-/// One-mesh W3: a save that leaves a waiting settle of a conflict as its view showed it, made
-/// once no rotation is due, signs that settle in its own records. m22 and m7 each put `shared`,
-/// neither seeing the other's, and m22 holds the conflict and m7's `Remove` of m42, not its
-/// rotation ([`held_remove`]). A person saves `shared` as the winner's own value on m22, and the
-/// settle waits for the new key. The rotation arrives, no pass runs, and the person saves another
-/// name from a view that still shows the settle waiting: the save's records sign the `Delete` of
-/// the siblings and the `Put` of the winner themselves, so right after the publish, while a claim
-/// keeps every pass from signing a waiting write, `shared` is no conflict on m22. A pass then
-/// signs no `[everyone]` value: every Mac reads the winner with no conflict, nothing is recorded
-/// as overtaken, and nothing waits.
-///
-/// NEGATIVE CONTROL: the `carried.resolves(name)` term of `draft_document_diff_with`'s `resolving`
-/// cut by hand, leaving only `resolving(aud, name)` (restored with cp from a backup plus touch,
-/// confirmed with cmp): the later save's records write nothing for `shared`, whose value is the
-/// winner's already, and the test fails "the later save's own records settle the conflict".
-#[test]
-fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
+/// What [`later_settle`] saw.
+struct LaterSettle {
+    lab: convergence::Six,
+    /// The winner of `shared`'s conflict, as m22's view showed it.
+    winner: Vec<u8>,
+    /// What the later save said waits.
+    later: Vec<String>,
+    /// Whether `shared` was still a conflict on m22 right after the later save.
+    conflicted: bool,
+}
+
+/// m22 and m7 each put `shared`, neither seeing the other's, and m22 holds the conflict and m7's
+/// `Remove` of m42, not its rotation ([`held_remove`]). A person saves `shared` as the winner's
+/// own value on m22, and the settle waits for the new key. The rotation arrives, no pass runs, and
+/// the person saves another name from a view that still shows the settle waiting, under a claim
+/// that keeps every pass from signing a waiting write. `control` sets
+/// [`log_entries::SETTLE_UNCARRIED`] for the saves.
+fn later_settle(control: bool) -> LaterSettle {
     let lab = convergence::six_with(true);
     let (m22, m7) = (&lab.all[0], &lab.all[1]);
     let base = convergence::ids(m7);
@@ -898,6 +924,7 @@ fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
         "CONTROL: m22 and m7 hold a conflict on shared"
     );
     let chain = held_remove(&lab);
+    log_entries::SETTLE_UNCARRIED.with(|cell| cell.set(control));
 
     let mut admin = admin_open(m22).expect("an admin");
     let winner = shows(&admin, "shared").expect("CONTROL: the view shows the conflict's winner");
@@ -937,15 +964,39 @@ fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
     let later = admin_publish(m22, &admin, &doc)
         .expect("the later save")
         .waiting;
+    let conflicted = conflicted(m22, "shared");
+    drop(claim);
+    log_entries::SETTLE_UNCARRIED.with(|cell| cell.set(false));
+    LaterSettle {
+        lab,
+        winner,
+        later,
+        conflicted,
+    }
+}
+
+/// One-mesh W3 ([`later_settle`]): a save that leaves a waiting settle of a conflict as its view
+/// showed it, made once no rotation is due, signs that settle in its own records: right after the
+/// publish, while the claim keeps every pass from signing a waiting write, `shared` is no
+/// conflict on m22. A pass then signs no `[everyone]` value: every Mac reads the winner with no
+/// conflict, nothing is recorded as overtaken, and nothing waits.
+///
+/// NEGATIVE CONTROL: [`log_entries::SETTLE_UNCARRIED`] (the save signs the name without the
+/// settle its view showed waiting, as before 24410be588), run in the test: the later save's
+/// records write nothing for `shared`, whose value is the winner's already, and the conflict
+/// stands, as the CONTROL assert says.
+#[test]
+fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
+    let run = later_settle(false);
+    let m22 = &run.lab.all[0];
     assert!(
-        later.is_empty(),
+        run.later.is_empty(),
         "CONTROL: no rotation is due, so the later save waits for nothing"
     );
     assert!(
-        !conflicted(m22, "shared"),
+        !run.conflicted,
         "the later save's own records settle the conflict"
     );
-    drop(claim);
 
     let before = convergence::ids(m22);
     vault_pass_at(m22, aterm_time::unix_millis().unwrap_or(0)).unwrap();
@@ -954,20 +1005,31 @@ fn a_later_save_signs_the_settle_of_a_conflict_its_view_showed_waiting() {
         0,
         "a pass then signs no [everyone] value"
     );
-    convergence::carry(&lab.all, 0);
+    convergence::carry(&run.lab.all, 0);
     assert!(
         log_entries::read_overtaken(m22).unwrap().is_empty(),
         "nothing is recorded as overtaken"
     );
     assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
-    for paths in &lab.all[..4] {
+    for paths in &run.lab.all[..4] {
         assert_eq!(
             reads(paths, true, "shared"),
-            Some(winner.clone()),
+            Some(run.winner.clone()),
             "every Mac reads the winner"
         );
         assert!(!conflicted(paths, "shared"), "no conflict anywhere");
         assert_eq!(reads(paths, true, "other"), Some(b"x".to_vec()));
     }
-    lab.macs.server.stop();
+    run.lab.macs.server.stop();
+
+    let control = later_settle(true);
+    assert!(
+        control.later.is_empty(),
+        "CONTROL: the uncarried save waits for nothing either"
+    );
+    assert!(
+        control.conflicted,
+        "CONTROL: a save that drops the settle its view showed leaves the conflict"
+    );
+    control.lab.macs.server.stop();
 }

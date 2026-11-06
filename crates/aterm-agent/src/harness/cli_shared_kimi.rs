@@ -111,8 +111,12 @@ impl Provider for KimiOauth {
                 ObservationError::Unavailable("Kimi recovery home is unavailable".into())
             })?;
             if let Some(mut journal) =
-                crate::harness::google_federation::recovery::Journal::open(&request, home)
-                    .map_err(ObservationError::Unavailable)?
+                crate::harness::google_federation::recovery::Journal::open_scoped(
+                    &request,
+                    home,
+                    context.host.work_scope(),
+                )
+                .map_err(ObservationError::Unavailable)?
             {
                 let deadline = std::time::Instant::now() + AUTH_CHECK_BUDGET;
                 if let Some(proof) = journal.observe_existing(&request, home, deadline)? {
@@ -561,8 +565,10 @@ fn verify_with(
 ) -> Result<Option<KimiProof>, NativeError> {
     check_directory(staging)?;
     let credential_dir = staging.join("credentials");
-    if !credential_dir.exists() {
-        return Ok(None);
+    match std::fs::symlink_metadata(&credential_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Kimi staged credentials directory is unavailable".into()),
     }
     check_directory(&credential_dir)?;
     let config = FileEvidence::read(staging.join("config.toml"), false)?;

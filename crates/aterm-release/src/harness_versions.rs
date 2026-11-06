@@ -264,29 +264,66 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
         crate::durable::read_text(&root.join(path))
             .map_err(|e| Error::new(format!("cannot read {path}: {e}")))
     };
-    let owed = owed(
-        &changed,
-        |h| text_at(git, released_commit, h.version_file()),
-        |h| read(h.version_file()),
-    )?;
+    let mut before_cache: [Option<Option<String>>; CliHarness::ALL.len()] = Default::default();
+    let mut after_cache: [Option<String>; CliHarness::ALL.len()] = Default::default();
+    let idx = |h: CliHarness| {
+        CliHarness::ALL
+            .iter()
+            .position(|candidate| *candidate == h)
+            .unwrap_or(0)
+    };
+    let owed = {
+        let mut read_before = |h: CliHarness| -> Result<Option<String>> {
+            let slot = &mut before_cache[idx(h)];
+            if let Some(cached) = slot {
+                return Ok(cached.clone());
+            }
+            let loaded = text_at(git, released_commit, h.version_file())?;
+            *slot = Some(loaded.clone());
+            Ok(loaded)
+        };
+        let mut read_after = |h: CliHarness| -> Result<String> {
+            let slot = &mut after_cache[idx(h)];
+            if let Some(cached) = slot {
+                return Ok(cached.clone());
+            }
+            let loaded = read(h.version_file())?;
+            *slot = Some(loaded.clone());
+            Ok(loaded)
+        };
+        owed(&changed, &mut read_before, &mut read_after)?
+    };
     for o in &owed {
         let path = o.harness.version_file();
-        let text = read(path)?;
-        let new = rewritten(&text, o.to).ok_or_else(|| {
+        let slot = &mut after_cache[idx(o.harness)];
+        let text = match slot {
+            Some(cached) => cached.as_str(),
+            None => slot.insert(read(path)?).as_str(),
+        };
+        let new = rewritten(text, o.to).ok_or_else(|| {
             Error::new(format!("harness-bump: {path} declares no HARNESS_VER line"))
         })?;
-        crate::durable::write_fresh(&root.join(path), new)
+        crate::durable::write_fresh(&root.join(path), &new)
             .map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
+        *slot = Some(new);
     }
     if !owed.is_empty() {
         let path = crate::changelog::CHANGELOG_FILE;
         let text = read(path)?;
         let mut names = Vec::new();
-        for h in CliHarness::ALL {
-            if let Some(then) = text_at(git, released_commit, h.version_file())?
-                .as_deref()
-                .and_then(declared)
-                && let Some(now) = declared(&read(h.version_file())?)
+        for (i, h) in CliHarness::ALL.into_iter().enumerate() {
+            let before = match &mut before_cache[i] {
+                Some(cached) => cached.as_deref(),
+                slot @ None => slot
+                    .insert(text_at(git, released_commit, h.version_file())?)
+                    .as_deref(),
+            };
+            let after = match &mut after_cache[i] {
+                Some(cached) => cached.as_str(),
+                slot @ None => slot.insert(read(h.version_file())?).as_str(),
+            };
+            if let Some(then) = before.and_then(declared)
+                && let Some(now) = declared(after)
                 && now > then
             {
                 names.push(format!("`alab {} harness {}.{}`", h.cli(), now.0, now.1));

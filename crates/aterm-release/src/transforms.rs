@@ -193,9 +193,10 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         .filter(|(_, _, path)| !aterm_census::export::in_astream_target_dir(path))
         .collect();
     for wanted in &paths {
-        let covered = entries
-            .iter()
-            .any(|(_, _, p)| p == wanted || p.starts_with(&format!("{wanted}/")));
+        let covered = entries.iter().any(|(_, _, p)| {
+            p.strip_prefix(wanted.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
         if !covered {
             return Err(format!(
                 "could not write vendor/astream@{rev} into the export: {wanted} is not in it"
@@ -236,19 +237,20 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
             let mut f = opts
                 .open(&target)
                 .map_err(|e| format!("{}: {e}", target.display()))?;
-            if !f
+            let meta = f
                 .metadata()
-                .map_err(|e| format!("{}: {e}", target.display()))?
-                .is_file()
-            {
+                .map_err(|e| format!("{}: {e}", target.display()))?;
+            if !meta.is_file() {
                 return Err(format!("{}: not a regular file", target.display()));
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 let perm = if mode == "100755" { 0o755 } else { 0o644 };
-                f.set_permissions(std::fs::Permissions::from_mode(perm))
-                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                if meta.permissions().mode() & 0o7777 != perm {
+                    f.set_permissions(std::fs::Permissions::from_mode(perm))
+                        .map_err(|e| format!("{}: {e}", target.display()))?;
+                }
             }
             f.set_len(0)
                 .and_then(|()| f.write_all(&bytes))

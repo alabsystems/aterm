@@ -209,10 +209,10 @@ impl Ledger {
     pub fn request(&self, actor: &Actor, request: &[u8; 16]) -> Option<&Recorded> {
         self.requests.get(&(*actor, *request))
     }
-    pub fn snapshot(&self, allocation: &Allocation) -> Snapshot {
+    pub fn into_snapshot(self, allocation: &Allocation) -> Snapshot {
         Snapshot {
             allocation: allocation.id(),
-            used: self.used.clone(),
+            used: self.used,
             retained: self.retained,
         }
     }

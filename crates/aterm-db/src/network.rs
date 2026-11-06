@@ -194,8 +194,10 @@ pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_OPERATION {
         return Err(Error::new("outgoing database frame too large"));
     }
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    stream.write_all(bytes)?;
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(bytes);
+    stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
 }
@@ -316,7 +318,7 @@ fn receive_operations(stream: &mut (impl Read + Write), dir: &Path) -> Result<(u
         let retained = while_busy(|| {
             Database::open(dir).and_then(|mut db| {
                 let fresh = db.ingest(&wire)?;
-                let refused = db.history.refusals().any(|(retained, _)| retained == &id);
+                let refused = db.history.is_refused(&id);
                 Ok((fresh, refused))
             })
         });

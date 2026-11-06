@@ -378,9 +378,26 @@ fn read_openconsole_bounded(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Copy `source` to `<cache>/<package>/OpenConsole.exe` unless an identical copy is already there, then prune the copies other packages left ([`prune_other_packages`]), so the cache holds one host however many Windows Terminal updates pass (each left about 1 MB behind before).
+/// Whether `package` names one folder inside the cache on every platform: one normal path
+/// component, with no separator of either kind, no drive (`C:pkg`) and no NUL, and not `.` or `..`.
+fn one_package_folder(package: &str) -> bool {
+    if package.contains(['/', '\\', ':', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(package).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+/// Copy `source` to `<cache>/<package>/OpenConsole.exe` unless an identical copy is already there, then prune the copies other packages left ([`prune_other_packages`]), so the cache holds one host however many Windows Terminal updates pass (each left about 1 MB behind before). A `package` that is not one folder name ([`one_package_folder`]) is refused before anything is read or written: joined to `cache`, it would copy outside it and prune beside it.
 pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result<PathBuf> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    if !one_package_folder(package) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing an OpenConsole.exe cache package that is not one folder name",
+        ));
+    }
     let dir = cache.join(package);
     if let Ok(meta) = std::fs::symlink_metadata(&dir)
         && !meta.is_dir()
@@ -944,6 +961,32 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(leftovers.len(), 1, "no partial file stays: {leftovers:?}");
+
+        // A package that is not one folder name copies nothing anywhere and prunes nothing.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "..\\outside",
+            "sub/pkg",
+            "sub\\pkg",
+            "C:pkg",
+            "/abs",
+            "nul\0",
+        ] {
+            let err = copy_out(&source, &cache, bad).expect_err(bad);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {err}");
+        }
+        assert!(
+            !root.join("outside").exists(),
+            "nothing was copied beside the cache"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"MZ two",
+            "a refused package prunes nothing"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -762,6 +762,29 @@ fn the_tools_password_goes_to_its_tab_from_the_card() {
     );
 }
 
+#[test]
+fn apples_installer_window_is_found_from_the_card() {
+    let app = reading(&status_of("clt-apple-window"));
+    let (_, card, _) = drawn(&app);
+    let item = card
+        .iter()
+        .find(|item| item.subject == Some(Subject::Setting(Setting::Repositories)))
+        .expect("Apple's window is in the card");
+    assert_eq!(item.title, APPLE_WINDOW_NOTE);
+    assert_eq!(
+        item.button.as_ref().map(|button| (
+            button.action.as_str(),
+            button.label.as_str(),
+            button.face.as_str()
+        )),
+        Some((
+            GO_TO_TOOLS_INSTALLER,
+            "Go to installer: Apple's Command Line Tools",
+            "Go to installer"
+        ))
+    );
+}
+
 /// The kitty's pose follows the run (§4.5): it looks up for the person, puts an ear back for a
 /// failure and settles into a loaf once the Mac is ready; Serious Mode shows the words alone.
 #[test]

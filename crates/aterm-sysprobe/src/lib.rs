@@ -470,6 +470,20 @@ pub fn machine_model() -> Option<String> {
     }
 }
 
+/// The running OS's build (macOS `kern.osversion`: `25B78`), which every update of the OS changes,
+/// a beta's included, `None` where unread, and off macOS.
+#[must_use]
+pub fn os_build() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::os_build()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The machine's physical memory in MiB (`hw.memsize` on macOS, `MemTotal` in `/proc/meminfo` on Linux), `None` where unknown.
 #[must_use]
 pub fn physical_memory_mib() -> Option<u64> {

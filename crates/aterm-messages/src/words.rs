@@ -57,28 +57,16 @@ pub fn local_words_at(
     at_unix_ms: u64,
     at_offset_s: i64,
 ) -> String {
-    let local = |ms: u64, offset_s: i64| {
-        u64::try_from((i64::try_from(ms / 1000).unwrap_or(i64::MAX)).saturating_add(offset_s))
-            .unwrap_or(0)
-    };
-    let (at, now) = (
-        local(at_unix_ms, at_offset_s),
-        local(now_unix_ms, now_offset_s),
+    let clock = twelve_hour(seconds_into_day(at_unix_ms, at_offset_s), true);
+    let words = day_heading(
+        local_day(now_unix_ms, now_offset_s),
+        local_day(at_unix_ms, at_offset_s),
+        false,
     );
-    let (at_day, now_day) = (at / 86_400, now / 86_400);
-    let clock = twelve_hour(at % 86_400, true);
-    let day = match now_day.checked_sub(at_day) {
-        Some(0) => "Today".to_string(),
-        Some(1) => "Yesterday".to_string(),
-        _ => {
-            let day = |d: u64| i64::try_from(d).unwrap_or(i64::MAX);
-            let words = day_heading(day(now_day), day(at_day), false);
-            if words.contains(',') {
-                format!("{words},")
-            } else {
-                words
-            }
-        }
+    let day = if words.contains(',') {
+        format!("{words},")
+    } else {
+        words
     };
     format!("{day} {clock}")
 }
@@ -137,17 +125,15 @@ pub fn words_change_after_at(
         1 => Some(today.saturating_add(1)),
         2..=6 => Some(day.saturating_add(7)),
         _ => {
-            let civil = |d: i64| civil_from_days(u64::try_from(d).unwrap_or(0));
-            let ((at_year, _, _), (this_year, _, _)) = (civil(day), civil(today));
-            (at_year == this_year).then(|| {
-                i64::try_from(days_from_civil(this_year.saturating_add(1), 1, 1))
-                    .unwrap_or(i64::MAX)
-            })
+            let ((at_year, _, _), (this_year, _, _)) =
+                (civil_from_days(day), civil_from_days(today));
+            (at_year == this_year && this_year < i64::MAX)
+                .then(|| days_from_civil(this_year + 1, 1, 1))
         }
     };
     let midnight = turn.map_or(u64::MAX, |turn| {
-        let secs = turn.saturating_mul(86_400).saturating_sub(now_offset_s);
-        u64::try_from(secs).unwrap_or(0).saturating_mul(1000)
+        let secs = i128::from(turn) * 86_400 - i128::from(now_offset_s);
+        u64::try_from(secs).map_or(u64::MAX, |secs| secs.saturating_mul(1000))
     });
     age_words.min(midnight)
 }
@@ -173,24 +159,30 @@ fn twelve_hour(secs: u64, seconds: bool) -> String {
     clock
 }
 
+/// `at_unix_ms`'s whole seconds on a clock `offset_s` from UTC, exact: before 1970 they are
+/// negative.
+#[inline]
+fn local_seconds(at_unix_ms: u64, offset_s: i64) -> i128 {
+    i128::from(at_unix_ms / 1000) + i128::from(offset_s)
+}
+
+/// The seconds `at_unix_ms` is into its local day, `offset_s` from UTC.
+#[inline]
+fn seconds_into_day(at_unix_ms: u64, offset_s: i64) -> u64 {
+    u64::try_from(local_seconds(at_unix_ms, offset_s).rem_euclid(86_400)).unwrap_or(0)
+}
+
 /// The reader's local calendar day of `at_unix_ms`.
 #[must_use]
 pub fn local_day(at_unix_ms: u64, offset_s: i64) -> i64 {
-    i64::try_from(at_unix_ms / 1000)
-        .unwrap_or(i64::MAX)
-        .saturating_add(offset_s)
-        .div_euclid(86_400)
+    i64::try_from(local_seconds(at_unix_ms, offset_s).div_euclid(86_400)).unwrap_or(i64::MAX)
 }
 
 /// When `at` was on the reader's local clock, `offset_s` from UTC, without
 /// the day or the seconds.
 #[must_use]
 pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
-    let secs = i64::try_from(at_unix_ms / 1000)
-        .unwrap_or(i64::MAX)
-        .saturating_add(offset_s)
-        .rem_euclid(86_400);
-    twelve_hour(u64::try_from(secs).unwrap_or(0), false)
+    twelve_hour(seconds_into_day(at_unix_ms, offset_s), false)
 }
 
 /// A day header's words for local day `day` read on local day `today` ([`local_day`]).
@@ -216,8 +208,7 @@ pub fn day_heading(today: i64, day: i64, short: bool) -> String {
         1 => "Yesterday".to_string(),
         2..=6 => weekday.to_string(),
         _ => {
-            let civil = |d: i64| civil_from_days(u64::try_from(d).unwrap_or(0));
-            let ((y, m, d), (this_year, _, _)) = (civil(day), civil(today));
+            let ((y, m, d), (this_year, _, _)) = (civil_from_days(day), civil_from_days(today));
             let mut month = MONTHS[usize::try_from(m.saturating_sub(1)).unwrap_or(0) % 12];
             let mut weekday = weekday;
             if short {
@@ -277,10 +268,10 @@ pub fn day_forms(today: i64, day: i64) -> Vec<String> {
 /// `YYYY-MM-DD` in UTC.
 #[must_use]
 pub(crate) fn date_words(at_unix_ms: u64) -> String {
-    let days = at_unix_ms / MS_PER_DAY;
+    let days = i64::try_from(at_unix_ms / MS_PER_DAY).unwrap_or(i64::MAX);
     let (y, m, d) = civil_from_days(days);
     let mut out = String::with_capacity(10);
-    push_padded(&mut out, y, 4);
+    push_padded(&mut out, u64::try_from(y).unwrap_or(0), 4);
     out.push('-');
     push_padded(&mut out, m, 2);
     out.push('-');
@@ -288,43 +279,40 @@ pub(crate) fn date_words(at_unix_ms: u64) -> String {
     out
 }
 
-/// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)`.
+/// Days since 1970-01-01, negative before it → proleptic-Gregorian `(year, month, day)`
+/// (Howard Hinnant's `civil_from_days`), exact for every `i64` day: the year stays within
+/// ±2.6·10^16, the month in 1..=12 and the day in 1..=31.
 #[inline]
-const fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days.saturating_add(719_468);
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = i128::from(days) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    (y, m, d)
+    let y = yoe + era * 400 + i128::from(m <= 2);
+    (
+        i64::try_from(y).unwrap_or(i64::MAX),
+        u64::try_from(m).unwrap_or(1),
+        u64::try_from(d).unwrap_or(1),
+    )
 }
 
-/// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, the
-/// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`), on
-/// the non-negative half only.
+/// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, negative before it, the
+/// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`), clamped to `i64`.
 #[inline]
-const fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
-    let y = if month <= 2 {
-        year.saturating_sub(1)
-    } else {
-        year
-    };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 {
-        month - 3
-    } else {
-        month.saturating_add(9)
-    };
-    let doy = (153u64.saturating_mul(mp).saturating_add(2)) / 5 + day.saturating_sub(1);
+fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
+    let month = i128::from(month);
+    let y = i128::from(year) - i128::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + i128::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era.saturating_mul(146_097)
-        .saturating_add(doe)
-        .saturating_sub(719_468)
+    let days = era * 146_097 + doe - 719_468;
+    i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
 }
 
 /// `v` in decimal, zero-padded to at least `width` digits.
@@ -517,10 +505,10 @@ mod tests {
             100 * MS_PER_DAY,
             400 * MS_PER_DAY,
         ];
-        for at in [1_758_470_000_250, 1_766_952_600_125] {
-            for offset in [0, -7 * 3600, 9 * 3600, 5 * 3600 + 1800] {
+        for at in [0, 1_758_470_000_250, 1_766_952_600_125] {
+            for offset in [0, -7 * 3600, 9 * 3600, 5 * 3600 + 1800, i64::MIN, i64::MAX] {
                 let mut nows: Vec<u64> = ages.iter().map(|age| at + age).collect();
-                nows.push(at - 10_000);
+                nows.extend(at.checked_sub(10_000));
                 for now in nows {
                     let change = words_change_after(now, at, offset);
                     assert!(change > now, "{now} at {offset}");
@@ -588,6 +576,14 @@ mod tests {
         assert_eq!(local_day(noon, 13 * 3600), today + 1, "past midnight east");
         assert_eq!(local_day(noon, -13 * 3600), today - 1, "before it west");
         assert_eq!(local_day(0, -3600), -1, "a day before the epoch is -1");
+        assert_eq!(
+            day_heading(today, -1, false),
+            "Wednesday, 31 December 1969",
+            "a day before the epoch keeps its own date"
+        );
+        assert_eq!(day_heading(today, -719_528, true), "Sat, 1 Jan 0");
+        assert_eq!(local_words(0, 0, -7 * 3600), "Today 5:00:00 PM");
+        assert_eq!(clock_words(0, -7 * 3600), "5:00 PM");
         let h = |ago: i64| day_heading(today, today - ago, false);
         assert_eq!(h(-1), "Today");
         assert_eq!(h(0), "Today");

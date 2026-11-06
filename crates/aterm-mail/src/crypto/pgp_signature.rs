@@ -81,14 +81,11 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     raw[32 - r.len()..32].copy_from_slice(r);
     raw[64 - s.len()..].copy_from_slice(s);
     let mut hash = ring::digest::Context::new(algorithm);
-    let canonical;
-    let data = if sig[1] == 1 {
-        canonical = canonical_text(data);
-        canonical.as_slice()
+    if sig[1] == 1 {
+        update_canonical_text(&mut hash, data);
     } else {
-        data
-    };
-    hash.update(data);
+        hash.update(data);
+    }
     hash.update(hashed);
     hash.update(&[4, 255]);
     hash.update(&(end as u32).to_be_bytes());
@@ -106,22 +103,37 @@ pub fn verify(data: &[u8], signature: &str, keys: &[[u8; 32]]) -> Result<(), Str
     }
 }
 
-fn canonical_text(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len());
-    let mut bytes = data.iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
-        match byte {
+fn update_canonical_text(hash: &mut ring::digest::Context, data: &[u8]) {
+    let mut start = 0;
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
             b'\r' => {
-                if bytes.peek() == Some(&b'\n') {
-                    bytes.next();
+                if start < i {
+                    hash.update(&data[start..i]);
                 }
-                result.extend_from_slice(b"\r\n");
+                hash.update(b"\r\n");
+                if data.get(i + 1) == Some(&b'\n') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                start = i;
             }
-            b'\n' => result.extend_from_slice(b"\r\n"),
-            byte => result.push(byte),
+            b'\n' => {
+                if start < i {
+                    hash.update(&data[start..i]);
+                }
+                hash.update(b"\r\n");
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
         }
     }
-    result
+    if start < data.len() {
+        hash.update(&data[start..]);
+    }
 }
 
 #[cfg(test)]

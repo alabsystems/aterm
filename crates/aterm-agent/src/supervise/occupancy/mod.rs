@@ -9,14 +9,18 @@ pub mod door;
 mod door_environment;
 pub mod due;
 pub mod fact_word;
+pub mod git_url;
 pub mod hold;
 #[cfg(any(test, debug_assertions))]
 mod left_environment;
+pub mod owner_rules;
 pub mod reading;
 pub mod replay;
+pub mod repo_config;
 pub mod ring;
 pub mod rules;
 pub mod said;
+pub mod source_episode;
 pub mod templates;
 pub mod wake_atoms;
 pub mod wakes;
@@ -267,6 +271,34 @@ pub mod fault {
         /// last: an episode taken again after the other's offer lapses with that older offer, and is
         /// offered to the other reader while its act may still be deciding.
         LeaseFromFirstOffer,
+        /// [`SourceBook::dwelt`](super::source_episode::SourceBook::dwelt) holds at the first
+        /// quiet read (the model's `CloseOnFirstQuiet`): a flap with a quiet read inside the dwell
+        /// is two episodes.
+        DwellCloseEarly,
+        /// [`SourceBook::look`](super::source_episode::SourceBook::look) restarts the quiet count
+        /// at a read with no edge: no episode ever dwells, and two moves hours apart are one.
+        QuietRestarts,
+        /// [`SourceBook::restore`](super::source_episode::SourceBook::restore) re-bases a book
+        /// saved within the day: a move made while aterm was down is never an edge.
+        RebaseOnRestart,
+        /// [`owner_rules::canonical`](super::owner_rules::canonical) leaves the rule's text out:
+        /// an edit of the words typed keeps the rev the owner confirmed.
+        RevSkipsField,
+        /// [`owner_rules::canonical`](super::owner_rules::canonical) leaves the resolved URL out:
+        /// a rewritten remote keeps the rev the owner confirmed.
+        RevSkipsUrl,
+        /// [`RuleState::of`](super::owner_rules::RuleState::of) counts any yes on record (the
+        /// model's `crev != none`): an edited table reads under the old table's yes.
+        ConfirmByName,
+        /// [`Snapshot::still_current`](super::owner_rules::Snapshot::still_current) checks the
+        /// rule's name alone: a yes to a snapshot confirms the table edited since.
+        ConfirmStaleSnapshot,
+        /// [`RemoteUrl::parse`](super::git_url::RemoteUrl::parse) drops a user-info secret and
+        /// reads the rest instead of refusing it.
+        StripUserinfo,
+        /// [`repo_config::remote_url`](super::repo_config::remote_url) reads past an include
+        /// instead of refusing the file.
+        IncludeFollowed,
     }
 
     thread_local! {
@@ -368,6 +400,15 @@ pub(crate) mod fault {
         CustodySettleKeepsAsked,
         OneOfferSlot,
         LeaseFromFirstOffer,
+        DwellCloseEarly,
+        QuietRestarts,
+        RebaseOnRestart,
+        RevSkipsField,
+        RevSkipsUrl,
+        ConfirmByName,
+        ConfirmStaleSnapshot,
+        StripUserinfo,
+        IncludeFollowed,
     }
 
     /// The shipped build: never armed.

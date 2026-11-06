@@ -43,6 +43,31 @@ fn is_install_process(path: &::std::path::Path) -> bool {
         || path == ::std::path::Path::new("/usr/sbin/installer")
 }
 
+/// The pid of the first of `processes` (each a running process's pid and the executable the
+/// kernel names for it, `None` where it names none) that is Apple's installer window, read
+/// exactly as [`reading_from`] reads the window ([`aterm_types::macos_setup::tools_installer`]):
+/// never one of Apple's command-line installers, a path that is not absolute or does not end in
+/// the installer app's own executable, or a process with no executable named.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn apple_window_pid(
+    processes: impl IntoIterator<Item = (u32, Option<impl AsRef<Path>>)>,
+) -> Option<u32> {
+    use aterm_types::macos_setup::{ToolsInstaller, tools_installer};
+    processes.into_iter().find_map(|(pid, exe)| {
+        (tools_installer(exe?.as_ref(), is_install_process) == Some(ToolsInstaller::AppleWindow))
+            .then_some(pid)
+    })
+}
+
+/// The pid of Apple's Command Line Tools installer window open now ([`apple_window_pid`] over
+/// every process), which the card's Go to installer brings forward
+/// ([`crate::App::go_to_developer_tools_installer`]): one look at the process table, at the
+/// press itself, so a window that closed since the page last read this Mac is none.
+#[cfg(target_os = "macos")]
+pub(super) fn apple_installer_pid() -> Option<u32> {
+    apple_window_pid(processes())
+}
+
 /// This Mac's [`super::Reading`] now: the placeholder there or not as one `lstat` finds it,
 /// which follows no link, as `aterm init` reads it, each process's executable as the kernel
 /// names it, and the stamp a live run of the root half wrote, matched with its process's start
@@ -52,7 +77,7 @@ pub(super) fn installing_now() -> super::Reading {
     let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
     let placeholder = std::fs::symlink_metadata(path).is_ok();
     let started = |pid| aterm_sysprobe::kproc::record(pid).map(|record| record.start_s);
-    let mut reading = reading_from(placeholder, processes());
+    let mut reading = reading_from(placeholder, processes().map(|(_, exe)| exe));
     reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
         aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, started)
     });
@@ -92,15 +117,15 @@ pub(super) fn installing_now() -> super::Reading {
     super::Reading::default()
 }
 
-/// Every process running now, as the executable the kernel names for it (`None` where it names
-/// none); one that exited before its executable was read is left out.
+/// Every process running now, by its pid, with the executable the kernel names for it (`None`
+/// where it names none); one that exited before its executable was read is left out.
 #[cfg(target_os = "macos")]
-fn processes() -> impl Iterator<Item = Option<std::path::PathBuf>> {
+fn processes() -> impl Iterator<Item = (u32, Option<std::path::PathBuf>)> {
     process_ids()
         .into_iter()
         .filter_map(|pid| match aterm_uds::holders::exe_of(pid) {
-            aterm_uds::holders::Exe::At(path) => Some(Some(path)),
-            aterm_uds::holders::Exe::Unnamed => Some(None),
+            aterm_uds::holders::Exe::At(path) => Some((pid, Some(path))),
+            aterm_uds::holders::Exe::Unnamed => Some((pid, None)),
             aterm_uds::holders::Exe::Exited => None,
         })
 }
@@ -233,6 +258,31 @@ mod tests {
             idle
         );
         assert_eq!(activity(true, ["/tmp/softwareupdate"]), idle);
+    }
+
+    /// The card's Go to installer finds Apple's installer window alone, by the pid of the first
+    /// process whose executable is that app's own, as the page reads the window: never one of the
+    /// command-line installers, a program merely named like the app, the app's path when it is
+    /// not absolute, or a process the kernel names no executable for.
+    #[test]
+    fn go_to_installer_finds_apples_installer_window_alone() {
+        let others = [
+            (11, Some("/usr/sbin/softwareupdate")),
+            (12, Some("/usr/sbin/installer")),
+            (13, Some("/tmp/Install Command Line Developer Tools")),
+            (
+                14,
+                Some(
+                    "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
+                ),
+            ),
+            (15, None),
+        ];
+        assert_eq!(apple_window_pid(others), None);
+        let open = others
+            .into_iter()
+            .chain([(16, Some(INSTALLER)), (17, Some(INSTALLER))]);
+        assert_eq!(apple_window_pid(open), Some(16), "the first window's");
     }
 
     /// Only the tools' command-line installers' live evidence beside the placeholder makes the

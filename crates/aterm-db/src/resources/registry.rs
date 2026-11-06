@@ -341,7 +341,7 @@ fn read(
             allocation,
             operation,
             receipt: store
-                .receipt(session, &record.header().id)?
+                .receipt_unchecked(&record.header().id)
                 .ok_or_else(|| Error::new("request binding receipt is missing"))?,
         };
         if claims.insert((writer, key), claim).is_some() {

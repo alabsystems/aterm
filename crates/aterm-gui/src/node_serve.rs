@@ -1810,8 +1810,8 @@ impl Drop for MeshHeld {
 /// What this Mac's presence row reads before each row: its build, its fleet addresses with the
 /// node listener's port, the membership log it holds (the vault's store, or with no vault the
 /// record store the job was given), and the topics its sessions hold, as its fabric bridge named
-/// them on `mesh`'s `bus.log` (C3). The lab tables have no store in the node job yet, so their
-/// digest is not known.
+/// them on `mesh`'s `bus.log` (C3), and what its lab tables hold as `mesh`'s egress read them
+/// (none where the mesh moves no tables).
 fn presence_config(
     cfg: &NodeServeConfig,
     port: &Arc<AtomicU16>,
@@ -1836,7 +1836,7 @@ fn presence_config(
                 }
                 (None, None) => None,
             },
-            tables: None,
+            tables: mesh.upgrade().and_then(|mesh| mesh.tables_held()),
             topics: mesh
                 .upgrade()
                 .map(|mesh| aterm_mesh::mail::held_topics(&mesh))
@@ -1885,6 +1885,15 @@ fn open_mesh(cfg: &NodeServeConfig) -> std::io::Result<Arc<aterm_mesh::Mesh>> {
         changed,
         watch_every: cfg.tick_every,
         observe: None,
+        // The vault's table stores and records file, whose records the mesh moves (B7b).
+        stores: cfg
+            .vault_paths
+            .clone()
+            .zip(aterm_types::dirs::aterm_config_path())
+            .map(|(paths, config)| {
+                Arc::new(aterm_mesh::stores::vault::VaultStores::new(paths, config))
+                    as Arc<dyn aterm_mesh::Stores>
+            }),
     })
 }
 
@@ -2197,6 +2206,15 @@ fn serve_one_node_generation(
     node: Option<NodeIdentity>,
     mesh_logs: Option<&Arc<aterm_mesh::Mesh>>,
 ) -> bool {
+    // Announcements belong to this listener generation. Stop them before its
+    // socket is released, including every early return while starting workers.
+    struct Announcing<'a>(&'a AlabTcpAdvertiser);
+    impl Drop for Announcing<'_> {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+    let _announcing = Announcing(advertiser);
     let running = Arc::new(AtomicBool::new(true));
     let open_table = Arc::new(NodeOpenTable::default());
     let automatic_joins = match cfg
@@ -2208,6 +2226,7 @@ fn serve_one_node_generation(
         Ok(joins) => joins,
         Err(error) => {
             aterm_log::warn!("node: the automatic admission worker did not start: {error}");
+            advertiser.stop();
             sleep_interruptible(&cfg.stop, cfg.tick_every);
             return false;
         }
@@ -2551,7 +2570,6 @@ fn serve_one_node_generation(
         per_source: aterm_net::fleet::per_source(fleet_slots()),
         lifetime: lifetime(),
     };
-    let port = addr.port();
     let state_dir = cfg.state_dir.clone();
     let relay_dir = cfg.relay_dir.clone();
     let home_dir = cfg.home_dir.clone();
@@ -2834,6 +2852,7 @@ fn serve_one_node_generation(
     );
 
     running.store(false, Ordering::Release);
+    advertiser.stop();
     drop(neighbours);
     if let Some(sharing) = sharing {
         let _ = sharing.join();
@@ -2842,16 +2861,6 @@ fn serve_one_node_generation(
         let _ = watch.join();
     }
     drop(automatic_joins);
-    if let Some(vault_paths) = cfg.vault_paths.as_ref()
-        && !cfg.stop.load(Ordering::Acquire)
-    {
-        advertiser.tick(
-            vault_paths,
-            cfg.config_path.as_deref(),
-            port,
-            has_live_window_relay(&cfg.relay_dir),
-        );
-    }
     true
 }
 
@@ -3415,10 +3424,11 @@ impl LinkServe {
         let Some(denied) = denied_nodes_for(self.vault_paths.as_ref(), &self.denied) else {
             return incoming.refuse("unread");
         };
-        // `Bus` is each mesh log's broker (B7a), which judges the peer's key itself; B7b serves
-        // `Inventory`. A stream for the fabric's `bus.log` (C2) is admitted as a driver is first
-        // (§4.11): the deny list, the membership log, the keyring binding and `[fleet]`'s drive
-        // grant; the mesh then judges the key against the seats and serves it the ring.
+        // `Bus` is each mesh log's broker (B7a), which judges the peer's key itself, and
+        // `Inventory` the mesh's digest exchange of the tables it moves (B7b), which does too. A
+        // stream for the fabric's `bus.log` (C2) is admitted as a driver is first (§4.11): the deny
+        // list, the membership log, the keyring binding and `[fleet]`'s drive grant; the mesh then
+        // judges the key against the seats and serves it the ring.
         if op == FleetOp::Bus {
             let Some(mesh) = &self.mesh else {
                 return incoming.refuse("unserved");
@@ -3451,7 +3461,10 @@ impl LinkServe {
             return mesh.serve_bus(incoming);
         }
         if op == FleetOp::Inventory {
-            return incoming.refuse("unserved");
+            return match &self.mesh {
+                Some(mesh) => mesh.serve_inventory(incoming),
+                None => incoming.refuse("unserved"),
+            };
         }
         let serving = (self.serving)();
         if !serving.ops_meshed(true).contains(&op) {

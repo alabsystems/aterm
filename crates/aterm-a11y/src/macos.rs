@@ -21,7 +21,7 @@ use crate::platform::{self as state, Changes, Handle, Publication};
 use crate::tree::{FilterResult, Node, NodeId, common_filter};
 
 #[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn NSAccessibilityFrameInView(view: Id, frame: CGRect) -> CGRect;
     fn NSAccessibilityPostNotification(element: Id, notification: Id);
     fn NSAccessibilityPostNotificationWithUserInfo(element: Id, notification: Id, info: Id);
@@ -626,6 +626,9 @@ fn notify(element: Id, notification: Notification) {
             Notification::Value => NSAccessibilityValueChangedNotification,
             Notification::Focus => NSAccessibilityFocusedUIElementChangedNotification,
         };
+        if name.is_null() {
+            return;
+        }
         NSAccessibilityPostNotification(element, name);
     }
 }
@@ -656,13 +659,18 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
         return;
     };
     // SAFETY: static framework NSString keys and an existing application element; the dictionary
-    // factory copies/retains each counted key and value for the call.
+    // factory copies/retains each counted non-null key and value for the call.
     unsafe {
+        let priority = number_object(if live == Live::Assertive { 90. } else { 50. });
+        if priority.is_null()
+            || NSAccessibilityAnnouncementKey.is_null()
+            || NSAccessibilityPriorityKey.is_null()
+            || NSAccessibilityAnnouncementRequestedNotification.is_null()
+        {
+            return;
+        }
         let keys = [NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey];
-        let values = [
-            value.id(),
-            number_object(if live == Live::Assertive { 90. } else { 50. }),
-        ];
+        let values = [value.id(), priority];
         let dictionary: unsafe extern "C-unwind" fn(
             aterm_objc::ClassPtr,
             Sel,
@@ -677,6 +685,9 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
             keys.as_ptr(),
             keys.len(),
         );
+        if info.is_null() {
+            return;
+        }
         NSAccessibilityPostNotificationWithUserInfo(
             application.id(),
             NSAccessibilityAnnouncementRequestedNotification,

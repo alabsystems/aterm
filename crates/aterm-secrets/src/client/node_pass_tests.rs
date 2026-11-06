@@ -543,64 +543,70 @@ fn ended_runner(exe: &Path) -> aterm_uds::spawnfd::Child {
 }
 
 #[test]
-fn node_convergence_retries_a_failed_runner_without_new_records_and_honors_the_lan_hold() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let failed = converge_program(root.path(), "failed", "exit 1");
-    let held = converge_program(root.path(), "held", "exit 75");
-    let success = converge_program(root.path(), "success", "exit 0");
-    let calls = std::cell::Cell::new(0);
-    let start = || {
-        calls.set(calls.get() + 1);
-        Some(ended_runner(match calls.get() {
-            1 | 4 => &failed,
-            2 => &held,
-            _ => &success,
-        }))
-    };
-    let mut converge = NodeConverge {
-        owed: true,
-        ..NodeConverge::default()
-    };
-    converge.tend_at(0, &|| false, &start);
-    assert_eq!(calls.get(), 0, "an owed version still honors the LAN hold");
-    converge.tend_at(1, &|| true, &start);
-    converge.tend_at(2, &|| true, &start);
-    for at in [3, 4_000, 5_001] {
-        converge.tend_at(at, &|| true, &start);
-    }
-    assert_eq!(
-        calls.get(),
-        1,
-        "one failure is consumed once, without a hot loop"
-    );
-    converge.tend_at(5_002, &|| false, &start);
-    assert_eq!(calls.get(), 1, "a due retry cannot bypass the LAN hold");
-    converge.tend_at(6_000, &|| true, &start);
-    assert_eq!(
-        calls.get(),
-        2,
-        "unchanged records do not strand the failure"
-    );
-    converge.tend_at(6_001, &|| true, &start);
-    assert_eq!(calls.get(), 3, "the held pass stays owed");
-    converge.tend_at(6_002, &|| true, &start);
-    converge.tend_at(30_000, &|| true, &start);
-    assert_eq!(calls.get(), 3, "success ends the retry streak");
+fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold() {
+    for code in [1, crate::converge::UNFINISHED] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let failed = converge_program(root.path(), "retry", &format!("exit {code}"));
+        let held = converge_program(
+            root.path(),
+            "held",
+            &format!("exit {}", crate::converge::HELD),
+        );
+        let success = converge_program(root.path(), "success", "exit 0");
+        let calls = std::cell::Cell::new(0);
+        let start = || {
+            calls.set(calls.get() + 1);
+            Some(ended_runner(match calls.get() {
+                1 | 4 => &failed,
+                2 => &held,
+                _ => &success,
+            }))
+        };
+        let mut converge = NodeConverge {
+            owed: true,
+            ..NodeConverge::default()
+        };
+        converge.tend_at(0, &|| false, &start);
+        assert_eq!(calls.get(), 0, "an owed version still honors the LAN hold");
+        converge.tend_at(1, &|| true, &start);
+        converge.tend_at(2, &|| true, &start);
+        for at in [3, 4_000, 5_001] {
+            converge.tend_at(at, &|| true, &start);
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "one failure is consumed once, without a hot loop"
+        );
+        converge.tend_at(5_002, &|| false, &start);
+        assert_eq!(calls.get(), 1, "a due retry cannot bypass the LAN hold");
+        converge.tend_at(6_000, &|| true, &start);
+        assert_eq!(
+            calls.get(),
+            2,
+            "unchanged records do not strand the failure"
+        );
+        converge.tend_at(6_001, &|| true, &start);
+        assert_eq!(calls.get(), 3, "the held pass stays owed");
+        converge.tend_at(6_002, &|| true, &start);
+        converge.tend_at(30_000, &|| true, &start);
+        assert_eq!(calls.get(), 3, "success ends the retry streak");
 
-    converge.owed = true;
-    converge.tend_at(30_001, &|| true, &start);
-    converge.tend_at(30_002, &|| true, &start);
-    converge.tend_at(35_001, &|| true, &start);
-    assert_eq!(calls.get(), 4);
-    converge.tend_at(35_002, &|| true, &start);
-    assert_eq!(
-        calls.get(),
-        5,
-        "success reset the next failure to five seconds"
-    );
-    converge.tend_at(35_003, &|| true, &start);
-    converge.tend_at(60_000, &|| true, &start);
-    assert_eq!(calls.get(), 5);
+        converge.owed = true;
+        converge.tend_at(30_001, &|| true, &start);
+        converge.tend_at(30_002, &|| true, &start);
+        converge.tend_at(35_001, &|| true, &start);
+        assert_eq!(calls.get(), 4);
+        converge.tend_at(35_002, &|| true, &start);
+        assert_eq!(
+            calls.get(),
+            5,
+            "success reset the next failure to five seconds"
+        );
+        converge.tend_at(35_003, &|| true, &start);
+        converge.tend_at(60_000, &|| true, &start);
+        assert_eq!(calls.get(), 5);
+    }
 }
 
 #[test]

@@ -15,6 +15,8 @@ pub mod account_catalog;
 pub mod account_progress;
 pub mod account_series;
 pub mod account_stats;
+pub mod account_work;
+
 pub mod accounts;
 pub mod accounts_overlay;
 pub mod accounts_pool;
@@ -122,6 +124,8 @@ pub mod repo_work;
 pub mod restart_stamp;
 pub mod result;
 pub mod resume;
+#[cfg(target_os = "macos")]
+mod safari_window;
 pub mod self_claimed;
 pub mod session_usage;
 pub(crate) mod sign_in_ladder;
@@ -149,6 +153,7 @@ pub mod usage;
 pub mod witness;
 pub mod work_record;
 pub mod worker;
+pub mod workflow_journal;
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary.
 pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {

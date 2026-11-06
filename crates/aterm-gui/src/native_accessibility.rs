@@ -291,6 +291,12 @@ pub(crate) struct PublishedNativeAccessibility {
 }
 
 impl PublishedNativeAccessibility {
+    /// The first line of the first text surface this table routes, as a client read it.
+    #[cfg(test)]
+    pub(crate) fn first_text_line(&self) -> Option<VirtualTextLine> {
+        self.virtual_text.first()?.lines.first().cloned()
+    }
+
     #[cfg(test)]
     pub(crate) fn new(view: ViewId, generation: u64, routes: Vec<AccessibilityRoute>) -> Self {
         let owner = AccessibilityOwner {

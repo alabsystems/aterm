@@ -286,7 +286,9 @@ impl Checkpoint {
         let mut d = Dec::new(&self.state);
         let state = schema.decode_state(&mut d).map_err(RestoreRefusal::Wire)?;
         d.finish().map_err(RestoreRefusal::Wire)?;
-        if encode_state(schema, &state) != self.state {
+        let mut again = Enc::with_capacity(self.state.len());
+        schema.encode_state(&state, &mut again);
+        if again.as_bytes() != self.state {
             return Err(RestoreRefusal::Wire(WireFault::NonCanonical {
                 field: "state",
             }));

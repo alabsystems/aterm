@@ -1847,6 +1847,26 @@ fn join_with_denial_deadline(
     let (denied, log) = denied_and_log_by(places, Some(deadline));
     let denied = denied.ok_or_else(|| failed(DENY_LIST_UNREAD))?;
     let mut dials = join_places(places, opts, &code, (&denied, log.as_deref()));
+    // Automatic joins solicit numeric endpoints before trying cached names.
+    // The vault's current log selects candidates; register_with still proves
+    // the answering node and the fleet before accepting its book.
+    if opts.synced.is_some()
+        && opts.adverts.is_none()
+        && let Ok(hints) = crate::lan_members::probe(Duration::from_millis(500))
+    {
+        let mut direct: Vec<_> = hints
+            .into_iter()
+            .filter(|hint| log.as_ref().is_some_and(|keys| keys.admits(&hint.key)))
+            .map(|hint| (hint.address.ip().to_string(), hint.address.port()))
+            .collect();
+        direct.extend(
+            dials
+                .into_iter()
+                .filter(|dial| !direct.contains(dial))
+                .collect::<Vec<_>>(),
+        );
+        dials = direct;
+    }
     // With no place it knows, the members that advertise themselves are its places; with one, they
     // are dialled only once none of those answered.
     let browsed = dials.is_empty();

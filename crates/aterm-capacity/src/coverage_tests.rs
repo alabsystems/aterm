@@ -4,6 +4,8 @@
 //! Whether a held claim covers a process's builds ([`crate::covered_memory`], [`crate::covering`]),
 //! on fixed processes and a scratch ledger: no test reads the live machine or this user's ledger.
 
+use std::path::Path;
+
 use crate::reading::{Proc, Procs};
 use crate::{
     Admit, COVER_ENV, Fixed, Held, Ledger, NO_COVER, Need, Pace, Reading, Record, admit_with,
@@ -366,4 +368,158 @@ fn an_unreadable_ledger_is_an_error_and_an_absent_one_covers_nothing() {
     assert!(covering(&Ledger::at(&file), &m, 1, None).is_err());
     let absent = Ledger::at(dir.path().join("absent"));
     assert_eq!(covering(&absent, &m, 1, None).expect("read"), None);
+}
+
+/// A RUN IS COVERED BY THE ONE DISK CLAIM ITS MARKER NAMES ([`crate::covering_disk`]): a release's
+/// held disk claim covers a verify run it started (its child) marked with that claim, and the
+/// holder's own process. NEGATIVE CONTROLS: a marker naming another claim of the same holder (its
+/// memory claim, held), a marker of another form, one whose
+/// holder is not of the run's line (the run reparented), the named claim where the run's writes land
+/// on another volume or on none read, and the named claim once it ended each cover nothing; and so
+/// does an ancestor's held disk claim the run was not handed (a VM's disk).
+#[test]
+fn a_disk_claim_covers_only_the_run_its_marker_names() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let me = std::process::id();
+    let mut room = Reading::of_gib(48, 40, 14);
+    room.volume = Some(crate::Volume {
+        mount: std::path::PathBuf::from("/vol"),
+        total: 400 * GIB,
+        free: 300 * GIB,
+        floor: 10 * GIB,
+        room: 2 * GIB,
+    });
+    let m = Fixed::new(room.clone());
+    let p = |pid, ppid| Proc {
+        pid,
+        ppid,
+        footprint: 0,
+        written: 0,
+        cpu_ns: 0,
+    };
+    let verify = me.wrapping_add(7);
+    m.set_procs(Some(Procs::of(vec![p(verify, me), p(me, 1)])));
+    let take = |need: Need| {
+        admit_with(
+            &ledger,
+            &m,
+            need,
+            Admit::Wait,
+            Pace::default(),
+            &mut |_: &str| {},
+        )
+        .expect("admitted")
+    };
+    let release = take(Need::new("release 0.156.0").disk(39 * GIB, "/vol"));
+    let memory = take(Need::new("release lint").mem(4 * GIB).covers());
+    let marker = release.record().cover_marker();
+    let by = |pid: u32, marker: &str| {
+        crate::covering_disk(&ledger, &m, pid, marker, Path::new("/vol/clone/target"))
+            .expect("read")
+            .map(|r| r.need.what)
+    };
+    assert_eq!(by(verify, &marker), Some("release 0.156.0".to_owned()));
+    assert_eq!(
+        by(me, &marker),
+        Some("release 0.156.0".to_owned()),
+        "its holder"
+    );
+    assert_eq!(
+        by(verify, &format!(" {marker}\n")),
+        Some("release 0.156.0".to_owned())
+    );
+    assert_eq!(
+        by(verify, &memory.record().cover_marker()),
+        None,
+        "a memory claim"
+    );
+    assert_eq!(by(verify, &me.to_string()), None, "a bare pid");
+    assert_eq!(by(verify, NO_COVER), None);
+    assert_eq!(by(verify, ""), None);
+    let other_seq = format!(
+        "{:013}-{me}-{}",
+        release.record().start_ms,
+        release.record().seq + 1
+    );
+    assert_eq!(by(verify, &other_seq), None, "another claim of its holder");
+    m.set_procs(Some(Procs::of(vec![p(verify, 1), p(me, 1)])));
+    assert_eq!(by(verify, &marker), None, "not of the holder's line");
+    m.set_procs(Some(Procs::of(vec![p(verify, me), p(me, 1)])));
+    let mut elsewhere = room.clone();
+    elsewhere.volume = elsewhere.volume.map(|v| crate::Volume {
+        mount: std::path::PathBuf::from("/other"),
+        ..v
+    });
+    m.set(elsewhere);
+    assert_eq!(
+        by(verify, &marker),
+        None,
+        "its writes land on another volume"
+    );
+    let mut unread = room.clone();
+    unread.volume = None;
+    m.set(unread);
+    assert_eq!(by(verify, &marker), None, "no volume read where it writes");
+    m.set(room.clone());
+    assert_eq!(by(verify, &marker), Some("release 0.156.0".to_owned()));
+    drop(release);
+    assert_eq!(by(verify, &marker), None, "its claim ended");
+    let vm = take(Need::new("lab vm boot").disk(20 * GIB, "/vol"));
+    let vm_marker = vm.record().cover_marker();
+    assert_eq!(
+        by(verify, &marker),
+        None,
+        "an ancestor's claim it was not handed"
+    );
+    assert_eq!(by(verify, &vm_marker), Some("lab vm boot".to_owned()));
+    drop((vm, memory));
+    assert_eq!(crate::DISK_COVER_ENV, "ATERM_DISK_COVERED");
+}
+
+/// A DISK CLAIM THAT WAITS COVERS NOTHING: its holder's run, marked with it while it waits for
+/// room, claims for itself. NEGATIVE CONTROL: once room comes and the claim is held, the same
+/// marker covers.
+#[test]
+fn a_waiting_disk_claim_covers_nothing() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let me = std::process::id();
+    let short = |free: u64| {
+        let mut r = Reading::of_gib(48, 40, 14);
+        r.volume = Some(crate::Volume {
+            mount: std::path::PathBuf::from("/vol"),
+            total: 400 * GIB,
+            free: free * GIB,
+            floor: 10 * GIB,
+            room: 2 * GIB,
+        });
+        r
+    };
+    let m = Fixed::new(short(20));
+    let waiter =
+        crate::Waiter::enter(&ledger, &m, Need::new("release").disk(39 * GIB, "/vol")).expect("in");
+    let (waiter, marker) = match waiter.poll(&m) {
+        crate::Polled::Waiting(w, _) => {
+            let marker = w.record().cover_marker();
+            (w, marker)
+        }
+        other => panic!("expected a wait: {other:?}"),
+    };
+    assert_eq!(
+        crate::covering_disk(&ledger, &m, me, &marker, Path::new("/vol/w")).expect("read"),
+        None
+    );
+    m.set(short(300));
+    let claim = match waiter.poll(&m) {
+        crate::Polled::Admitted(c) => c,
+        other => panic!("expected admission: {other:?}"),
+    };
+    assert_eq!(claim.record().cover_marker(), marker);
+    assert!(
+        crate::covering_disk(&ledger, &m, me, &marker, Path::new("/vol/w"))
+            .expect("read")
+            .is_some()
+    );
+    drop(claim);
 }

@@ -695,6 +695,22 @@ fn retire_state(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<(), Strin
         .map_err(|e| format!("{} -> {}: {e}", from.display(), to.display()))
 }
 
+/// Whether the `known_hosts` line `line` pins a key under `alias`: one of the comma-separated
+/// names in its first field is `alias` (or `[alias]:port`), as OpenSSH matches a host name,
+/// without regard to case.
+pub(crate) fn pins(line: &str, alias: &str) -> bool {
+    let named = |pattern: &str| {
+        pattern
+            .strip_prefix('[')
+            .and_then(|p| p.split_once("]:"))
+            .map_or(pattern, |(name, _)| name)
+            .eq_ignore_ascii_case(alias)
+    };
+    line.split_whitespace()
+        .next()
+        .is_some_and(|hosts| hosts.split(',').any(named))
+}
+
 /// Drop every `known_hosts` line pinned under `alias` (the host's UUID; OpenSSH matches it without regard to case).
 /// # Errors
 /// One line when the file cannot be read or written.
@@ -705,21 +721,9 @@ pub fn forget_host_key(sys: &dyn System, paths: &Paths, alias: &str) -> Result<(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let pinned = |pattern: &str| {
-        pattern
-            .strip_prefix('[')
-            .and_then(|p| p.split_once("]:"))
-            .map_or(pattern, |(name, _)| name)
-            .eq_ignore_ascii_case(alias)
-    };
-    let names_alias = |line: &str| {
-        line.split_whitespace()
-            .next()
-            .is_some_and(|hosts| hosts.split(',').any(pinned))
-    };
     let kept: String = text
         .split_inclusive('\n')
-        .filter(|line| !names_alias(line))
+        .filter(|line| !pins(line, alias))
         .collect();
     if kept.len() == text.len() {
         return Ok(());
@@ -936,14 +940,25 @@ pub fn inside(root: &Path, path: &Path) -> bool {
     })
 }
 
+/// `raw` without its surrounding whitespace, its trailing dots and a `.local` suffix in any
+/// case (an mDNS name is read without regard to case).
+fn without_dot_local(raw: &str) -> &str {
+    let clean = raw.trim().trim_end_matches('.');
+    clean
+        .len()
+        .checked_sub(".local".len())
+        .filter(|&at| {
+            clean
+                .get(at..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(".local"))
+        })
+        .map_or(clean, |at| &clean[..at])
+}
+
 /// Extract a canonical short tag from a host selector or Bonjour name (`m14` from `m14 Air M5 32GB 4TB prime`, `spark-49f7` from `spark-49f7-SSH`).
 #[must_use]
 pub fn host_tag_key(raw: &str) -> String {
-    let clean = raw
-        .trim()
-        .trim_end_matches('.')
-        .strip_suffix(".local")
-        .unwrap_or_else(|| raw.trim().trim_end_matches('.'));
+    let clean = without_dot_local(raw);
     let tokens: Vec<&str> = clean
         .split(|c: char| c.is_whitespace() || c == '-')
         .filter(|t| !t.is_empty())
@@ -971,12 +986,7 @@ pub fn canonical_host_name(
     raw: &str,
     custom_names: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let trimmed = raw
-        .trim()
-        .trim_end_matches('.')
-        .strip_suffix(".local")
-        .unwrap_or_else(|| raw.trim().trim_end_matches('.'))
-        .trim();
+    let trimmed = without_dot_local(raw).trim();
     if trimmed.is_empty() {
         return "unknown-host".to_owned();
     }
@@ -1720,6 +1730,26 @@ user = \"labadmin\"
         assert!(!is_uuid("0A1B2C3D-0000-4000-8000-00000000000"));
         assert!(!is_uuid("0A1B2C3D-0000-4000-8000-00000000000G"));
         assert!(!is_uuid("../0000-4000-8000-000000000007"));
+    }
+
+    /// mDNS reads `.local` without regard to case, so `M14.LOCAL.` is the host `m14.local`
+    /// names. NEGATIVE CONTROL: a name that only ends in `local` keeps it.
+    #[test]
+    fn a_dot_local_suffix_in_any_case_names_the_same_host() {
+        let empty = std::collections::BTreeMap::new();
+        for spelled in ["M14.LOCAL.", "m14.Local", "m14.local", "m14"] {
+            assert_eq!(host_tag_key(spelled), "m14", "{spelled}");
+        }
+        assert_eq!(
+            canonical_host_name("M1-Air-M2-24GB-1TB.LOCAL.", &empty),
+            canonical_host_name("m1-Air-M2-24GB-1TB", &empty)
+        );
+        assert_eq!(
+            canonical_host_name("spark-49f7-SSH.Local", &empty),
+            "spark-49f7"
+        );
+        assert_eq!(host_tag_key("buildlocal"), "buildlocal");
+        assert_eq!(host_tag_key(".LOCAL"), "");
     }
 
     #[test]

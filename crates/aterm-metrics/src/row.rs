@@ -251,8 +251,11 @@ impl fmt::Display for Sid {
 struct Out(Vec<u8>);
 
 impl Out {
-    fn new(kind: u8) -> Out {
-        Out(vec![kind, VERSION])
+    fn with_capacity(kind: u8, cap: usize) -> Out {
+        let mut v = Vec::with_capacity(cap.max(2));
+        v.push(kind);
+        v.push(VERSION);
+        Out(v)
     }
 
     fn varint(&mut self, mut v: u64) {
@@ -542,7 +545,7 @@ impl QuotaRow {
     /// The canonical encoding; each percent at most [`PCT_MAX`].
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_QUOTA);
+        let mut o = Out::with_capacity(KIND_QUOTA, 128);
         o.varint(self.at);
         o.text(self.cli.word());
         o.account(self.account);
@@ -664,7 +667,7 @@ impl AgyRow {
     /// [`REMAINING_MAX`].
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_AGY);
+        let mut o = Out::with_capacity(KIND_AGY, 32 + self.groups.len().min(AGY_GROUPS_MAX) * 24);
         o.varint(self.at);
         o.home(self.home);
         let n = o.count(&self.groups, AGY_GROUPS_MAX);
@@ -746,7 +749,7 @@ impl PlaceRow {
     /// The canonical encoding.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_PLACE);
+        let mut o = Out::with_capacity(KIND_PLACE, 64);
         o.varint(self.at);
         o.account(self.account);
         o.text(self.place.as_str());
@@ -849,7 +852,11 @@ impl NeedsRow {
     /// The canonical encoding: the first [`NEEDS_MAX`] entries of each list.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_NEEDS);
+        let cap = 16
+            + self.needs.len().min(NEEDS_MAX) * 56
+            + self.held.len().min(NEEDS_MAX) * 56
+            + self.managers.len().min(NEEDS_MAX) * 28;
+        let mut o = Out::with_capacity(KIND_NEEDS, cap);
         o.varint(self.at);
         let k = o.count(&self.needs, NEEDS_MAX);
         for n in self.needs.iter().take(k) {
@@ -954,7 +961,7 @@ impl UnreadRow {
     /// The canonical encoding: its first [`UNREAD_MAX`] pools.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_UNREAD);
+        let mut o = Out::with_capacity(KIND_UNREAD, 16 + self.pools.len().min(UNREAD_MAX) * 8);
         o.varint(self.at);
         let n = o.count(&self.pools, UNREAD_MAX);
         for p in self.pools.iter().take(n) {
@@ -1081,10 +1088,10 @@ impl WindowRecord {
     /// The canonical encoding.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut o = Out::new(KIND_WINDOW);
         // A node's origin and a compiled metric name keep the identity far under the reader's
         // 255 bytes, for every metric (`every_row_reads_back_as_itself_at_its_subject`).
         let id = self.id().encode();
+        let mut o = Out::with_capacity(KIND_WINDOW, 64 + id.len());
         o.varint(u64::try_from(id.len()).unwrap_or(u64::MAX));
         o.0.extend_from_slice(&id);
         o.varint(self.revision);

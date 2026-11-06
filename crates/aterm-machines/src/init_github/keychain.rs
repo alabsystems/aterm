@@ -73,7 +73,7 @@ impl Item for Keychain {
             }
             Err(why) => return Probe::Unusable { why },
         }
-        let git = Git::new(sys);
+        let git = Git::for_user(sys, &self.user);
         if !git.installed(sys) {
             return Probe::NotApplicable {
                 why: "no git on this machine reads its settings yet".into(),
@@ -124,7 +124,7 @@ impl Item for Keychain {
         if sys.euid() != self.user.uid {
             return Err("git's GitHub settings belong to their local user".into());
         }
-        let git = Git::new(sys);
+        let git = Git::for_user(sys, &self.user);
         let Some(block) =
             git.keychain_block(sys, &self.user, &|| super::token_here(sys, &self.user))?
         else {

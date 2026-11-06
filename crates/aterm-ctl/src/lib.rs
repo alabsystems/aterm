@@ -3244,7 +3244,41 @@ fn open_regular_token_file(path: &Path) -> io::Result<(std::fs::File, std::fs::M
     Ok((file, meta))
 }
 
+/// Windows: the final component opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`), then judged by
+/// the handle it gave, so a symlink or other reparse point swapped in after a look at the path
+/// is refused rather than followed. `FILE_FLAG_BACKUP_SEMANTICS` opens a directory there too, so
+/// it is judged `InvalidData` like any other non-regular file rather than failing the open, which
+/// [`read_token_file_at`] would take for a miss and reach past.
+#[cfg(windows)]
+fn open_regular_token_file(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token path is a symlink or other reparse point",
+        ));
+    }
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token path is not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
 #[cfg(not(any(
+    windows,
     all(
         any(target_os = "linux", target_os = "android"),
         any(

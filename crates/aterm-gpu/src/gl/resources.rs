@@ -412,8 +412,11 @@ impl GlDevice {
             return Ok(());
         }
         let bpp = tex.format.bytes;
+        let min_row = w.checked_mul(bpp);
+        let row_texels = GLint::try_from(bytes_per_row / bpp).ok();
         if !bytes_per_row.is_multiple_of(bpp)
-            || bytes_per_row < w * bpp
+            || min_row.is_none_or(|min| bytes_per_row < min)
+            || row_texels.is_none()
             || x.checked_add(w).is_none_or(|end| end > tex.width)
             || y.checked_add(h).is_none_or(|end| end > tex.height)
         {
@@ -423,7 +426,15 @@ impl GlDevice {
                 tex.width, tex.height
             ));
         }
-        let need = bytes_per_row as usize * (h as usize - 1) + (w * bpp) as usize;
+        let min_row = min_row.expect("checked above") as usize;
+        let Some(need) = (bytes_per_row as usize)
+            .checked_mul(h as usize - 1)
+            .and_then(|rows| rows.checked_add(min_row))
+        else {
+            return Err(format!(
+                "gl: upload of {h} rows at stride {bytes_per_row} overflows usize"
+            ));
+        };
         if bytes.len() < need {
             return Err(format!(
                 "gl: upload of {h} rows needs {need} bytes, got {}",
@@ -438,7 +449,10 @@ impl GlDevice {
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);
-            (gl.pixel_storei)(ffi::GL_UNPACK_ROW_LENGTH, (bytes_per_row / bpp) as GLint);
+            (gl.pixel_storei)(
+                ffi::GL_UNPACK_ROW_LENGTH,
+                row_texels.expect("checked above"),
+            );
             (gl.tex_sub_image_2d)(
                 ffi::GL_TEXTURE_2D,
                 0,
@@ -545,17 +559,23 @@ impl GlDevice {
                 tex.format.internal
             ));
         }
+        let min_row = (width as usize).checked_mul(4);
+        let pack_row = GLint::try_from(padded / 4).ok();
         if width > tex.width
             || height > tex.height
-            || padded < width as usize * 4
+            || min_row.is_none_or(|min| padded < min)
             || !padded.is_multiple_of(4)
+            || pack_row.is_none()
         {
             return Err(format!(
                 "gl: readback of {width}x{height} at stride {padded} from a {}x{} texture",
                 tex.width, tex.height
             ));
         }
-        let mut out = vec![0u8; padded * height as usize];
+        let total = padded.checked_mul(height as usize).ok_or_else(|| {
+            format!("gl: readback of {width}x{height} at stride {padded} overflows usize")
+        })?;
+        let mut out = vec![0u8; total];
         if width == 0 || height == 0 {
             return Ok(out);
         }
@@ -567,7 +587,7 @@ impl GlDevice {
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
             (gl.pixel_storei)(ffi::GL_PACK_ALIGNMENT, 4);
-            (gl.pixel_storei)(ffi::GL_PACK_ROW_LENGTH, (padded / 4) as GLint);
+            (gl.pixel_storei)(ffi::GL_PACK_ROW_LENGTH, pack_row.expect("checked above"));
             (gl.read_pixels)(
                 0,
                 0,

@@ -534,8 +534,10 @@ fn with_recording_cargo_from(
         };
         let header = format!("     Running {src} (target/debug/deps/{name}-1)");
         fs::create_dir_all(repo.root.join("crates").join(pkg)).expect("mkdir");
+        // `after_running`, when a test's `extra` sets it, is what cargo's log says next.
         record.push_str(&format!(
-            "echo '{header}' >&2\n(cd '{root}/crates/{pkg}' && CARGO_PKG_NAME={pkg} \"$runner\" \
+            "echo '{header}' >&2\nif [ -n \"${{after_running:-}}\" ]; then eval \"$after_running\"; fi\n\
+             (cd '{root}/crates/{pkg}' && CARGO_PKG_NAME={pkg} \"$runner\" \
              \"$flag\" \"$dir\" '{exe}' $targs) || {{ echo \"Caused by:\"; echo \"  process \
              didn't exit successfully: \\`$runner $flag $dir {exe}\\` (exit status: 1)\"; \
              status=101; }}\n",
@@ -980,7 +982,14 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
         ("fixture", "--test b", "b"),
         ("fixture", "--test c", "c"),
     ];
-    with_recording_cargo(&repo, &bins, "");
+    // After each Running header, a line that reads as a fresh unit's artifact: no unit of the
+    // recording pass's, which reads its log only up to cargo's first header.
+    let after = r#"{"fresh":true,"reason":"compiler-artifact","filenames":[]}"#;
+    let after = format!(
+        "after_running={}",
+        sh_quote(&format!("printf '%s\\n' {}", sh_quote(after)))
+    );
+    with_recording_cargo(&repo, &bins, &after);
     let deps = repo.root.join("target/debug/deps");
     let m = marks.display();
     let libtest_ok = |n: &str| {
@@ -1034,6 +1043,8 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     // unheld, the ceiling is the host's cores, and 2 x 6 does not fit a Mac with fewer than 12.
     ctx.env.build_slot_held = Some("1".into());
     ctx.env.cargo_build_jobs = Some("12".into());
+    let history = repo.scratch.join("verify/test-binaries.json");
+    ctx.test_history = Some(history.clone());
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)
@@ -1042,10 +1053,43 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let block = report.render();
 
     assert_eq!(tags(&block), ["FAIL"], "{block}");
+    // Each binary's run is one sample of its row, at the threads it ran at, with its outcome
+    // and the tests libtest said it runs.
+    let kept = aterm_verify::test_history::load(&history);
+    assert_eq!(kept.rows().len(), bins.len(), "{kept:?}");
+    for (test, outcome, tests) in [
+        ("-p fixture --lib", "ok", 1),
+        ("-p fixture2 --test d", "ok", 1),
+        ("-p fixture --test b", "FAIL", 2),
+        ("-p fixture --test c", "ok", 1),
+    ] {
+        let row = kept
+            .row(test)
+            .unwrap_or_else(|| panic!("no row {test}: {kept:?}"));
+        assert_eq!(
+            row.samples
+                .iter()
+                .map(|s| (s.width, s.outcome.as_str(), s.tests))
+                .collect::<Vec<_>>(),
+            [(6, outcome, Some(tests))],
+            "{test}"
+        );
+    }
     assert!(block.contains("   Compiling fixture v0.1.0"), "{block}");
     assert!(
         !block.contains("{\"reason\""),
         "the JSON leaves the ladder:\n{block}"
+    );
+    // The recording pass is a compile call of its own: one plain line, its four artifacts read
+    // from Cargo's messages (the stand-in reports no `fresh`, so none is counted fresh or built).
+    assert_eq!(
+        block
+            .lines()
+            .filter(|l| l.starts_with("  compile test/") && l.contains("(recording pass): "))
+            .map(|l| l.contains(": 0 fresh / 0 compiled / 4 unknown, "))
+            .collect::<Vec<_>>(),
+        [true],
+        "{block}"
     );
     let at = |needle: &str| {
         block
@@ -1090,6 +1134,147 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
         "{block}"
     );
     assert!(t.could_not_run.is_empty(), "{t:?}");
+}
+
+/// The first test binary that fails ends a run whose halt is armed (`release`, `--fail-fast`): no
+/// binary starts after it, the row is decided from the binaries that ran, and those it stopped are
+/// one NOT RUN row with the halt's words. CONTROLS: a binary its machine refused (NOT RUN) is no
+/// red, though its `test … FAILED` line was read while it ran, so every other binary runs; and a
+/// run with no halt runs them all after a failure.
+#[test]
+fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
+    use aterm_verify::sched::Halt;
+    const WORDS: &str = "stopped: the run failed at test";
+    let failed = "test a::broke ... FAILED\n\nfailures:\n\n---- a::broke stdout ----\n\n\
+                  thread 'a::broke' panicked at src/a.rs:3:5:\nassertion failed: broke";
+    let refused = "test a::broke ... FAILED\n\nfailures:\n\n---- a::broke stdout ----\n\n\
+                   thread 'a::broke' panicked at src/a.rs:3:5:\n\
+                   aterm-gate: COULD NOT RUN: this machine has no fish";
+    // The test row's ladder, which binaries ran, and the halt's words, for a run whose first
+    // binary prints `first` and fails, under `halt`.
+    let run = |halt: Halt, first: &str| {
+        let repo = FakeRepo::new();
+        let marks = repo.scratch.join("marks");
+        fs::create_dir_all(&marks).expect("mkdir");
+        let bins = [
+            ("fixture", "--lib", "a"),
+            ("fixture", "--test b", "b"),
+            ("fixture", "--test c", "c"),
+        ];
+        with_recording_cargo(&repo, &bins, "");
+        let deps = repo.root.join("target/debug/deps");
+        let m = marks.display();
+        common::standin_body(
+            &deps.join("a-1"),
+            &format!(
+                "touch '{m}/a'\ncat <<'EOF'\n\nrunning 1 test\n{first}\n\nfailures:\n    a::broke\n\n\
+                 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+                 finished in 0.01s\n\nEOF\nexit 101"
+            ),
+        );
+        for name in ["b", "c"] {
+            common::standin_body(
+                &deps.join(format!("{name}-1")),
+                &format!(
+                    "touch '{m}/{name}'\nprintf '\\nrunning 1 test\\ntest {name}::fine ... ok\\n\\n\
+                     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                     finished in 0.01s\\n\\n'"
+                ),
+            );
+        }
+        let mut ctx = repo.ctx(&land(), Scope::workspace()).with_halt(halt);
+        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        ctx.test_jobs = 1;
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::Test)
+            .expect("the test stage");
+        let block = stages::run_stage(&ctx, &spec).render();
+        let ran: Vec<&str> = ["a", "b", "c"]
+            .into_iter()
+            .filter(|name| marks.join(name).exists())
+            .collect();
+        (block, ran, ctx.halt.words().map(str::to_owned))
+    };
+    let armed = || Halt::at_first_red("the run", |_| {});
+
+    let (block, ran, words) = run(armed(), failed);
+    assert_eq!(ran, ["a"], "nothing started after the red:\n{block}");
+    assert_eq!(words.as_deref(), Some(WORDS));
+    assert_eq!(tags(&block), ["FAIL", "NOT RUN"], "{block}");
+    assert!(
+        labels_with(&block, "NOT RUN")
+            .iter()
+            .any(|l| l.ends_with(&format!("2 of 3 test binaries not run: {WORDS}"))),
+        "{block}"
+    );
+    assert!(
+        block.contains("error: test failed, to rerun pass `-p fixture --lib`"),
+        "decided from the binary that ran:\n{block}"
+    );
+
+    let (block, ran, words) = run(armed(), refused);
+    assert_eq!(ran, ["a", "b", "c"], "a refusal is no red:\n{block}");
+    assert_eq!(words, None);
+    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+
+    let (block, ran, words) = run(Halt::off(), failed);
+    assert_eq!(
+        ran,
+        ["a", "b", "c"],
+        "a bare run keeps its whole sweep:\n{block}"
+    );
+    assert_eq!(words, None);
+    assert_eq!(tags(&block), ["FAIL"], "{block}");
+}
+
+/// A BINARY THE CEILING ENDED KEEPS ITS SAMPLE, AND ONE IT LEFT NO TIME TO START KEEPS NONE: one
+/// binary at a time under a 3 s ceiling, the first runs until the ceiling ends it, which spends
+/// the run's ceiling, so the second is not started. The first's row has its one sample, a FAIL
+/// at the one thread it ran at; the second, said not started as before, has no row, where a
+/// wall of about 0 ms would have pushed a measured sample out of it.
+#[cfg(unix)]
+#[test]
+fn a_binary_the_ceiling_left_no_time_to_start_keeps_no_history() {
+    let repo = FakeRepo::new();
+    let bins = [("fixture", "--test a", "a"), ("fixture", "--test b", "b")];
+    with_recording_cargo(&repo, &bins, "");
+    let deps = repo.root.join("target/debug/deps");
+    common::standin_body(
+        &deps.join("a-1"),
+        "printf '\\nrunning 1 test\\n'\nwhile :; do sleep 1; done",
+    );
+    common::standin_body(&deps.join("b-1"), "echo 'b ran'\nexit 0");
+    let mut ctx = repo.ctx(&land(), Scope::workspace());
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_jobs = 1;
+    ctx.test_threads = Some(1);
+    ctx.child_ceiling = Some(std::time::Duration::from_secs(3));
+    let history = repo.scratch.join("verify/test-binaries.json");
+    ctx.test_history = Some(history.clone());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let block = stages::run_stage(&ctx, &spec).render();
+
+    assert!(
+        block.contains("not started: the test run's 3.0s wall-clock ceiling was spent")
+            && !block.contains("b ran"),
+        "{block}"
+    );
+    let kept = aterm_verify::test_history::load(&history);
+    assert_eq!(
+        kept.rows()
+            .iter()
+            .map(|row| {
+                let outcomes = row.samples.iter().map(|s| (s.width, s.outcome.clone()));
+                (row.test.as_str(), outcomes.collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>(),
+        [("-p fixture --test a", vec![(1, "FAIL".to_owned())])],
+        "{block}"
+    );
 }
 
 #[test]

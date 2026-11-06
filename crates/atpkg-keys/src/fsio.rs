@@ -13,6 +13,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Maximum bytes read by [`read_bytes`].
 pub const READ_CAP: u64 = 1024 * 1024;
 
+/// Maximum bytes of the file `sign` signs and `verify-signed` checks (a release's
+/// `SHA256SUMS`): one bound, so every file one verb takes the other takes too.
+pub const SIGNED_FILE_READ_CAP: u64 = 64 * 1024 * 1024;
+
 /// Build a message by concatenation — deliberately not `format!`.
 #[must_use]
 pub fn concat(parts: &[&str]) -> String {

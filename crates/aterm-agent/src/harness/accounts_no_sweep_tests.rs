@@ -121,15 +121,18 @@ impl Mac {
         let cooldown = Mutex::new(None);
         let rediscovery = Mutex::new(Rediscovery::default());
         let fx = UpkeepEffects {
+            scope: None,
             fetch: &fetch,
             spawn_renewal: &spawn,
             sync_cooldown: &cooldown,
             rediscovery: &rediscovery,
             renew_guard: &guard,
             find_browser: &|_: &Path| true,
-            vault_sync: |_: &Path| super::super::sign_in_ladder::Vault::NotMember,
+            vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
             spawn_vault: &|_work| Ok(()),
-            default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+            default_check: |_: &Path, _scope| {
+                crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+            },
             // A route the ladder can take, so only the doors decide what starts.
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(|_: &str| {}),

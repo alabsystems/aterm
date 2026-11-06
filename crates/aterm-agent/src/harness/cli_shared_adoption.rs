@@ -366,7 +366,15 @@ pub(in crate::harness) fn adopt(
     signin: &super::Begun,
     roster_path: &Path,
     candidate: Candidate,
-) -> Result<bool, String> {
+) -> Result<bool, RenewalFailure> {
+    let work_current = || {
+        if host.work_cancelled() {
+            Err(super::RenewalFailure::cancelled().to_string())
+        } else {
+            Ok(())
+        }
+    };
+    work_current()?;
     let Candidate {
         mut row,
         cli,
@@ -384,6 +392,7 @@ pub(in crate::harness) fn adopt(
         return Err("automatic shared adoption is off".into());
     }
     let mut grant = authority.prepare(&row)?;
+    work_current()?;
     let (target, mode) = roster_target(roster_path)?;
     store.recover_sync_within(&accounts::LOCK_LADDER, &target)?;
     let before = accounts::roster_text(&target)?;
@@ -449,6 +458,7 @@ pub(in crate::harness) fn adopt(
     });
     // New admissions need a usable opener before consuming authority. A
     // retained attempt first checks its staging home and recovery eligibility.
+    work_current()?;
     let mut selected_browser = pending
         .is_none()
         .then(|| browser(store, host, &row, cli))
@@ -482,6 +492,7 @@ pub(in crate::harness) fn adopt(
             grant.generation,
             grant.expected_principal,
         )?;
+        work_current()?;
         let staging = store
             .claim_staging_dir(&row.label)
             .map_err(|why| why.to_string())?;
@@ -506,7 +517,8 @@ pub(in crate::harness) fn adopt(
             .map_err(|why| why.to_string())?
             .ok_or(accounts::LOCK_HELD)?;
         let mut token = None;
-        store.transact_sync_held(
+        let mut cancelled_before_begin = false;
+        let begun = store.transact_sync_held(
             &held,
             env.now,
             &mut None,
@@ -517,6 +529,10 @@ pub(in crate::harness) fn adopt(
                 mode,
             },
             |_, current| {
+                if let Err(why) = work_current() {
+                    cancelled_before_begin = true;
+                    return Err(why);
+                }
                 if !super::super::accounts_sync::shared_adoption_on(roster_path) {
                     return Err("automatic shared adoption is off".into());
                 }
@@ -532,6 +548,10 @@ pub(in crate::harness) fn adopt(
                     staging_text,
                 )? {
                     return Err(format!("shared adoption staging is retained by `{owner}`"));
+                }
+                if let Err(why) = work_current() {
+                    cancelled_before_begin = true;
+                    return Err(why);
                 }
                 token = Some(
                     current.shared.begin(
@@ -558,7 +578,13 @@ pub(in crate::harness) fn adopt(
                 ])
             },
             || Ok(()),
-        )?;
+        );
+        if let Err(why) = begun {
+            if cancelled_before_begin {
+                super::drop_staging(&staging, &mut io::sink());
+            }
+            return Err(why.into());
+        }
         (staging, token, true)
     };
     let staging_text = staging.to_str().ok_or("staging path is not UTF-8")?;
@@ -598,6 +624,7 @@ pub(in crate::harness) fn adopt(
         Ok(())
     };
     let current = || {
+        work_current()?;
         if !super::super::accounts_sync::shared_adoption_on(roster_path) {
             return Err("automatic shared adoption is off".into());
         }
@@ -623,10 +650,7 @@ pub(in crate::harness) fn adopt(
         // Lost local staging cannot supply a proof or safely resume an
         // unstarted flow. Keep its exact outcome and request new authority.
         request_recovery(retained.outcome)?;
-        return Err(format!(
-            "shared adoption staging is missing: {}",
-            staging.display()
-        ));
+        return Err(format!("shared adoption staging is missing: {}", staging.display()).into());
     }
     let native_admission = admission::Current {
         authority: source_authority,
@@ -649,11 +673,13 @@ pub(in crate::harness) fn adopt(
     };
     let mut execution_error = None;
     if run_provider {
+        current()?;
         if selected_browser.is_none() {
             selected_browser = Some(browser(store, host, &row, cli)?);
         }
         if pending.is_some() {
             store.transact_logins(env.now, &mut None, |_, current| {
+                work_current()?;
                 authority.current(&grant, &row)?;
                 custody_current(current)?;
                 if accounts::roster_text(&target)? != before {
@@ -665,6 +691,7 @@ pub(in crate::harness) fn adopt(
                 Ok(Vec::new())
             })?;
         }
+        current()?;
         match provider.execute_attempt(
             &context,
             &row,
@@ -673,10 +700,17 @@ pub(in crate::harness) fn adopt(
                 .as_ref()
                 .ok_or("shared provider has no prepared opener")?,
         ) {
+            shared_provider::Execution::Deferred(why) => {
+                return Err(RenewalFailure {
+                    reason: why,
+                    ..RenewalFailure::deferred()
+                });
+            }
             shared_provider::Execution::Completed => {}
             shared_provider::Execution::Unknown(why) => execution_error = Some(why),
             shared_provider::Execution::NotStarted(why) => {
                 store.transact_logins(host.now().max(env.now), &mut None, |_, current| {
+                    work_current()?;
                     custody_current(current)?;
                     if accounts::roster_text(&target)? != before {
                         return Err(
@@ -689,25 +723,29 @@ pub(in crate::harness) fn adopt(
                     )?;
                     Ok(Vec::new())
                 })?;
-                return Err(why);
+                return Err(why.into());
             }
         }
         current()?;
     }
     // Recovery observes only the exact retained attempt; no provider replay.
+    current()?;
     let observed = provider.observe(&context, &row, &staging);
+    current()?;
     let proof = match observed {
         Ok(Some(proof)) => proof,
         Err(shared_provider::ObservationError::Unavailable(why)) => {
             current()?;
-            return Err(why);
+            return Err(why.into());
         }
         missing => {
             request_recovery(Outcome::Pending)?;
             if let Some(why) = execution_error {
-                return Err(why);
+                return Err(why.into());
             }
-            return missing.map(|_| false).map_err(|error| error.to_string());
+            return missing
+                .map(|_| false)
+                .map_err(|error| RenewalFailure::from(error.to_string()));
         }
     };
     let principal = proof.principal();
@@ -753,6 +791,7 @@ pub(in crate::harness) fn adopt(
             mode,
         },
         |state, current| {
+            work_current()?;
             authority.current(&grant, &row)?;
             custody_current(current)?;
             if accounts::roster_text(&target)? != before {
@@ -762,6 +801,7 @@ pub(in crate::harness) fn adopt(
                 return Err("automatic shared adoption is off".into());
             }
             proof.check_current()?;
+            work_current()?;
             // A bounded file or native credential read can outlive the previous
             // authority observation; it grants no permission to publish later.
             authority.current(&grant, &row)?;
@@ -772,6 +812,7 @@ pub(in crate::harness) fn adopt(
                 .generation_clock
                 .checked_add(1)
                 .ok_or("local generation exhausted")?;
+            work_current()?;
             current.shared.finish(
                 token.take().ok_or("shared adoption already completed")?,
                 Outcome::Published { generation },

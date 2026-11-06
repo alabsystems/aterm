@@ -15,6 +15,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+impl std::os::fd::AsFd for Multicast {
+    /// Borrow readiness only; receiving and sending still recheck the attachment.
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.socket)
+    }
+}
+
 /// Maximum discovery datagram, below an ordinary LAN MTU.
 pub const MAX_PACKET: usize = 1200;
 

@@ -915,7 +915,9 @@ fn rearm_window_unproven_trial(
     let Some(record) = WindowUnproven::read(staging).filter(|record| record.build == build) else {
         return false;
     };
-    if sentinel.read_state().is_some() || record.install_root != app_root || staging.ready.exists()
+    if sentinel.read_state().is_some()
+        || record.install_root != app_root
+        || marker_present(&staging.ready)
     {
         return false;
     }
@@ -2757,7 +2759,7 @@ pub(crate) fn handoff_cached_pass_refusal_at(
 ) -> Option<String> {
     let stage_moment = crate::verify::mark_passing;
     let Some(ready) = Ready::read(&staging.ready) else {
-        return Some(stage_moment(if staging.ready.exists() {
+        return Some(stage_moment(if marker_present(&staging.ready) {
             "staged ready marker is unreadable".to_string()
         } else {
             format!("staged build {build} is no longer staged; not handing off to it")
@@ -5138,7 +5140,7 @@ fn confirm_health_under_apply_lock_with_proof(
 }
 
 fn reclaim_swapped_out_orphan(staging: &Staging) {
-    if !staging.ready.exists() {
+    if !marker_present(&staging.ready) {
         let _ = std::fs::remove_dir_all(&staging.staged_app);
     }
 }
@@ -6161,12 +6163,23 @@ pub(crate) fn confirm_roster_authorization(
     Ok(())
 }
 
+/// Whether an entry stands at `path`, by `lstat`: a symlink (a dangling one included) is
+/// present, and so is an entry whose `lstat` fails other than with `NotFound`. [`Ready::read`]
+/// opens without following a link, so a marker that reads as nothing but is present here is
+/// one it could not read, never one that is gone.
+fn marker_present(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 fn read_ready(staging: &Staging, current_build: u64) -> ReadyState {
     match Ready::read(&staging.ready) {
         Some(r) if !r.has_canonical_identity() => ReadyState::Corrupt,
         Some(r) if r.build_number > current_build => ReadyState::Newer(r),
         Some(_) => ReadyState::NotNewer,
-        None if staging.ready.exists() => ReadyState::Corrupt,
+        None if marker_present(&staging.ready) => ReadyState::Corrupt,
         None => ReadyState::Absent,
     }
 }
@@ -6179,9 +6192,15 @@ fn random_nonce() -> Option<String> {
     aterm_uds::rand::hex_token::<16>().ok()
 }
 
+/// Write `data` as the whole of the regular file at `path` (never through a link, never blocking
+/// on a FIFO), mode 0600 before any byte of it changes.
+///
+/// # Errors
+/// The open's, a file that is not regular, a chmod to 0600 that is refused (a file another user
+/// owns), which leaves the file as it was, and the truncation's or write's.
 pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -6194,9 +6213,40 @@ pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()
             "refusing to write non-regular file",
         ));
     }
+    make_private(&f)?;
     f.set_len(0)?;
-    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     f.write_all(data)
+}
+
+/// Mode 0600 on `f`.
+fn make_private(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    if PRIVATE_MODE_REFUSED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`make_private`] fails on this thread as a chmod of another user's file does, which a test
+    /// cannot make.
+    static PRIVATE_MODE_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with [`make_private`] refused on this thread.
+#[cfg(test)]
+fn as_if_the_private_mode_is_refused<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PRIVATE_MODE_REFUSED.with(|flag| flag.set(false));
+        }
+    }
+    PRIVATE_MODE_REFUSED.with(|flag| flag.set(true));
+    let _reset = Reset;
+    f()
 }
 
 /// Best-effort RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, empty when the clock gives no time)

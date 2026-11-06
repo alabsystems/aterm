@@ -181,6 +181,7 @@ fn observations(case: i64) -> Vec<aterm_spec::interp::State> {
             next.provider = provider.clone();
             let lock = adoption_sign_in(&store, &host.roster, &next);
             super::super::shared_adoption::adopt(&env, &host, &store, &lock, &host.roster, next)
+                .map_err(|failure| failure.to_string())
         } else {
             run_with_provider(&env, &host, &approval, provider.clone())
         }

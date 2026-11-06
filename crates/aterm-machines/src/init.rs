@@ -98,7 +98,8 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
   records or drops this checkout as a develop machine; --no-wait waits for no System State
   pass (else 10 min); --converge runs one pass now. Exit: 0 done, or left to the vault or
-  a person (--check: 77); 75 a lock or step, 77 a permission, 69 offline; 1 else; 2 usage.
+  a person (--check: 77); 75 a lock or step, 76 unfinished --converge work,
+  77 a permission, 69 offline; 1 else; 2 usage.
 ",
         spotlight = Setting::Spotlight.label(),
         secrets = Setting::Secrets.label(),
@@ -1420,8 +1421,10 @@ fn tab(
 /// `aterm init --converge`: one converge pass ([`crate::sync::converge`]) over `ports`, which
 /// it reaches only through them (no workstation item, question or setup record), at background
 /// QoS. `--check` probes and writes nothing. Its rows print as init's do, then a tally (or the
-/// JSON report). Exit 0 once it ran with no failed row (what it defers included), 75 while
-/// another pass holds the lock, 1 for a failed row, an unwritten record, a pass that cannot
+/// JSON report). Exit 0 once admitted work settled (or a check ran without failure),
+/// [`aterm_secrets::converge::UNFINISHED`] while an apply pass has work left, and
+/// [`aterm_secrets::converge::HELD`] while another pass holds the lock; 1 for a failed row,
+/// an unwritten record, a pass that cannot
 /// run here or a tally standard output could not take ([`answer_to`]). A subscriber's pass
 /// from a program that is not the installed release app (a held copy) is the installed app's
 /// to run ([`hand_off`]).
@@ -1451,7 +1454,7 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
                 aterm_converge::FileJournal::DIR,
                 crate::sync::LOCK
             ));
-            return ExitCode::from(75);
+            return ExitCode::from(aterm_secrets::converge::HELD);
         }
         Err(crate::sync::Stop::Refused(why)) => {
             say_after_run(format_args!("aterm init: {why}"));
@@ -1459,7 +1462,7 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
         }
     };
     let failed = pass.rows.iter().any(|row| row.outcome.is_failure());
-    let complete = !pass.rows.is_empty() && !failed;
+    let complete = pass.complete();
     let answered = if options.json {
         match report_json(action, complete, pass.rows, &laps) {
             Ok(report) => answer(&format!("{report}\n")),
@@ -1484,7 +1487,16 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
     if failed || pass.unrecorded.is_some() {
         ExitCode::FAILURE
     } else {
-        answered.map_or_else(|failed| failed, |()| ExitCode::SUCCESS)
+        answered.map_or_else(
+            |failed| failed,
+            |()| {
+                if mode == Mode::Apply && !complete {
+                    ExitCode::from(aterm_secrets::converge::UNFINISHED)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            },
+        )
     }
 }
 
@@ -1902,15 +1914,13 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
     {
         return Ok(OwedClone::Held(line));
     }
-    // Every clone runs an installed git: on a Mac Apple's, which `base.clt` installs (System
-    // State's Install…, or an `aterm init` a person runs) and this pass never does. Nothing a
-    // pass could do comes before it, so the step waits for it as for the token, naming the
-    // step that brings it, and the pass after it arrives clones.
+    // The default toolset provisions managed Git independently of this pass. A ready managed
+    // Git is preferred; developer tools or the distribution's Git are usable fallbacks. Keep
+    // the clone owed while none is ready, then retry without another vault change.
     if crate::items::github::installed_git(sys).is_none() {
         return Ok(OwedClone::Waiting(if sys.macos() {
-            "aterm init's GitHub step waits for Apple's Command Line Tools to bring git: \
-             Install\u{2026} on System State, or `aterm init --only base.clt` in a terminal, \
-             installs them"
+            "aterm init's GitHub step waits for Git to finish installing automatically; \
+             Apple's Command Line Tools or Xcode also provide Git"
                 .into()
         } else {
             format!(
@@ -2197,6 +2207,16 @@ fn owe(mut row: ItemReport) -> ItemReport {
         row.why = Some(OWED.into());
     }
     row
+}
+
+/// [`owe`], save a row a later hold left (a Stop pressed, or GitHub repositories turned off, while
+/// its batch ran: [`HeldLate`], whose words `held` are): its line is the person's words and what
+/// the batch did before it stopped, and it waits on no vault, so it is not deferred as owed.
+fn owe_unless_held(row: ItemReport, held: Option<&str>) -> ItemReport {
+    let theirs = held.is_some_and(|words| {
+        waiting(&row) && row.why.as_deref().is_some_and(|why| why.starts_with(words))
+    });
+    if theirs { row } else { owe(row) }
 }
 
 /// Whether `row` waits for this Mac to be let into the vault, and runs once it is ([`owe`]).
@@ -2924,7 +2944,16 @@ fn converge(
         Ok(rows)
     };
     laps.lap("questions");
-    let on_row = |row: &ItemReport| (front.on_row)(&owe(row.clone()));
+    // The words a later hold left GitHub's batch in, once one did ([`owe_unless_held`]).
+    let late_words = || {
+        let late = late.lock().unwrap_or_else(PoisonError::into_inner);
+        late.1
+            .as_ref()
+            .filter(|_| late.0.contains(Setting::Repositories))
+            .map(|now| now.why(Setting::Repositories))
+    };
+    let on_row =
+        |row: &ItemReport| (front.on_row)(&owe_unless_held(row.clone(), late_words().as_deref()));
     let rows = run_layers(
         sys,
         &ctx,
@@ -2947,6 +2976,10 @@ fn converge(
     // The one line of what the person's choices held: the preparation's, or, where the records
     // read later held more, all of them in the words the later reading gives.
     let (left, now) = late.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let late_words = now
+        .as_ref()
+        .filter(|_| left.contains(Setting::Repositories))
+        .map(|now| now.why(Setting::Repositories));
     let line = match now {
         Some(now) if !left.is_empty() => {
             let kept = left.union(picked.kept);
@@ -2972,7 +3005,10 @@ fn converge(
             line,
         ));
     }
-    Ok(rows.into_iter().map(owe).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| owe_unless_held(row, late_words.as_deref()))
+        .collect())
 }
 
 /// The lines of the keys a run left as the person set them ([`Instead::Kept`]), by the System
@@ -3192,6 +3228,53 @@ pub fn run_workstation_selected(
     selected: Selection,
 ) -> Result<Vec<ItemReport>, String> {
     prepare_workstation_selected(sys, group, selected)?.run(sys, mode)
+}
+
+/// Activate accepted Caps defaults on the new HID services only. The caller holds the setup
+/// profile lock and checks its exact-run Stop before each item, including this process's Stop.
+///
+/// # Errors
+/// Console identity, input observations or the local change journal cannot be resolved.
+pub fn activate_keyboard_attachments(
+    sys: &dyn System,
+    registries: &[u64],
+    kept: &dyn Fn(&str) -> bool,
+    continues: &dyn Fn() -> bool,
+) -> Result<bool, String> {
+    let mut selected = Selection::none();
+    selected.set(Setting::CapsLock, true);
+    let ctx = context_for_selected(sys, WorkstationGroup::InputActivation, selected)?;
+    if ctx.console.is_none() {
+        return Err(outside_console_session(sys));
+    }
+    let items = crate::init_preferences::attachment_items(&ctx, registries)?;
+    let mut journal = sys.journal()?;
+    let mut ready = true;
+    for item in items {
+        if kept(&item.id()) {
+            continue;
+        }
+        if !continues() {
+            return Ok(false);
+        }
+        let rows = crate::engine::run_with(
+            &[item],
+            Mode::Apply,
+            sys,
+            &ctx,
+            &aterm_converge::Remedy::None,
+            journal.as_mut(),
+            &mut |_| {},
+        )
+        .map_err(|why| why.to_string())?;
+        ready &= rows.iter().all(|row| {
+            matches!(
+                row.outcome,
+                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            )
+        });
+    }
+    Ok(ready)
 }
 
 /// A workstation pass whose before-images and apply share one resolved account and item set.
@@ -4836,12 +4919,16 @@ impl Item for Unchanged<'_> {
 /// clone, which may start half an hour in): it reads those choices as it starts
 /// ([`Hooks::held`]), and one they hold by then changes nothing and reads as left, in their
 /// words. An admitted batch checks that same policy at each effect boundary; a later hold is
-/// retained for the row, while ordinary read-back preserves the item's first admission.
+/// retained for the row, while ordinary read-back preserves the item's first admission. The row
+/// of a batch a later hold stopped says the person's words, then what the batch said it did
+/// before it stopped (a clone's hook installer, a clone that failed): nothing reads it back.
 struct HeldLate<'a> {
     inner: &'a dyn Item,
     held: &'a (dyn Fn(&str) -> Option<String> + Sync),
     decided: std::sync::OnceLock<Option<String>>,
     late: std::sync::OnceLock<String>,
+    /// What the batch answered when a later hold stopped it.
+    said: std::sync::OnceLock<String>,
 }
 
 impl HeldLate<'_> {
@@ -4888,10 +4975,13 @@ impl Item for HeldLate<'_> {
                     }
                 };
                 let result = self.inner.apply_guarded(sys, ctx, &current);
-                if self.late.get().is_some() {
-                    Ok(())
-                } else {
-                    result
+                match (self.late.get(), result) {
+                    (Some(_), Err(said)) => {
+                        let _ = self.said.set(said);
+                        Ok(())
+                    }
+                    (Some(_), Ok(())) => Ok(()),
+                    (None, result) => result,
                 }
             }
         }
@@ -4924,7 +5014,13 @@ impl Item for HeldLate<'_> {
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         self.late
             .get()
-            .map(|why| aterm_converge::StoodAside::Waiting(why.clone()))
+            .map(|why| {
+                aterm_converge::StoodAside::Waiting(match self.said.get() {
+                    None => why.clone(),
+                    Some(said) if said.starts_with(why.as_str()) => said.clone(),
+                    Some(said) => format!("{why}; {said}"),
+                })
+            })
             .or_else(|| self.inner.stood_aside())
     }
     fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {
@@ -5129,6 +5225,7 @@ fn run_layers(
             held: hooks.held,
             decided: std::sync::OnceLock::new(),
             late: std::sync::OnceLock::new(),
+            said: std::sync::OnceLock::new(),
         })
         .collect();
     // Downloaded tools and repository clones need no Apple compiler. Finish them before
@@ -6872,6 +6969,35 @@ mod tests {
         assert_eq!(ports.base_applied(), Vec::<String>::new());
         let left: Vec<_> = std::fs::read_dir(checked.path()).unwrap().collect();
         assert!(left.is_empty(), "--check wrote {left:?}");
+    }
+
+    /// Pending admitted work has its own non-failure transport and an incomplete JSON report.
+    /// A locally ready Git resumes the same clone; an explicit group hold is settled instead.
+    #[test]
+    fn converge_transports_unfinished_repository_work_without_claiming_completion() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = crate::sync::tests::Inert::new(scratch.path());
+        ports.clone_is(OwedClone::Waiting("Git is installing".into()));
+        assert_eq!(
+            converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports),
+            exit(aterm_secrets::converge::UNFINISHED)
+        );
+        let pass = crate::sync::converge(
+            &ports,
+            crate::sync::Trigger::Subscriber,
+            Mode::Plan,
+            &mut |_| {},
+        )
+        .unwrap();
+        let json = report_json(Action::Check, pass.complete(), pass.rows, &Laps::start()).unwrap();
+        let report: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+        assert_eq!(report["complete"], aterm_json::Value::Bool(false));
+        assert!(!ports.applies().contains(&"clone"));
+        ports.clone_is(OwedClone::Due("managed Git is now ready".into()));
+        assert_eq!(converge_run(&["--converge"], &ports), exit(0));
+        assert!(ports.applies().contains(&"clone"));
+        ports.clone_is(OwedClone::Held("repositories left as is".into()));
+        assert_eq!(converge_run(&["--converge"], &ports), exit(0));
     }
 
     /// A subscriber's pass from a held copy is the installed app's: it runs `init --converge
@@ -11078,6 +11204,112 @@ mod tests {
         );
     }
 
+    /// System State's records, stopped once `stop` is set (a Stop pressed in System State).
+    struct StoppedLater(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Records for StoppedLater {
+        fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            Ok(Box::new(NoRecords))
+        }
+        fn holds(&self) -> Holds {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Holds {
+                    stopped: Some("you stopped setup in System State".to_owned()),
+                    stopped_revision: Some(1),
+                    ..Holds::NONE
+                }
+            } else {
+                Holds::NONE
+            }
+        }
+    }
+
+    /// A GitHub batch the person stops after a clone ran its hook installer: its row says their
+    /// words and what the installer did, both printed live and returned, and is not deferred as
+    /// a clone owed until this Mac is let into the vault, which it is not waiting for.
+    /// NEGATIVE CONTROL: deferring every waiting row as owed answers `OWED` here, the person's
+    /// words and the installer's line gone.
+    #[test]
+    fn a_late_stop_keeps_the_persons_words_and_the_installer_line_on_the_github_row() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Batch(Arc<AtomicBool>);
+        impl Item for Batch {
+            fn id(&self) -> String {
+                "init.github.batch@alice".into()
+            }
+            fn family(&self) -> &'static str {
+                "github"
+            }
+            fn title(&self) -> String {
+                self.id()
+            }
+            fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+                change()
+            }
+            fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+                panic!("the wrapper forwards its hold into the batch")
+            }
+            fn apply_guarded(
+                &self,
+                _: &dyn System,
+                _: &Ctx,
+                current: &(dyn Fn() -> Result<(), String> + Sync),
+            ) -> Result<(), String> {
+                current()?;
+                // The clone is published and its installer ran; the person presses Stop.
+                self.0.store(true, Ordering::SeqCst);
+                current().map_err(|why| {
+                    format!("{why}; $HOME/trust: ran its scripts/install-git-hooks.sh: installed")
+                })
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let records = StoppedLater(Arc::clone(&stop));
+        let batch = Arc::clone(&stop);
+        let prepare = move |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let picked = picked(reading.picks, reading.only, &|| true, &Holds::NONE, true);
+            let items: Vec<Box<dyn Item>> = vec![Box::new(Batch(Arc::clone(&batch)))];
+            let _ = ctx;
+            Ok((vec![(items, anywhere(Class::Install))], picked))
+        };
+        let sys = alice_with_checkout(501, None);
+        let printed = Mutex::new(Vec::new());
+        let rows = converge(
+            &sys,
+            &Options::default(),
+            &Front {
+                base: &|_| Base::none(),
+                groups: &prepare,
+                targo: None,
+                cwd: None,
+                records: &records,
+                on_row: &|row| printed.lock().unwrap().push(row.clone()),
+                present: &|| true,
+                on_held: &|_| {},
+            },
+            &mut NoJournal,
+            &mut Laps::start(),
+        )
+        .unwrap();
+        assert!(stop.load(Ordering::SeqCst), "the batch ran");
+        let printed = printed.into_inner().unwrap();
+        for rows in [&rows, &printed] {
+            let row = rows
+                .iter()
+                .find(|row| row.id == "init.github.batch@alice")
+                .expect("the batch's row");
+            assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+            assert_eq!(
+                row.why.as_deref(),
+                Some(
+                    "left as it is because you stopped setup in System State; $HOME/trust: ran its \
+                     scripts/install-git-hooks.sh: installed"
+                ),
+                "{row:?}"
+            );
+        }
+    }
+
     /// System State's records as init holds them: `taken` once held, `held` while held, as the
     /// profile lock is.
     struct Watched {
@@ -11927,7 +12159,10 @@ mod tests {
                 current: &(dyn Fn() -> Result<(), String> + Sync),
             ) -> Result<(), String> {
                 for at in 0..2 {
-                    current()?;
+                    // What its first effect did, which only its own answer can say.
+                    current().map_err(|why| {
+                        format!("{why}; ~/batch: ran its scripts/install-git-hooks.sh")
+                    })?;
                     self.effects.fetch_add(1, Ordering::SeqCst);
                     if at == 0 && self.stop_late {
                         self.stopped.store(true, Ordering::SeqCst);
@@ -11953,6 +12188,7 @@ mod tests {
                 held: &policy,
                 decided: std::sync::OnceLock::new(),
                 late: std::sync::OnceLock::new(),
+                said: std::sync::OnceLock::new(),
             };
             let sys = crate::port::Fake::root();
             let ctx = crate::items::defaults::tests::ctx(&[]);
@@ -11965,7 +12201,12 @@ mod tests {
                 batch.effects.load(Ordering::SeqCst),
                 if stop_late { 1 } else { 2 }
             );
-            assert_eq!(wrapper.stood_aside().is_some(), stop_late);
+            // NEGATIVE CONTROL: a wrapper that answers the hold's words alone loses the line.
+            assert_eq!(
+                wrapper.stood_aside().map(|aside| aside.why().to_owned()),
+                stop_late
+                    .then(|| "late Stop; ~/batch: ran its scripts/install-git-hooks.sh".to_owned())
+            );
             if stop_late {
                 assert!(matches!(
                     wrapper.probe(&sys, &ctx),

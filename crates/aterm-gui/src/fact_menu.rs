@@ -1848,6 +1848,9 @@ impl App {
                 self.set_fact_mask(session, off);
             }
             FactAct::UseAccount(label) => {
+                let Some(scope) = self.account_work.enter() else {
+                    return;
+                };
                 use aterm_agent::harness::accounts;
                 let Some(cli) = self.session_cli(session) else {
                     return;
@@ -1866,8 +1869,8 @@ impl App {
                 {
                     let home = aterm_primer::home_dir();
                     let upkeep_live = matches!(
-                        crate::harness_host::live_accounts_upkeep(),
-                        crate::harness_host::AccountsUpkeep::Live
+                        crate::harness_host::live_accounts_upkeep(self.account_work.clone()),
+                        crate::harness_host::AccountsUpkeep::Live(_)
                     );
                     if select_menu_account_for(
                         cli,
@@ -1876,14 +1879,16 @@ impl App {
                         now,
                         upkeep_live,
                         |worker_request, worker_home| {
+                            let scope = scope.clone();
                             let worker_state = state_dir.clone();
                             let worker_roster = roster_path.clone();
                             std::thread::Builder::new()
                                 .name("aterm-acct-renew".to_string())
-                                .spawn(move || {
+                                .spawn(scope.clone().wrap(move || {
                                     let worker_store =
                                         accounts::Store::at_for(&worker_state, cli, &worker_home);
-                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label_for(
+                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label_for_scoped(
+                                        scope,
                                         cli,
                                         &worker_home,
                                         &worker_state,
@@ -1899,7 +1904,7 @@ impl App {
                                         let _ = worker_store
                                             .cancel_pin_request(&worker_request, now_done);
                                     }
-                                })
+                                }))
                                 .map(|_| ())
                                 .map_err(|_| ())
                         },
@@ -1909,6 +1914,9 @@ impl App {
                 }
             }
             FactAct::AutoRotate => {
+                let Some(scope) = self.account_work.enter() else {
+                    return;
+                };
                 use aterm_agent::harness::accounts;
                 let Some(cli) = self.session_cli(session) else {
                     return;
@@ -1941,15 +1949,17 @@ impl App {
                             aterm_types::dirs::aterm_config_path()
                                 .and_then(|cfg| accounts::roster_beside_for(&cfg, cli))
                         };
-                        let upkeep = crate::harness_host::live_accounts_upkeep();
+                        let upkeep =
+                            crate::harness_host::live_accounts_upkeep(self.account_work.clone());
                         let _ = std::thread::Builder::new()
                             .name("aterm-acct-rotate".to_string())
-                            .spawn(move || {
-                                upkeep.make(aterm_agent::harness::accounts_sync::UpkeepStep::Both);
-                                if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live)
+                            .spawn(scope.clone().wrap(move || {
+                                upkeep.make_scoped(scope.clone(), aterm_agent::harness::accounts_sync::UpkeepStep::Both);
+                                if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live(_))
                                     && let (Some(home), Some(roster_path)) = (home, roster_path)
                                 {
-                                    let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive_for(
+                                    let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive_for_scoped(
+                                        scope,
                                         cli,
                                         &home,
                                         &state_dir,
@@ -1957,7 +1967,7 @@ impl App {
                                         now,
                                     );
                                 }
-                            });
+                            }));
                         self.redraw_claude_footer(session);
                     }
                 }

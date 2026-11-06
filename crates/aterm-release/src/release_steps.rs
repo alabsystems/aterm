@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::gates::{Outcome, Precheck, PrecheckGate};
 use crate::interrupt;
 use crate::ledger::{BYTE_EXACT, GitCli, GitRunner};
+use crate::line::{Fix, Hop, Line};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
@@ -166,9 +167,17 @@ pub(crate) fn started_of(pid: u32) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
+/// The release state below HOME: its logs, its build times and its kept build-inputs seal
+/// (`inputs-seal/`, [`crate::build_inputs::arm`]).
+pub(crate) const RELEASE_STATE: &str = ".local/state/aterm-release";
+
 /// The real backend.
 pub struct Real {
     pub(crate) build_inputs: fn() -> Result<String, String>,
+    /// Keeps this process's build-inputs seal in the release state ([`crate::build_inputs::arm`]).
+    pub(crate) arm_inputs: fn(&Path),
+    /// The kept seal each child is handed ([`crate::build_inputs::handed_path`]).
+    pub(crate) handed_inputs: fn() -> Option<PathBuf>,
     repo: PathBuf,
     home: PathBuf,
     engine: PathBuf,
@@ -183,13 +192,15 @@ pub struct Real {
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
     /// This process's arguments (after the program) with every path flag's value
-    /// anchored ([`crate::release::ReleaseOptions::anchored_args`]): what the re-run
-    /// as R's own cutter ([`Real::reexec_command`]) passes on, from the clone's root.
+    /// anchored and no `--fix` ([`crate::release::ReleaseOptions::rerun_args`]): what the
+    /// re-run as R's own cutter ([`Real::reexec_command`]) passes on, from the clone's root.
     argv: Vec<std::ffi::OsString>,
     source_signing: Option<crate::source_signing::Tools>,
     prepared_source_helper: Option<PathBuf>,
     scanner_tools: Option<scanner_tools::Report>,
     scanner_probe: scanner_tools::Probe,
+    /// The release's one disk claim ([`Backend::claim_disk`]), named to every child it starts.
+    disk_claim: Option<atpkg::admit_disk::Whole>,
 }
 
 struct Forwarded {
@@ -236,7 +247,7 @@ impl Real {
             |_| engine.clone(),
             |cwd| crate::release::anchor(&engine, &cwd),
         );
-        let state = home.join(".local/state/aterm-release");
+        let state = home.join(RELEASE_STATE);
         let started = now();
         let offset = i64::try_from(started)
             .ok()
@@ -264,6 +275,8 @@ impl Real {
             .join("aterm-release");
         Ok(Self {
             build_inputs: crate::build_inputs::current,
+            arm_inputs: crate::build_inputs::arm,
+            handed_inputs: crate::build_inputs::handed_path,
             repo: repo.to_path_buf(),
             home,
             engine,
@@ -279,6 +292,7 @@ impl Real {
             prepared_source_helper: None,
             scanner_tools: None,
             scanner_probe: scanner_tools::run,
+            disk_claim: None,
         })
     }
 
@@ -436,6 +450,10 @@ impl Real {
         }
         if let Some(tools) = &self.scanner_tools {
             tools.apply(&mut cmd);
+        }
+        hand_inputs_seal(&mut cmd, (self.handed_inputs)());
+        if let Some(claim) = &self.disk_claim {
+            cmd.env(aterm_capacity::DISK_COVER_ENV, claim.marker());
         }
         cmd
     }
@@ -1451,10 +1469,10 @@ impl Real {
         if ran.code != 0 {
             return Err(Refusal::new(
                 format!("required workspace test compilation failed (exit {}); this attempt starts no downstream product build", ran.code),
-                format!("fix the compilation failure on main, then {RELEASE_COMMAND} --commit origin/main"),
+                format!("fix the compilation failure: {}", crate::release::fix_remedy(&c.commit)),
             ).detail(ran.detail));
         }
-        self.source_closure(prover, |cmd| self.logged(self.step, cmd))?;
+        self.source_closure(prover, &c.commit, |cmd| self.logged(self.step, cmd))?;
         if let Some(off) = self.off_tree(&c.commit) {
             return Err(refuse_tree().detail(off));
         }
@@ -1464,6 +1482,7 @@ impl Real {
     fn source_closure(
         &self,
         prover: &Prover,
+        head: &str,
         run: impl FnOnce(&mut Command) -> Ran,
     ) -> Result<(), Refusal> {
         // Keep the workspace feature graph just compiled above. Selecting only the
@@ -1482,28 +1501,16 @@ impl Real {
         // physical target every verify child is handed, after `child` has removed the
         // caller's Cargo layout overrides: a test compiled here through the clone's
         // `target -> target.noindex` link would spell its `CARGO_BIN_EXE_*` unlike verify's.
-        let env = aterm_verify::EnvSnapshot {
-            home: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            path: publication_path(),
-            ..Default::default()
-        };
-        // The clone by its physical path, as verify reads its root, so the cache and its
-        // layout are the ones verify chose.
-        let repo = aterm_verify::physical(&self.repo);
-        let target = aterm_verify::physical_target(&env, &repo);
+        let (target, layout) = verify_layout(&self.repo);
         cmd.env("CARGO_TARGET_DIR", &target);
-        if let Some(layout) = aterm_verify::main_build_dir(&env, &repo)
-            .or_else(|| aterm_verify::fallback_build_dir(&env, &repo, &target))
-        {
+        if let Some(layout) = layout {
             cmd.arg("--config").arg(layout);
         }
         let ran = run(&mut cmd);
         if ran.code != 0 {
             return Err(Refusal::new(
                 format!("required source-to-spec closure failed (exit {}); this attempt starts no downstream product build", ran.code),
-                format!("fix the source/model bindings on main, then {RELEASE_COMMAND} --commit origin/main"),
+                format!("fix the source/model bindings: {}", crate::release::fix_remedy(head)),
             ).detail(ran.detail));
         }
         Ok(())
@@ -1539,19 +1546,7 @@ impl Real {
         if target == StageTarget::Local {
             cmd.arg("--dry-run");
         }
-        let handed = if crate::cutter::running()
-            .is_ok_and(|built| crate::accepted_measure::policy_cutter(&self.git(), commit, built))
-        {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    hand_this_cutter(&mut cmd, &exe, crate::cutter::reference());
-                    "== transforms: owner-accepted policy cutter; export rules unchanged".into()
-                }
-                Err(_) => hand_transforms_cutter(&mut cmd, commit),
-            }
-        } else {
-            hand_transforms_cutter(&mut cmd, commit)
-        };
+        let handed = hand_transforms_cutter(&mut cmd, commit);
         (cmd, handed)
     }
 
@@ -1579,9 +1574,9 @@ impl Real {
                         log.display()
                     ),
                     format!(
-                        "fix it on main (rustup run stable cargo check --release --target \
-                         x86_64-apple-darwin -p aterm), then {RELEASE_COMMAND} --commit \
-                         origin/main"
+                        "fix it (rustup run stable cargo check --release --target \
+                         x86_64-apple-darwin -p aterm names it): {}",
+                        crate::release::fix_remedy(&c.commit)
                     ),
                 )
                 .detail(if errors.is_empty() {
@@ -1645,10 +1640,11 @@ impl Real {
             Refusal::new(
                 text.lines().next().unwrap_or("").to_string(),
                 format!(
-                    "fix it on main (targo --unverified test -p aterm-gui --lib -- {} with \
-                         the pins {} names), then {RELEASE_COMMAND} --commit origin/main",
+                    "fix it (targo --unverified test -p aterm-gui --lib -- {} with the pins {} \
+                     names): {}",
                     crate::fixtures::generator_args().join(" "),
-                    crate::gates::HANDOFF_FIXTURE_README
+                    crate::gates::HANDOFF_FIXTURE_README,
+                    crate::release::fix_remedy(&c.commit)
                 ),
             )
             .detail(text.lines().skip(1).take(8).map(str::to_string))
@@ -1674,8 +1670,8 @@ impl Real {
             return Err(Refusal::new(
                 format!("the build did not finish (ship build exited {})", ran.code),
                 format!(
-                    "read its log; a red build is fixed on main, then {RELEASE_COMMAND} \
-                     --commit origin/main (nothing was claimed)"
+                    "read its log; for a red build, {} (nothing was claimed)",
+                    crate::release::fix_remedy(&c.commit)
                 ),
             )
             .detail(ran.detail));
@@ -1991,12 +1987,12 @@ impl Arrivals {
                 }
                 continue;
             }
-            let text = String::from_utf8_lossy(&self.line).into_owned();
+            let text = String::from_utf8_lossy(&self.line);
             let _ = writeln!(
                 self.file,
                 "release-event: {}",
                 aterm_json::json!({
-                    "schema": 1, "event": "publish-line", "at_unix_ms": now_ms(), "line": text,
+                    "schema": 1, "event": "publish-line", "at_unix_ms": now_ms(), "line": &*text,
                 })
             );
             self.line.clear();
@@ -2128,19 +2124,34 @@ fn scrub(cmd: &mut Command) {
 }
 
 /// Remove from `cmd` each of `inherited` (the names of this process's environment) that a step
-/// runs without: what [`clears`] and [`launcher_env`] name, and the cutter this process may have
+/// runs without: what [`clears`] and [`launcher_env`] name, the cutter this process may have
 /// been handed ([`RELEASE_CUTTER_ENV`], [`RELEASE_CUTTER_SINCE_ENV`]), which a child has only
-/// from [`hand_this_cutter`].
+/// from [`hand_this_cutter`], the build-inputs seal it may have been handed
+/// ([`crate::build_inputs::SEAL_ENV`]), which a child has only from [`hand_inputs_seal`], and a
+/// disk claim it may have been named ([`aterm_capacity::DISK_COVER_ENV`]), which a child has
+/// only from this release's own claim ([`Real::scrubbed`]).
 fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::OsString>) {
     for name in inherited {
         if let Some(name) = name.to_str()
             && (clears(name)
                 || launcher_env(name)
                 || name == RELEASE_CUTTER_ENV
-                || name == RELEASE_CUTTER_SINCE_ENV)
+                || name == RELEASE_CUTTER_SINCE_ENV
+                || name == crate::build_inputs::SEAL_ENV
+                || name == aterm_capacity::DISK_COVER_ENV)
         {
             cmd.env_remove(name);
         }
+    }
+    cmd.env(aterm_capacity::RELEASE_RUN_ENV, "1");
+}
+
+/// Hand `cmd`, scrubbed ([`scrub_names`]), this process's kept build-inputs seal
+/// ([`crate::build_inputs::handed_path`]), so the child adopts it after a recheck by stat
+/// instead of hashing the inputs again; with none kept, the child has none.
+fn hand_inputs_seal(cmd: &mut Command, kept: Option<PathBuf>) {
+    if let Some(path) = kept {
+        cmd.env(crate::build_inputs::SEAL_ENV, path);
     }
 }
 
@@ -2223,16 +2234,25 @@ pub fn audit_rows_merged(text: &str, kept: &[String]) -> String {
             })
             .unwrap_or_default()
     };
-    let mut rows: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut rows: Vec<(String, String)> = text.lines().map(|r| (at(r), r.to_string())).collect();
     for row in kept {
-        if rows.contains(row) {
+        if rows.iter().any(|(_, r)| r == row) {
             continue;
         }
         let when = at(row);
-        let i = rows.iter().position(|r| at(r) > when).unwrap_or(rows.len());
-        rows.insert(i, row.clone());
+        let i = rows
+            .iter()
+            .position(|(row_at, _)| row_at > &when)
+            .unwrap_or(rows.len());
+        rows.insert(i, (when, row.clone()));
     }
-    let mut out = rows.join("\n");
+    let mut out = String::new();
+    for (idx, (_, row)) in rows.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(row);
+    }
     out.push('\n');
     out
 }
@@ -2611,6 +2631,27 @@ pub(crate) fn engine_bootstrap(repo: &Path, engine: &Path) -> Result<(), Bootstr
             format!(": {said}")
         }
     )))
+}
+
+/// Where a `verify` the release runs in the clone `repo` builds: the physical target its children
+/// are handed and the `--config` naming its build directory, read as that `verify` reads them,
+/// from the environment a release child has (the caller's home and the publication PATH, every
+/// Cargo layout variable removed, as `Real::child` does) and the clone by its physical path, as
+/// verify reads its root; so what the release builds beside its `verify` runs, and the
+/// directories its disk claim keeps (`crate::release_disk::own_dirs`), are the ones they choose.
+pub(crate) fn verify_layout(repo: &Path) -> (PathBuf, Option<String>) {
+    let env = aterm_verify::EnvSnapshot {
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default(),
+        path: publication_path(),
+        ..Default::default()
+    };
+    let repo = aterm_verify::physical(repo);
+    let target = aterm_verify::physical_target(&env, &repo);
+    let layout = aterm_verify::main_build_dir(&env, &repo)
+        .or_else(|| aterm_verify::fallback_build_dir(&env, &repo, &target));
+    (target, layout)
 }
 
 /// The publication engine sees installed managed programs, rustup, the pinned scanner and the
@@ -3192,13 +3233,11 @@ fn pointer_hop_problem(
 #[must_use]
 pub fn appcast_problems(text: &str, slug: &str, tag: &str, version: &str) -> Vec<String> {
     let field = |key: &str| {
-        text.lines().find_map(|l| {
-            l.strip_prefix(&format!("{key} = \""))
-                .and_then(|v| v.strip_suffix('"'))
-                .map(str::to_string)
-        })
+        let prefix = format!("{key} = \"");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix).and_then(|v| v.strip_suffix('"')))
     };
-    if field("version").as_deref() != Some(version) {
+    if field("version") != Some(version) {
         return vec![format!(
             "the appcast served for {tag} does not name version {version}"
         )];
@@ -3210,7 +3249,7 @@ pub fn appcast_problems(text: &str, slug: &str, tag: &str, version: &str) -> Vec
         url => vec![format!(
             "the appcast's url is '{}', not {want} — the credential-less updater refuses a \
              manifest whose url does not bind it to its tag and container",
-            url.unwrap_or_else(|| "<absent>".into())
+            url.unwrap_or("<absent>")
         )],
     }
 }
@@ -3277,6 +3316,18 @@ impl Backend for Real {
 
     fn entered(&mut self, step: Step) {
         self.step = step;
+        // What the release wrote so far is no longer free, so a peer's wait counts only the rest
+        // of its claim as reserved.
+        if let Some(claim) = &mut self.disk_claim
+            && let Some(bytes) = crate::release_timeline::Timeline::of_logs(&self.logs)
+                .ok()
+                .and_then(|t| t.output_bytes())
+            && let Err(error) = claim.wrote(bytes)
+        {
+            self.say(&format!(
+                "        disk: cannot note what the release wrote: {error}"
+            ));
+        }
         if !self.scratch_logs
             && crate::release::read_holder(&self.release.join(crate::release::RUNNING_FILE))
                 .is_some_and(|holder| holder.pid == std::process::id())
@@ -3396,6 +3447,18 @@ impl Backend for Real {
 
     fn lease(&mut self, prover: &Prover) -> Result<(), String> {
         crate::gates::lease_toolchain_checked(&prover.bin)
+    }
+
+    /// The release's one build-inputs seal: kept in the release state and handed to every child
+    /// ([`hand_inputs_seal`]), taken here or adopted from the cutter that re-ran this one. A dry
+    /// run never comes here, and seals lazily, keeping none. Off macOS a release has no
+    /// build-inputs identity to seal.
+    fn seal_inputs(&mut self) -> Result<(), String> {
+        if cfg!(target_os = "macos") {
+            (self.arm_inputs)(&self.state);
+            (self.build_inputs)()?;
+        }
+        Ok(())
     }
 
     fn cleared_env(&mut self) -> Vec<String> {
@@ -3727,6 +3790,62 @@ impl Backend for Real {
 
     fn is_dir(&mut self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn tree_has(&mut self, rev: &str, path: &str) -> Result<bool, Refusal> {
+        Ok(crate::line::tree_has(&self.git(), rev, path)?)
+    }
+
+    fn fix_of(&mut self, line: &Line, rev: &str) -> Result<crate::line::Admitted, Refusal> {
+        let git = self.git();
+        crate::line::git_ready(&git)?;
+        Ok(crate::line::admit(&git, line, rev)?)
+    }
+
+    fn carry(&mut self, line: &Line, fixes: &[Fix]) -> Result<(Vec<Hop>, String), Refusal> {
+        let git = self.git();
+        crate::line::git_ready(&git)?;
+        let fixes = crate::line::order(&git, fixes.to_vec())?;
+        let hops = crate::line::carry(&git, line, &fixes)?;
+        let head = hops.last().map_or(line.head(), |hop| hop.commit.as_str());
+        let named: Vec<&str> = fixes.iter().map(|fix| short(&fix.commit)).collect();
+        // A hop is the same commit however often it is made, so naming the fixes again makes
+        // these hops and records them; a bare re-run resumes the journal, which names none yet.
+        let recorded = crate::line::record(
+            &git,
+            &line.version,
+            head,
+            crate::line::MAX_RECORD_ATTEMPTS,
+        )
+        .map_err(|stop| {
+            let first = if stop.reason == crate::line::Reason::Unreachable {
+                "check the network and your git credentials, then run "
+            } else {
+                "run "
+            };
+            crate::line::Stop {
+                remedy: format!(
+                    "{first}{RELEASE_COMMAND} --fix {} again: it makes the same hop commits and \
+                     records them on the tip it finds",
+                    named.join(" ")
+                ),
+                ..stop
+            }
+        })?;
+        let note = match recorded {
+            crate::line::Recorded::Already { tip } => {
+                format!("origin/main ({}) holds the head already", short(&tip))
+            }
+            crate::line::Recorded::Pushed { merge, attempt } => format!(
+                "recorded on main by the merge {} (main's tree unchanged; push {attempt})",
+                short(&merge)
+            ),
+        };
+        Ok((hops, note))
+    }
+
+    fn verify_line(&mut self, line: &Line) -> Result<String, Refusal> {
+        Ok(crate::line::verify(&self.git(), line)?)
     }
 
     fn sync(&mut self) -> Result<String, Refusal> {
@@ -4070,6 +4189,42 @@ impl Backend for Real {
         (free, warm)
     }
 
+    fn disk_record(&mut self) -> aterm_capacity::Footprints {
+        crate::release_disk::load(&crate::release_disk::record_in(&self.state))
+    }
+
+    fn claim_disk(&mut self, bytes: u64, why: &str) -> Result<(), Refusal> {
+        let repo = self.repo.clone();
+        self.disk_claim =
+            crate::release_disk::claim(&repo, bytes, why, &mut |line| self.say(line))?;
+        Ok(())
+    }
+
+    fn let_disk_go(&mut self, passed: bool) {
+        let Some(claim) = self.disk_claim.take() else {
+            return;
+        };
+        drop(claim);
+        let wrote = crate::release_timeline::Timeline::of_logs(&self.logs)
+            .ok()
+            .and_then(|t| t.output_bytes())
+            .filter(|&bytes| bytes > 0);
+        let kept = match (passed, wrote) {
+            (true, Some(bytes)) => {
+                match crate::release_disk::keep(&crate::release_disk::record_in(&self.state), bytes)
+                {
+                    Ok(()) => format!(
+                        "; this run wrote {} MiB, kept to size the next claim",
+                        bytes >> 20
+                    ),
+                    Err(error) => format!("; what this run wrote could not be kept: {error}"),
+                }
+            }
+            _ => String::new(),
+        };
+        self.say(&format!("        disk: the release's claim ended{kept}"));
+    }
+
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
         let mut blocks: Vec<Refusal> = Vec::new();
         let git = self.git();
@@ -4145,11 +4300,14 @@ impl Backend for Real {
         creds: &Path,
         kind: crate::publish::CutKind,
     ) -> Vec<Refusal> {
-        let gates = crate::publish::pre_cut_gates(&self.repo, &c.version, creds, kind);
-        let mut found: Vec<Refusal> = gates
+        crate::publish::pre_cut_gates(&self.repo, &c.version, creds, kind)
             .into_iter()
             .map(|(gate, why)| cut_refusal(gate, &why))
-            .collect();
+            .collect()
+    }
+
+    fn head_gates(&mut self, c: &Candidate) -> Vec<Refusal> {
+        let mut found = Vec::new();
         let git = self.git();
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
         if let Err(e) = crate::gates::handoff_fixture_gate_at(&git, commit, version) {
@@ -4535,15 +4693,14 @@ pub fn engine_rows_in(mappings: &str, commit: Option<&str>) -> EngineRows {
     else {
         return EngineRows::default();
     };
-    let at = |row: &aterm_json::Value| {
+    fn at(row: &aterm_json::Value) -> &str {
         row.get("verified_at")
             .and_then(aterm_json::Value::as_str)
             .unwrap_or("")
-            .to_string()
-    };
+    }
     let newest = rows
         .iter()
-        .max_by(|a, b| at(a.1).cmp(&at(b.1)))
+        .max_by_key(|(_, row)| at(row))
         .map(|(sha, _)| sha.clone());
     let mine = commit.and_then(|c| rows.get(c));
     EngineRows {
@@ -4562,6 +4719,10 @@ pub fn attestation_qualifies(json: &str, commit: &str) -> bool {
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
         return false;
     };
+    attestation_qualifies_in(&a, commit)
+}
+
+fn attestation_qualifies_in(a: &aterm_json::Value, commit: &str) -> bool {
     let source = a
         .get("source")
         .and_then(|s| s.get("commit"))
@@ -4573,7 +4734,7 @@ pub fn attestation_qualifies(json: &str, commit: &str) -> bool {
     let mode = a.get("release_mode").and_then(aterm_json::Value::as_str);
     source == Some(commit)
         && (gate == Some("pass") || (gate == Some("skipped") && mode == Some("source-only")))
-        && attested_engine(json).is_some()
+        && attested_engine_in(a).is_some()
         && a.get("staging")
             .and_then(|s| s.get("candidate_rev"))
             .and_then(aterm_json::Value::as_str)
@@ -4587,27 +4748,30 @@ pub fn attestation_qualifies(json: &str, commit: &str) -> bool {
 /// A checked export whose candidate was also attested on the remote staging tier.
 #[must_use]
 pub fn attestation_promotes(json: &str, commit: &str) -> bool {
-    if !attestation_qualifies(json, commit) {
-        return false;
-    }
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
         return false;
     };
+    if !attestation_qualifies_in(&a, commit) {
+        return false;
+    }
     let stage = &a["staging"];
     stage["attested_rev"]
         .as_str()
         .is_some_and(|attested| Some(attested) == stage["candidate_rev"].as_str())
 }
 
-/// The engine commit an attestation names (`engine.commit`): the engine that staged it.
-#[must_use]
-pub fn attested_engine(json: &str) -> Option<String> {
-    let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
+fn attested_engine_in(a: &aterm_json::Value) -> Option<&str> {
     a.get("engine")?
         .get("commit")?
         .as_str()
         .filter(|c| !c.is_empty())
-        .map(str::to_string)
+}
+
+/// The engine commit an attestation names (`engine.commit`): the engine that staged it.
+#[must_use]
+pub fn attested_engine(json: &str) -> Option<String> {
+    let a = aterm_json::from_str::<aterm_json::Value>(json).ok()?;
+    attested_engine_in(&a).map(str::to_string)
 }
 
 /// The immutable qualified commit and exported tree named by an attestation.
@@ -4623,6 +4787,20 @@ pub fn attested_candidate(json: &str) -> Option<(String, String)> {
 #[must_use]
 pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     interrupt::install();
+    let _line = if !opts.dry_run {
+        match aterm_capacity::admit(
+            aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
+            aterm_capacity::Admit::Wait,
+        ) {
+            Ok(claim) => Some(claim),
+            Err(error) => {
+                eprintln!("release line: {error}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
     if !opts.dry_run {
         crate::gates::arm_toolchain_lease();
     }
@@ -4637,7 +4815,7 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
             return 2;
         }
     };
-    real.argv = opts.anchored_args(std::env::args_os().skip(1).collect());
+    real.argv = opts.rerun_args(std::env::args_os().skip(1).collect());
     let home = real.home.clone();
     crate::release::run_with(&mut real, &opts, &home).code
 }
@@ -6131,6 +6309,72 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// EVERY CHILD THE RELEASE STARTS IS NAMED ITS DISK CLAIM WHILE IT HOLDS ONE: a `verify` it
+    /// runs is covered by that claim alone (`aterm_capacity::covering_disk`), walking nothing. One
+    /// this process inherited is never passed on, and once the claim is let go no child is named
+    /// it. NEGATIVE CONTROL: before the claim, the same child carries no marker.
+    #[test]
+    fn every_child_is_named_the_releases_disk_claim_while_it_holds_one() {
+        let gib = 1u64 << 30;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        let marker = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(aterm_capacity::DISK_COVER_ENV))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+        let mut inherited = command("/bin/true");
+        scrub_names(
+            &mut inherited,
+            [std::ffi::OsString::from(aterm_capacity::DISK_COVER_ENV)],
+        );
+        assert_eq!(
+            marker(&inherited),
+            Some(None),
+            "an inherited claim is removed"
+        );
+        assert_eq!(
+            marker(&real.child("/bin/true", None)),
+            None,
+            "no claim, no marker"
+        );
+
+        let mut reading = aterm_capacity::Reading::of_gib(48, 40, 14);
+        reading.volume = Some(aterm_capacity::Volume {
+            mount: dir.path().to_path_buf(),
+            total: 400 * gib,
+            free: 300 * gib,
+            floor: 10 * gib,
+            room: 2 * gib,
+        });
+        let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+        let whole = atpkg::admit_disk::admit_sized_on(
+            crate::release_disk::sized(dir.path(), 39 * gib, "release v0.6.0", Vec::new()),
+            &ledger,
+            &aterm_capacity::Fixed::new(reading),
+            atpkg::admit_disk::Admit::Wait,
+            aterm_capacity::Pace::default(),
+            &mut atpkg::admit_disk::Reclaim::of(
+                Box::new(|_, _| (0, Vec::new(), Vec::new())),
+                Box::new(|_, _, _| None),
+                Box::new(|_, _| Vec::new()),
+            ),
+            &mut |_| {},
+        )
+        .expect("room for the claim");
+        let name = std::ffi::OsString::from(whole.marker());
+        real.disk_claim = Some(whole);
+        assert_eq!(marker(&real.child("/bin/true", None)), Some(Some(name)));
+
+        real.let_disk_go(false);
+        assert!(real.disk_claim.is_none());
+        assert_eq!(marker(&real.child("/bin/true", None)), None, "let go");
+        assert!(
+            !crate::release_disk::record_in(&real.state).exists(),
+            "a run that did not pass keeps nothing"
+        );
+    }
+
     #[test]
     fn scanner_export_preflight_uses_the_actual_dry_run_environment() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -6200,6 +6444,7 @@ mod tests {
             version: "1.0.0".into(),
             why: "test".into(),
             bump_from: None,
+            carry: Vec::new(),
         };
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -6356,6 +6601,7 @@ mod tests {
             version: "1.0.0".into(),
             why: "test".into(),
             bump_from: None,
+            carry: Vec::new(),
         };
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -6410,7 +6656,7 @@ mod tests {
             source: "test".into(),
         };
         for code in [0, 101, -1] {
-            let result = real.source_closure(&prover, |cmd| {
+            let result = real.source_closure(&prover, &"c".repeat(40), |cmd| {
                 assert_eq!(cmd.get_program(), prover.bin.join("targo"));
                 assert_eq!(cmd.get_current_dir(), Some(dir.path()));
                 let args = cmd.get_args().collect::<Vec<_>>();
@@ -6448,7 +6694,13 @@ mod tests {
             if code == 0 {
                 assert!(result.is_ok());
             } else {
-                assert_eq!(result.unwrap_err().detail, ["unbound model action"]);
+                let refused = result.unwrap_err();
+                assert_eq!(refused.detail, ["unbound model action"]);
+                assert!(
+                    refused.remedy.contains("--fix") && refused.remedy.contains(&"c".repeat(9)),
+                    "a red carries its fix onto the line's head: {}",
+                    refused.remedy
+                );
             }
         }
     }
@@ -6851,16 +7103,20 @@ mod tests {
         assert_eq!(since(&cmd), Some(None), "none, and none inherited");
     }
 
-    /// A step runs without the cutter this process may have been handed: a child has
-    /// [`RELEASE_CUTTER_ENV`] and [`RELEASE_CUTTER_SINCE_ENV`] only from [`hand_this_cutter`],
-    /// never inherited, and keeps what the scrub does not name. NEGATIVE CONTROL: scrub only
-    /// what [`clears`] and [`launcher_env`] name, and both reach the child.
+    /// A step runs without the cutter or the build-inputs seal this process may have been
+    /// handed: a child has [`RELEASE_CUTTER_ENV`] and [`RELEASE_CUTTER_SINCE_ENV`] only from
+    /// [`hand_this_cutter`] and [`crate::build_inputs::SEAL_ENV`] only from
+    /// [`hand_inputs_seal`] (this process's kept seal, else none), never inherited, and keeps
+    /// what the scrub does not name. NEGATIVE CONTROL: scrub only what [`clears`] and
+    /// [`launcher_env`] name, and all three reach the child.
     #[test]
     fn a_step_inherits_no_handed_cutter() {
+        let seal = crate::build_inputs::SEAL_ENV;
         let mut cmd = command("/usr/bin/true");
         let inherited = [
             RELEASE_CUTTER_ENV,
             RELEASE_CUTTER_SINCE_ENV,
+            seal,
             "HOME",
             "RUSTFLAGS",
         ];
@@ -6872,7 +7128,12 @@ mod tests {
             .collect();
         assert_eq!(
             removed,
-            [RELEASE_CUTTER_ENV, RELEASE_CUTTER_SINCE_ENV, "RUSTFLAGS"]
+            [
+                RELEASE_CUTTER_ENV,
+                RELEASE_CUTTER_SINCE_ENV,
+                seal,
+                "RUSTFLAGS"
+            ]
         );
         hand_this_cutter(&mut cmd, Path::new("/t/gate/aterm-release"), None);
         assert!(cmd.get_envs().any(|kv| kv
@@ -6880,6 +7141,89 @@ mod tests {
                 std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
                 Some(std::ffi::OsStr::new("/t/gate/aterm-release"))
             )));
+        let handed = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(seal))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+        };
+        hand_inputs_seal(&mut cmd, None);
+        assert_eq!(handed(&cmd), Some(None), "none kept, none handed");
+        let kept = PathBuf::from("/state/aterm-release/inputs-seal/k.toml");
+        hand_inputs_seal(&mut cmd, Some(kept.clone()));
+        assert_eq!(handed(&cmd), Some(Some(kept.into_os_string())));
+    }
+
+    /// Step 1's seal arms keeping in the release state, then takes the seal, whose failure is
+    /// the step's; every child the backend starts (a step, the cut, the re-run as R's cutter)
+    /// is handed the kept seal, and none while none is kept. CONTROL: off macOS step 1 arms and
+    /// takes nothing. NEGATIVE CONTROL: drop the hand-off from [`Real::scrubbed`], or the arm
+    /// from [`Real::seal_inputs`], and the children carry no seal, or nothing is armed.
+    #[test]
+    fn step_one_keeps_the_inputs_seal_and_every_child_is_handed_it() {
+        thread_local! {
+            static ARMED: std::cell::RefCell<Vec<PathBuf>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).expect("a backend");
+        real.arm_inputs = |state| ARMED.with(|armed| armed.borrow_mut().push(state.into()));
+        real.build_inputs = || {
+            TAKEN.with(|n| n.set(n.get() + 1));
+            Ok("inputs".into())
+        };
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(real.seal_inputs(), Ok(()));
+        assert_eq!(
+            (
+                ARMED.with(|armed| armed.borrow().clone()),
+                TAKEN.with(std::cell::Cell::get)
+            ),
+            if macos {
+                (vec![real.state.clone()], 1)
+            } else {
+                (Vec::new(), 0)
+            }
+        );
+        assert!(real.state.ends_with(RELEASE_STATE));
+        real.build_inputs = || Err("build input changed while it was hashed: /sdk".into());
+        assert_eq!(
+            real.seal_inputs().is_err(),
+            macos,
+            "a seal that cannot be taken refuses step 1"
+        );
+
+        let seal = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(crate::build_inputs::SEAL_ENV))
+                .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+        };
+        let prover = Prover {
+            bin: PathBuf::from("/store/trust/9192/bin"),
+            commit: "321aaeda7".into(),
+            source: "the store".into(),
+        };
+        let exe = || Ok(PathBuf::from("/t/gate/aterm-release"));
+        let children = |real: &Real| {
+            [
+                real.child("/usr/bin/true", None),
+                real.cut_command_of(exe(), &["cut".into()], &prover)
+                    .unwrap(),
+                real.reexec_command(&prover, std::iter::empty()),
+            ]
+            .map(|cmd| seal(&cmd))
+        };
+        real.handed_inputs = || None;
+        assert_eq!(
+            children(&real),
+            [None, None, None],
+            "none kept, none handed"
+        );
+        real.handed_inputs = || Some(PathBuf::from("/state/aterm-release/inputs-seal/k.toml"));
+        let kept = Some(std::ffi::OsString::from(
+            "/state/aterm-release/inputs-seal/k.toml",
+        ));
+        assert_eq!(children(&real), [kept.clone(), kept.clone(), kept]);
     }
 
     #[test]

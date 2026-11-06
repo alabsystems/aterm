@@ -141,18 +141,25 @@ fn state(conditions: &[Box<dyn Condition>], seen: &[Seen], elapsed: Duration) ->
 }
 
 fn unmet(conditions: &[Box<dyn Condition>], seen: &[Seen]) -> String {
-    let parts: Vec<String> = conditions
-        .iter()
-        .zip(seen)
-        .filter(|(_, seen)| !matches!(seen, Some((true, _))))
-        .map(|(condition, seen)| {
-            let observed = seen
-                .as_ref()
-                .map_or_else(|| Value::Null.to_string(), |(_, v)| v.to_string());
-            format!("{}:{observed}", condition.describe())
-        })
-        .collect();
-    parts.join("; ")
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (condition, seen) in conditions.iter().zip(seen) {
+        if matches!(seen, Some((true, _))) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        match seen {
+            Some((_, v)) => {
+                let _ = write!(out, "{}:{v}", condition.describe());
+            }
+            None => {
+                let _ = write!(out, "{}:null", condition.describe());
+            }
+        }
+    }
+    out
 }
 
 impl Poller<'_> {

@@ -1641,16 +1641,7 @@ impl Bootstrap {
             let node_ok = !matches!(
                 sub_membership.node(binding.writer()),
                 crate::membership_log::NodeStanding::Removed(_)
-            ) && !sub_membership.members().iter().any(|(m_actor, m)| {
-                (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
-                    && m.node_key.is_some_and(|nk| {
-                        nk != [0; 32]
-                            && matches!(
-                                sub_membership.nodes().get(&nk),
-                                Some(crate::membership_log::NodeStanding::Removed(_))
-                            )
-                    })
-            });
+            ) && !sub_membership.kin_removed(binding);
             let seat_ok = sub.has_historical_seat(binding) && removal_ok && recipient_ok && node_ok;
             let audience_ok = !sub.audience_left_out(
                 &crate::membership_log::EpochAudience::Commons,

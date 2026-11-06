@@ -196,7 +196,7 @@ pub(crate) struct SessionRow {
     pub need_alone: bool,
     /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
     pub place: Option<String>,
-    /// The number of the person's last plain Enter in the tab (`HumanInputStamp::last_plain_enter`), `0` for none: the owner's turn, which lets a need he was told of be told again ([`Escalation::owner_turn`]). The menu never shows it, so a keypress moves no row.
+    /// The number of the person's last plain Enter in the tab (`HumanInputStamp::last_plain_enter`), `0` for none: the owner's turn, which lets a need they were told of be told again ([`Escalation::owner_turn`]). The menu never shows it, so a keypress moves no row.
     pub owner_turn: u64,
 }
 
@@ -614,7 +614,7 @@ struct HeraldSlot {
 /// The most need ids one session's told memory keeps ([`Told`]); the oldest goes first, and its need can be told again.
 pub(crate) const TOLD_MAX: usize = 32;
 
-/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on his look, the program's own notification or alerts off — since his last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. Process-local: an update carries only whether the standing need was told ([`StatusCarry::told`]), which marks that escalation's ids told in the successor, and the needs it counts without naming them once a read under its key names them ([`Herald::note_spent`]).
+/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look, the program's own notification or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. Process-local: an update carries only whether the standing need was told ([`StatusCarry::told`]), which marks that escalation's ids told in the successor, and the needs it counts without naming them once a read under its key names them ([`Herald::note_spent`]).
 #[derive(Debug, Default)]
 struct Told {
     /// The owner's turn the memory is kept under.
@@ -1081,7 +1081,7 @@ impl Herald {
         }
         let mut transition = slot.shown != ident;
         // TOLD ONCE (§14.18): an ask's needs are judged by their words. The owner's own turn
-        // forgets what he was told; a re-read under the same key that carries a need neither
+        // forgets what they were told; a re-read under the same key that carries a need neither
         // told nor noted last is a transition; a transition whose every need was told is none
         // owed.
         if slot.told.turn != esc.owner_turn {
@@ -1749,9 +1749,13 @@ pub(crate) struct Glance {
     /// System State's one quiet signal (`docs/DESIGN-system-state-2026-10-21.md`
     /// §3.6): a row it manages needs a person or failed.
     pub system_state: Option<SystemStateLine>,
+    /// This machine's title (`m8 Heron`, [`crate::machine_title::machine_menu_bar_title`]), which
+    /// leads the tooltip and This Mac's row (`docs/DESIGN-machine-names-2026-11-04.md` §5.5);
+    /// `None` until the title's reader has read it, and off macOS.
+    pub machine: Option<String>,
 }
 
-/// The status menu's System State line: `System State: <row> needs you` (or
+/// The status menu's System State line: `System State: Needs you: <row>` (or
 /// `<row> failed`, `N need you`, `N failed`), which opens the tab, and a waiting
 /// vault approval code under it (`system_state_access::menu_line`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2241,7 +2245,10 @@ impl Glance {
         expect(dead_code, reason = "the menu-bar status item is macOS's")
     )]
     pub(crate) fn tooltip(&self) -> String {
-        "aterm".into()
+        match &self.machine {
+            Some(machine) => format!("aterm \u{b7} {machine}"),
+            None => "aterm".into(),
+        }
     }
 
     /// The local sessions needing the owner, in the order the menu lists them: what a test reads off a real App.
@@ -2470,12 +2477,14 @@ fn harness_need_line(
     format!("{lead}{SEP}{}{end}", fold_clip(&ask.first, room))
 }
 
-/// This Mac's row: `This Mac — ` and each nonzero count of `here` in its order, `·` between.
+/// This Mac's row: this machine's title (`m8 Heron`, `machine`), else `This Mac`, then ` — ` and
+/// each nonzero count of `here` in its order, `·` between.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
-pub(crate) fn here_line(here: &Here) -> String {
+pub(crate) fn here_line(here: &Here, machine: Option<&str>) -> String {
+    let lead = machine.unwrap_or("This Mac");
     let parts: Vec<String> = [
         (here.working, "working"),
         (here.need_you, "need you"),
@@ -2493,9 +2502,9 @@ pub(crate) fn here_line(here: &Here) -> String {
     .chain((here.shells > 0).then(|| format!("{} shell{}", here.shells, plural(here.shells))))
     .collect();
     let mut line = if parts.is_empty() {
-        "This Mac \u{2014} no sessions".to_string()
+        format!("{lead} \u{2014} no sessions")
     } else {
-        format!("This Mac \u{2014} {}", parts.join(" \u{b7} "))
+        format!("{lead} \u{2014} {}", parts.join(" \u{b7} "))
     };
     if here.elsewhere > 0 {
         line.push_str(&format!(" (+{} in another aterm)", here.elsewhere));
@@ -2984,7 +2993,7 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
         }
         rows.push(StatusRow::Separator);
     }
-    rows.push(StatusRow::Info(here_line(&g.here)));
+    rows.push(StatusRow::Info(here_line(&g.here, g.machine.as_deref())));
     for manager in g.managers.iter().take(MANAGERS_SHOWN) {
         let mut sub = Vec::new();
         if let Some(at) = manager.go {
@@ -5723,7 +5732,7 @@ mod tests {
             "zsh's ask needs you; the limited tab waits"
         );
         assert_eq!(
-            here_line(&g.here),
+            here_line(&g.here, g.machine.as_deref()),
             "This Mac \u{2014} 2 working \u{b7} 1 need you \u{b7} 1 waiting \u{b7} 2 done \u{b7} 1 shell"
         );
     }
@@ -5747,7 +5756,7 @@ mod tests {
             "{:?}",
             g.here
         );
-        let line = here_line(&g.here);
+        let line = here_line(&g.here, g.machine.as_deref());
         assert_eq!(
             line,
             "This Mac \u{2014} 1 need you \u{b7} 6 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells"
@@ -6014,9 +6023,9 @@ mod tests {
         assert!(line("fine").starts_with('\u{2713}'), "{}", line("fine"));
         assert!(g.here.failed >= 1, "{:?}", g.here);
         assert!(
-            here_line(&g.here).contains("failed"),
+            here_line(&g.here, g.machine.as_deref()).contains("failed"),
             "{}",
-            here_line(&g.here)
+            here_line(&g.here, g.machine.as_deref())
         );
     }
 
@@ -6440,6 +6449,41 @@ mod tests {
         let mut regen = a.clone();
         regen.generation = 9;
         assert_eq!(a.fingerprint(), regen.fingerprint());
+    }
+
+    /// THE MACHINE'S TITLE LEADS THE TOOLTIP AND THIS MAC'S ROW (machine names §5.5), moves the
+    /// fingerprint so a rename reaches the item, and leaves the face alone; before a read, both
+    /// keep their plain words.
+    #[test]
+    fn the_machine_title_leads_the_tooltip_and_this_mac_row() {
+        let plain = local_glance(&[row(1, "zsh", None)], &[], 0, None);
+        assert_eq!(plain.tooltip(), "aterm");
+        assert_eq!(
+            here_line(&plain.here, plain.machine.as_deref()),
+            "This Mac \u{2014} 1 shell"
+        );
+        let mut named = plain.clone();
+        named.machine = Some("m8 Heron".to_owned());
+        assert_eq!(named.tooltip(), "aterm \u{b7} m8 Heron");
+        assert_eq!(
+            here_line(&named.here, named.machine.as_deref()),
+            "m8 Heron \u{2014} 1 shell"
+        );
+        assert_eq!(
+            here_line(&Here::default(), Some("m0 Maize")),
+            "m0 Maize \u{2014} no sessions"
+        );
+        assert!(
+            compose_status_menu(&named, 0)
+                .contains(&StatusRow::Info("m8 Heron \u{2014} 1 shell".to_owned())),
+            "the menu's row carries the title"
+        );
+        assert_ne!(plain.fingerprint(), named.fingerprint());
+        assert_eq!(
+            named.button_title(),
+            plain.button_title(),
+            "the face stays ❯"
+        );
     }
 
     #[test]
@@ -7994,7 +8038,10 @@ mod tests {
             Some(&StatusRow::Info("Approval code 4F7-2KQ".to_string()))
         );
         assert_eq!(menu.get(2), Some(&StatusRow::Separator));
-        assert_eq!(menu.get(3), Some(&StatusRow::Info(here_line(&g.here))));
+        assert_eq!(
+            menu.get(3),
+            Some(&StatusRow::Info(here_line(&g.here, g.machine.as_deref())))
+        );
     }
 
     /// Every clickable row's label and tip in `menu`, a submenu's rows after its own.

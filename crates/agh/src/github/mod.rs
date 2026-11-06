@@ -55,13 +55,10 @@ pub(crate) fn limit_after_sort<T>(listing: &mut crate::page::Listing<T>, limit: 
     listing.end = crate::page::cut(listing.end, &mut listing.items, limit);
 }
 
-/// `/repos/{o}/{r}`, each half one encoded segment.
+/// `/repos/{o}/{r}`, each half one segment (`Slug` allows only `[A-Za-z0-9._-]`, which are all
+/// RFC 3986 unreserved bytes).
 pub(crate) fn repo_root(slug: &Slug) -> String {
-    format!(
-        "/repos/{}/{}",
-        crate::path::segment(slug.owner()),
-        crate::path::segment(slug.repo())
-    )
+    format!("/repos/{}/{}", slug.owner(), slug.repo())
 }
 
 /// How a resource call is routed. Built from `How::read()`, `How::writer()` or `How::write()`

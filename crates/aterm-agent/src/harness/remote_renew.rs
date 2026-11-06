@@ -85,6 +85,7 @@ enum State {
     Working,
     Done(Output),
     Failed(String),
+    Unavailable,
 }
 
 struct Entry {
@@ -100,9 +101,10 @@ struct Book {
 impl Book {
     fn start(
         self: &Arc<Self>,
+        lifetime: &super::account_work::Lifetime,
         caller: &str,
         nonce: &str,
-        run: impl FnOnce() -> Result<Output, String> + Send + 'static,
+        run: impl FnOnce(&super::account_work::Scope) -> Result<Option<Output>, String> + Send + 'static,
     ) -> Result<State, String> {
         let key = (caller.to_owned(), nonce.to_owned());
         let now = Instant::now();
@@ -113,6 +115,9 @@ impl Book {
         if let Some(job) = jobs.get(&key) {
             return Ok(job.state.clone());
         }
+        let Some(scope) = lifetime.enter() else {
+            return Ok(State::Unavailable);
+        };
         if jobs.values().any(|job| matches!(job.state, State::Working)) {
             return Err("another remote renewal is running".into());
         }
@@ -134,14 +139,35 @@ impl Book {
         drop(jobs);
         let book = Arc::clone(self);
         let kept = key.clone();
+        let running = scope.clone();
         let started = std::thread::Builder::new()
             .name("fleet-account-renewal".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-                let state = match result {
-                    Ok(Ok(output)) => State::Done(output),
-                    Ok(Err(why)) => State::Failed(super::one_line(&why, 320)),
-                    Err(_) => State::Failed("renewal worker panicked".into()),
+            .spawn(scope.wrap(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if running.cancelled() {
+                        return Ok(None);
+                    }
+                    run(&running)
+                }));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if let Err(secondary) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+                        {
+                            std::mem::forget(secondary);
+                        }
+                        Err("renewal worker panicked".into())
+                    }
+                };
+                let state = if running.cancelled() {
+                    State::Unavailable
+                } else {
+                    match result {
+                        Ok(Some(output)) => State::Done(output),
+                        Ok(None) => State::Unavailable,
+                        Err(why) => State::Failed(super::one_line(&why, 320)),
+                    }
                 };
                 if let Some(job) = book
                     .jobs
@@ -152,7 +178,7 @@ impl Book {
                     job.at = Instant::now();
                     job.state = state;
                 }
-            });
+            }));
         if let Err(error) = started {
             self.jobs
                 .lock()
@@ -181,16 +207,42 @@ fn encode(nonce: &str, state: State) -> String {
         State::Done(output) => json!({"schema":1,"request":nonce,"state":"done",
             "code":output.code,"stdout":output.stdout,"stderr":output.stderr}),
         State::Failed(error) => json!({"schema":1,"request":nonce,"state":"failed","error":error}),
+        State::Unavailable => {
+            json!({"schema":1,"request":nonce,"state":"unavailable","error":"account work service is unavailable"})
+        }
     };
     format!("OK 1\n{value}\n")
 }
 
 /// Execute a fixed unattended renewal in this process's own home and configuration.
-fn run(program: &Path) -> Result<Output, String> {
+fn run(
+    program: &Path,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<Option<Output>, String> {
+    // The Windows capture retains its established standalone behavior. App-owned work
+    // cannot promise cancellation retirement there and is explicitly unavailable.
+    #[cfg(not(unix))]
+    if scope.is_some() {
+        return Ok(None);
+    }
     use aterm_uds::spawnfd::Tether as _;
     let mut command = aterm_uds::spawnfd::command(program);
     command.tether();
     command.args(["harness", "accounts", "renew", "--due", "--here"]);
+    #[cfg(unix)]
+    let output = aterm_uds::deadline::output_with_input_until_watching(
+        &mut command,
+        aterm_uds::secret::Secret::new(&[]),
+        Instant::now() + WITHIN,
+        MAX_OUTPUT,
+        || scope.is_some_and(super::account_work::Scope::cancelled),
+    )
+    .map_err(|error| format!("local renewal did not complete: {error}"))?;
+    #[cfg(unix)]
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    #[cfg(not(unix))]
     let output = aterm_uds::deadline::output_with_input_until(
         &mut command,
         aterm_uds::secret::Secret::new(&[]),
@@ -208,22 +260,43 @@ fn run(program: &Path) -> Result<Output, String> {
     };
     #[cfg(not(unix))]
     let code = output.status.code().unwrap_or(1);
-    Ok(Output {
+    Ok(Some(Output {
         code,
         stdout: String::from_utf8(output.stdout).map_err(|_| "renewal stdout was not UTF-8")?,
         stderr: String::from_utf8(output.stderr).map_err(|_| "renewal stderr was not UTF-8")?,
-    })
+    }))
 }
 
 /// The caller has already passed the current local-owner or fleet-drive gate.
 /// No caller-supplied command, account, path or environment reaches the child.
+pub fn serve_scoped(lifetime: &super::account_work::Lifetime, caller: &str, rest: &str) -> String {
+    serve_with(lifetime, caller, rest, true)
+}
+
+/// Serve a standalone node process independently of any GUI App lifetime.
 pub fn serve(caller: &str, rest: &str) -> String {
+    serve_with(
+        &super::account_work::Lifetime::default(),
+        caller,
+        rest,
+        false,
+    )
+}
+
+fn serve_with(
+    lifetime: &super::account_work::Lifetime,
+    caller: &str,
+    rest: &str,
+    scoped: bool,
+) -> String {
     static BOOK: OnceLock<Arc<Book>> = OnceLock::new();
     let answer = (|| {
         let request = Request::parse(rest)?;
         let book = BOOK.get_or_init(|| Arc::new(Book::default()));
         let state = match request {
-            Request::Start(nonce) => book.start(caller, nonce, || run(&crate::own_exe()?))?,
+            Request::Start(nonce) => book.start(lifetime, caller, nonce, move |scope| {
+                run(&crate::own_exe()?, scoped.then_some(scope))
+            })?,
             Request::Poll(nonce) => book.poll(caller, nonce)?,
         };
         Ok::<_, String>(encode(request.nonce(), state))
@@ -239,6 +312,7 @@ fn decode(nonce: &str, text: &str) -> Result<State, String> {
     }
     match value["state"].as_str() {
         Some("working") => Ok(State::Working),
+        Some("unavailable") => Ok(State::Unavailable),
         Some("failed") => Err(value["error"]
             .as_str()
             .map(|error| {
@@ -292,6 +366,9 @@ fn request_with(
         match state {
             State::Done(output) => return Ok(output),
             State::Failed(error) => return Err(error),
+            State::Unavailable => {
+                return Err("remote account work service is unavailable".into());
+            }
             State::Working => {}
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -391,23 +468,72 @@ mod tests {
     }
 
     #[test]
+    fn paused_remote_work_is_retained_until_the_admitted_worker_finishes() {
+        let book = Arc::new(Book::default());
+        let lifetime = super::super::account_work::Lifetime::default();
+        let (ready, began) = mpsc::channel();
+        let (release, finish) = mpsc::channel();
+        assert!(matches!(
+            book.start(&lifetime, "a", ID, move |scope| {
+                ready.send(()).unwrap();
+                finish.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                assert!(scope.cancelled());
+                Ok(Some(output(0)))
+            }),
+            Ok(State::Working)
+        ));
+        began.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        let pause = lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect_err("remote worker is retained");
+        assert!(matches!(
+            book.start(&lifetime, "a", ID, |_| panic!("duplicate work")),
+            Ok(State::Working)
+        ));
+        assert!(matches!(
+            book.start(&lifetime, "a", OTHER, |_| panic!("paused work")),
+            Ok(State::Unavailable)
+        ));
+        assert!(book.poll("a", OTHER).is_err());
+        release.send(()).unwrap();
+        let mut pause = Some(pause);
+        let drained = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || match pause.take().unwrap().try_wait() {
+                Ok(drained) => Some(drained),
+                Err(pending) => {
+                    pause = Some(pending);
+                    None
+                }
+            },
+        )
+        .expect("remote worker retired");
+        assert!(matches!(book.poll("a", ID), Ok(State::Unavailable)));
+        assert!(drained.resume().is_ok());
+    }
+
+    #[test]
     fn duplicates_share_one_run_and_callers_cannot_read_each_others_results() {
         let book = Arc::new(Book::default());
+        let lifetime = super::super::account_work::Lifetime::default();
         let (release, wait) = mpsc::channel();
         assert!(matches!(
-            book.start("a", ID, move || {
+            book.start(&lifetime, "a", ID, move |_| {
                 wait.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
-                Ok(output(7))
+                Ok(Some(output(7)))
             }),
             Ok(State::Working)
         ));
         assert!(matches!(
-            book.start("a", ID, || panic!("duplicate execution")),
+            book.start(&lifetime, "a", ID, |_| panic!("duplicate execution")),
             Ok(State::Working)
         ));
         assert!(book.poll("b", ID).is_err());
         assert!(
-            book.start("b", OTHER, || panic!("parallel execution"))
+            book.start(&lifetime, "b", OTHER, |_| panic!("parallel execution"))
                 .is_err()
         );
         release.send(()).unwrap();
@@ -422,7 +548,7 @@ mod tests {
         .expect("the owned worker finished");
         assert_eq!(done.code, 7);
         assert!(matches!(
-            book.start("a", ID, || panic!("completed replay")),
+            book.start(&lifetime, "a", ID, |_| panic!("completed replay")),
             Ok(State::Done(_))
         ));
         assert!(book.poll("b", ID).is_err());
@@ -431,7 +557,8 @@ mod tests {
     #[test]
     fn an_error_finishes_the_request_and_does_not_hold_the_worker_slot() {
         let book = Arc::new(Book::default());
-        book.start("a", ID, || Err("no local route".into()))
+        let lifetime = super::super::account_work::Lifetime::default();
+        book.start(&lifetime, "a", ID, |_| Err("no local route".into()))
             .ok()
             .unwrap();
         aterm_spec::wait::within(
@@ -440,7 +567,9 @@ mod tests {
             || matches!(book.poll("a", ID), Ok(State::Failed(_))).then_some(()),
         )
         .expect("the refused worker finished");
-        book.start("a", OTHER, || Ok(output(0))).ok().unwrap();
+        book.start(&lifetime, "a", OTHER, |_| Ok(Some(output(0))))
+            .ok()
+            .unwrap();
         aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
             Duration::from_millis(1),

@@ -84,19 +84,19 @@ pub fn is_login_runtime_dir(dir: &OsStr) -> bool {
 }
 
 /// Make this process's root in `temp`'s directory of roots ([`roots_dir`]), after taking
-/// back the roots of dead processes there (and any earlier one of this pid's), and
-/// arrange its removal at exit. Debug builds only, as [`scratch_root`]'s check is: a
-/// shipped build compiles none of this housekeeping.
+/// back the roots of dead processes there (and any earlier one of this pid's) that no first exec
+/// can still be assessed under ([`sweep`]), and arrange its removal at exit. Debug builds only, as
+/// [`scratch_root`]'s check is: a shipped build compiles none of this housekeeping.
 #[cfg(debug_assertions)]
 fn claim(temp: &Path) -> Option<PathBuf> {
     let roots = roots_dir(temp)?;
-    sweep(&roots);
+    sweep(&roots, None, crate::process::awake_ms());
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.subsec_nanos());
     let root = roots.join(format!("{}-{stamp:x}", std::process::id()));
     make_private(&root).ok()?;
-    sweep_at_exit(&roots);
+    sweep_at_exit(&roots, &root);
     Some(root)
 }
 
@@ -150,10 +150,33 @@ fn make_private(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Remove every root directly under `roots` whose pid is this process's or names no
-/// live process. Best-effort: a test run never fails over housekeeping.
+/// Whether a program a test copied may still be in its first exec under this process's root: a
+/// [`crate::deadline::KeptUntilRan`] was dropped before its children showed they ran
+/// ([`hold_own_root`]), so the root's sweep at exit leaves it under custody ([`sweep`]).
+#[cfg(any(test, debug_assertions))]
+static OWN_ROOT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep this process's root under first-exec custody at its exit ([`OWN_ROOT_HELD`]).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn hold_own_root() {
+    OWN_ROOT_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Take back the roots directly under `roots` that no live process owns: `own`, this process's
+/// root at its exit, at once unless it is held (a test kept a copy unproven, [`hold_own_root`]); any
+/// other whose pid is this process's (an earlier owner of the pid) or names no live process only
+/// under first-exec custody, as a held own root is. Its owner may have died (a SIGKILL, a halted
+/// run) while macOS still assessed the first exec of a program a test copied under it, and
+/// unlinking that file mid-assessment crashes syspolicyd. So the sweep that finds such a root
+/// stamps it ([`crate::deadline::try_stamp_exec`]): every first exec under it began before its
+/// owner died, so before that stamp. A later sweep removes it once
+/// [`crate::deadline::FIRST_EXEC_HANG`] of awake time (`awake_now`) has passed since
+/// ([`crate::deadline::copy_wait_left`]); where no awake clock reads, of wall time since the
+/// blank stamp made the root's own modification time. A root whose stamp cannot be written or
+/// read where the clock reads (a full disk, an `exec` that is no regular file) stays until one
+/// can. Best-effort: a test run never fails over housekeeping.
 #[cfg(debug_assertions)]
-fn sweep(roots: &Path) {
+fn sweep(roots: &Path, own: Option<(&Path, bool)>, awake_now: Option<u64>) {
     let Ok(entries) = std::fs::read_dir(roots) else {
         return;
     };
@@ -165,8 +188,25 @@ fn sweep(roots: &Path) {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        if pid == me || !crate::process::pid_alive(pid) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        let path = entry.path();
+        let owned = own.filter(|(root, _)| *root == path.as_path());
+        if owned.is_some_and(|(_, held)| !held) {
+            let _ = std::fs::remove_dir_all(&path);
+        } else if owned.is_some() || pid == me || !crate::process::pid_alive(pid) {
+            let stamped = crate::deadline::exec_stamp(&path).is_some()
+                || awake_now.is_none()
+                    && std::fs::symlink_metadata(path.join(crate::deadline::EXEC_STAMP)).is_ok();
+            if !stamped {
+                let _ = crate::deadline::try_stamp_exec(&path);
+            } else if crate::deadline::copy_wait_left_at(
+                &path,
+                std::time::SystemTime::now(),
+                awake_now,
+            )
+            .is_none()
+            {
+                let _ = std::fs::remove_dir_all(&path);
+            }
         }
     }
 }
@@ -180,16 +220,17 @@ fn owner_pid(name: &str) -> Option<u32> {
         .flatten()
 }
 
-/// Run [`sweep`] over `roots` inside `exit(3)`.
+/// Run [`sweep`] over `roots` inside `exit(3)`, taking back `own`, this process's root.
 #[cfg(all(unix, debug_assertions))]
-fn sweep_at_exit(roots: &Path) {
-    static ROOTS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if ROOTS.set(roots.to_path_buf()).is_err() {
+fn sweep_at_exit(roots: &Path, own: &Path) {
+    static ROOTS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    if ROOTS.set((roots.to_path_buf(), own.to_path_buf())).is_err() {
         return;
     }
     extern "C" fn at_exit() {
-        if let Some(roots) = ROOTS.get() {
-            sweep(roots);
+        if let Some((roots, own)) = ROOTS.get() {
+            let held = OWN_ROOT_HELD.load(std::sync::atomic::Ordering::SeqCst);
+            sweep(roots, Some((own, held)), crate::process::awake_ms());
         }
     }
     unsafe extern "C" {
@@ -202,13 +243,15 @@ fn sweep_at_exit(roots: &Path) {
 
 /// No exit hook off unix: the next test binary's first-use sweep takes the root back.
 #[cfg(all(not(unix), debug_assertions))]
-fn sweep_at_exit(_roots: &Path) {}
+fn sweep_at_exit(_roots: &Path, _own: &Path) {}
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
     #[cfg(unix)]
     use super::{adoptable, roots_dir, sweep};
     use super::{is_test_binary, owner_pid, scratch_root};
+    #[cfg(unix)]
+    use crate::deadline::{FIRST_EXEC_HANG, exec_stamp};
     use std::path::Path;
 
     #[test]
@@ -276,11 +319,25 @@ mod tests {
         assert_eq!(scratch_root(), Some(root), "one root per process");
     }
 
-    /// A first use takes back a dead process's root and an earlier one of this pid's,
-    /// and leaves a live process's and anything not named as a root.
+    /// The awake-clock reading `hang` after `at`.
+    #[cfg(unix)]
+    fn past(at: u64, hang: std::time::Duration) -> Option<u64> {
+        Some(at + u64::try_from(hang.as_millis()).expect("a hang in milliseconds"))
+    }
+
+    /// The stamp a sweep left in `root` when it found it.
+    #[cfg(unix)]
+    fn stamp(root: &Path) -> u64 {
+        exec_stamp(root).expect("stamped when the sweep found it")
+    }
+
+    /// A sweep takes back this process's own root at once, and a dead process's root and an
+    /// earlier one of this pid's only once [`FIRST_EXEC_HANG`] has passed since it found them; it
+    /// leaves a live process's and anything not named as a root. CONTROL: a sweep that took a dead
+    /// owner's root at once fails the first check.
     #[cfg(unix)]
     #[test]
-    fn a_first_use_takes_back_only_what_no_live_process_owns() {
+    fn a_sweep_takes_back_only_what_no_live_process_owns_or_may_still_assess() {
         let temp = aterm_tempfile::TempDir::new().expect("a temp dir");
         let temp = temp.path();
         let me = std::process::id();
@@ -292,15 +349,119 @@ mod tests {
         };
         let dead = dir("0-1".to_owned());
         let mine = dir(format!("{me}-1"));
+        let own = dir(format!("{me}-2"));
         let live = dir(format!("{parent}-1"));
         let signed = dir("+0-1".to_owned());
         let other = dir("x".to_owned());
-        sweep(temp);
-        assert!(!dead.exists(), "a dead process's root goes");
-        assert!(!mine.exists(), "an earlier root of this pid goes");
+        let awake = crate::process::awake_ms();
+        sweep(temp, Some((&own, false)), awake);
+        assert!(
+            dead.exists(),
+            "a dead process's root stays while a first exec may be assessed"
+        );
+        assert!(mine.exists(), "and so does an earlier root of this pid");
+        assert!(!own.exists(), "this process's own root goes at its exit");
+        // Each root is stamped as the sweep finds it, so the two may differ by a millisecond.
+        let (first, last) = (
+            stamp(&dead).min(stamp(&mine)),
+            stamp(&dead).max(stamp(&mine)),
+        );
+        assert!(
+            Some(first) >= awake && Some(last) <= crate::process::awake_ms(),
+            "stamped when found"
+        );
+        sweep(
+            temp,
+            None,
+            past(first, FIRST_EXEC_HANG - std::time::Duration::from_millis(1)),
+        );
+        assert!(dead.exists() && mine.exists(), "until the hang has passed");
+        sweep(temp, None, past(last, FIRST_EXEC_HANG));
+        assert!(!dead.exists(), "then a dead process's root goes");
+        assert!(!mine.exists(), "and an earlier root of this pid");
         assert!(live.exists(), "a live process's root stays");
+        assert!(exec_stamp(&live).is_none(), "unstamped");
         assert!(signed.exists(), "a signed prefix is no root");
         assert!(other.exists(), "a name that is no root stays");
+    }
+
+    /// A test binary the run killed (a halt, a SIGKILL) may have started a program it copied
+    /// under its root that never showed it ran, so macOS may still assess its first exec: the
+    /// next sweep leaves the copy in place, and a later one takes it once the hang has passed. The
+    /// copy goes only after a child showed it ran from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_whose_child_died_before_its_proof_outlives_its_owners_sweep() {
+        use crate::spawnfd::{Stdio, command};
+        let mut kept = crate::deadline::KeptUntilRan::new(
+            aterm_tempfile::TempDir::new().expect("a temp dir").keep(),
+        );
+        let mut gone = command("/usr/bin/true")
+            .spawn()
+            .expect("spawn a short life");
+        let owner = gone.id();
+        assert!(gone.wait().expect("reap it").success());
+        let root = kept.path().join(format!("{owner}-1"));
+        std::fs::create_dir(&root).expect("a dead owner's root");
+        let copy = root.join("cat");
+        crate::deadline::ad_hoc_copy(Path::new("/bin/cat"), &copy);
+        let spawn = || {
+            command(&copy)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn the copy")
+        };
+        let mut killed = spawn();
+        crate::deadline::kill_within(&mut killed, crate::deadline::ECHO_HANG);
+        sweep(kept.path(), None, crate::process::awake_ms());
+        assert!(
+            copy.exists(),
+            "the copy stays while its first exec may be assessed"
+        );
+        let mut proven = spawn();
+        drop(crate::deadline::cat_echoes(&mut proven));
+        assert!(proven.wait().expect("reap the proof").success());
+        kept.ran();
+        sweep(kept.path(), None, past(stamp(&root), FIRST_EXEC_HANG));
+        assert!(!root.exists(), "it goes once the hang has passed");
+    }
+
+    /// A test that kept a copy unproven ([`crate::deadline::KeptUntilRan`] dropped before its
+    /// children showed they ran) keeps its process's own root under custody at exit, stamped like
+    /// a dead owner's; with none kept the root goes at once. CONTROL: the second case.
+    #[cfg(unix)]
+    #[test]
+    fn an_own_root_holding_an_unproven_copy_stays_at_exit() {
+        let temp = aterm_tempfile::TempDir::new().expect("a temp dir");
+        let me = std::process::id();
+        let own = temp.path().join(format!("{me}-7"));
+        std::fs::create_dir(&own).expect("this process's root");
+        sweep(temp.path(), Some((&own, true)), crate::process::awake_ms());
+        assert!(own.exists(), "held: kept");
+        let at = stamp(&own);
+        sweep(temp.path(), Some((&own, true)), past(at, FIRST_EXEC_HANG));
+        assert!(!own.exists(), "held: it goes once the hang has passed");
+        std::fs::create_dir(&own).expect("this process's root again");
+        sweep(temp.path(), Some((&own, false)), crate::process::awake_ms());
+        assert!(!own.exists(), "not held: it goes at once");
+    }
+
+    /// A dropped [`crate::deadline::KeptUntilRan`] that never said its children ran holds this
+    /// process's root ([`super::OWN_ROOT_HELD`]) for its sweep at exit.
+    #[cfg(unix)]
+    #[test]
+    fn an_unproven_copy_holds_the_own_root() {
+        let dir = aterm_tempfile::TempDir::new().expect("a temp dir").keep();
+        let kept = crate::deadline::KeptUntilRan::new(&dir);
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(kept)));
+        assert!(
+            dropped.is_err(),
+            "an unproven drop outside a panic is the test's failure"
+        );
+        assert!(super::OWN_ROOT_HELD.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(dir.exists(), "its directory stays");
+        std::fs::remove_dir(&dir).expect("nothing was copied or run there");
     }
 
     /// The directory of roots is made `0700`, then adopted while it stays this user's

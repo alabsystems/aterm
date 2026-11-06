@@ -2955,25 +2955,67 @@ impl BrowserChild {
         BrowserChild { child, grace }
     }
 
-    /// Waits up to the grace for the browser to exit, then kills it; its exit status.
+    /// Allows the browser its grace, then requests termination and retains ownership until
+    /// its positive owning wait. The grace bounds browser work, not uncertain cleanup.
     /// # Errors
-    /// The child could not be waited for.
+    /// A wait failed before the eventual positive reap. Lost custody retains this call
+    /// indefinitely rather than retrying a numeric PID or releasing the profile's owner.
     pub fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.close_with(aterm_uds::spawnfd::LaneChild::wait)
+    }
+
+    fn close_with(
+        &mut self,
+        mut wait: impl FnMut(
+            &mut aterm_uds::spawnfd::LaneChild,
+        ) -> std::io::Result<std::process::ExitStatus>,
+    ) -> std::io::Result<std::process::ExitStatus> {
         let now = Instant::now();
         let until = now
             .checked_add(self.grace)
             .unwrap_or_else(|| now + Duration::from_secs(3600));
+        let mut failed = None;
+        let mut lost = false;
         loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(status);
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    lost = error.raw_os_error() == Some(libc::ECHILD);
+                    failed = Some((error.kind(), error.raw_os_error()));
+                    break;
+                }
             }
             if Instant::now() >= until {
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let _ = self.child.kill();
-        self.child.wait()
+        if !lost {
+            let _ = self.child.kill();
+        }
+        loop {
+            if lost {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            match wait(&mut self.child) {
+                Ok(status) => {
+                    return match failed {
+                        Some((kind, raw)) => Err(raw.map_or_else(
+                            || std::io::Error::from(kind),
+                            std::io::Error::from_raw_os_error,
+                        )),
+                        None => Ok(status),
+                    };
+                }
+                Err(error) => {
+                    lost = error.raw_os_error() == Some(libc::ECHILD);
+                    failed.get_or_insert((error.kind(), error.raw_os_error()));
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
     }
 }
 
@@ -5918,23 +5960,76 @@ fn pump_cdp_reader(mut from: std::io::PipeReader, tx: &Sender<Value>) {
 
 type CdpWrite = (Vec<u8>, std::sync::mpsc::SyncSender<bool>);
 
-/// Chrome DevTools Protocol client over `--remote-debugging-pipe` (fds 3 and 4).
-pub struct CdpClient {
-    to: std::sync::mpsc::SyncSender<CdpWrite>,
-    from: Receiver<Value>,
-    next_id: u64,
-    events: Vec<Value>,
-    write_failed: bool,
+enum CdpReceiveError {
+    Cancelled,
+    Timeout,
+    Disconnected,
 }
 
-impl CdpClient {
-    /// Create a CDP pipe client over `to` (browser fd 3) and `from` (browser fd 4).
-    #[must_use]
-    pub fn new(mut to: std::io::PipeWriter, from: std::io::PipeReader) -> Self {
+fn receive_cdp<T>(
+    from: &Receiver<T>,
+    timeout: Duration,
+    scope: Option<&super::account_work::Scope>,
+) -> Result<T, CdpReceiveError> {
+    let started = Instant::now();
+    loop {
+        if scope.is_some_and(super::account_work::Scope::cancelled) {
+            return Err(CdpReceiveError::Cancelled);
+        }
+        let left = timeout.saturating_sub(started.elapsed());
+        let tick = if scope.is_some() {
+            left.min(Duration::from_millis(25))
+        } else {
+            left
+        };
+        match from.recv_timeout(tick) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Disconnected) => return Err(CdpReceiveError::Disconnected),
+            Err(RecvTimeoutError::Timeout) if started.elapsed() >= timeout => {
+                return Err(CdpReceiveError::Timeout);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+// Pipes retire before the admission, including an unstarted constructor.
+struct CdpStartup {
+    to: std::io::PipeWriter,
+    from: std::io::PipeReader,
+    work: Option<super::account_work::Scope>,
+}
+
+fn spawn_cdp_work(
+    work: impl FnOnce() + Send + 'static,
+    scope: Option<super::account_work::Scope>,
+) -> Result<(), String> {
+    let work: Box<dyn FnOnce() + Send> = match scope {
+        Some(scope) => Box::new(scope.wrap(work)),
+        None => Box::new(work),
+    };
+    std::thread::Builder::new()
+        .spawn(work)
+        .map(|_| ())
+        .map_err(|why| format!("browser DevTools pipe worker did not start ({why})"))
+}
+
+impl CdpStartup {
+    fn start(self) -> Result<CdpClient, String> {
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err("browser DevTools account work is paused".into());
+        }
         let (tx, rx) = channel();
-        std::thread::spawn(move || pump_cdp_reader(from, &tx));
         let (commands, pending) = std::sync::mpsc::sync_channel::<CdpWrite>(1);
-        std::thread::spawn(move || {
+        let reader_scope = self.work.clone();
+        let writer_scope = self.work.clone();
+        let reader = move || pump_cdp_reader(self.from, &tx);
+        let writer = move || {
+            let mut to = self.to;
             while let Ok((mut bytes, done)) = pending.recv() {
                 let written = to.write_all(&bytes).and_then(|()| to.flush()).is_ok();
                 bytes.fill(0);
@@ -5943,14 +6038,56 @@ impl CdpClient {
                     break;
                 }
             }
-        });
-        Self {
+        };
+        spawn_cdp_work(reader, reader_scope)?;
+        spawn_cdp_work(writer, writer_scope)?;
+        Ok(CdpClient {
             to: commands,
             from: rx,
             next_id: 0,
             events: Vec::new(),
             write_failed: false,
+            work: self.work,
+        })
+    }
+}
+
+/// Chrome DevTools Protocol client over `--remote-debugging-pipe` (fds 3 and 4).
+pub struct CdpClient {
+    to: std::sync::mpsc::SyncSender<CdpWrite>,
+    from: Receiver<Value>,
+    next_id: u64,
+    events: Vec<Value>,
+    write_failed: bool,
+    // Client buffers and channels retire before this admission clone.
+    work: Option<super::account_work::Scope>,
+}
+
+impl CdpClient {
+    /// Create a CDP pipe client over `to` (browser fd 3) and `from` (browser fd 4).
+    /// # Panics
+    /// An I/O worker cannot be started.
+    #[must_use]
+    pub fn new(to: std::io::PipeWriter, from: std::io::PipeReader) -> Self {
+        Self::new_scoped(to, from, None).expect("browser DevTools pipe workers could not start")
+    }
+
+    /// Creates a client whose buffers and actual detached I/O workers retain `scope`.
+    /// Thread retirement is counted; no join receipt is implied.
+    ///
+    /// # Errors
+    /// The scope is cancelled or an I/O worker cannot be started.
+    pub fn new_scoped(
+        to: std::io::PipeWriter,
+        from: std::io::PipeReader,
+        scope: Option<super::account_work::Scope>,
+    ) -> Result<Self, String> {
+        CdpStartup {
+            to,
+            from,
+            work: scope,
         }
+        .start()
     }
 
     /// Send a CDP command and wait for its matching response within `timeout`.
@@ -5961,6 +6098,13 @@ impl CdpClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, &'static str> {
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err("browser DevTools account work is paused");
+        }
         if self.write_failed {
             return Err("browser DevTools pipe is unavailable");
         }
@@ -5978,13 +6122,20 @@ impl CdpClient {
             self.write_failed = true;
             return Err("browser DevTools pipe is unavailable");
         }
-        match written.recv_timeout(timeout.saturating_sub(t0.elapsed())) {
+        match receive_cdp(
+            &written,
+            timeout.saturating_sub(t0.elapsed()),
+            self.work.as_ref(),
+        ) {
             Ok(true) => {}
-            Ok(false) | Err(RecvTimeoutError::Disconnected) => {
+            Err(CdpReceiveError::Cancelled) => {
+                return Err("browser DevTools account work is paused");
+            }
+            Ok(false) | Err(CdpReceiveError::Disconnected) => {
                 self.write_failed = true;
                 return Err("failed writing to browser DevTools pipe");
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Err(CdpReceiveError::Timeout) => {
                 self.write_failed = true;
                 return Err("timed out writing to browser DevTools pipe");
             }
@@ -5994,7 +6145,7 @@ impl CdpClient {
             if remaining.is_zero() {
                 return Err("timed out waiting for browser DevTools response");
             }
-            match self.from.recv_timeout(remaining) {
+            match receive_cdp(&self.from, remaining, self.work.as_ref()) {
                 Ok(m) => {
                     if m.get("id").and_then(Value::as_u64) != Some(id) {
                         self.events.push(m);
@@ -6005,10 +6156,13 @@ impl CdpClient {
                     }
                     return Ok(m.get("result").cloned().unwrap_or(Value::Null));
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                Err(CdpReceiveError::Cancelled) => {
+                    return Err("browser DevTools account work is paused");
+                }
+                Err(CdpReceiveError::Timeout) => {
                     return Err("timed out waiting for browser DevTools response");
                 }
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(CdpReceiveError::Disconnected) => {
                     return Err("browser closed its DevTools pipe prematurely");
                 }
             }
@@ -7265,6 +7419,8 @@ pub const BOT_CHECK_UNCLEARED: &str =
 pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
+const CHALLENGE_UNAVAILABLE: &str = "the fleet challenge service cannot admit account work";
+
 thread_local! {
     /// Why this thread's last headless Claude sign-in ended without the callback
     /// ([`note_met`], [`take_met`]).
@@ -7419,11 +7575,12 @@ fn central_callback(
     flow: &MailboxFlow,
     authorize_url: &str,
     email: Option<&str>,
-) -> Result<String, &'static str> {
-    let callback = super::challenge_relay::request_central(authorize_url, email)
-        .map_err(|_| "the fleet challenge service could not complete sign-in")?;
+) -> Result<String, super::challenge_relay::RequestError> {
+    let callback = super::challenge_relay::request_central(authorize_url, email)?;
     if !flow.is_callback(&callback) {
-        return Err("the fleet challenge service returned another OAuth flow's callback");
+        return Err(super::challenge_relay::RequestError::Unconfirmed(
+            "the fleet challenge service returned another OAuth flow's callback".into(),
+        ));
     }
     Ok(callback)
 }
@@ -7627,22 +7784,34 @@ fn drive_cdp_oauth_flow_until(
             }
             match state {
                 "block_page" => {
-                    if google_config.is_none()
-                        && let Ok(callback) =
-                            central_callback(&flow, authorize_url, email.as_deref())
-                    {
-                        return callback_delivery_result(deliver_callback(&callback));
+                    if google_config.is_none() {
+                        match central_callback(&flow, authorize_url, email.as_deref()) {
+                            Ok(callback) => {
+                                return callback_delivery_result(deliver_callback(&callback));
+                            }
+                            Err(super::challenge_relay::RequestError::Unavailable) => {
+                                note_met(MetWord::ServiceUnavailable, None);
+                                return Err(CHALLENGE_UNAVAILABLE);
+                            }
+                            Err(_) => {}
+                        }
                     }
                     note_met(MetWord::BlockPage, last_host.as_deref());
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
                     if bot.check(url, deadline.now()) >= bot_stall {
-                        if google_config.is_none()
-                            && let Ok(callback) =
-                                central_callback(&flow, authorize_url, email.as_deref())
-                        {
-                            return callback_delivery_result(deliver_callback(&callback));
+                        if google_config.is_none() {
+                            match central_callback(&flow, authorize_url, email.as_deref()) {
+                                Ok(callback) => {
+                                    return callback_delivery_result(deliver_callback(&callback));
+                                }
+                                Err(super::challenge_relay::RequestError::Unavailable) => {
+                                    note_met(MetWord::ServiceUnavailable, None);
+                                    return Err(CHALLENGE_UNAVAILABLE);
+                                }
+                                Err(_) => {}
+                            }
                         }
                         note_met(MetWord::BotCheck, last_host.as_deref());
                         return Err(BOT_CHECK_UNCLEARED);
@@ -8081,6 +8250,19 @@ fn authorize_pinned_browser_until(
                     )
                 },
                 |cb_url| {
+                    if cb_url.split('?').next()
+                        == Some("https://platform.claude.com/oauth/code/callback")
+                    {
+                        let code = super::open_url::extract_query_param(cb_url, "code")
+                            .ok_or("the hosted OAuth callback has no authorization code")?;
+                        let outcome = std::env::var_os(super::open_url::OUTCOME_ENV)
+                            .ok_or("the hosted OAuth callback has no renewal input channel")?;
+                        super::open_url::write_oauth_code(
+                            Path::new(&outcome).with_extension("code"),
+                            &code,
+                        )?;
+                        return Ok(200);
+                    }
                     let mut cookies = BTreeMap::new();
                     super::open_url::loopback_http_exchange_until(
                         "GET",
@@ -8789,7 +8971,7 @@ const BOT_CHECK_JS: &str = bot_check_helpers_js!();
 
 /// Where `page` is: its host and path, without its query (which may carry a code or a
 /// challenge's token) or fragment.
-fn url_place(url: &str) -> String {
+pub(super) fn url_place(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or("");
     let place = strip_ascii_prefix_ci(url, "https://")
         .or_else(|| strip_ascii_prefix_ci(url, "http://"))
@@ -9682,6 +9864,7 @@ pub struct VendorApprover {
     /// Whether the row's email may be typed into the vendor's page
     /// ([`crate::ai::connector::SignIn::types_email`]).
     pub types_email: bool,
+    pub(super) work: Option<super::account_work::Scope>,
 }
 
 #[cfg(unix)]
@@ -9698,6 +9881,12 @@ fn google_state_dir(shared_dir: &Path) -> PathBuf {
 }
 
 impl VendorApprover {
+    /// Retain the caller's automatic lifetime through browser I/O workers.
+    #[must_use]
+    pub fn with_work(mut self, work: Option<super::account_work::Scope>) -> Self {
+        self.work = work;
+        self
+    }
     /// Use one already-authorized mailbox without discovering or merging any
     /// ambient credential source. The caller owns its authorization checks.
     #[must_use]
@@ -9711,6 +9900,7 @@ impl VendorApprover {
         let senders = cli.accounts().mail_senders;
         mailbox.senders = senders.iter().map(|sender| (*sender).to_owned()).collect();
         Self {
+            work: None,
             #[cfg(unix)]
             google_state: google_state_dir(shared_dir),
             #[cfg(unix)]
@@ -9762,6 +9952,7 @@ impl VendorApprover {
         let mailbox_source = found.clone();
         let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
+            work: None,
             #[cfg(unix)]
             google_state: google_state_dir(shared_dir),
             #[cfg(unix)]
@@ -9798,6 +9989,9 @@ impl VendorApprover {
 }
 
 impl super::login_drive::Approver for VendorApprover {
+    fn work_scope(&self) -> Option<super::account_work::Scope> {
+        self.work.clone()
+    }
     #[cfg(unix)]
     fn resume(
         &mut self,
@@ -9809,7 +10003,11 @@ impl super::login_drive::Approver for VendorApprover {
         let Some(home) = self.home.as_deref() else {
             return Ok(super::login_drive::Resume::Fresh);
         };
-        let mut journal = match super::google_federation::recovery::Journal::open(request, home)? {
+        let mut journal = match super::google_federation::recovery::Journal::open_scoped(
+            request,
+            home,
+            self.work.clone(),
+        )? {
             Some(journal) => journal,
             None => return Ok(super::login_drive::Resume::Fresh),
         };
@@ -9861,6 +10059,7 @@ impl super::login_drive::Approver for VendorApprover {
             return Ok(());
         }
         if let Some(journal) = self.google_recovery.as_mut() {
+            journal.retain_work(self.work.clone());
             let home = self
                 .home
                 .as_deref()
@@ -9881,7 +10080,8 @@ impl super::login_drive::Approver for VendorApprover {
             },
         };
         match pending {
-            Some(pending) => {
+            Some(mut pending) => {
+                pending.retain_work(self.work.clone());
                 pending.complete(request, outcome, deadline, self.google_recovery.as_ref())
             }
             None => Ok(()),
@@ -9894,6 +10094,13 @@ impl super::login_drive::Approver for VendorApprover {
         handoff: &super::login_drive::Handoff<'_>,
     ) -> super::login_drive::Approval {
         use super::login_drive::Approval;
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Approval::NotRun("automatic account work is cancelled".into());
+        }
         if let Some(result) = super::google_federation::configured(self, handoff) {
             return result;
         }
@@ -9925,7 +10132,14 @@ impl super::login_drive::Approver for VendorApprover {
         let browser = match super::headless_fetch::ensure_headless_browser(
             self.home.as_deref(),
             &mut super::headless_fetch::Curl,
-            &|| (handoff.finished)() || Instant::now() >= handoff.deadline,
+            &|| {
+                (handoff.finished)()
+                    || Instant::now() >= handoff.deadline
+                    || self
+                        .work
+                        .as_ref()
+                        .is_some_and(super::account_work::Scope::cancelled)
+            },
         ) {
             Ok(browser) => browser,
             Err(why) => {
@@ -9976,10 +10190,18 @@ impl VendorApprover {
                 std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
             let cmd =
                 headless_browser_command(browser, profile_dir, &|name| std::env::var_os(name));
+            if self
+                .work
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return Err("automatic account work is cancelled");
+            }
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
-            let mut cdp = CdpClient::new(cmd_write, out_read);
+            let mut cdp = CdpClient::new_scoped(cmd_write, out_read, self.work.clone())
+                .map_err(|_| "could not start scoped CDP workers")?;
             let make_up_now = Instant::now();
             let make_up_until = make_up_now
                 .checked_add(super::browser_window::MAKE_UP_WITHIN)
@@ -10046,6 +10268,10 @@ impl VendorApprover {
 #[cfg(test)]
 #[path = "headless_vendor_tests.rs"]
 pub(super) mod vendor_tests;
+
+#[cfg(all(test, unix))]
+#[path = "headless_cdp_scope_tests.rs"]
+mod cdp_scope_tests;
 
 #[cfg(all(test, unix))]
 mod browser_start_tests {

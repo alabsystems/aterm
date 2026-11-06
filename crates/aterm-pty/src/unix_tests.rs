@@ -81,6 +81,42 @@ fn a_wake_pipe_is_cloexec_and_a_wake_into_a_full_one_never_blocks() {
     close_fd(wr);
 }
 
+/// Both ends of a wake pipe are kept out of children beside close-on-exec: each carries Apple's
+/// `FD_CLOFORK` wherever the kernel keeps that mark (a fresh pipe marked by hand says whether it
+/// does), set under `aterm_uds::kept_out`, which holds every spawn off until it is set. Off Apple
+/// no such mark exists, and only close-on-exec is read.
+#[test]
+fn a_wake_pipe_is_kept_out_of_children_where_the_kernel_keeps_the_mark() {
+    let kernel_keeps = cfg!(target_vendor = "apple") && {
+        let mut probe = [0i32; 2];
+        // SAFETY: valid 2-int out-array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(probe.as_mut_ptr()) }, 0, "probe pipe");
+        let flags = fd_flags(probe[0], "the probe's read end");
+        // SAFETY: `F_SETFD` sets the descriptor-flag word of this test's own fresh read end.
+        let set = unsafe { libc::fcntl(probe[0], libc::F_SETFD, flags | FD_CLOFORK) } == 0;
+        let kept = set && fd_flags(probe[0], "the probe's read end") & FD_CLOFORK != 0;
+        close_fd(probe[0]);
+        close_fd(probe[1]);
+        kept
+    };
+    let (rd, wr) = make_wake_pipe().expect("wake pipe");
+    for fd in [rd, wr] {
+        let flags = fd_flags(fd, "a wake pipe end");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "fd {fd} is close-on-exec: {flags:#x}"
+        );
+        assert_eq!(
+            flags & FD_CLOFORK != 0,
+            kernel_keeps,
+            "fd {fd} is kept out of children where the kernel keeps the mark: {flags:#x}"
+        );
+    }
+    close_fd(rd);
+    close_fd(wr);
+}
+
 #[test]
 fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
     use std::os::fd::AsRawFd as _;
@@ -764,6 +800,30 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
         "an armed idle wait must park once and gather the refill into the same \
          batch: (dry gaps parked at, bytes gathered)"
     );
+}
+
+/// `select` holds no negative descriptor (`FD_SET` would index outside its set), so an idle wait
+/// with no master delivers at once, as one past `FD_SETSIZE` does. Control: a live master still
+/// waits, ending Quiet when its wait passes with no input and Refill once input is there.
+#[test]
+fn an_idle_wait_with_no_master_delivers_and_a_live_one_still_waits() {
+    assert!(matches!(
+        super::idle_refill_wait(-1, -1, -1, 1_000),
+        super::BridgeWait::Deliver
+    ));
+    let (rd, wr) = make_wake_pipe().expect("owned CLOEXEC nonblocking pipe");
+    assert!(matches!(
+        super::idle_refill_wait(rd, -1, -1, 1_000),
+        super::BridgeWait::Quiet
+    ));
+    wake(wr);
+    let hang_detector_us = u32::try_from(HANG_DETECTOR.as_micros()).expect("fits");
+    assert!(matches!(
+        super::idle_refill_wait(rd, -1, -1, hang_detector_us),
+        super::BridgeWait::Refill
+    ));
+    close_fd(rd);
+    close_fd(wr);
 }
 
 #[test]

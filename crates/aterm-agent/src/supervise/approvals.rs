@@ -462,9 +462,9 @@ static LEDGER_LOCKS: [std::sync::Mutex<()>; 16] = [const { std::sync::Mutex::new
 /// [`LEDGER_LOCKS`] the ledger at `path` falls in: the cut ([`bound`]) holds it from its first
 /// read to its rename, and [`book_self_claim`] from its open to its append, so a row a control
 /// thread books while a loop's start cuts the same ledger lands in the file the cut leaves, never
-/// in the copy the cut read nor in the file it renamed over. The loop's own rows take no lock:
-/// the loop cuts its ledger before it opens it, on its own thread. Two ledgers share a lock only
-/// where their paths fall in one stripe, which only serializes them.
+/// in the copy the cut read nor in the file it renamed over. The journal also locks every append
+/// and cut across processes by a stable sibling, reopening the current ledger for each append.
+/// Two ledgers share this in-process lock only where their paths fall in one stripe.
 fn ledger_stripe(path: &Path) -> &'static std::sync::Mutex<()> {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::hash::DefaultHasher::new();
@@ -5132,8 +5132,8 @@ mod tests {
     /// the cut ([`bound`]) holds the ledger's lock from its first read to its rename, and
     /// [`book_self_claim`] opens and appends under it, so a booking begun mid-cut waits the cut
     /// out and its row is the cut file's newest, and the lock is free once the cut is over.
-    /// NEGATIVE CONTROL: a row written through a handle opened before a cut's rename is in no
-    /// file the ledger's path names, which the shared lock rules out.
+    /// NEGATIVE CONTROL: a raw descriptor that bypasses the journal's reopen-and-lock protocol
+    /// still writes to the old inode after a cut's rename, outside the named ledger.
     #[test]
     fn a_self_claims_row_booked_during_a_cut_lands_in_the_file_the_cut_leaves() {
         let dir = crate::supervise::ScratchDir::new("apr-cut", "self-claim");
@@ -5149,16 +5149,18 @@ mod tests {
         };
 
         std::fs::write(&path, &past).expect("seed");
-        let mut warn = Vec::new();
-        let mut stale = Ledger::open(Some(&path), sid, &mut warn);
+        let mut stale = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("raw descriptor outside the journal protocol");
         bound(&path);
-        let lost = stale
-            .write_self_claim(2_000, &row, &mut warn)
-            .expect("written");
+        let lost = row.to_json(2_000, sid);
+        writeln!(stale, "{lost}").expect("write old inode");
+        stale.flush().expect("flush old inode");
         let cut = std::fs::read_to_string(&path).expect("read");
         assert_eq!(cut.lines().count(), KEEP_ROWS, "the ledger is cut");
         assert!(!cut.contains(&lost), "NEGATIVE CONTROL: {lost}");
-        assert!(warn.is_empty(), "{warn:?}");
+        drop(stale);
 
         std::fs::write(&path, &past).expect("seed");
         let (at, row) = (path.as_path(), &row);

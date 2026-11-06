@@ -577,15 +577,6 @@ fn converge<'a>(
             ));
         }
     }
-    let rows: Vec<ItemReport> = fact_rows
-        .iter()
-        .chain(&repair_rows)
-        .chain(&docs_rows)
-        .chain(&develop_rows)
-        .chain(&packages)
-        .chain(&refused)
-        .cloned()
-        .collect();
     let judged: Vec<ItemReport> = fact_rows
         .iter()
         .chain(&repair_rows)
@@ -604,9 +595,18 @@ fn converge<'a>(
         } else {
             ""
         },
-        rows.len()
+        judged.len()
     );
     if args.json {
+        let rows: Vec<ItemReport> = fact_rows
+            .iter()
+            .chain(&repair_rows)
+            .chain(&docs_rows)
+            .chain(&develop_rows)
+            .chain(&packages)
+            .chain(&refused)
+            .cloned()
+            .collect();
         let mode = if mode == Mode::Plan {
             ReportMode::Check
         } else {
@@ -630,38 +630,37 @@ fn converge<'a>(
             },
         };
     }
-    let refused_rows = refused.clone();
-    let mut sections: Vec<Section> = refused
-        .into_iter()
-        .map(|row| Section {
-            label: match (row.family.as_str(), row.id.as_str()) {
-                ("pkg", _) => "packages:",
-                ("develop", _) => "develop:",
-                ("shell", _) => "shell:",
-                (_, "doctor.repairs") => "repair:",
-                _ => "doctor:",
-            },
-            mark: Mark::Warn,
-            fact: row.why.unwrap_or_default(),
-        })
-        .collect();
-    let hold = ports.not_own_account.map(aterm_converge::not_own_account);
-    sections.extend(repair_section(&repair_rows, &how, hold.as_deref()));
-    sections.extend(docs_section(&docs_rows));
-    sections.extend(develop_section(&develop_rows));
-    if !packages.is_empty() {
-        let (healthy, lines) = atpkg::doctor::packages_view(&packages);
-        sections.push(Section {
-            label: "packages:",
-            mark: match (healthy, pkg_failing) {
-                (true, _) => Mark::Ok,
-                (false, false) => Mark::Note,
-                (false, true) => Mark::Warn,
-            },
-            fact: lines.join("\n"),
-        });
-    }
     let text = if args.verbose {
+        let mut sections: Vec<Section> = refused
+            .into_iter()
+            .map(|row| Section {
+                label: match (row.family.as_str(), row.id.as_str()) {
+                    ("pkg", _) => "packages:",
+                    ("develop", _) => "develop:",
+                    ("shell", _) => "shell:",
+                    (_, "doctor.repairs") => "repair:",
+                    _ => "doctor:",
+                },
+                mark: Mark::Warn,
+                fact: row.why.unwrap_or_default(),
+            })
+            .collect();
+        let hold = ports.not_own_account.map(aterm_converge::not_own_account);
+        sections.extend(repair_section(&repair_rows, &how, hold.as_deref()));
+        sections.extend(docs_section(&docs_rows));
+        sections.extend(develop_section(&develop_rows));
+        if !packages.is_empty() {
+            let (healthy, lines) = atpkg::doctor::packages_view(&packages);
+            sections.push(Section {
+                label: "packages:",
+                mark: match (healthy, pkg_failing) {
+                    (true, _) => Mark::Ok,
+                    (false, false) => Mark::Note,
+                    (false, true) => Mark::Warn,
+                },
+                fact: lines.join("\n"),
+            });
+        }
         cli::render_readiness(&gathered, &fact_rows, &sections, &readiness)
     } else {
         let (more, changes) = brief_rows(
@@ -672,7 +671,7 @@ fn converge<'a>(
                 ("rust-docs:", docs_rows.as_slice()),
                 ("develop:", develop_rows.as_slice()),
                 ("packages:", packages.as_slice()),
-                ("doctor:", refused_rows.as_slice()),
+                ("doctor:", refused.as_slice()),
             ],
             &how,
         );

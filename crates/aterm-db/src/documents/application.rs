@@ -281,8 +281,8 @@ pub(crate) struct Declaration {
 pub(crate) fn peek_declaration(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    deadline: std::time::Instant,
 ) -> Result<Option<Declaration>> {
-    let deadline = admission_deadline();
     let paths = crate::generation::observed_paths_until(paths, deadline)?;
     if Bootstrap::cached(&paths)
         .map_err(crate::table::failure)?

@@ -2803,7 +2803,7 @@ impl Wake {
             #[cfg(target_os = "linux")]
             Wake::WindowOp { session, .. } => Some(*session),
             #[cfg(target_os = "macos")]
-            Wake::MachineName(..) => None,
+            Wake::MachineName(..) | Wake::NicknameNotSet(..) => None,
             Wake::ProtectedRead { session, .. } => Some(*session),
             Wake::GrokSigninLooked { session } => Some(*session),
             Wake::LeaseChanged { .. }
@@ -3073,9 +3073,9 @@ impl Wake {
             Wake::CancelSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::AllocationMonitorChanged => None,
-            Wake::MailChanged
+            Wake::AccountsDrained { .. }
+            | Wake::MailChanged
             | Wake::WorkstationSetup(_)
-            | Wake::DeveloperToolsInstall(_, _)
             | Wake::DeveloperToolsWatch(_)
             | Wake::DeveloperToolsLowData(_)
             | Wake::RootStepsOwed(_)

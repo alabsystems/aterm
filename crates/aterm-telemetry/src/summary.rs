@@ -23,24 +23,39 @@ pub struct Spread {
     pub p90: Option<u64>,
 }
 
-impl Spread {
-    fn of(figs: impl Iterator<Item = Option<u64>>) -> Self {
-        let mut known = Vec::with_capacity(figs.size_hint().0);
-        let mut unknown = 0;
-        for f in figs {
-            match f {
-                Some(v) => known.push(v),
-                None => unknown += 1,
-            }
-        }
-        known.sort_unstable();
-        Self {
-            n: known.len() as u64,
-            unknown,
-            p50: rank(&known, 50),
-            p90: rank(&known, 90),
+#[derive(Default)]
+struct SpreadAcc {
+    known: Vec<u64>,
+    unknown: u64,
+}
+
+impl SpreadAcc {
+    fn push(&mut self, fig: Option<u64>) {
+        match fig {
+            Some(v) => self.known.push(v),
+            None => self.unknown += 1,
         }
     }
+
+    fn finish(mut self) -> Spread {
+        self.known.sort_unstable();
+        Spread {
+            n: self.known.len() as u64,
+            unknown: self.unknown,
+            p50: rank(&self.known, 50),
+            p90: rank(&self.known, 90),
+        }
+    }
+}
+
+#[derive(Default)]
+struct KindAcc {
+    n: u64,
+    failed: u64,
+    stalled: u64,
+    wall: SpreadAcc,
+    cpu: SpreadAcc,
+    peak: SpreadAcc,
 }
 
 /// The nearest-rank `pct`th percentile of sorted `v`.
@@ -76,26 +91,30 @@ pub struct KindLine {
 /// One line a kind, in kind order.
 #[must_use]
 pub fn by_kind(rows: &[Row]) -> Vec<KindLine> {
-    let mut kinds: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+    let mut kinds: BTreeMap<&str, KindAcc> = BTreeMap::new();
     for row in rows {
-        kinds.entry(row.kind.word()).or_default().push(row);
+        let acc = kinds.entry(row.kind.word()).or_default();
+        acc.n += 1;
+        if matches!(row.outcome, Outcome::Fail | Outcome::Refused) {
+            acc.failed += 1;
+        }
+        if matches!(row.stop, Stop::Stalled | Stop::Pressure) {
+            acc.stalled += 1;
+        }
+        acc.wall.push(row.wall_ms.known());
+        acc.cpu.push(row.cpu_ms.known());
+        acc.peak.push(row.peak_bytes.known());
     }
     kinds
         .into_iter()
-        .map(|(kind, rows)| KindLine {
+        .map(|(kind, acc)| KindLine {
             kind: kind.to_owned(),
-            n: rows.len() as u64,
-            failed: rows
-                .iter()
-                .filter(|r| matches!(r.outcome, Outcome::Fail | Outcome::Refused))
-                .count() as u64,
-            stalled: rows
-                .iter()
-                .filter(|r| matches!(r.stop, Stop::Stalled | Stop::Pressure))
-                .count() as u64,
-            wall: Spread::of(rows.iter().map(|r| r.wall_ms.known())),
-            cpu: Spread::of(rows.iter().map(|r| r.cpu_ms.known())),
-            peak: Spread::of(rows.iter().map(|r| r.peak_bytes.known())),
+            n: acc.n,
+            failed: acc.failed,
+            stalled: acc.stalled,
+            wall: acc.wall.finish(),
+            cpu: acc.cpu.finish(),
+            peak: acc.peak.finish(),
         })
         .collect()
 }
@@ -164,7 +183,7 @@ pub fn head(reading: &Reading, since_ms: Option<u64>, dir: &str) -> String {
         facts.map_or("-", |h| h.spelled.host.as_str()),
     );
     match facts {
-        Some(h) => out.push_str(&h.facts.hex()),
+        Some(h) => crate::row::push_hex(&mut out, &h.facts.0),
         None => out.push('-'),
     }
     out.push_str(" dir=");
@@ -230,7 +249,7 @@ pub fn render_rows(
         .collect();
     tail.reverse();
     for row in tail {
-        out.push_str(&row.body());
+        row.write_body(&mut out);
         out.push('\n');
     }
     out

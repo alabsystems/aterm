@@ -113,15 +113,16 @@ fn helpers(rows: &[Row], root: i32) -> Vec<(i32, String)> {
         .filter(|row| tree.contains(&row.pid))
         .filter_map(|row| helper_name(&row.args).map(|name| (row, name)))
         .collect();
-    let is_helper = |pid: i32| named.iter().any(|(row, _)| row.pid == pid);
-    let parent = |pid: i32| rows.iter().find(|row| row.pid == pid).map(|row| row.ppid);
+    let helper_pids: BTreeSet<i32> = named.iter().map(|(row, _)| row.pid).collect();
+    let parents: std::collections::BTreeMap<i32, i32> =
+        rows.iter().map(|row| (row.pid, row.ppid)).collect();
     let under_a_helper = |row: &Row| {
         let mut at = row.ppid;
         for _ in 0..rows.len() {
-            if is_helper(at) {
+            if helper_pids.contains(&at) {
                 return true;
             }
-            match parent(at) {
+            match parents.get(&at).copied() {
                 Some(up) if at != root => at = up,
                 _ => return false,
             }

@@ -4,6 +4,81 @@
 use super::*;
 
 #[test]
+fn saturation_predicate_matches_the_probability_model_at_integer_boundaries() {
+    use aterm_spec::rng::XorShift;
+    let mut rng = XorShift::new(0xB100_5A7E_7E00_0001);
+    let mut filter = BloomFilter::with_size(64);
+    for bits in (1..=4096)
+        .map(|n| n * 64)
+        .chain(
+            (0..4096)
+                .map(|_| BloomFilter::storage_layout(rng.range(64, BloomFilter::MAX_BITS + 1)).1),
+        )
+        .chain([BloomFilter::MAX_BITS])
+    {
+        // The saturation estimate depends on layout and insertion count, not on bit contents.
+        // Avoid allocating a maximum-sized filter to inspect its numerical boundary.
+        filter.num_bits = bits;
+        // Locate the original probability model's first saturated integer count.
+        let mut low = 0;
+        let mut high = bits;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            filter.count = mid;
+            if filter.estimated_fpr() > 0.5 {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        let threshold = low;
+        for count in [
+            0,
+            threshold.saturating_sub(1),
+            threshold,
+            threshold + 1,
+            threshold + 2,
+            usize::MAX,
+        ] {
+            filter.count = count;
+            assert_eq!(
+                filter.is_saturated(),
+                filter.estimated_fpr() > 0.5,
+                "bits={bits} count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual saturation predicate cost measurement"]
+fn saturation_predicate_cost() {
+    let mut filter = BloomFilter::with_capacity(1000);
+    const REPEATS: u32 = 1_000_000;
+    let mut reference_hits = None;
+    for direct in [false, true] {
+        let began = std::time::Instant::now();
+        let mut hits = 0usize;
+        for step in 0..REPEATS {
+            filter.count = std::hint::black_box(step as usize % 8000);
+            let filter = std::hint::black_box(&filter);
+            let saturated = if direct {
+                filter.is_saturated()
+            } else {
+                filter.estimated_fpr() > 0.5
+            };
+            hits += usize::from(std::hint::black_box(saturated));
+        }
+        let elapsed = began.elapsed();
+        assert_eq!(*reference_hits.get_or_insert(hits), hits);
+        eprintln!(
+            "saturation_predicate direct={direct} repeats={REPEATS} ns_per_op={:.3}",
+            elapsed.as_secs_f64() * 1e9 / f64::from(REPEATS)
+        );
+    }
+}
+
+#[test]
 fn bloom_no_false_negatives() {
     let mut bloom = BloomFilter::with_capacity(1000);
 

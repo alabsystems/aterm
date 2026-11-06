@@ -505,7 +505,7 @@ pub fn compare(facts: &Facts, local: &Copies<'_>, live: &Copies<'_>) -> Vec<Diff
             continue;
         };
         let live_hrefs = hrefs(page, &text);
-        if live_hrefs != [facts.mac.url.clone()] {
+        if live_hrefs.len() != 1 || live_hrefs[0] != facts.mac.url {
             out.push(Difference::Href {
                 page,
                 live: live_hrefs,

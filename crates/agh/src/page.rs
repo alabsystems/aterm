@@ -643,7 +643,7 @@ impl Walk<'_> {
         for page in pages {
             crate::client::retarget(&mut page.call, old, new);
         }
-        if matches!(&self.scope, LinkScope::Repo(slug) if slug.key() == old.key()) {
+        if matches!(&self.scope, LinkScope::Repo(slug) if slug == old) {
             self.scope = LinkScope::Repo(new.clone());
         }
         self.repo_id = None;
@@ -685,12 +685,13 @@ impl Walk<'_> {
             }
             let value = answered.json()?;
             let n = pages.len() + 1;
-            let kept = (self.consistency == Consistency::Snapshot).then(|| stable(value.clone()));
+            let page_start = items.len();
             match self.shape {
                 Shape::Items => {
                     let Value::Array(array) = value else {
                         return Err(Error::protocol(format!("page {n} is not a JSON array")));
                     };
+                    items.reserve(array.len());
                     for item in array {
                         if self.consistency == Consistency::AsRead
                             && let Some(id) = item.get("id")
@@ -705,15 +706,25 @@ impl Walk<'_> {
             }
             as_.get_or_insert_with(|| answered.as_.clone());
             let next = answered.header("link").and_then(link_next);
+            let read = u32::try_from(pages.len() + 1).unwrap_or(u32::MAX);
+            let limited = self.opts.limit.is_some_and(|limit| {
+                items.len() >= limit && (items.len() > limit || next.is_some())
+            });
+            let single_page =
+                pages.is_empty() && (limited || next.is_none() || read >= self.opts.max_pages);
+            let kept = (self.consistency == Consistency::Snapshot && !single_page).then(|| {
+                match self.shape {
+                    Shape::Items => stable(Value::Array(items[page_start..].to_vec())),
+                    Shape::Pages => stable(items[page_start].clone()),
+                }
+            });
             pages.push(PageRead {
                 call: call.clone(),
                 etag: answered.etag.clone(),
                 stable: kept,
             });
-            let read = u32::try_from(pages.len()).unwrap_or(u32::MAX);
             if let Some(limit) = self.opts.limit
-                && items.len() >= limit
-                && (items.len() > limit || next.is_some())
+                && limited
             {
                 items.truncate(limit);
                 return Ok(self.ended(pages, items, End::Limited { at: limit }, as_));

@@ -1463,7 +1463,7 @@ impl MtlRegion {
 /// Upload CPU bytes into a 2-D texture's level 0.
 ///
 /// # Safety
-/// `tex` must be a 2-D `MTLTexture` whose storage mode is not `Private`, whose dimensions are at least `region`, and whose pixel format has exactly `bytes_per_row / region.size.width` bytes per texel; `bytes` holds at least `bytes_per_row * region.size.height` bytes.
+/// `tex` must be a 2-D `MTLTexture` whose storage mode is not `Private` and whose dimensions are at least `region`; `bytes_per_row` is a whole number of its pixel format's texels and at least `region.size.width` of them; `bytes` holds at least `bytes_per_row * region.size.height` bytes.
 pub(crate) unsafe fn texture_upload(
     tex: &Obj,
     region: MtlRegion,

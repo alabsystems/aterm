@@ -54,6 +54,9 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          git's credential helper over ~/.secrets (or, for
                                          the dev token, the file --token-file names and, in
                                          it, the <name>= line --token-key names)
+  aterm secrets git-setup [--apply]    plan a local migration of known vault/native Git helpers
+                                         to this protected development executable; --apply keeps
+                                         exact private rollback files and refuses custom helpers
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
         [--no-agent] [--serve]           a new open vault (at a <url> a machine is let in by
@@ -240,6 +243,9 @@ enum Command {
         /// The `<name>=` line of `token_file` that holds the token.
         token_key: Option<String>,
         operation: Option<String>,
+    },
+    GitSetup {
+        apply: bool,
     },
     Create {
         source: String,
@@ -870,6 +876,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
             Ok(Command::Keep(f.operands))
         }
+        "git-setup" => {
+            let f = flags(rest, &[], &["--apply"])?;
+            no_operands(&f, "git-setup")?;
+            Ok(Command::GitSetup {
+                apply: f.has("--apply"),
+            })
+        }
         "git-credential" => {
             let f = flags(rest, &["--dev-user", "--token-file", "--token-key"], &[])?;
             if f.operands.len() > 1 {
@@ -1167,7 +1180,7 @@ fn parse(words: &[String]) -> Result<Command, String> {
 }
 
 /// Whether `value` is a syntactically valid GitHub account login.
-fn is_github_login(value: &str) -> bool {
+pub(crate) fn is_github_login(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 39
         && !value.starts_with('-')
@@ -1238,6 +1251,22 @@ mod unix {
         "an admin Mac on an aterm older than open vaults cannot open this vault until it updates";
 
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
+        if let Command::GitSetup { apply } = command {
+            // Local developer setup must not initialize, join, or move this Mac's identity.
+            let paths = Paths::locate()?;
+            let program = std::env::current_exe()?;
+            let report = crate::git_setup::setup(&paths.home, &program, apply)?;
+            println!(
+                "{} {} known helper configuration file(s) using {}",
+                if apply { "updated" } else { "would update" },
+                report.files.len(),
+                report.program.display()
+            );
+            if let Some(backup) = report.backup {
+                println!("private rollback files: {}", backup.display());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         if let Command::GitCredential {
             dev_user,
             token_file,
@@ -1304,6 +1333,7 @@ mod unix {
             Command::Get(name) => get(&paths, &name),
             Command::Keep(names) => keep(&paths, &names),
             Command::GitCredential { .. } => unreachable!(),
+            Command::GitSetup { .. } => unreachable!(),
             Command::Create {
                 source,
                 import,
@@ -1798,23 +1828,50 @@ mod unix {
     }
 
     /// A password piped in for `--password-stdin` or `password set`: one line, blanks
-    /// around it dropped.
+    /// around it dropped ([`read_piped_password`]).
     fn piped_password(what: &str) -> crate::Result<SecretBytes> {
         if std::io::stdin().is_terminal() {
             return Err(Error::new(format!("{what} reads the password from a pipe")));
         }
-        let mut bytes = Vec::with_capacity(join::MAX_LEN + 2);
+        read_piped_password(what, &mut std::io::stdin().lock())
+    }
+
+    /// The most a piped password's input may hold, blanks around the password included: past it
+    /// the input is refused whole, never cut to a password the person did not type.
+    const PIPED_PASSWORD_INPUT_MAX: usize = 4096;
+
+    /// [`piped_password`]'s reading of `input`: one line of at most [`join::MAX_LEN`] bytes, blanks
+    /// around it dropped. A longer password, an input past [`PIPED_PASSWORD_INPUT_MAX`], or one
+    /// that breaks its line with a CR or LF is refused.
+    pub(super) fn read_piped_password(
+        what: &str,
+        input: &mut dyn Read,
+    ) -> crate::Result<SecretBytes> {
+        let too_long = || {
+            Error::new(format!(
+                "{what}: a join password is at most {} bytes",
+                join::MAX_LEN
+            ))
+        };
+        let mut bytes = Vec::with_capacity(PIPED_PASSWORD_INPUT_MAX + 1);
         crate::secret::read_to_end_wiping_on_error(
-            std::io::stdin().take(join::MAX_LEN as u64 + 2),
+            input.take(PIPED_PASSWORD_INPUT_MAX as u64 + 1),
             &mut bytes,
         )?;
+        if bytes.len() > PIPED_PASSWORD_INPUT_MAX {
+            bytes.zeroize();
+            return Err(too_long());
+        }
         let trimmed = SecretBytes::from(bytes.trim_ascii());
         bytes.zeroize();
         if trimmed.as_slice().is_empty() {
             return Err(Error::new(format!("{what}: nothing was piped in")));
         }
-        if trimmed.as_slice().contains(&b'\n') {
+        if trimmed.as_slice().contains(&b'\n') || trimmed.as_slice().contains(&b'\r') {
             return Err(Error::new(format!("{what}: the password is one line")));
+        }
+        if trimmed.as_slice().len() > join::MAX_LEN {
+            return Err(too_long());
         }
         Ok(trimmed)
     }
@@ -2293,7 +2350,9 @@ mod unix {
             Membership::In { seq, heard } => {
                 println!("membership: in, seq {seq}, last heard {}", ago(heard));
             }
-            Membership::Revoked { seq } => println!("membership: revoked at seq {seq}"),
+            Membership::Revoked { seq } => {
+                println!("membership: {}", client::out_words(paths, seq))
+            }
             Membership::Plain => println!("membership: reading a plain text file"),
         }
         if !status.names.is_empty() {
@@ -2926,12 +2985,19 @@ mod unix {
         }
     }
 
+    /// git's attribute lines, up to the blank line that ends them or the end of `input`. Every
+    /// line git writes ends with its LF, so a last line cut off before one is refused (`None`):
+    /// a `host=` value cut short could name another host.
     fn read_credential_attributes(input: &mut dyn Read) -> Option<SecretBytes> {
         let mut buf = Vec::with_capacity(128);
         let mut line_len = 0usize;
         let mut byte = [0u8; 1];
         loop {
             match input.read(&mut byte) {
+                Ok(0) if line_len != 0 => {
+                    buf.zeroize();
+                    return None;
+                }
                 Ok(0) => break,
                 Ok(_) => {
                     if buf.len() >= CREDENTIAL_INPUT_MAX {
@@ -6795,6 +6861,43 @@ mod tests {
         }
     }
 
+    /// A piped join password longer than a `[join]` line holds is refused, never cut to the
+    /// part that fits, and so is one a CR breaks; the blanks around a password that fits are
+    /// dropped. Control: exactly [`crate::join::MAX_LEN`] bytes and a CR LF are taken whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_piped_password_is_refused_rather_than_cut_or_split() {
+        let read = |bytes: &[u8]| {
+            let mut input = bytes;
+            unix::read_piped_password("--password-stdin", &mut input)
+                .map(|password| password.as_slice().to_vec())
+        };
+        let mut exact = vec![b'p'; crate::join::MAX_LEN];
+        exact.extend_from_slice(b"\r\n");
+        assert_eq!(read(&exact).unwrap(), vec![b'p'; crate::join::MAX_LEN]);
+        let mut padded = b"  \n".to_vec();
+        padded.extend_from_slice(&exact);
+        padded.extend(std::iter::repeat_n(b'\n', 3000));
+        assert_eq!(read(&padded).unwrap(), vec![b'p'; crate::join::MAX_LEN]);
+
+        // What the old two-byte margin read as a whole password: the first MAX_LEN bytes and
+        // the CR LF after them, with the rest of the line dropped unread.
+        let mut cut = exact.clone();
+        cut.push(b'x');
+        let mut longer = vec![b'p'; crate::join::MAX_LEN + 1];
+        longer.push(b'\n');
+        let mut blank_tail = exact.clone();
+        blank_tail.extend(std::iter::repeat_n(b' ', 4096));
+        for refused in [
+            cut.as_slice(),
+            longer.as_slice(),
+            blank_tail.as_slice(),
+            b"first\rsecond\n",
+        ] {
+            assert!(read(refused).is_err(), "{:?}", refused.len());
+        }
+    }
+
     /// `revoke` and `admins remove` list every secret the machine could read (everything for an
     /// admin, `[everyone]` plus its own host sections for a member).
     #[cfg(unix)]
@@ -7804,6 +7907,27 @@ mod tests {
             ),
         ] {
             assert_eq!(silent, "");
+        }
+        // A request whose last line ends without its LF was cut short (here a `:8443` port git
+        // never sent past): no answer. Control: the same lines ended, at the end of input as at a
+        // blank line, answer.
+        assert_eq!(
+            ask(
+                Some("octocat"),
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com"
+            ),
+            ""
+        );
+        for ended in [
+            &b"protocol=https\nhost=github.com\n"[..],
+            b"protocol=https\r\nhost=github.com\r\n",
+        ] {
+            assert_eq!(
+                ask(Some("octocat"), Some("get"), false, ended),
+                "username=octocat\npassword=ghp_rotated_token\n"
+            );
         }
 
         // Terminal stdin, loose mode, empty/malformed content, symlink or missing token -> quit=1.

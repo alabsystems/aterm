@@ -266,9 +266,10 @@ impl Reader {
             } else {
                 string_token(rest.trim_start())?.0
             };
+            let display_name = folder_name(&name);
             folders.push(Folder {
-                id: name.clone(),
-                name: folder_name(&name),
+                id: name,
+                name: display_name,
             });
         }
         Ok(folders)
@@ -321,17 +322,21 @@ impl Reader {
         let reply = self.session.command(&format!(
             "UID FETCH {set} (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])"
         ))?;
-        let mut messages = Vec::new();
-        for part in fetch_parts(reply)? {
-            if !wanted.contains(&part.id) {
-                return Err("Unexpected message UID".into());
-            }
+        let mut parts = fetch_parts(reply)?;
+        if parts
+            .iter()
+            .any(|part| wanted.binary_search_by(|probe| part.id.cmp(probe)).is_err())
+        {
+            return Err("Unexpected message UID".into());
+        }
+        parts.sort_unstable_by_key(|part| std::cmp::Reverse(part.id));
+        let mut messages = Vec::with_capacity(parts.len());
+        for part in parts {
             let mut message = crate::mime::parse(&part.bytes)?;
             message.id = part.id.to_string();
             message.unread = !attributes_have_seen(&part.attributes);
             messages.push(message);
         }
-        messages.sort_by_key(|message| std::cmp::Reverse(message.id.parse::<u32>().unwrap_or(0)));
         Ok(messages)
     }
 
@@ -486,7 +491,6 @@ impl Session {
                 self.wire.renew(std::time::Duration::from_secs(60));
                 self.tag += 1;
                 let tag = format!("a{}", self.tag);
-                let tag_prefix = format!("{tag} ");
                 self.wire
                     .write(format!("{tag} AUTHENTICATE XOAUTH2\r\n").as_bytes())?;
                 let mut challenged = false;
@@ -498,7 +502,10 @@ impl Session {
                     }
                     let raw = String::from_utf8_lossy(&line);
                     let text = raw.trim_end_matches(['\r', '\n']);
-                    if let Some(status) = text.strip_prefix(&tag_prefix) {
+                    if let Some(status) = text
+                        .strip_prefix(&tag)
+                        .and_then(|rest| rest.strip_prefix(' '))
+                    {
                         if status
                             .split_whitespace()
                             .next()
@@ -556,7 +563,6 @@ impl Session {
     fn receive_status(&mut self, tag: &str) -> Result<Reply, ReceiveError> {
         let mut reply = Reply::default();
         let mut size = 0usize;
-        let tag_prefix = format!("{tag} ");
         loop {
             let mut line = self.wire.line()?;
             size = size
@@ -570,7 +576,10 @@ impl Session {
             }
             let text = String::from_utf8(line)
                 .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-            if let Some(status) = text.strip_prefix(&tag_prefix) {
+            if let Some(status) = text
+                .strip_prefix(tag)
+                .and_then(|rest| rest.strip_prefix(' '))
+            {
                 if status
                     .split_whitespace()
                     .next()

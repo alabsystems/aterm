@@ -41,3 +41,27 @@ fn expired_deadline_never_starts_a_helper() {
     let answer = read_claude_stage(Path::new("/private/state/logins/person+1"), Instant::now());
     assert!(matches!(answer, Err(ReadError::TimedOut)));
 }
+
+/// An answer that stays in the output buffer because the flush fails exits as unavailable,
+/// never `0`. NEGATIVE CONTROL: the same answer through a writer that takes it exits `0`.
+#[test]
+fn an_answer_the_parent_never_got_is_not_a_success() {
+    struct Unflushable(Vec<u8>);
+    impl std::io::Write for Unflushable {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let synthetic = b"synthetic answer";
+    assert_eq!(
+        emit(&mut Unflushable(Vec::new()), synthetic),
+        code(ReadError::Unavailable)
+    );
+    let mut taken = Vec::new();
+    assert_eq!(emit(&mut taken, synthetic), 0);
+    assert_eq!(taken, synthetic);
+}

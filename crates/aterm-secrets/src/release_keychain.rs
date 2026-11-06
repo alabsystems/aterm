@@ -15,6 +15,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::rc::{Rc, Weak};
+use zeroize::Zeroizing;
 
 use aterm_uds::deadline::RunError;
 
@@ -180,8 +181,9 @@ pub fn login_keychain_path(home: &Path) -> PathBuf {
         .join("login.keychain-db")
 }
 
-/// The release keychain's password. Its `Debug` is redacted, so no derive or panic prints it.
-pub struct Password(String);
+/// The release keychain's password. Its `Debug` is redacted, so no derive or panic prints it,
+/// and its text is zeroed when it is dropped.
+pub struct Password(Zeroizing<String>);
 
 impl std::fmt::Debug for Password {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,7 +193,7 @@ impl std::fmt::Debug for Password {
 
 impl AsRef<OsStr> for Password {
     fn as_ref(&self) -> &OsStr {
-        OsStr::new(&self.0)
+        OsStr::new(self.0.as_str())
     }
 }
 
@@ -1024,7 +1026,9 @@ fn stored_password(home: &Path) -> Stored {
         Ok(_) => {}
         Err(e) => return Stored::Unreadable(e.to_string()),
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    // Room for the most a read takes, so the read never moves the password to grow; zeroed on
+    // every way out.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_BYTES as usize + 1));
     if let Err(e) = file.take(MAX_PASSWORD_BYTES + 1).read_to_end(&mut bytes) {
         return Stored::Unreadable(e.to_string());
     }
@@ -1033,7 +1037,7 @@ fn stored_password(home: &Path) -> Stored {
     }
     match std::str::from_utf8(&bytes).map(str::trim) {
         Ok(text) if aterm_codec::hex::is_hex(text, 64) => {
-            Stored::Password(Password(text.to_string()))
+            Stored::Password(Password(Zeroizing::new(text.to_owned())))
         }
         _ => Stored::Malformed,
     }
@@ -1103,11 +1107,15 @@ fn create_password_with(
         .parent()
         .ok_or_else(|| fail(format!("{} has no folder", path.display())))?;
     crate::fsx::ensure_private_dir(dir).map_err(|e| fail(e.to_string()))?;
-    let mut bytes = [0u8; 32];
+    let mut bytes = Zeroizing::new([0u8; 32]);
     ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
+        .fill(&mut *bytes)
         .map_err(|_| fail("the system's random source failed".into()))?;
-    let password = aterm_codec::hex::encode_lower(&bytes);
+    let password = Password(Zeroizing::new(aterm_codec::hex::encode_lower(&*bytes)));
+    // The file's line, sized whole so it never moves the password to grow.
+    let mut line = Zeroizing::new(String::with_capacity(password.0.len() + 1));
+    line.push_str(&password.0);
+    line.push('\n');
     // Written whole beside the file, then linked into place: a full disk or a kill leaves no
     // partial file behind to block the next run, and a link never replaces a file another run
     // put there first.
@@ -1122,13 +1130,13 @@ fn create_password_with(
         .mode(0o600)
         .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
         .open(&partial)
-        .and_then(|mut file| fill(&mut file, format!("{password}\n").as_bytes()))
+        .and_then(|mut file| fill(&mut file, line.as_bytes()))
         .and_then(|()| std::fs::hard_link(&partial, &path));
     let _ = std::fs::remove_file(&partial);
     written
         .and_then(|()| aterm_durable::durable_dir(dir))
         .map_err(|e| fail(format!("{}: {e}", path.display())))?;
-    Ok(Password(password))
+    Ok(password)
 }
 
 /// A stand-in for `security` and `codesign` over modelled keychains, logging every argv.
@@ -2059,14 +2067,11 @@ mod tests {
             let password = read_password(&home)
                 .expect("readable")
                 .expect("written before any keychain is made");
-            let secret = password.0.clone();
+            let secret = password.0.as_str();
             let said = format!("{} {} {refused:?}", refused.what, refused.fix);
             assert!(refused.what.contains(said_as), "{step}: {said}");
-            assert!(
-                !said.contains(&secret),
-                "{step} leaked the password: {said}"
-            );
-            assert!(!format!("{password:?}").contains(&secret));
+            assert!(!said.contains(secret), "{step} leaked the password: {said}");
+            assert!(!format!("{password:?}").contains(secret));
         }
     }
 
@@ -2214,6 +2219,23 @@ mod tests {
                 "both move aside together: {refused:?}"
             );
         }
+    }
+
+    /// A password, made or read back from its file, holds its text where dropping it zeroes the
+    /// whole buffer ([`Zeroizing`]), and both spell the same password. This is a check on the
+    /// type: with a bare `String` in the field it does not compile.
+    #[test]
+    fn a_password_made_or_read_is_zeroed_when_it_is_dropped() {
+        fn zeroed_on_drop(text: &Zeroizing<String>) -> &str {
+            text.as_str()
+        }
+        let (_dir, home) = home();
+        let made = create_password(&home).expect("made");
+        let Stored::Password(read) = stored_password(&home) else {
+            panic!("the password just written reads back");
+        };
+        assert_eq!(zeroed_on_drop(&read.0), zeroed_on_drop(&made.0));
+        assert!(aterm_codec::hex::is_hex(zeroed_on_drop(&made.0), 64));
     }
 
     /// A password write that fails part-way leaves no password file and no partial file, so

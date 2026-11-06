@@ -99,6 +99,7 @@ fn default_unlisted(built: &Roster, observed: Option<&str>) -> bool {
         (&desk.roster(), &config),
         super::login_tests::NOW,
         &rediscovery,
+        None,
     );
     assert_eq!(rediscovery.lock().unwrap().synced_for.is_some(), due);
     if due {
@@ -108,6 +109,7 @@ fn default_unlisted(built: &Roster, observed: Option<&str>) -> bool {
             (&desk.roster(), &config),
             super::login_tests::NOW,
             &rediscovery,
+            None,
         ));
     }
     due

@@ -184,7 +184,12 @@ pub(crate) fn write_atomic_durable(path: &Path, bytes: &[u8], mode: u32) -> std:
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if file
+            .metadata()
+            .map_or(true, |m| m.permissions().mode() & 0o7777 != (mode & 0o7777))
+        {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
     }
     std::io::Write::write_all(&mut file, bytes)?;
     sync_all(&file)?;

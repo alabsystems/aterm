@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 13, "0.13");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 14, "0.14");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1718,7 +1718,12 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
     line_end_in(&cut, 0, cut.len(), rule).map(|end| i + end)
 }
 
-/// The status row's line, wrapped in a narrow pane.
+/// The status row's line, wrapped in a narrow pane. A done row's line (`✻ Cooked for 9s · done
+/// 3:33 PM`, [`is_done_shape`] as the transcript's box reads it) is read in that box
+/// ([`crate::wrap::transcript_line_end`]), where the captures measure Claude Code drawing and
+/// wrapping it. Any other status row's text-column wrap (a wait, a spinner whose parenthesis
+/// wraps) keeps [`crate::wrap::line_end`]'s boxed room and its slack: no capture measures where
+/// Claude Code wraps one, and that room joins every row the transcript's box would.
 fn line_end_in(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
     let row = rows[i].as_str();
     let t = crate::text::trim(row);
@@ -1751,7 +1756,12 @@ fn line_end_in(rows: &[String], i: usize, until: usize, width: usize) -> Option<
     let done_end = if is_activity_row(row) && !paren_open(text) {
         i
     } else {
-        crate::wrap::line_end(rows, i, text, lead + 2, width, until)
+        let boxed = crate::wrap::transcript_line_end(rows, i, text, lead + 2, width, until);
+        if is_done_shape(&crate::wrap::rejoined(&rows[i..=boxed])) {
+            boxed
+        } else {
+            crate::wrap::line_end(rows, i, text, lead + 2, width, until)
+        }
     };
     if done_end > i {
         return Some(if keeps(done_end) { done_end } else { i });
@@ -2809,18 +2819,14 @@ fn message_end(rows: &[String], open: usize, until: usize) -> usize {
     end
 }
 
-/// The line row `i` opens, read across the rows Ink wrapped it onto ([`crate::wrap`]).
+/// The line row `i` opens, read across the rows Ink wrapped it onto ([`crate::wrap`]): each line
+/// of a `⎿` block's text in its box, which ends at the pane's edge
+/// ([`crate::wrap::row_line_end`]).
 pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> (usize, String) {
-    let row = rows[i].as_str();
-    let end = if row.starts_with(['⏺', '●']) {
+    let end = if rows[i].starts_with(['⏺', '●']) {
         message_end(rows, i, until)
-    } else if let Some(after) = crate::text::trim_start(row).strip_prefix('⎿') {
-        let head = crate::text::trim(after);
-        let col = leading_spaces(row) + 1 + leading_spaces(after);
-        crate::wrap::line_end(rows, i, head, col, width, until)
     } else {
-        let head = crate::text::trim(row);
-        crate::wrap::line_end(rows, i, head, leading_spaces(row), width, until)
+        crate::wrap::row_line_end(rows, i, width, until)
     };
     (end, crate::wrap::rejoined(&rows[i..=end]))
 }
@@ -6165,6 +6171,135 @@ mod tests {
         assert_eq!(worker_phase(&wrap), Phase::Busy);
     }
 
+    /// A done row's status line is read in the transcript's box, which ends at the pane's edge
+    /// ([`crate::wrap::transcript_room`]), as Ink wraps there: no slack, the lead an exactly full
+    /// row leaves counted. MEASURED: under the 2.1.310 no-response retry at 60 columns the vendor's
+    /// hint opens a row of its own though its first word fits on the retry row (56 + 1 + 1 cells
+    /// of 58), and the status line is that row alone (a retry row takes no row under it, in any
+    /// box); each measured done row whose next word would end one cell past the edge (2.1.299 at
+    /// 34, 2.1.310 at 16 and 22, 2.1.318 at 12 and 14) is one line with the rows Ink wrapped it
+    /// onto. CONSTRUCTED from measured rows: the 2.1.302 done row `✻ Crunched for 0s · done 6:15
+    /// PM` over the 2.1.310 hint, each wrapped in the transcript's room, under 2.1.294's `⏺ Tool
+    /// call done.`, at 34 to 37 columns, where the hint's `A` fits on the done row at the pane's
+    /// edge but had no room in the pane less twice the column with two cells of slack: the done row
+    /// is the status line alone. NEGATIVE CONTROL: at 33 the `A` would end one cell past the edge,
+    /// and the rows are those a wrap draws. The same holds for that done row and the measured
+    /// 2.1.299, 2.1.310 and 2.1.318 ones over the hint at every width from 12 to 60: the done row
+    /// alone wherever the two lines draw other rows than Ink draws for them as one line, and where
+    /// they draw that one line's rows (the BOUND) the line takes the hint in, as no reader can tell
+    /// them apart. That covers 14 columns, where the done row's first row (`✻ Crunched for`) has
+    /// no done row's shape alone, so the box is chosen by the line it reads (`line_end_in`).
+    #[test]
+    fn a_status_line_is_read_in_a_box_that_ends_at_the_panes_edge() {
+        use crate::prompt::fixtures::{API_NO_RESPONSE_QUEUED_60_2_1_310, ink_wrap, screen};
+        let narrow = screen(API_NO_RESPONSE_QUEUED_60_2_1_310);
+        let lead = "✻ No response from the… · retrying once, waiting up to 10m";
+        let at = narrow
+            .iter()
+            .position(|r| r == lead)
+            .expect("PRECONDITION: the status row");
+        assert!(
+            narrow[at + 1].starts_with("  A proxy or gateway"),
+            "PRECONDITION: the hint under it"
+        );
+        assert_eq!(
+            status_line(&narrow).as_deref(),
+            Some(lead),
+            "measured at 60"
+        );
+        for (name, capture, line) in [
+            (
+                "2.1.299 at 34",
+                include_str!("fixtures/claude-2.1.299-api-error-529-34col.txt"),
+                "✻ Brewed for 2m 58s · done 10:27 AM",
+            ),
+            (
+                "2.1.310 at 16",
+                include_str!("fixtures/claude-2.1.310-auto-mode-setup-16col.txt"),
+                "✻ Cooked for 0s · done 12:39 AM",
+            ),
+            (
+                "2.1.310 at 22",
+                include_str!("fixtures/claude-2.1.310-auto-mode-setup-22col.txt"),
+                "✻ Churned for 0s · done 12:02 AM",
+            ),
+            (
+                "2.1.318 at 12",
+                include_str!("fixtures/claude-2.1.318-history-search-no-match-12col.txt"),
+                "✻ Churned for 0s · done 11:15 AM",
+            ),
+            (
+                "2.1.318 at 14",
+                include_str!("fixtures/claude-2.1.318-history-search-14col-long-query.txt"),
+                "✻ Cooked for 9s · done 3:33 PM",
+            ),
+        ] {
+            assert_eq!(
+                status_line(&screen(capture)).as_deref(),
+                Some(line),
+                "{name}"
+            );
+        }
+        let hint = "A proxy or gateway that buffers streaming responses can cause this · set \
+                    CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to change the first wait";
+        let drawn = |glyph: &str, text: &str, room: usize| -> Vec<String> {
+            ink_wrap(text, room)
+                .iter()
+                .enumerate()
+                .map(|(k, r)| format!("{}{r}", if k == 0 { glyph } else { "  " }))
+                .collect()
+        };
+        let stacked = |words: &str, width: usize| {
+            let room = crate::wrap::transcript_room(2, width);
+            let mut body = drawn("⏺ ", "Tool call done.", room);
+            body.push(String::new());
+            body.extend(drawn("✻ ", words, room));
+            body.extend(drawn("  ", hint, room));
+            body.push(String::new());
+            let body: Vec<&str> = body.iter().map(String::as_str).collect();
+            pane(&body, width, "  ⏵⏵ auto")
+        };
+        let words = "Crunched for 0s · done 6:15 PM";
+        let done = format!("✻ {words}");
+        let over_hint = |width: usize| stacked(words, width);
+        for width in 34..=37 {
+            let r = over_hint(width);
+            assert_eq!(
+                status_line(&r).as_deref(),
+                Some(done.as_str()),
+                "{width}: {r:#?}"
+            );
+        }
+        assert_eq!(
+            status_line(&over_hint(33)).map(|line| line.starts_with(&format!("{done} A proxy"))),
+            Some(true),
+            "NEGATIVE CONTROL: at 33 the rows are those a wrap draws"
+        );
+        for words in [
+            words,
+            "Brewed for 2m 58s · done 10:27 AM",
+            "Churned for 0s · done 12:02 AM",
+            "Cooked for 9s · done 3:33 PM",
+        ] {
+            let done = format!("✻ {words}");
+            for width in 12..=60 {
+                let room = crate::wrap::transcript_room(2, width);
+                let one = ink_wrap(&format!("{words} {hint}"), room);
+                let apart = [ink_wrap(words, room), ink_wrap(hint, room)].concat();
+                let r = stacked(words, width);
+                let line = status_line(&r);
+                if one == apart {
+                    assert!(
+                        line.is_some_and(|line| line.starts_with(&format!("{done} A proxy"))),
+                        "BOUND {width}: {r:#?}"
+                    );
+                } else {
+                    assert_eq!(line.as_deref(), Some(done.as_str()), "{width}: {r:#?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_status_glyph_ink_wrapped_away_from_its_text_is_the_status_row() {
         use crate::prompt::fixtures::screen as measured;
@@ -6414,6 +6549,10 @@ mod tests {
             .position(|row| row.starts_with("\u{273B} Waiting for"))
             .expect("the waiting row");
         assert_eq!(busy_zone_start(&r), waiting);
+        // HAND-BUILT: a wait wrapped at 16 columns. No capture measures where Claude Code wraps a
+        // wait, so its line keeps the boxed room and its slack (`line_end_in`): read in the
+        // transcript's box, where `1` fits on its first row, it would be `✻ Waiting for` alone
+        // and the carried wait would read Idle.
         let narrow = pane(
             &[
                 "✻ Waiting for",
@@ -7684,11 +7823,11 @@ mod tests {
     /// continuing automatically` beside one row, then the 2.1.316 composer's rules around the
     /// 2.1.302 composer's and footer's rows. CONTROL: the same rows in a pane as wide as the rule
     /// with no panel (each cut at the rule, the composer's rules that wide) read the same, and the
-    /// limit as measured: its kind, reset and placement, its message the notice's and the
-    /// countdown's (in the rule's room the wrap reader also joins the notice's `/upgrade …` row,
-    /// as it does in a pane that wide with no panel). NEGATIVE CONTROL: the vendor's words drawn as
-    /// a row of the transcript under the cancel end the auto-continue, and the cancel leaves no
-    /// limit.
+    /// limit as measured: its kind, reset, placement and message (the notice's `/upgrade …` line,
+    /// which fits on the notice's row in the rule's room, none of it:
+    /// [`a_line_that_fits_on_the_limit_notices_row_is_no_word_of_it`]). NEGATIVE CONTROL: the
+    /// vendor's words drawn as a row of the transcript under the cancel end the auto-continue, and
+    /// the cancel leaves no limit.
     #[test]
     fn the_side_panels_text_is_no_word_of_the_limit_a_cancel_left() {
         use crate::prompt::fixtures::{
@@ -7819,7 +7958,7 @@ mod tests {
                 );
                 let message = left.as_ref().map(|w| w.message.as_str());
                 if read != wanted
-                    || !message.is_some_and(|m| m.starts_with(NOTICE) && m.ends_with(COUNTDOWN))
+                    || message != Some(measured.3.message.as_str())
                     || left != left_wall(&narrow(&beside("", usize::MAX, None)))
                 {
                     misread.push(format!("{pane}, {name}: {read:?} {message:?}"));
@@ -7832,6 +7971,189 @@ mod tests {
             (auto_continue_end(&went_on), left_wall(&went_on)),
             (Some(AutoContinue::Fired), None),
             "NEGATIVE CONTROL"
+        );
+    }
+
+    /// A LINE THAT FITS ON THE LIMIT NOTICE'S ROW IS NO WORD OF IT: the limit a cancel left
+    /// ([`crate::wall::left_wall`], its message the newest limit notice's line) and the line last
+    /// said ([`last_said_line`], from the row [`crate::wrap::line_start`] walks back to) read a
+    /// `⎿` block's lines in its box, which ends at the pane's edge ([`crate::wrap::transcript_room`]),
+    /// as Ink wraps them. Read in the pane less twice the `⎿` text's column with two cells of
+    /// slack before (KI-1101-3), the notice's last row had no room for `/upgrade` in a pane 38 to
+    /// 40, 43 to 49 or 81 to 87 columns wide (of the widths from 38) nor beside the 2.1.316 panel's
+    /// rule at 81, so there the notice's message took in the separate `/upgrade to increase your
+    /// usage limit.` line, though it fits on that row (67 + 1 + 8 cells fit the 76 of a pane 81
+    /// wide), and, where that line is the last row said, so did the line last said, even once
+    /// `line_at` read the `⎿` row in its box: `line_start` walked back in the old room. No capture
+    /// draws this cancel at those widths, so these screens are CONSTRUCTED: the measured 2.1.302
+    /// cancelled auto-continue's rows, each drawn as Claude Code draws it in a pane `width` cells
+    /// wide (measured): a `⎿` block's text to the pane's edge, the vendor's own `⏺` notices (the countdown and the cancel) [`NOTICE_MARGIN`]
+    /// columns short of it, a reply to its edge, the composer's rules that wide; beside the panel,
+    /// the measured 2.1.316 panel capture's rows above its last waiting row, then the rows from the
+    /// prompt down to the cancel and a blank row drawn in the rule's room and padded to it, then
+    /// the 2.1.316 composer's rules around the 2.1.302 composer's and footer's rows; for the line
+    /// last said, the same rows down to the `/upgrade` line and a blank row. At every width from
+    /// 38 (the footer's 38 cells) to the measured 144 and beside the panel, wherever the two lines
+    /// draw other rows than Ink draws for them as one line, the limit reads as measured (its kind,
+    /// reset, placement and message) and the line last said is the `/upgrade` line. BOUND: where
+    /// they draw the very rows of the one line (the notice's last row too full for `/upgrade`:
+    /// 72 to 80 columns, and 41 and 42, where that row or the one over it is exactly full), the
+    /// rows cannot tell them apart, and both readers read the one line. CONTROL: the measured
+    /// 26-column 2.1.299 notice, which Ink wrapped over six rows (`session limit ·` over `resets`
+    /// one cell past the edge), is one line last said.
+    #[test]
+    fn a_line_that_fits_on_the_limit_notices_row_is_no_word_of_it() {
+        use crate::prompt::fixtures::{
+            WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302, ink_wrap, screen as captured,
+        };
+        use crate::question::cells;
+        use crate::wall::left_wall;
+        const NOTICE: &str = "You've hit your Sonnet limit · resets 10:06am (America/Los_Angeles)";
+        const UPGRADE: &str = "/upgrade to increase your usage limit.";
+        const COUNTDOWN: &str =
+            " — Usage limit reached · continuing automatically at 10:06am · esc to cancel";
+        const VENDORS: [&str; 2] = ["⏺ Usage limit reached", "⏺ Automatic continue cancelled"];
+        let cancelled = captured(WALL_SONNET_BUCKET_AUTO_CONTINUE_CANCELLED_2_1_302);
+        let measured = left_wall(&cancelled).expect("the measured cancel's limit");
+        assert_eq!(
+            measured.message,
+            format!("{NOTICE}{COUNTDOWN}"),
+            "PRECONDITION: the limit as measured at 144"
+        );
+        let frame = composer_frame(&cancelled).expect("the frame");
+        let find = |text: &str| {
+            cancelled
+                .iter()
+                .position(|r| crate::text::trim_start(r).starts_with(text))
+                .unwrap_or_else(|| panic!("the row {text:?}"))
+        };
+        let (from, upgrade, cancel) = (
+            find("❯ carry on with the task"),
+            find(UPGRADE),
+            find(VENDORS[1]),
+        );
+        assert!(
+            cancelled[upgrade + 1].is_empty(),
+            "PRECONDITION: a blank row under the `/upgrade` line"
+        );
+        let drawn = |row: &str, width: usize| -> Vec<String> {
+            let (lead, on, room) = if VENDORS.iter().any(|v| row.starts_with(v)) {
+                (2, "  ", width - NOTICE_MARGIN)
+            } else if row.starts_with('⏺') {
+                (2, "  ", width - 2)
+            } else if crate::text::trim_start(row).starts_with('⎿') || leading_spaces(row) == 5 {
+                (5, "     ", crate::wrap::transcript_room(5, width))
+            } else {
+                assert!(cells(row) <= width, "PRECONDITION: {row} fits");
+                return vec![row.to_string()];
+            };
+            let split = row.char_indices().nth(lead).map_or(row.len(), |(i, _)| i);
+            let (head, text) = row.split_at(split);
+            ink_wrap(text, room)
+                .into_iter()
+                .enumerate()
+                .map(|(k, r)| format!("{}{r}", if k == 0 { head } else { on }))
+                .collect()
+        };
+        let framed = |mut s: Vec<String>, width: usize| {
+            s.push("─".repeat(width));
+            s.extend(cancelled[frame.top + 1..frame.bottom].iter().cloned());
+            s.push("─".repeat(width));
+            s.extend(cancelled[frame.bottom + 1..].iter().cloned());
+            s
+        };
+        // The rows above row `until`, then the composer.
+        let at_width = |width: usize, until: usize| {
+            let s: Vec<String> = cancelled[..until]
+                .iter()
+                .flat_map(|r| drawn(r, width))
+                .collect();
+            framed(s, width)
+        };
+        let (panel, rule) = panel_capture_2_1_316();
+        let waiting = panel
+            .iter()
+            .rposition(|r| r.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let top = composer_frame(&panel).expect("the panel's frame").top;
+        let beside = |until: usize| {
+            let mut s = panel[..waiting].to_vec();
+            for row in cancelled[from..until]
+                .iter()
+                .map(String::as_str)
+                .chain([""])
+            {
+                s.extend(drawn(row, rule).iter().map(|r| format!("{r:<rule$}│")));
+            }
+            s.extend([
+                panel[top].clone(),
+                cancelled[frame.top + 1].clone(),
+                panel[top + 2].clone(),
+                cancelled[frame.bottom + 1].clone(),
+            ]);
+            s
+        };
+        let read = |r: &[String]| left_wall(r).map(|w| (w.kind, w.message, w.reset, w.placement));
+        let wanted = |message: String| {
+            Some((
+                measured.kind,
+                message,
+                measured.reset.clone(),
+                measured.placement,
+            ))
+        };
+        let one = format!("{NOTICE} {UPGRADE}");
+        let mark = crate::text::trim(&cancelled[upgrade - 1])
+            .strip_suffix(NOTICE)
+            .expect("PRECONDITION: the notice's `⎿` row over the `/upgrade` line");
+        let mut misread = Vec::new();
+        let mut one_line = Vec::new();
+        let panes = (38..=144)
+            .map(|w| {
+                let (r, said) = (at_width(w, frame.top), at_width(w, upgrade + 2));
+                (format!("{w} columns"), w, r, said)
+            })
+            .chain([(
+                format!("beside the panel's rule at {rule}"),
+                rule,
+                beside(cancel + 1),
+                beside(upgrade + 1),
+            )]);
+        for (pane, room, r, said) in panes {
+            let gutter = crate::wrap::transcript_room(5, room);
+            let apart = [ink_wrap(NOTICE, gutter), ink_wrap(UPGRADE, gutter)].concat();
+            let tell = ink_wrap(&one, gutter) != apart;
+            if !tell {
+                one_line.push(room);
+            }
+            let (message, line) = if tell {
+                (measured.message.clone(), UPGRADE.to_string())
+            } else {
+                (format!("{one}{COUNTDOWN}"), format!("{mark}{one}"))
+            };
+            if read(&r) != wanted(message) {
+                misread.push(format!("{pane}: left_wall {:?}", read(&r)));
+            }
+            let said_line = last_said_line(&said, Some(room));
+            if said_line.as_deref() != Some(line.as_str()) {
+                misread.push(format!("{pane}: last_said_line {said_line:?}"));
+            }
+        }
+        assert!(misread.is_empty(), "{misread:#?}");
+        assert_eq!(
+            one_line,
+            [vec![41, 42], (72..=80).collect()].concat(),
+            "BOUND: the widths whose rows are the one line's"
+        );
+        let narrow = captured(crate::prompt::fixtures::WALL_SESSION_AFTER_CANCEL_26_2_1_299);
+        let notice = crate::wall::wall(&narrow).expect("the measured notice");
+        assert_eq!(
+            last_said_line(&narrow, Some(26))
+                .as_deref()
+                .and_then(|l| l.strip_prefix('⎿'))
+                .map(crate::text::trim),
+            Some(notice.message.as_str()),
+            "CONTROL: the notice Ink wrapped over six rows is one line"
         );
     }
 

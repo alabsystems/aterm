@@ -287,7 +287,7 @@ fn a_posted_legacy_notary_request_is_reissued_with_its_entry_binding() {
         let mut terminal_seq = None;
         let mut replacement_seq = None;
         for (operation, command) in log.eligible() {
-            let mut record = record_of(&command)?;
+            let mut record = record_of(command)?;
             if record.kind == "request" && record.body.contains_key("entry") {
                 replacement_seq = Some(operation.header.sequence);
                 continue; // 0.146's closed schema rejects this request.

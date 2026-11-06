@@ -160,6 +160,81 @@ fn ok(r: (Result<Outcome>, Transcript)) -> (Outcome, Transcript) {
     }
 }
 
+#[test]
+fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to_publication() {
+    let fx = Fx::at(scratch("linux-upstream-git"));
+    fx.publish_pkg("git", 12, &manifest("git", 12, &DARWIN));
+    fx.publish_head(7, &[("git", 12)]);
+    let w = World::of(fx);
+    w.fx.packer.upstream.store(true, Ordering::SeqCst);
+    w.builder.0.lock().unwrap().clear();
+    w.keyless();
+    let (dry, _) = ok(w.run(true));
+    assert!(matches!(decision(&dry, "git"), Decision::Build { .. }));
+    assert!(w.fx.packer.legs().is_empty());
+    let (staged, _) = ok(w.run(false));
+    assert_eq!(staged.staged, ["git"]);
+    assert_eq!(staged.ready, ["git"]);
+    assert!(staged.signed.is_empty());
+    assert_eq!(w.fx.packer.legs().len(), 2);
+    assert!(
+        w.fx.packer
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.checkout.as_os_str().is_empty())
+    );
+    assert!(
+        w.fx.calls("clone ").is_empty(),
+        "an upstream Git package is not built from the aterm repo"
+    );
+    w.rekey();
+    let (published, _) = ok(w.run(false));
+    assert_eq!(published.signed, ["git"]);
+    assert_eq!(
+        w.fx.packer.legs().len(),
+        2,
+        "staged qualified rows are reused"
+    );
+    let (complete, _) = ok(w.run(true));
+    assert_eq!(*decision(&complete, "git"), Decision::Ok);
+    let published =
+        w.fx.public_asset("git", 12, "pkg-git-12.toml")
+            .expect("public signed package manifest");
+    let package: atpkg::PkgManifest =
+        aterm_toml::from_str(std::str::from_utf8(&published).unwrap()).unwrap();
+    assert!(package.artifact_for(X86.as_str()).is_some());
+    assert!(package.artifact_for(ARM.as_str()).is_some());
+    assert!(
+        package
+            .artifact_for(AARCH64_APPLE_DARWIN.as_str())
+            .is_some()
+    );
+}
+
+#[test]
+fn c_source_targets_remain_bound_to_their_own_channel_pin_without_rust_cross_support() {
+    let fx = Fx::at(scratch("linux-upstream-target-pin"));
+    fx.publish_pkg("git", 12, &manifest("git", 12, &DARWIN));
+    let mut text = fx.index_text(7, &[("git", 12)]);
+    text.push_str("pin_by_target = { \"aarch64-unknown-linux-gnu\" = { git = 13 } }\n");
+    fx.publish_index_text(7, &text);
+    let w = World::of(fx);
+    w.fx.packer.upstream.store(true, Ordering::SeqCst);
+    w.builder.0.lock().unwrap().clear();
+    let (outcome, _) = ok(w.run(true));
+    let git = outcome
+        .table
+        .iter()
+        .find(|(program, _)| program.name == "git")
+        .unwrap();
+    assert_eq!(git.0.rows[&ARM], RowState::Skipped);
+    assert_eq!(git.0.need(), [X86]);
+    assert_eq!(outcome.can, [X86]);
+    assert!(w.fx.packer.legs().is_empty());
+}
+
 fn decision<'a>(o: &'a Outcome, p: &str) -> &'a Decision {
     &o.table
         .iter()

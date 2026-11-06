@@ -9,7 +9,9 @@ use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{Plan, Subject};
 
 mod check;
+mod input_activation;
 pub use check::{check_initial_setup, check_initial_setup_observed};
+pub use input_activation::{activate_input_attachments, input_activation_revision};
 mod background_observation;
 pub use background_observation::check_background_workstation;
 mod observation;
@@ -5116,12 +5118,6 @@ trait InitialHost {
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String>;
-    /// Whether the Repositories stage, as [`Self::repositories`] last ran it, stopped for want
-    /// of Apple's Command Line Tools ([`aterm_machines::init_observe::Wait::CommandLineTools`]):
-    /// the pass then asks the window to install them ([`SetupHooks::developer_tools`]).
-    fn repositories_want_developer_tools(&mut self) -> bool {
-        false
-    }
     /// The reason the failed part of the Repositories stage, as [`Self::repositories`] last ran
     /// it, gives where the step that stopped decided one
     /// ([`aterm_machines::init_observe::failure_note`]): System State's row says it in place of
@@ -5202,28 +5198,15 @@ pub struct SetupHooks {
     pub stop: fn(u64) -> bool,
     /// A stage started or ended.
     pub stage: for<'a> fn(StageEvent<'a>),
-    /// The exact run revision and whether its Repositories stage waits on Apple's Command Line
-    /// Tools, which only a root install with the person's password adds: `true`, at the end of
-    /// an unstopped pass whose stage waits on them, and the window starts that install in a
-    /// terminal tab of its own (`aterm init --only base.clt`), once per launch, never in the
-    /// middle of a pass; `false` withdraws a want the window still holds, said as soon as the
-    /// stage ends without waiting on them (so a pass that fails after it leaves no want), or
-    /// when a Stop ends a pass whose stage waits on them. Once a pass that ran the stage, unless
-    /// it fails after asking. The run's park wakes once the tools are there:
-    /// a park's later sample differs from its first, and an install that finished during the
-    /// pass is a fact [`InitialSetupParkMark::facts_changed_since`] reads.
-    pub developer_tools: fn(u64, bool),
 }
 
 impl SetupHooks {
     /// A pass nobody stops or watches, with no page to say a person is there: nobody is on
     /// screen, so its sign-outs, a person stage, only read and wait; only a real presence hook
-    /// ([`Self::on_screen`]) runs them. Its person installs the Command Line Tools by
-    /// `aterm init`, which its row's remedy names.
+    /// ([`Self::on_screen`]) runs them.
     pub const NONE: Self = Self {
         stop: |_| false,
         stage: |_| {},
-        developer_tools: |_, _| {},
     };
 }
 
@@ -5278,48 +5261,6 @@ pub(super) const WAITING: &str = "waiting";
 /// vault coming back moves it without a person.
 pub(super) const UNREACHED: &str = "unreached";
 
-/// Where this process's LAN stands for a Secrets join held for System State's Local Network step
-/// ([`aterm_types::macos_setup::lan_first_use::Door`]), coarsely: a wait that only shrinks is no
-/// new fact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LanDoor {
-    /// The step is still to come and the wait for it holds the join.
-    Waits,
-    /// The wait ran out: the join goes through the door at the person's next quiet moment.
-    Spent,
-    /// Nothing holds the join for the step.
-    Open,
-}
-
-impl LanDoor {
-    /// The coarse reading of `door`, and when the wait could run out at the earliest (seconds
-    /// since the epoch, `now` being the read's), while it holds the join.
-    fn of(door: aterm_types::macos_setup::lan_first_use::Door, now: u64) -> (Self, Option<u64>) {
-        use aterm_types::macos_setup::lan_first_use::Door;
-        match door {
-            Door::Waits(left) => (
-                Self::Waits,
-                Some(now.saturating_add(left.as_secs() + u64::from(left.subsec_nanos() > 0))),
-            ),
-            Door::Spent => (Self::Spent, None),
-            Door::Open => (Self::Open, None),
-        }
-    }
-}
-
-/// A reading the park mark carries for its timer alone: no change of it is a new fact, so the
-/// timer only reads the mark again.
-#[derive(Clone, Copy, Default)]
-struct ParkTimer(Option<u64>);
-
-impl PartialEq for ParkTimer {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for ParkTimer {}
-
 /// Local facts that can wake a parked setup run. This is an observation, never
 /// authorization to run its stages.
 #[derive(Clone, PartialEq, Eq)]
@@ -5345,14 +5286,9 @@ pub struct InitialSetupParkMark {
     mac_settings_retry_due: Option<u64>,
     /// The earliest Secrets or Mac settings retry not due yet ([`InitialSetupParkMark::next_due`]).
     retry_ahead: Option<u64>,
-    /// Where this process's LAN stands for an unfinished Secrets stage's join, which waits while
-    /// System State's Local Network step is still to come (`lan_first_use::door`): the moment it
-    /// opens (the step hands it over, a use asks through the door) or the wait for the step runs
-    /// out is a new fact, so a join parked on the step goes on then.
-    lan: Option<LanDoor>,
-    /// When the wait for the step could run out at the earliest, in seconds since the epoch, while
-    /// it holds the join: the park's timer for it ([`Self::next_due`]), not a fact.
-    lan_spent_at: ParkTimer,
+    /// Current door readiness for an unfinished Secrets join. Becoming ready,
+    /// or another use asking, wakes the join without a countdown.
+    lan: Option<aterm_types::macos_setup::lan_first_use::Door>,
     /// An admitted, unfinished Accounts or Permissions stage
     /// ([`InitialSetupParkMark::waits_on_settings`]).
     in_settings: bool,
@@ -5397,28 +5333,13 @@ impl InitialSetupParkMark {
                 && before.developer_tools == Some(false))
     }
 
-    /// The mark with where this process's LAN stands for System State's step (`door`, read at
-    /// `now`), read only for a run whose Secrets stage is unfinished.
-    fn with_lan_door_at(
-        mut self,
-        now: u64,
-        door: impl FnOnce() -> aterm_types::macos_setup::lan_first_use::Door,
-    ) -> Self {
-        let read = self.subscriber_run.map(|_| LanDoor::of(door(), now));
-        self.lan = read.map(|(door, _)| door);
-        self.lan_spent_at = ParkTimer(read.and_then(|(_, spent)| spent));
-        self
-    }
-
-    /// [`Self::with_lan_door_at`] now, on this Mac's clock.
+    /// Read the first-use door only for an unfinished Secrets stage.
     fn with_lan_door(
-        self,
+        mut self,
         door: impl FnOnce() -> aterm_types::macos_setup::lan_first_use::Door,
     ) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        self.with_lan_door_at(now, door)
+        self.lan = self.subscriber_run.map(|_| door());
+        self
     }
 
     /// The mark with whether the Command Line Tools are installed (`installed`), read only
@@ -5468,9 +5389,16 @@ impl InitialSetupParkMark {
     /// one timer. `None`: no retry is ahead, so only a wake or a watched fact ends the park.
     pub fn next_due(&self) -> Option<u64> {
         self.retry_ahead
-            .into_iter()
-            .chain(self.lan_spent_at.0)
-            .min()
+    }
+
+    /// Presence, key rest or another dialog holds the first LAN use. These
+    /// process-local conditions need a bounded look beside the file/network watches.
+    #[must_use]
+    pub fn waits_on_lan_door(&self) -> bool {
+        matches!(
+            self.lan,
+            Some(aterm_types::macos_setup::lan_first_use::Door::Waiting)
+        )
     }
 
     /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
@@ -5663,7 +5591,6 @@ fn initial_setup_park_mark_reading(
             .min(),
         in_settings: pending.is_some_and(|(_, _, _, _, _, in_settings)| in_settings),
         lan: None,
-        lan_spent_at: ParkTimer(None),
     }
 }
 
@@ -6207,9 +6134,6 @@ mod parked_secrets_route_tests {
 
 struct LiveInitial<R> {
     reads: R,
-    /// Whether the last Repositories stage stopped for want of the Command Line Tools
-    /// ([`InitialHost::repositories_want_developer_tools`]).
-    developer_tools_wanted: bool,
     /// The reason the last Repositories stage's failed part gives
     /// ([`InitialHost::repositories_failure`]).
     repositories_failure: Option<&'static str>,
@@ -6227,7 +6151,6 @@ impl LiveInitial<secrets_retry::Live> {
     const fn live() -> Self {
         Self {
             reads: secrets_retry::Live,
-            developer_tools_wanted: false,
             repositories_failure: None,
             token_wanted: false,
             door_pass: None,
@@ -6379,7 +6302,6 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
 
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         let sys = aterm_machines::port::Live::new();
-        self.developer_tools_wanted = false;
         self.repositories_failure = None;
         self.token_wanted = false;
         let start = initial_setup_holds();
@@ -6397,14 +6319,9 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
                 }
             },
         )?;
-        self.developer_tools_wanted = ran.developer_tools;
         self.repositories_failure = ran.failure;
         self.token_wanted = ran.token;
         Ok(ran.rows)
-    }
-
-    fn repositories_want_developer_tools(&mut self) -> bool {
-        self.developer_tools_wanted
     }
 
     fn repositories_want_token(&mut self) -> bool {
@@ -6697,15 +6614,49 @@ fn secrets_try_with(
 }
 
 enum SecretsLaneFinish {
-    NotRun {
-        password: Option<SecretBytes>,
-    },
+    NotRun,
     Ran {
         ready: bool,
         rows: Vec<Row>,
         page: Option<PassPage>,
-        password: Option<SecretBytes>,
     },
+}
+
+/// A stage's running fence ([`SetupHooks::stage`]): open from [`Self::open`] until it drops, so
+/// a stage that ends early with an error is read as ended too, as one that finishes is. While its
+/// thread unwinds from a panic it calls no hook (as [`ledger::Begun`] records no end): the pass's
+/// caller retires what a panic cut off.
+struct StageFence<'a> {
+    stage: for<'b> fn(StageEvent<'b>),
+    settings: &'a [Setting],
+    subjects: &'a [Subject],
+}
+
+impl<'a> StageFence<'a> {
+    fn open(hooks: SetupHooks, settings: &'a [Setting], subjects: &'a [Subject]) -> Self {
+        (hooks.stage)(StageEvent {
+            settings,
+            subjects,
+            running: true,
+        });
+        Self {
+            stage: hooks.stage,
+            settings,
+            subjects,
+        }
+    }
+}
+
+impl Drop for StageFence<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            (self.stage)(StageEvent {
+                settings: self.settings,
+                subjects: self.subjects,
+                running: false,
+            });
+        }
+    }
 }
 
 struct WakeLaneOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
@@ -6730,7 +6681,7 @@ fn run_secrets_lane(
     admitted_vault: AdmittedVault,
     initial_done: u16,
     boot: Option<u128>,
-    mut password: Option<SecretBytes>,
+    password: &std::sync::Mutex<Option<SecretBytes>>,
     hooks: SetupHooks,
     reached_secrets: &std::sync::atomic::AtomicBool,
     stop_lane: &std::sync::atomic::AtomicBool,
@@ -6741,13 +6692,12 @@ fn run_secrets_lane(
             ready: rows_ready(&rows),
             rows,
             page: None,
-            password,
         });
     }
     if plan.vault_url != aterm_types::macos_setup::DEFAULT_VAULT_URL
         || in_plan_vault(plan, lane.configured_vault())
     {
-        return Ok(SecretsLaneFinish::NotRun { password });
+        return Ok(SecretsLaneFinish::NotRun);
     }
     let lan = access::wait_for_local_network_grant(root, access_revision, || {
         stop_lane.load(Ordering::Acquire)
@@ -6760,14 +6710,13 @@ fn run_secrets_lane(
         || (hooks.stop)(revision)
         || stopped_at(root)?.is_some()
     {
-        return Ok(SecretsLaneFinish::NotRun { password });
+        return Ok(SecretsLaneFinish::NotRun);
     }
     if let Some(rows) = automatic_secrets_rows(lane.swarm_enabled()) {
         return Ok(SecretsLaneFinish::Ran {
             ready: rows_ready(&rows),
             rows,
             page: None,
-            password,
         });
     }
     let paced = lane.secrets_pace();
@@ -6776,7 +6725,7 @@ fn run_secrets_lane(
         .and_then(|pace| secrets_retry::paused(root, revision, pace))
         .is_some()
     {
-        return Ok(SecretsLaneFinish::NotRun { password });
+        return Ok(SecretsLaneFinish::NotRun);
     }
     let stamp = ledger::Stamp {
         boot,
@@ -6789,16 +6738,12 @@ fn run_secrets_lane(
         ledger.begin(Stage::Secrets, initial_done, stamp, root)
     })?;
     if admitted != ledger::Admit::Run {
-        return Ok(SecretsLaneFinish::NotRun { password });
+        return Ok(SecretsLaneFinish::NotRun);
     }
     let begun = ledger::Begun::new(root, revision, Stage::Secrets);
     let settings = [Setting::Secrets];
     let subjects = [Subject::Setting(Setting::Secrets)];
-    (hooks.stage)(StageEvent {
-        settings: &settings,
-        subjects: &subjects,
-        running: true,
-    });
+    let fence = StageFence::open(hooks, &settings, &subjects);
     let started = std::time::Instant::now();
     let result = match secrets_try_with(|| lane.configured_vault(), plan, admitted_vault) {
         Ok(SecretsTry::LeaveInPlace(vault)) => {
@@ -6818,7 +6763,12 @@ fn run_secrets_lane(
             }
             Ok(rows)
         }
-        Ok(SecretsTry::RunItem(replaces)) => lane.secrets(plan, replaces, &mut password),
+        Ok(SecretsTry::RunItem(replaces)) => {
+            let mut held = password
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lane.secrets(plan, replaces, &mut held)
+        }
         Err(detail) => Ok(vec![Row {
             name: Stage::Secrets.name().into(),
             status: "unverified".into(),
@@ -6858,37 +6808,22 @@ fn run_secrets_lane(
     if ready || rows.iter().all(|row| row.status != "error") {
         page = Some(secrets_page(root, revision, &rows));
     }
-    (hooks.stage)(StageEvent {
-        settings: &settings,
-        subjects: &subjects,
-        running: false,
-    });
-    Ok(SecretsLaneFinish::Ran {
-        ready,
-        rows,
-        page,
-        password,
-    })
+    drop(fence);
+    Ok(SecretsLaneFinish::Ran { ready, rows, page })
 }
 
-/// Stop the pass's Secrets lane, if it runs (it stops at its next boundary), and take back the
-/// password it held.
+/// Stop the pass's Secrets lane, if it runs (it stops at its next boundary), and wait for it to
+/// end: the password it did not spend stays in the pass's hold for it ([`execute_pass`]).
 fn stop_secrets_lane(
     stop_lane: &std::sync::atomic::AtomicBool,
     lane: Option<
         std::io::Result<std::thread::ScopedJoinHandle<'_, Result<SecretsLaneFinish, String>>>,
     >,
-    password: &mut Option<SecretBytes>,
 ) {
     stop_lane.store(true, std::sync::atomic::Ordering::Release);
     access::notify_local_network_waiters();
-    if let Some(Ok(handle)) = lane
-        && let Ok(Ok(
-            SecretsLaneFinish::NotRun { password: left }
-            | SecretsLaneFinish::Ran { password: left, .. },
-        )) = handle.join()
-    {
-        *password = left;
+    if let Some(Ok(handle)) = lane {
+        let _ = handle.join();
     }
 }
 
@@ -6957,10 +6892,6 @@ fn execute_pass(
     let mut pages: Vec<(std::ops::Range<usize>, PassPage)> = Vec::new();
     // Each stage's rows its producer did not time carry the stage's time.
     let mut clock = RowClock::start();
-    // Whether this pass's Repositories stage, if it ran, waits on the Command Line Tools: the
-    // window hears an ask once the pass is over, a withdrawal at once
-    // ([`SetupHooks::developer_tools`]).
-    let mut developer_tools = None;
     let secrets_lane = (Stage::Secrets.selected(&plan)
         && progress.done & Stage::Secrets.bit() == 0
         && Stage::Workstation.selected(&plan)
@@ -6973,11 +6904,19 @@ fn execute_pass(
     let pass_revision = progress.revision;
     let pass_access_revision = progress.access_revision();
     let pass_admitted_vault = progress.admitted_vault;
+    // The typed join password, held for the Secrets lane while it runs beside the stages: what
+    // the lane leaves unspent goes back to `password` however the scope ends (its Secrets stage,
+    // a Stop, aterm quitting, an error, the lane failing to start or panicking).
+    let lane_password = std::sync::Mutex::new(if secrets_lane.is_some() {
+        password.take()
+    } else {
+        None
+    });
     // The scope ends the pass early with what it leaves: a Stop, or aterm quitting.
-    if let Some(cut) = std::thread::scope(|scope| -> Result<Option<SetupNext>, String> {
+    let cut = std::thread::scope(|scope| -> Result<Option<SetupNext>, String> {
         let _wake_on_drop = WakeLaneOnDrop(&stop_lane);
         let mut lane_handle = secrets_lane.map(|mut lane| {
-            let lane_password = password.take();
+            let lane_password = &lane_password;
             let lane_plan = &plan;
             let reached_ref = &reached_secrets;
             let stop_ref = &stop_lane;
@@ -7013,19 +6952,13 @@ fn execute_pass(
                         .map_err(|why| format!("secrets setup lane did not start: {why}"))?
                         .join()
                         .map_err(|_| "secrets setup lane panicked".to_owned())??;
+                    *password = lane_password
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
                     match finished {
-                        SecretsLaneFinish::NotRun {
-                            password: unspent_password,
-                        } => {
-                            *password = unspent_password;
-                        }
-                        SecretsLaneFinish::Ran {
-                            ready,
-                            rows,
-                            page,
-                            password: left_password,
-                        } => {
-                            *password = left_password;
+                        SecretsLaneFinish::NotRun => {}
+                        SecretsLaneFinish::Ran { ready, rows, page } => {
                             let left = SetupNext::of(&rows);
                             if ready {
                                 progress.done |= Stage::Secrets.bit();
@@ -7046,7 +6979,7 @@ fn execute_pass(
                 }
             }
             if stop_at_boundary(root, &mut progress, hooks)? {
-                stop_secrets_lane(&stop_lane, lane_handle.take(), password);
+                stop_secrets_lane(&stop_lane, lane_handle.take());
                 report.rows.push(Row {
                     name: "System State".into(),
                     status: "stopped".into(),
@@ -7055,9 +6988,6 @@ fn execute_pass(
                     elapsed_ms: None,
                 });
                 clock.lap(&mut report.rows);
-                if developer_tools == Some(true) {
-                    (hooks.developer_tools)(progress.revision, false);
-                }
                 return Ok(Some(SetupNext::Done));
             }
             let mut repository_vault = None;
@@ -7165,7 +7095,7 @@ fn execute_pass(
                 // here, so the quit cuts off only stages its note names, and goes on at the next
                 // launch, or at this one's next pass should the handoff be refused.
                 ledger::Admit::Quitting => {
-                    stop_secrets_lane(&stop_lane, lane_handle.take(), password);
+                    stop_secrets_lane(&stop_lane, lane_handle.take());
                     return Ok(Some(SetupNext::Retry));
                 }
                 ledger::Admit::Parked(park) => {
@@ -7186,11 +7116,7 @@ fn execute_pass(
             let begun = ledger::Begun::new(root, progress.revision, stage);
             progress.running = Some(stage);
             save_progress(root, progress)?;
-            (hooks.stage)(StageEvent {
-                settings: &settings,
-                subjects: &subjects,
-                running: true,
-            });
+            let fence = StageFence::open(hooks, &settings, &subjects);
             // The page's words for the stage's rows, where its report has them.
             let mut page = None;
             // The Secrets stage's join waited for System State's Local Network step, so it tried
@@ -7303,13 +7229,6 @@ fn execute_pass(
                 {
                     page.failed_because(Setting::Repositories, reason);
                 }
-                let wanted = host.repositories_want_developer_tools();
-                // A stage that no longer waits on the tools withdraws at once, so a pass that fails
-                // after it leaves no want standing; an ask waits for the pass's end.
-                if !wanted {
-                    (hooks.developer_tools)(progress.revision, false);
-                }
-                developer_tools = Some(wanted);
             }
             let left = SetupNext::of(&rows);
             if ready {
@@ -7350,14 +7269,17 @@ fn execute_pass(
             if let Some(page) = page {
                 pages.push((at..report.rows.len(), page));
             }
-            (hooks.stage)(StageEvent {
-                settings: &settings,
-                subjects: &subjects,
-                running: false,
-            });
+            drop(fence);
         }
         Ok(None)
-    })? {
+    });
+    if let Some(unspent) = lane_password
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        *password = Some(unspent);
+    }
+    if let Some(cut) = cut? {
         return Ok(Some((paged(report, pages), cut)));
     }
     clock.lap(&mut report.rows);
@@ -7375,26 +7297,15 @@ fn execute_pass(
             elapsed_ms: None,
         });
         clock.lap(&mut report.rows);
-        if developer_tools == Some(true) {
-            (hooks.developer_tools)(progress.revision, false);
-        }
         return Ok(Some((paged(report, pages), SetupNext::Done)));
     }
     // The follow-up changes its rows as a stage does: fenced from readings the same way.
     let owed = host.withheld_owed(root);
     let owed_subjects: Vec<Subject> = owed.iter().copied().map(Subject::Setting).collect();
-    let fence = |running| {
-        if !owed.is_empty() {
-            (hooks.stage)(StageEvent {
-                settings: &owed,
-                subjects: &owed_subjects,
-                running,
-            });
-        }
+    let followed = {
+        let _fence = (!owed.is_empty()).then(|| StageFence::open(hooks, &owed, &owed_subjects));
+        host.withheld(root)
     };
-    fence(true);
-    let followed = host.withheld(root);
-    fence(false);
     match followed {
         Ok(Some(follow_up)) => {
             let at = report.rows.len();
@@ -7446,11 +7357,6 @@ fn execute_pass(
         next = SetupNext::Done;
     }
     clock.lap(&mut report.rows);
-    // Only now, with nothing of this pass left to run (no sign-out to drive Messages over the
-    // password prompt), and never for a stopped run.
-    if developer_tools == Some(true) {
-        (hooks.developer_tools)(progress.revision, !stopped);
-    }
     Ok(Some((paged(report, pages), next)))
 }
 
@@ -7644,9 +7550,6 @@ mod tests {
         /// The live Accounts stage adapter over an inert account machine.
         native_accounts: Option<(aterm_machines::port::Fake, NativeHost)>,
         native_accounts_now: Option<std::time::SystemTime>,
-        /// Whether the last native Repositories stage stopped for want of the Command Line
-        /// Tools, read as the live host reads it ([`repositories::want_developer_tools`]).
-        developer_tools_wanted: bool,
         /// The reason its failed part gave ([`repositories::failure_note`]).
         repositories_failure: Option<&'static str>,
         /// Whether it stopped for want of a GitHub token ([`repositories::want_token`]).
@@ -7870,16 +7773,11 @@ mod tests {
                     ctx,
                     aterm_machines::model::Mode::Apply,
                 )?;
-                self.developer_tools_wanted = repositories::want_developer_tools(&rows);
                 self.repositories_failure = repositories::failure_note(&rows);
                 self.token_wanted = repositories::want_token(&rows);
                 return Ok(item_rows(rows));
             }
             self.stage(Stage::Repositories)
-        }
-
-        fn repositories_want_developer_tools(&mut self) -> bool {
-            self.developer_tools_wanted
         }
 
         fn repositories_failure(&mut self) -> Option<&'static str> {
@@ -10797,129 +10695,31 @@ mod tests {
         }
     }
 
-    /// At the end of a pass, a Repositories stage that stops for want of Apple's Command Line
-    /// Tools asks the window to install them ([`SetupHooks::developer_tools`] `true`), as the
-    /// live host reads the stop; one that stops on anything else (GitHub unreached, a person's
-    /// missing token) withdraws the ask (`false`) at once, before the pass's next stop boundary,
-    /// so a pass that fails after it leaves no want; and a pass a Stop ended at any boundary
-    /// after the stage withdraws there: before the deferred settings, at the pass's end, or
-    /// before a later stage.
+    /// Git readiness is a retryable repository prerequisite. A pass never asks the window to
+    /// install developer tools merely because managed Git has not arrived yet.
     #[test]
-    fn a_repositories_stage_without_the_command_line_tools_asks_the_window_to_install_them() {
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // Each call: the revision, the want, and how many stop boundaries the pass had asked.
-        static TOLD: Mutex<Vec<(u64, bool, usize)>> = Mutex::new(Vec::new());
-        // The pass's stop boundaries asked so far, and the one a Stop arrives at (0 is the
-        // first stage's).
-        static ASKED: AtomicUsize = AtomicUsize::new(0);
-        static STOP_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
-        let told = || std::mem::take(&mut *TOLD.lock().unwrap());
-        let hooks = SetupHooks {
-            developer_tools: |revision, wanted| {
-                TOLD.lock()
-                    .unwrap()
-                    .push((revision, wanted, ASKED.load(Ordering::SeqCst)));
-            },
-            stop: |_| ASKED.fetch_add(1, Ordering::SeqCst) >= STOP_AT.load(Ordering::SeqCst),
-            ..SetupHooks::NONE
-        };
-        let repositories: &[Setting] = &[Setting::Repositories];
-        let then_accounts: &[Setting] = &[Setting::Repositories, Setting::Messages];
-        let never = usize::MAX;
-        // `at`: the stop boundaries asked when the window hears: an ask after the pass's last
-        // (2), a withdrawal right after the stage (before the next) or at the Stop's own.
-        for (case, settings, tools, token, stop_at, waits, wanted, at) in [
-            (
-                "no tools",
-                repositories,
-                false,
-                true,
-                never,
-                SetupNext::Park,
-                true,
-                3,
-            ),
-            (
-                "GitHub unreached",
-                repositories,
-                true,
-                true,
-                never,
-                SetupNext::Retry,
-                false,
-                1,
-            ),
-            (
-                "no token",
-                repositories,
-                true,
-                false,
-                never,
-                SetupNext::Park,
-                false,
-                1,
-            ),
-            (
-                "stopped before deferred settings",
-                repositories,
-                false,
-                true,
-                1,
-                SetupNext::Done,
-                false,
-                2,
-            ),
-            (
-                "stopped at the pass's end",
-                repositories,
-                false,
-                true,
-                2,
-                SetupNext::Done,
-                false,
-                3,
-            ),
-            (
-                "stopped before the Accounts stage",
-                then_accounts,
-                false,
-                true,
-                1,
-                SetupNext::Done,
-                false,
-                2,
-            ),
-        ] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let revision = authorize_at(root.path(), &selected(settings))
-                .unwrap()
-                .unwrap();
-            let mut host = native_repositories(tools, token);
-            told();
-            STOP_AT.store(stop_at, Ordering::SeqCst);
-            // A stopped run runs no second pass.
-            let passes = if stop_at == never { 2 } else { 1 };
-            for pass in 1..=passes {
-                ASKED.store(0, Ordering::SeqCst);
-                let (_, next) = execute_initial_for_revision(
-                    &mut host,
-                    root.path(),
-                    revision,
-                    &mut None,
-                    hooks,
-                )
-                .unwrap()
-                .unwrap();
-                assert_eq!(next, waits, "{case}, pass {pass}");
-                assert_eq!(
-                    told(),
-                    [(revision, wanted, at)],
-                    "{case}, pass {pass}: told once, at that boundary"
-                );
-            }
+    fn a_repository_git_readiness_wait_remains_owed_without_a_developer_tools_request() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let revision = authorize_at(root.path(), &selected(&[Setting::Repositories]))
+            .unwrap()
+            .unwrap();
+        let mut host = native_repositories(false, true);
+        for _ in 0..2 {
+            let (_, next) = execute_initial_for_revision(
+                &mut host,
+                root.path(),
+                revision,
+                &mut None,
+                SetupHooks::NONE,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(next, SetupNext::Retry);
+            let saved = progress(root.path()).unwrap().unwrap();
+            assert!(!saved.completed);
+            assert_eq!(saved.done & Stage::Repositories.bit(), 0);
         }
+        assert_eq!(host.calls, [Stage::Repositories, Stage::Repositories]);
     }
 
     fn repositories_recover_after_an_interface_change(with_secrets: bool) {
@@ -11411,7 +11211,6 @@ mod tests {
             let hooks = SetupHooks {
                 stop: |_| STOP.load(Ordering::SeqCst),
                 stage: if request { after_permissions } else { |_| {} },
-                ..SetupHooks::NONE
             };
             let (_, next) =
                 execute_initial_for_revision(&mut stages, root.path(), revision, &mut None, hooks)
@@ -12919,11 +12718,7 @@ mod tests {
         fn stop(_: u64) -> bool {
             !ENDED.lock().unwrap().is_empty()
         }
-        let hooks = SetupHooks {
-            stop,
-            stage,
-            developer_tools: |_, _| {},
-        };
+        let hooks = SetupHooks { stop, stage };
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = selected(&[Setting::Widgets, Setting::Secrets]);
         let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
@@ -15337,7 +15132,6 @@ mod tests {
         };
         let mut host = LiveInitial {
             reads: reads(true),
-            developer_tools_wanted: false,
             repositories_failure: None,
             token_wanted: false,
             door_pass: None,
@@ -16417,13 +16211,8 @@ mod tests {
         assert_eq!(next, SetupNext::Done);
     }
 
-    /// A Secrets join parked on System State's Local Network step goes on once the LAN is no
-    /// longer held for the step, whatever window is in front: the park's timer is set for the
-    /// earliest moment the wait for the step could run out, and the wait running out, a use of
-    /// this window asking through the door, or the step handing the LAN over is a new fact that
-    /// ends the park (the setup worker hears each at once, `lan_first_use::on_open`). A wait that
-    /// only shrinks is no new fact. NEGATIVE CONTROL: a run with no unfinished Secrets stage
-    /// reads no door.
+    /// A Secrets join reacts to the first-use door's actual conditions, without
+    /// arming an artificial timer. A run with no unfinished Secrets stage reads no door.
     #[test]
     fn a_secrets_join_parked_on_the_step_wakes_once_the_lan_is_free() {
         use aterm_types::macos_setup::lan_first_use::Door;
@@ -16447,36 +16236,30 @@ mod tests {
         assert_eq!(next, SetupNext::Park);
         let route = || Some("en0 192.168.1.20 00:11:22:33:44:55".to_owned());
         let at = |now: u64, door: Door| {
-            initial_setup_park_mark_with(Some(root.path()), None, now, route)
-                .with_lan_door_at(now, || door)
+            initial_setup_park_mark_with(Some(root.path()), None, now, route).with_lan_door(|| door)
         };
-        let before = at(
-            vault::START,
-            Door::Waits(std::time::Duration::from_millis(40_500)),
+        let before = at(vault::START, Door::Waiting);
+        assert_eq!(before.next_due(), None, "no pre-door countdown");
+        assert!(
+            before.waits_on_lan_door(),
+            "the runner watches local readiness"
         );
-        assert_eq!(
-            before.next_due(),
-            Some(vault::START + 41),
-            "the park's timer: the earliest moment the wait could run out"
-        );
-        let later = at(
-            vault::START + 41,
-            Door::Waits(std::time::Duration::from_secs(25)),
-        );
+        let later = at(vault::START + 41, Door::Waiting);
         assert!(
             later == before && !later.facts_changed_since(&before),
-            "the person was away part of it: the timer reads the mark again, no new fact"
+            "elapsed time alone changes no door fact"
         );
-        assert_eq!(later.next_due(), Some(vault::START + 66));
-        let spent = at(vault::START + 66, Door::Spent);
+        let ready = at(vault::START + 42, Door::Ready);
         assert!(
-            spent != before && spent.facts_changed_since(&before),
-            "the wait ran out: the join goes through the door"
+            ready != before && ready.facts_changed_since(&before),
+            "the person's quiet moment admits the join now"
         );
-        assert_eq!(spent.next_due(), None, "no timer once spent");
+        assert_eq!(ready.next_due(), None);
+        assert!(!ready.waits_on_lan_door());
         let open = at(vault::START + 3_600, Door::Open);
+        assert!(!open.waits_on_lan_door());
         assert!(
-            open != spent && open.facts_changed_since(&spent),
+            open != ready && open.facts_changed_since(&ready),
             "another use asked through the door: the join follows its answer"
         );
         assert!(
@@ -16488,9 +16271,9 @@ mod tests {
         authorize_at(done.path(), &selected(&[Setting::Repositories])).unwrap();
         let read = |door: Door| {
             initial_setup_park_mark_with(Some(done.path()), None, vault::START, route)
-                .with_lan_door_at(vault::START, || door)
+                .with_lan_door(|| door)
         };
-        let waits = read(Door::Waits(std::time::Duration::from_secs(5)));
+        let waits = read(Door::Waiting);
         assert_eq!(waits.next_due(), None, "no Secrets stage: no door timer");
         assert!(read(Door::Open) == waits, "and no door fact");
     }
@@ -20315,6 +20098,8 @@ mod tests {
             parallel: bool,
             swarm: bool,
             turn_off_on_grant: bool,
+            /// Workstation ends the pass with an error before the lane hears its grant.
+            abort_before_grant: bool,
             state: Arc<(Mutex<LaneTimings>, Condvar)>,
         }
 
@@ -20336,12 +20121,14 @@ mod tests {
                 &mut self,
                 _plan: &Plan,
                 _replaces: Replaces,
-                _password: &mut Option<SecretBytes>,
+                password: &mut Option<SecretBytes>,
             ) -> Result<Vec<Row>, String> {
                 assert!(
                     self.swarm && !self.state.0.lock().unwrap().swarm_off,
                     "master-Off must never reach a join"
                 );
+                // The join spends the password it was given.
+                password.take();
                 let (lock, cvar) = &*self.state;
                 {
                     let mut st = lock.lock().unwrap();
@@ -20412,6 +20199,22 @@ mod tests {
             ) -> Result<Option<Report>, String> {
                 let revision = access_revision_at(root)?;
                 access::record_step_isolated_at(root, revision, AccessOutcome::Triggered);
+                if self.abort_before_grant {
+                    // The pass then reads no progress after the step, an error it ends on.
+                    std::fs::remove_file(root.join("initial-setup.json")).unwrap();
+                    return Ok(Some(Report {
+                        action: Action::Apply,
+                        rows: vec![readiness_row(
+                            Stage::Workstation.name(),
+                            true,
+                            "workstation preferences applied".into(),
+                        )],
+                        manual_steps: Vec::new(),
+                        backup: root.join("original-preferences.json"),
+                        restore: None,
+                        page: None,
+                    }));
+                }
                 if self.turn_off_on_grant {
                     let (lock, cvar) = &*self.state;
                     let mut state = lock.lock().unwrap();
@@ -20578,6 +20381,7 @@ mod tests {
             parallel: true,
             swarm: true,
             turn_off_on_grant: false,
+            abort_before_grant: false,
             state: Arc::clone(&parallel_state),
         };
         let (_, next) = execute_pass(
@@ -20614,6 +20418,7 @@ mod tests {
             parallel: false,
             swarm: true,
             turn_off_on_grant: false,
+            abort_before_grant: false,
             state: Arc::clone(&queued_state),
         };
         execute_pass(
@@ -20650,6 +20455,7 @@ mod tests {
                 parallel,
                 swarm,
                 turn_off_on_grant,
+                abort_before_grant: false,
                 state: Arc::clone(&state),
             };
             let (report, next) =
@@ -20667,6 +20473,67 @@ mod tests {
             assert!(!recorded.joined);
             assert_eq!(recorded.events, ["grant", "workstation-finished"]);
         }
+
+        // An earlier stage's error, while the lane still waits for its grant, ends the pass:
+        // that stage's fence still closes, and the join password the lane did not spend comes
+        // back to the person's run. NEGATIVE CONTROL: a pass whose lane joined spent the password,
+        // and closed each fence it opened too.
+        static FENCES: Mutex<Vec<StageReading>> = Mutex::new(Vec::new());
+        fn record_fence(event: StageEvent<'_>) {
+            FENCES.lock().unwrap().push((
+                event.running,
+                event.settings.to_vec(),
+                event.subjects.to_vec(),
+            ));
+        }
+        let fenced = SetupHooks {
+            stage: record_fence,
+            ..SetupHooks::NONE
+        };
+        let typed = || Some(SecretBytes::from(b"typed-join-pass".as_slice()));
+        let spent_root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(spent_root.path(), &chosen).unwrap().unwrap();
+        let mut spent_host = LaneFixture {
+            parallel: true,
+            swarm: true,
+            turn_off_on_grant: false,
+            abort_before_grant: false,
+            state: Arc::new((Mutex::new(LaneTimings::default()), Condvar::new())),
+        };
+        let mut spent = typed();
+        execute_pass(&mut spent_host, spent_root.path(), &mut spent, fenced)
+            .unwrap()
+            .expect("the control pass ran");
+        assert!(spent.is_none(), "the lane's join spent the password");
+        let events = std::mem::take(&mut *FENCES.lock().unwrap());
+        let opened = events.iter().filter(|event| event.0).count();
+        assert!(opened > 1 && events.len() == 2 * opened, "{events:?}");
+        let abort_root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(abort_root.path(), &chosen).unwrap().unwrap();
+        let mut abort_host = LaneFixture {
+            parallel: true,
+            swarm: true,
+            turn_off_on_grant: false,
+            abort_before_grant: true,
+            state: Arc::new((Mutex::new(LaneTimings::default()), Condvar::new())),
+        };
+        let mut unspent = typed();
+        let abort = execute_pass(&mut abort_host, abort_root.path(), &mut unspent, fenced)
+            .expect_err("a pass that loses its progress ends on an error");
+        assert!(abort.contains("setup progress changed"), "{abort}");
+        assert_eq!(
+            unspent.as_ref().map(SecretBytes::as_slice),
+            Some(b"typed-join-pass".as_slice()),
+            "an unspent join password outlives an earlier stage's error"
+        );
+        let events = std::mem::take(&mut *FENCES.lock().unwrap());
+        assert_eq!(
+            events.iter().map(|event| event.0).collect::<Vec<_>>(),
+            [true, false],
+            "{events:?}"
+        );
+        assert_eq!((&events[0].1, &events[0].2), (&events[1].1, &events[1].2));
+        assert!(events[0].1.contains(&Setting::Dock), "{events:?}");
     }
 
     #[test]

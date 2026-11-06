@@ -639,7 +639,7 @@ pub fn should_advertise_alab_tcp_with(
     (true, role)
 }
 
-/// Tender for a single `_alab._tcp` registration helper, tied to this process by
+/// The listener's direct LAN responder and one `_alab._tcp` registration helper, tied to this process by
 /// [`aterm_uds::spawnfd::Tether`], killed and reaped on drop or whenever this Mac stops
 /// advertising ([`advertises`]).
 pub struct AlabTcpAdvertiser {
@@ -651,6 +651,8 @@ pub struct AlabTcpAdvertiser {
 
 struct AdvertiserInner {
     child: Option<(aterm_uds::spawnfd::Child, Vec<String>)>,
+    #[cfg(unix)]
+    lan: Option<crate::lan_members::Responder>,
 }
 
 impl Default for AlabTcpAdvertiser {
@@ -667,7 +669,11 @@ impl AlabTcpAdvertiser {
             instance,
             mesh: DiscoveryPolicy::process_discovery().mesh,
             state: aterm_types::dirs::state_dir(),
-            inner: Mutex::new(AdvertiserInner { child: None }),
+            inner: Mutex::new(AdvertiserInner {
+                child: None,
+                #[cfg(unix)]
+                lan: None,
+            }),
         }
     }
 
@@ -694,14 +700,61 @@ impl AlabTcpAdvertiser {
         fleet_port: u16,
         window_open: bool,
     ) {
-        if !cfg!(target_os = "macos") {
-            return;
-        }
         let routes = current_route_tokens();
         let now_secs = aterm_time::unix_secs().unwrap_or(0);
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (eligible, role) =
             should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
+        #[cfg(unix)]
+        {
+            let identity = eligible
+                .then_some(self.state.as_ref())
+                .flatten()
+                .and_then(|state| {
+                    aterm_net::fleet_member::read_node_identity(state)
+                        .ok()
+                        .flatten()
+                });
+            let wanted = identity.as_ref().map(|node| (fleet_port, node.key()));
+            if guard.lan.as_ref().map(|lan| (lan.port, lan.key)) != wanted
+                || guard
+                    .lan
+                    .as_ref()
+                    .is_some_and(crate::lan_members::Responder::finished)
+            {
+                guard.lan = None;
+                if let Some((port, key)) = wanted
+                    && !cfg!(test)
+                    && std::env::var_os(aterm_types::world::MARKER).is_none()
+                    && std::env::var_os("CI").is_none()
+                    && std::env::var_os(aterm_secrets::discover::LAB_MEMBER_SERVICE_ENV).is_none()
+                {
+                    let paths = vault_paths.clone();
+                    let config = aterm_config.map(Path::to_owned);
+                    let state = self.state.clone();
+                    guard.lan = crate::lan_members::Responder::start(port, key, move || {
+                        state.as_ref().is_some_and(|state| {
+                            !left_the_fleet(state)
+                                && !node_turned_off(state)
+                                && aterm_net::fleet_member::read_node_identity(state)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|node| node.key() == key)
+                        }) && should_advertise_alab_tcp_with(
+                            &paths,
+                            config.as_deref(),
+                            &current_route_tokens(),
+                            aterm_time::unix_secs().unwrap_or(0),
+                        )
+                        .0
+                    })
+                    .ok();
+                }
+            }
+        }
+        if !cfg!(target_os = "macos") {
+            return;
+        }
         let wanted = eligible
             .then(|| {
                 if self.mesh {
@@ -723,9 +776,13 @@ impl AlabTcpAdvertiser {
         reconcile_dns_sd(&mut guard.child, wanted, &spawn_dns_sd);
     }
 
-    /// Stop and reap any running `dns-sd` child immediately.
+    /// Stop and join the LAN responder and reap any running `dns-sd` child.
     pub fn stop(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(unix)]
+        {
+            guard.lan = None;
+        }
         if let Some((mut child, _)) = guard.child.take() {
             let _ = child.kill();
             let _ = child.wait();

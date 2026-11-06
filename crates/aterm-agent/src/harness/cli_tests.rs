@@ -2983,6 +2983,37 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
 }
 
 #[test]
+fn an_open_journal_follows_the_ledger_left_by_each_kind_of_cut() {
+    for folded in [false, true] {
+        let tmp = tmp_dir("ledger-cut-writer");
+        let path = tmp.path().join("ledger.jsonl");
+        std::fs::write(&path, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+        let mut journal = Journal::open(Some(&path), None, &mut Vec::new());
+        let cut = |rows: &mut dyn Iterator<Item = String>, _: &dyn Fn(&Path) -> Option<String>| {
+            Some(rows.last().into_iter().collect())
+        };
+        // Both cut paths respect an append's lock and leave the file intact on contention.
+        let held = aterm_uds::line_log::lock(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = if folded {
+            bound_ledger_cut(&path, 1, &cut)
+        } else {
+            bound_ledger(&path, 1, 1)
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        assert!(if folded {
+            bound_ledger_cut(&path, 1, &cut).unwrap()
+        } else {
+            bound_ledger(&path, 1, 1).unwrap()
+        });
+        assert!(journal.append_raw("{\"id\":3}", &mut Vec::new()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"id\":2}\n{\"id\":3}\n");
+    }
+}
+
+#[test]
 fn a_ledger_cut_is_ordered_ahead_of_its_rename() {
     let tmp = tmp_dir("ledger-cut-flush");
     let path = tmp.path().join("ledger.jsonl");
@@ -3424,8 +3455,8 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
 }
 
 /// The owner's verb uses the same unit: with `disk.apply = true`, `--apply cargo-targets`
-/// reclaims only the idle profile's `incremental/`, prints what went and what it freed ("freed
-/// about": a count of unlinked blocks, not a measurement), and journals intent and outcome.
+/// reclaims only the idle profile's `incremental/`, prints what went and the file allocation
+/// counted, and journals intent and outcome.
 #[cfg(unix)]
 #[test]
 fn the_verb_applies_cargo_targets_with_the_same_unit() {
@@ -9696,9 +9727,10 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
             Unused::Stale {
                 incremental: 2,
                 units: 5,
+                superseded: 4,
                 after: RECLAIM_STALE,
             },
-            &["2 incremental", "5 unit", "3d"],
+            &["2 incremental", "5 unit", "4 unit", "3d"],
         ),
         (
             Unused::Tooling {
@@ -11225,6 +11257,148 @@ fn disk_free_removes_a_scratch_cache_journals_it_and_exits_nonzero_on_a_refusal(
 }
 
 #[test]
+fn disk_free_result_write_and_flush_failures_are_nonzero_without_undoing_cleanup() {
+    const OUTPUT_FAILURE: &str = "fixture output failure";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        Row,
+        Summary,
+        Flush,
+    }
+
+    struct ResultSink {
+        bytes: Vec<u8>,
+        remaining: Option<usize>,
+        fail_flush: bool,
+        flushed: bool,
+    }
+
+    impl Write for ResultSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = self
+                .remaining
+                .map_or(bytes.len(), |left| left.min(bytes.len()));
+            if count == 0 && !bytes.is_empty() {
+                return Err(io::Error::other(OUTPUT_FAILURE));
+            }
+            self.bytes.extend_from_slice(&bytes[..count]);
+            if let Some(left) = &mut self.remaining {
+                *left -= count;
+            }
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed = true;
+            if self.fail_flush {
+                Err(io::Error::other(OUTPUT_FAILURE))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    for dry_run in [false, true] {
+        for (json, failure) in [
+            (false, Failure::Row),
+            (true, Failure::Row),
+            (false, Failure::Summary),
+            (false, Failure::Flush),
+            (true, Failure::Flush),
+        ] {
+            let tmp = tmp_dir("disk-free-output");
+            let mut env = env_at(&tmp);
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let home = std::fs::canonicalize(home).expect("resolved home");
+            env.home = Some(home.clone());
+            std::fs::write(
+                env.config.as_ref().expect("fixture config"),
+                "[disk]\nauto_free_gib = 10\n",
+            )
+            .expect("grant");
+            let cache = home.join(".cache/tool");
+            let refill = || {
+                std::fs::create_dir_all(&cache).expect("cache");
+                std::fs::write(cache.join("blob"), vec![1u8; 4096]).expect("blob");
+            };
+            refill();
+            let paths = [cache.clone()];
+            let ask = DiskFree {
+                paths: &paths,
+                dry_run,
+                json,
+            };
+            let nobody = |_: &[PathBuf], _: &[u32]| -> io::Result<aterm_uds::holders::PathScan> {
+                Ok(aterm_uds::holders::PathScan::default())
+            };
+            let table = aterm_sysprobe::volumes::Table {
+                complete: true,
+                ..Default::default()
+            };
+            let (mut complete, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run_disk_free_with(&env, &ask, &nobody, &table, &mut complete, &mut err),
+                ExitCode::SUCCESS
+            );
+            if !dry_run {
+                assert!(!cache.exists());
+                refill();
+            }
+            let remaining = match failure {
+                Failure::Row => Some(1),
+                Failure::Summary => Some(
+                    complete
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .expect("result row")
+                        + 1,
+                ),
+                Failure::Flush => None,
+            };
+            let mut sink = ResultSink {
+                bytes: Vec::new(),
+                remaining,
+                fail_flush: matches!(failure, Failure::Flush),
+                flushed: false,
+            };
+            err.clear();
+            let code = run_disk_free_with(&env, &ask, &nobody, &table, &mut sink, &mut err);
+            assert_eq!(
+                code,
+                ExitCode::from(1),
+                "{failure:?} dry_run={dry_run} json={json}"
+            );
+            assert!(String::from_utf8_lossy(&err).contains(OUTPUT_FAILURE));
+            if let Some(limit) = remaining {
+                assert_eq!(sink.bytes, complete[..limit]);
+            } else {
+                assert!(sink.flushed);
+                assert_eq!(sink.bytes, complete);
+            }
+            if dry_run {
+                assert_eq!(
+                    std::fs::read(cache.join("blob")).expect("kept cache"),
+                    vec![1u8; 4096]
+                );
+                assert!(!env.disk_ledger().exists());
+            } else {
+                assert!(!cache.exists());
+                let actions: Vec<_> = std::fs::read_to_string(env.disk_ledger())
+                    .expect("ledger")
+                    .lines()
+                    .map(|line| aterm_json::from_str::<Value>(line).expect("row"))
+                    .filter(|row| row["kind"] == Value::from("disk-free"))
+                    .map(|row| row["action"].as_str().expect("action").to_owned())
+                    .collect();
+                assert_eq!(actions, ["removing", "removed", "removing", "removed"]);
+            }
+        }
+    }
+}
+
+#[test]
 fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions() {
     let tmp = tmp_dir("accounts-c17a");
     let env = env_at(&tmp);
@@ -11517,4 +11691,65 @@ fn a_refused_config_turns_disk_removals_off() {
     assert!(reading.off_by_fault);
     assert!(!reading.config.apply);
     assert!(reading.floor_gib.is_none());
+}
+
+/// THE ACCOUNTS REPORT'S TEXT COUNTS THE CATALOG'S OTHER ROWS, AND ITS JSON KEEPS THEM. Going
+/// through the report's own writer: a test of the catalog's text alone passes whichever the report
+/// calls.
+#[test]
+fn the_accounts_report_counts_other_macs_catalog_rows_and_its_json_keeps_them() {
+    use super::super::account_catalog::{Account, Catalog};
+    let row = |email: &str| Account {
+        key: email.into(),
+        operation: "operation".into(),
+        label: "Shared".into(),
+        provider: "anthropic".into(),
+        method: Some("oauth".into()),
+        email: Some(email.into()),
+        realm: None,
+        secret_reference: true,
+        required_browser: false,
+        conflicted: false,
+        stopped: false,
+        import: None,
+        import_link: None,
+    };
+    let catalog = Ok(Catalog {
+        table: "table".into(),
+        history_complete: true,
+        rows: vec![row("one@example.test"), row("two@example.test")],
+        ..Default::default()
+    });
+    let mut text = Vec::new();
+    write_combined_accounts_report(
+        Cli::Claude,
+        0,
+        false,
+        b"local\n",
+        None,
+        (Some(&catalog), None),
+        &mut text,
+    );
+    let text = String::from_utf8(text).expect("text");
+    assert!(
+        text.contains("2 of its 2 rows are not on this Mac"),
+        "{text}"
+    );
+    assert!(!text.contains("one@example.test"), "{text}");
+    let mut json = Vec::new();
+    write_combined_accounts_report(
+        Cli::Claude,
+        0,
+        true,
+        b"{}",
+        None,
+        (Some(&catalog), None),
+        &mut json,
+    );
+    let json: Value = aterm_json::from_slice(&json).expect("json");
+    assert_eq!(
+        json["shared_accounts"]["accounts"].as_array().map(Vec::len),
+        Some(2),
+        "{json}"
+    );
 }

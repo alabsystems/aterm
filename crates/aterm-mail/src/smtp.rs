@@ -124,8 +124,7 @@ fn expect(wire: &mut Wire, expected: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Encode a plain UTF-8 message with base64 transfer encoding and no Bcc header.
-pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
+pub(crate) fn validate_draft(draft: &Draft) -> Result<(), String> {
     fn address(value: &str) -> bool {
         value.is_ascii()
             && value.split_once('@').is_some_and(|(local, domain)| {
@@ -157,81 +156,86 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
     if draft.text.len() > 20 * 1024 * 1024 {
         return Err("Message exceeds 20 MiB".into());
     }
+    Ok(())
+}
+
+/// Encode a plain UTF-8 message with base64 transfer encoding and no Bcc header.
+pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
+    validate_draft(draft)?;
     let mut subject = String::new();
-    let mut part = String::new();
-    for ch in draft.subject.chars() {
-        if part.len() + ch.len_utf8() > 36 {
+    let mut chunk_start = 0usize;
+    let mut chunk_len = 0usize;
+    for (idx, ch) in draft.subject.char_indices() {
+        let ch_len = ch.len_utf8();
+        if chunk_len + ch_len > 36 {
             if !subject.is_empty() {
                 subject.push_str("\r\n ");
             }
             subject.push_str("=?UTF-8?B?");
-            subject.push_str(
-                &aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?,
-            );
+            aterm_codec::base64::encode_into(
+                &mut subject,
+                &draft.subject.as_bytes()[chunk_start..idx],
+            )
+            .map_err(|e| e.to_string())?;
             subject.push_str("?=");
-            part.clear();
+            chunk_start = idx;
+            chunk_len = 0;
         }
-        part.push(ch);
+        chunk_len += ch_len;
     }
-    if !part.is_empty() {
+    if chunk_start < draft.subject.len() {
         if !subject.is_empty() {
             subject.push_str("\r\n ");
         }
         subject.push_str("=?UTF-8?B?");
-        subject.push_str(&aterm_codec::base64::encode(part.as_bytes()).map_err(|e| e.to_string())?);
+        aterm_codec::base64::encode_into(&mut subject, &draft.subject.as_bytes()[chunk_start..])
+            .map_err(|e| e.to_string())?;
         subject.push_str("?=");
     }
-    let mut normalized = Vec::with_capacity(draft.text.len().saturating_add(draft.text.len() / 16));
     let raw_text = draft.text.as_bytes();
-    let mut i = 0;
-    while i < raw_text.len() {
-        match raw_text[i] {
-            b'\r' => {
-                normalized.extend_from_slice(b"\r\n");
-                if raw_text.get(i + 1) == Some(&b'\n') {
-                    i += 2;
-                } else {
+    let needs_crlf_norm = raw_text.iter().enumerate().any(|(i, &b)| {
+        (b == b'\r' && raw_text.get(i + 1) != Some(&b'\n'))
+            || (b == b'\n' && (i == 0 || raw_text[i - 1] != b'\r'))
+    });
+    let normalized: std::borrow::Cow<'_, [u8]> = if needs_crlf_norm {
+        let mut buf = Vec::with_capacity(raw_text.len().saturating_add(raw_text.len() / 16));
+        let mut i = 0;
+        while i < raw_text.len() {
+            match raw_text[i] {
+                b'\r' => {
+                    buf.extend_from_slice(b"\r\n");
+                    if raw_text.get(i + 1) == Some(&b'\n') {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                b'\n' => {
+                    buf.extend_from_slice(b"\r\n");
+                    i += 1;
+                }
+                b => {
+                    buf.push(b);
                     i += 1;
                 }
             }
-            b'\n' => {
-                normalized.extend_from_slice(b"\r\n");
-                i += 1;
-            }
-            b => {
-                normalized.push(b);
-                i += 1;
-            }
         }
-    }
-    let body = aterm_codec::base64::encode(&normalized).map_err(|e| e.to_string())?;
+        std::borrow::Cow::Owned(buf)
+    } else {
+        std::borrow::Cow::Borrowed(raw_text)
+    };
     let now = aterm_time::unix_secs().ok_or("System clock is unavailable")?;
     let date = mail_date(now)?;
     let mut identifier = [0u8; 16];
     aterm_uds::rand::fill(&mut identifier).map_err(|_| "Could not generate message identity")?;
-    let mut identifier = aterm_codec::base64::encode(&identifier)
-        .map_err(|e| e.to_string())?
-        .into_bytes();
-    while identifier.last() == Some(&b'=') {
-        identifier.pop();
-    }
-    for b in &mut identifier {
-        match *b {
-            b'+' => *b = b'-',
-            b'/' => *b = b'_',
-            _ => {}
-        }
-    }
-    let identifier = String::from_utf8(identifier).map_err(|e| e.to_string())?;
     let domain = draft.from.split_once('@').ok_or("Invalid sender")?.1;
+    let body_b64_len = normalized.len().div_ceil(3) * 4;
     let mut message =
-        String::with_capacity(256 + subject.len() + body.len() + (body.len() / 76) * 2);
+        String::with_capacity(256 + subject.len() + body_b64_len + (body_b64_len / 76) * 2);
     use std::fmt::Write as _;
-    let _ = write!(
-        message,
-        "Date: {date}\r\nMessage-ID: <{identifier}@{domain}>\r\nFrom: {}\r\n",
-        draft.from
-    );
+    let _ = write!(message, "Date: {date}\r\nMessage-ID: <");
+    aterm_codec::base64::encode_url_into(&mut message, &identifier).map_err(|e| e.to_string())?;
+    let _ = write!(message, "@{domain}>\r\nFrom: {}\r\n", draft.from);
     if !draft.to.is_empty() {
         message.push_str("To: ");
         for (i, addr) in draft.to.iter().enumerate() {
@@ -256,12 +260,13 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
         message,
         "Subject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
     );
-    for line in body.as_bytes().chunks(76) {
-        message.push_str(std::str::from_utf8(line).map_err(|_| "Invalid encoded body")?);
+    if normalized.is_empty() {
         message.push_str("\r\n");
-    }
-    if body.is_empty() {
-        message.push_str("\r\n");
+    } else {
+        for chunk in normalized.chunks(57) {
+            aterm_codec::base64::encode_into(&mut message, chunk).map_err(|e| e.to_string())?;
+            message.push_str("\r\n");
+        }
     }
     Ok(message.into_bytes())
 }

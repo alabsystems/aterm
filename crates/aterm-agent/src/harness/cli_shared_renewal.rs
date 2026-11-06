@@ -1018,7 +1018,12 @@ pub(in crate::harness) fn background(
         &mut guard,
         &mut observation,
     );
-    if result != Renewal::Renewed {
+    if result != Renewal::Renewed
+        && !host.work_cancelled()
+        && !observation
+            .as_ref()
+            .is_some_and(super::RenewalObservation::service_deferred)
+    {
         guard.failed(
             store,
             policy,

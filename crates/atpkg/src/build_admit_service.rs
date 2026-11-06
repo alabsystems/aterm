@@ -28,7 +28,19 @@ pub mod monitor;
 
 #[path = "build_admit_epochs.rs"]
 mod epochs;
+pub use super::host::RetainedRefused;
 pub use epochs::{EpochAccepted, EpochId, EpochRefused};
+
+/// Resource custody is installed, including if dispatch or publication later failed.
+/// Keep the attempt for recovery; publication success is not a start or drain receipt.
+#[derive(Debug)]
+#[must_use = "an accepted retained attempt remains owned through later failure"]
+pub struct RetainedAccepted {
+    pub attempt: Attempt,
+    /// Observer publication outcome. Dispatch failures stay with the owned attempt
+    /// and are reported in its job snapshot and eventual completion.
+    pub publication: io::Result<()>,
+}
 
 /// Incarnation-bound event cursor, not a control credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +430,72 @@ impl Owner {
             generation: self.generation,
             sequence,
         })
+    }
+
+    /// Retain actual resource guards before target birth and until native cohort settlement.
+    /// The accepted attempt stays owned through dispatch, observer and wait failures;
+    /// dropping clients never releases its resources. A reaped root with a retained or
+    /// unreadable cohort remains in the table and keeps `is_empty()` false.
+    ///
+    /// This is process-local ownership, not a Python submission endpoint or crash-safe
+    /// transfer to another process. Dropping the owner leaves pending retained jobs to
+    /// its process's reaper, which supplies no receipt of completed cleanup.
+    ///
+    /// # Errors
+    /// A pre-dispatch refusal returns the original admission and resource bundle.
+    pub fn submit_retained<T: Send + 'static>(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: std::time::Duration,
+        retained: T,
+    ) -> Result<RetainedAccepted, RetainedRefused<T>> {
+        let ready = (|| {
+            self.check_owner()?;
+            if self.jobs.len() + self.epochs.active_len() >= aterm_capacity::host_protocol::MAX_JOBS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "host observation capacity is full",
+                ));
+            }
+            if let Some(fence) = &self.fence {
+                fence.check_claim(held.claim())?;
+            }
+            let state = self
+                .observer
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.exhausted || state.snapshot.revision == u64::MAX {
+                return Err(io::Error::other(
+                    "host publication exhausted; new submission refused",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = ready {
+            return Err(RetainedRefused::new(error, held, retained));
+        }
+        let ticket = self.jobs.submit_retained(held, command, grace, retained)?;
+        let sequence = ticket.id.sequence();
+        self.tickets.insert(sequence, ticket);
+        Ok(RetainedAccepted {
+            attempt: Attempt {
+                generation: self.generation,
+                sequence,
+            },
+            publication: self.publish(vec![(Some(sequence), Event::Submitted)]),
+        })
+    }
+
+    /// Direct owner-side job observations, including retained resources after root reap.
+    /// These values supply no child, group-control or guard-release authority.
+    /// # Errors
+    /// This owner belongs to a different process.
+    pub fn job_snapshot(&self) -> io::Result<Vec<super::host::JobInfo>> {
+        self.check_owner()?;
+        self.jobs.snapshot()
     }
 
     fn controls(&mut self, events: &mut Vec<(Option<u64>, Event)>) {

@@ -85,7 +85,7 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
             .map_err(|_| "Invalid mail session")?,
     );
     rest = &rest[8..];
-    let mut field = || -> Result<Secret, String> {
+    let mut field = || -> Result<&str, String> {
         let len = u32::from_le_bytes(
             rest.get(..4)
                 .ok_or("Truncated mail session")?
@@ -102,16 +102,16 @@ fn decode(email: &str, bytes: &[u8]) -> Result<Credentials, String> {
             return Err("Invalid mail session field".into());
         }
         rest = &rest[len..];
-        Ok(Secret::new(value.into()))
+        Ok(value)
     };
-    if !field()?.expose().eq_ignore_ascii_case(email) {
+    if !field()?.eq_ignore_ascii_case(email) {
         return Err("Mail session belongs to another account".into());
     }
     let credentials = Credentials {
         expires,
-        uid: field()?,
-        access: field()?,
-        refresh: field()?,
+        uid: Secret::new(field()?.into()),
+        access: Secret::new(field()?.into()),
+        refresh: Secret::new(field()?.into()),
     };
     if !rest.is_empty() {
         return Err("Trailing mail session data".into());

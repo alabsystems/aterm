@@ -80,6 +80,47 @@ pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     read_within(path, MAX_CSV)
 }
 
+/// Read a file's bytes within [`MAX_CSV`] when `path` is a regular file, or `Ok(None)` when it is
+/// absent or not a regular file, without a preliminary `stat`.
+///
+/// # Errors
+/// A regular file is there and cannot be read or exceeds capacity.
+#[cfg(unix)]
+pub(crate) fn read_bounded_if_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_CSV as u64 {
+        return Err(Error::new("a sheet exceeds import capacity"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+    file.take((MAX_CSV + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CSV {
+        return Err(Error::new("a sheet exceeds import capacity"));
+    }
+    Ok(Some(bytes))
+}
+
 /// [`read_bounded`] with `max` bytes the most read: an xlsx workbook ([`MAX_WORKBOOK`]).
 ///
 /// # Errors

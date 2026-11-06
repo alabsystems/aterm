@@ -164,7 +164,11 @@ fn standin_run_reports_once_interrupted() {
         std::thread::sleep(MUST_HAPPEN * 2);
     }
     let scratch = ctx.scratch.clone();
-    crate::let_disk_go(Some(disk), code == crate::exit::PASS, Some(&mut log));
+    crate::let_disk_go(
+        crate::disk::Disk::Held(disk),
+        code == crate::exit::PASS,
+        Some(&mut log),
+    );
     crate::end_run(&ctx, &scratch);
     std::process::exit(code);
 }

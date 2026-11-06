@@ -1364,7 +1364,7 @@ impl NativeUpdaterService {
         })
     }
 
-    fn apply_ticket_is_current(&self, ticket: &ApplyAttemptTicket) -> bool {
+    pub(crate) fn apply_ticket_is_current(&self, ticket: &ApplyAttemptTicket) -> bool {
         let matches_stage = self.snapshot.staged.as_ref().is_some_and(|staged| {
             staged.generation == ticket.generation && staged.build == ticket.artifact_build
         });

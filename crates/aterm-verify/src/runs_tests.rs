@@ -1719,6 +1719,7 @@ fn a_runs_record_roots_are_the_dirs_its_build_names() {
             ),
             code: Some(0),
             spawn_error: None,
+            usage: None,
         }
     })
     .expect("a record");
@@ -1803,6 +1804,7 @@ fn a_stage_groups_line_is_bounded_whatever_its_label() {
         output: String::new(),
         code: None,
         spawn_error: None,
+        usage: None,
     })
     .expect("a record");
     let fits = "targo --unverified test -p aterm-uds -p aterm-verify …+3 args";
@@ -2213,6 +2215,7 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         output: String::new(),
         code: None,
         spawn_error: None,
+        usage: None,
     })
     .expect("a record");
     let cmd = crate::exec::Cmd::new("/bin/sh")
@@ -2292,6 +2295,7 @@ fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
         output: String::new(),
         code: None,
         spawn_error: None,
+        usage: None,
     })
     .expect("a record");
     let reaped_leader = || -> u32 {
@@ -2878,6 +2882,7 @@ fn the_default_poster_is_inert() {
         output: String::new(),
         code: None,
         spawn_error: None,
+        usage: None,
     })
     .expect("a record");
     assert_eq!(format!("{:?}", runs.poster), format!("{Inert:?}"));

@@ -1165,6 +1165,12 @@ fn short_version_query(word: &str) -> bool {
 /// and clean. Clean must reach Cargo even for an unregistered target, without adopting it.
 /// A command name used as an option value, an external alias or lint argument proves none of this.
 fn non_producing_command(args: &[String], tool: super::Tool) -> bool {
+    // A native scheduler capability probe has no command or build output.
+    // Recognize only its exact shape; aliases and mixed commands still owe
+    // normal cache ownership and build admission.
+    if tool == super::Tool::Targo && matches!(args, [flag] if flag == "--resource-capabilities") {
+        return true;
+    }
     if tool == super::Tool::Tippy {
         return false;
     }
@@ -2062,17 +2068,17 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
             super::RECLAIM_STALE,
         );
         if !doomed.is_empty() {
-            let incremental = doomed
-                .iter()
-                .filter(|part| part.part == super::stale::Part::Incremental)
-                .count();
-            let units = doomed.len() - incremental;
+            let count = |which| doomed.iter().filter(|part| part.part == which).count();
+            let incremental = count(super::stale::Part::Incremental);
+            let units = count(super::stale::Part::Unit);
+            let superseded = count(super::stale::Part::Superseded);
             planned.push(super::Planned {
                 path: cache.root,
                 paths: doomed.into_iter().flat_map(|part| part.paths).collect(),
                 why: super::Unused::Stale {
                     incremental,
                     units,
+                    superseded,
                     after: super::RECLAIM_STALE,
                 },
                 held,
@@ -2715,6 +2721,36 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn resource_capabilities_query_reaches_native_without_observing_cache_ownership() {
+        let args = vec!["--resource-capabilities".to_owned()];
+        let home = Path::new("/unreadable-home");
+        let machine = super::super::Machine {
+            home: Some(home),
+            root: None,
+            cwd: Some(home),
+            env: &|_| panic!("a capability query must not inspect inherited cache settings"),
+            read: &|_| panic!("a capability query must not read or register caches"),
+            writable: &|_| panic!("a capability query must not require cache writes"),
+        };
+        assert!(
+            !observe_for_producer(&args, super::super::Tool::Targo, home, &machine, true).unwrap()
+        );
+        assert!(crate::build_admit::classify(&args, super::super::Tool::Targo).is_none());
+        for tool in [super::super::Tool::Cargo, super::super::Tool::Tippy] {
+            assert!(!non_producing_command(&args, tool));
+        }
+        for args in [
+            vec!["--resource-capabilities", "build"],
+            vec!["--resource-capabilities", "--target-dir=elsewhere"],
+            vec!["--unverified", "--resource-capabilities"],
+            vec!["alias", "--resource-capabilities"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(!non_producing_command(&args, super::super::Tool::Targo));
+        }
+    }
 
     struct World {
         _directory: aterm_tempfile::TempDir,

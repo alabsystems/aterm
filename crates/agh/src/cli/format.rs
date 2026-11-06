@@ -37,6 +37,7 @@ pub fn render(
         }
         Format::Tsv => {
             let mut out = String::new();
+            let mut scratch = String::new();
             if header {
                 for (i, c) in columns.iter().enumerate() {
                     if i > 0 {
@@ -51,7 +52,9 @@ pub fn render(
                     if i > 0 {
                         out.push('\t');
                     }
-                    tsv_escape_into(&mut out, &cell(&value_at(value, c)));
+                    scratch.clear();
+                    cell_into(&mut scratch, &value_at(value, c));
+                    tsv_escape_into(&mut out, &scratch);
                 }
                 out.push('\n');
             }
@@ -96,15 +99,21 @@ pub fn render(
 
 /// Formats a single cell value as an unescaped string.
 pub(crate) fn cell(value: &Value) -> String {
+    let mut out = String::new();
+    cell_into(&mut out, value);
+    out
+}
+
+/// Appends a single cell value as an unescaped string to `out`.
+pub(crate) fn cell_into(out: &mut String, value: &Value) {
+    use std::fmt::Write as _;
     match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        Value::Array(items) => {
-            let mut out = String::new();
-            cell_array_into(&mut out, items);
-            out
+        Value::Null => {}
+        Value::String(text) => out.push_str(text),
+        Value::Array(items) => cell_array_into(out, items),
+        Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+            let _ = write!(out, "{value}");
         }
-        Value::Bool(_) | Value::Number(_) | Value::Object(_) => value.to_string(),
     }
 }
 
@@ -142,6 +151,9 @@ fn tsv_escape_into(out: &mut String, text: &str) {
 
 /// Escapes tabs, line endings, and control bytes for terminal display.
 fn for_person(text: &str) -> String {
+    if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
+        return aterm_codec::tty::safe(text.as_bytes()).into_owned();
+    }
     let mut flat = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(c, '\n' | '\r' | '\t') {

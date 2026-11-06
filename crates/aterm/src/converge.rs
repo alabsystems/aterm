@@ -397,18 +397,6 @@ fn accounts_at(
     }
 }
 
-/// Whether `aterm.toml` at `config_path` explicitly turns swarm off (`[swarm] enabled = false`).
-fn swarm_disabled_at(config_path: &Path) -> Result<bool, String> {
-    let config =
-        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let Some(text) = config.text().map_err(|e| e.to_string())? else {
-        return Ok(false);
-    };
-    aterm_secrets::swarm::enabled_in_toml(text)
-        .map(|on| !on)
-        .map_err(|e| format!("aterm.toml: {e}"))
-}
-
 /// The Mac's own names the root half of the one password sets as two separate `[names]` rows
 /// (`scutil --set ComputerName` and `--set LocalHostName`), as `scutil --get` reads them now:
 /// `None` where a read failed, the name is unset, or the platform has none.
@@ -500,26 +488,54 @@ struct IdentityConfig {
 }
 
 /// Read what `sync.identity` reads from `config_path` (an absent file holds nothing).
+#[cfg(test)]
 fn read_identity_config(config_path: &Path) -> Result<IdentityConfig, String> {
     let config =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
     read_identity_snapshot(&config)
 }
 
+/// Read identity choices from `config`, or `None` when `[swarm] enabled = false`.
+fn read_enabled_identity_snapshot(
+    config: &aterm_uds::atomic_file::ConfigFile,
+) -> Result<Option<IdentityConfig>, String> {
+    let Some(text) = config.text().map_err(|e| e.to_string())? else {
+        return Ok(Some(IdentityConfig {
+            machines: [None, None],
+            name: NameChoice::Roster,
+            git_off: false,
+        }));
+    };
+    let doc: aterm_toml::Table = aterm_toml::from_str(text)
+        .map_err(|e| format!("aterm.toml is not valid TOML, so it is left as it was: {e}"))?;
+    if !aterm_secrets::swarm::enabled_in_table(&doc).map_err(|e| format!("aterm.toml: {e}"))? {
+        return Ok(None);
+    }
+    read_identity_table(&doc).map(Some)
+}
+
 /// Read identity choices from the snapshot an apply will compare before it writes.
 fn read_identity_snapshot(
     config: &aterm_uds::atomic_file::ConfigFile,
 ) -> Result<IdentityConfig, String> {
+    let Some(text) = config.text().map_err(|e| e.to_string())? else {
+        return Ok(IdentityConfig {
+            machines: [None, None],
+            name: NameChoice::Roster,
+            git_off: false,
+        });
+    };
+    let doc: aterm_toml::Table = aterm_toml::from_str(text)
+        .map_err(|e| format!("aterm.toml is not valid TOML, so it is left as it was: {e}"))?;
+    read_identity_table(&doc)
+}
+
+fn read_identity_table(doc: &aterm_toml::Table) -> Result<IdentityConfig, String> {
     let mut read = IdentityConfig {
         machines: [None, None],
         name: NameChoice::Roster,
         git_off: false,
     };
-    let Some(text) = config.text().map_err(|e| e.to_string())? else {
-        return Ok(read);
-    };
-    let doc: aterm_toml::Table = aterm_toml::from_str(text)
-        .map_err(|e| format!("aterm.toml is not valid TOML, so it is left as it was: {e}"))?;
     let table = |section: &str| -> Result<Option<&aterm_toml::Table>, String> {
         doc.get(section)
             .map(|item| {
@@ -744,7 +760,6 @@ fn confirm_written(record: &Path, keys: &[&str]) -> Result<(), String> {
     if earlier.is_empty() {
         doc.as_table_mut().remove(EARLIER);
     }
-    check_record_dirs(record, false)?;
     aterm_uds::atomic_file::write(record, doc.to_string().as_bytes(), 0o600)
         .map_err(|e| format!("{}: {e}", record.display()))
 }
@@ -815,25 +830,36 @@ struct IdentityOwed {
     write: Option<(String, Vec<&'static str>)>,
 }
 
+type IdentityTarget = (String, Option<String>);
+
 /// The name `sync.identity` gives this Mac at `config_path` (the person's `[identity] name`, else
 /// the swarm `m<N>` label the vault's roster gave it at admission) and that label, or `None`
 /// where no name applies (swarm off, `[identity] name = false`, no label).
+#[cfg(target_os = "macos")]
 fn identity_target(
     config_path: &Path,
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
     roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
-) -> Result<Option<(String, Option<String>)>, String> {
-    if swarm_disabled_at(config_path)? {
+) -> Result<Option<IdentityTarget>, String> {
+    let snapshot =
+        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
+    let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
+        return Ok(None);
+    };
+    if config.name == NameChoice::Off {
         return Ok(None);
     }
-    let choice = read_identity_config(config_path)?.name;
     let label = name_label(paths, roster, hostnames)?;
-    Ok(match (choice, label) {
+    Ok(identity_target_from(&config.name, label))
+}
+
+fn identity_target_from(choice: &NameChoice, label: Option<String>) -> Option<IdentityTarget> {
+    match (choice, label) {
         (NameChoice::Off, _) | (_, None) => None,
-        (NameChoice::Yours(name), label) => Some((name, label)),
+        (NameChoice::Yours(name), label) => Some((name.clone(), label)),
         (NameChoice::Roster, Some(label)) => Some((label.clone(), Some(label))),
-    })
+    }
 }
 
 fn name_label(
@@ -915,18 +941,19 @@ pub(crate) enum MacName {
 pub(crate) fn mac_names() -> Result<MacName, String> {
     let config = aterm_types::dirs::aterm_config_path()
         .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
-    if swarm_disabled_at(&config)? {
+    let snapshot = aterm_uds::atomic_file::ConfigFile::open(&config).map_err(|e| e.to_string())?;
+    let Some(identity) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(MacName::Off("swarm off".to_owned()));
-    }
-    if matches!(read_identity_config(&config)?.name, NameChoice::Off) {
+    };
+    if matches!(identity.name, NameChoice::Off) {
         return Ok(MacName::Off("[identity] name = false".to_owned()));
     }
     let paths = vault_paths()?;
     let roster = read_name_roster(&paths)?;
     let own = own_names();
     let hostnames = local_hostnames(&own);
-    let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
-    else {
+    let label = name_label(&paths, roster.as_ref(), &hostnames)?;
+    let Some((target, label)) = identity_target_from(&identity.name, label) else {
         return Ok(MacName::Unlabelled);
     };
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
@@ -1060,7 +1087,7 @@ fn identity_owed_at(
     hostnames: &[String],
 ) -> Result<IdentityOwed, String> {
     let roster = read_name_roster(paths)?;
-    identity_owed_from(config_path, record, paths, hostnames, roster.as_ref())
+    Ok(identity_owed_from(config_path, record, paths, hostnames, roster.as_ref())?.0)
 }
 
 fn identity_owed_from(
@@ -1069,23 +1096,30 @@ fn identity_owed_from(
     paths: &aterm_secrets::client::Paths,
     hostnames: &[String],
     roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
-) -> Result<IdentityOwed, String> {
-    let off = |why: &str| IdentityOwed {
-        read: IdentityRead::NotApplicable(why.to_owned()),
-        write: None,
+) -> Result<(IdentityOwed, Option<IdentityTarget>), String> {
+    let off = |why: &str| {
+        (
+            IdentityOwed {
+                read: IdentityRead::NotApplicable(why.to_owned()),
+                write: None,
+            },
+            None,
+        )
     };
-    if swarm_disabled_at(config_path)? {
+    let snapshot =
+        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
+    let Some(config) = read_enabled_identity_snapshot(&snapshot)? else {
         return Ok(off("off: [swarm] enabled = false"));
-    }
-    if read_identity_config(config_path)?.name == NameChoice::Off {
+    };
+    if config.name == NameChoice::Off {
         return Ok(off("off: [identity] name = false"));
     }
     let label = name_label(paths, roster, hostnames)?;
-    let config =
-        aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    identity_owed_in(&config, record, label.as_deref(), &|pair| {
+    let owed = identity_owed_for_config(&config, record, label.as_deref(), &|pair| {
         roster_gives(roster, label.as_deref(), pair)
-    })
+    })?;
+    let target = identity_target_from(&config.name, label);
+    Ok((owed, target))
 }
 
 /// Compare `config_path`'s `[ai] machine` and `[fleet] machine` with the name this Mac goes by:
@@ -1104,11 +1138,21 @@ fn identity_owed(
     identity_owed_in(&config, record, label, &|_| true)
 }
 
+fn format_machine_keys(keys: &[&str]) -> &'static str {
+    match keys {
+        ["ai"] => "[ai] machine",
+        ["fleet"] => "[fleet] machine",
+        ["ai", "fleet"] => "[ai] machine and [fleet] machine",
+        _ => "",
+    }
+}
+
 /// Decide which keys are owed from the same config snapshot the write must still match, where
 /// `ours` says which roster labels the vault's roster gives this Mac ([`unrecorded_label`]).
 /// What aterm wrote is its last write, and while that write is unconfirmed the values before it
 /// ([`EARLIER`]): once a write landed ([`confirm_written`]), a key back at an earlier value is
 /// the person's choice.
+#[cfg(test)]
 fn identity_owed_in(
     snapshot: &aterm_uds::atomic_file::ConfigFile,
     record: &Path,
@@ -1116,6 +1160,15 @@ fn identity_owed_in(
     ours: &dyn Fn(&str) -> bool,
 ) -> Result<IdentityOwed, String> {
     let config = read_identity_snapshot(snapshot)?;
+    identity_owed_for_config(&config, record, label, ours)
+}
+
+fn identity_owed_for_config(
+    config: &IdentityConfig,
+    record: &Path,
+    label: Option<&str>,
+    ours: &dyn Fn(&str) -> bool,
+) -> Result<IdentityOwed, String> {
     let Some(label) = label else {
         return Ok(IdentityOwed {
             read: IdentityRead::NotApplicable(
@@ -1178,13 +1231,7 @@ fn identity_owed_in(
                 .map(|(key, now)| format!("[{key}] machine = {now}"))
                 .collect::<Vec<_>>()
                 .join(", "),
-            to: format!(
-                "{whose} in {}{kept}{git}",
-                keys.iter()
-                    .map(|key| format!("[{key}] machine"))
-                    .collect::<Vec<_>>()
-                    .join(" and ")
-            ),
+            to: format!("{whose} in {}{kept}{git}", format_machine_keys(&keys)),
         },
         write: Some((target, keys)),
     })
@@ -1214,7 +1261,8 @@ fn write_identity_after_read(
 ) -> Result<String, String> {
     let config =
         aterm_uds::atomic_file::ConfigFile::open(config_path).map_err(|e| e.to_string())?;
-    let owed = identity_owed_in(&config, record, label, ours)?;
+    let snapshot = read_identity_snapshot(&config)?;
+    let owed = identity_owed_for_config(&snapshot, record, label, ours)?;
     let Some((target, keys)) = owed.write else {
         return Ok(match owed.read {
             IdentityRead::NotApplicable(why) => format!("left as it is: {why}"),
@@ -1232,8 +1280,7 @@ fn write_identity_after_read(
         aterm_uds::atomic_file::read_regular(record, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
             .ok()
             .map(|(b, _)| b);
-    let now = read_identity_snapshot(&config)?.machines;
-    record_written(record, &keys, &target, &now).map_err(|why| {
+    record_written(record, &keys, &target, &snapshot.machines).map_err(|why| {
         format!("could not record what aterm writes, so aterm.toml is left as it was: {why}")
     })?;
     if let Err(why) = write_machine_label(&config, &target, &keys) {
@@ -1248,10 +1295,7 @@ fn write_identity_after_read(
     let _ = confirm_written(record, &keys);
     Ok(format!(
         "wrote {target} into {}",
-        keys.iter()
-            .map(|key| format!("[{key}] machine"))
-            .collect::<Vec<_>>()
-            .join(" and ")
+        format_machine_keys(&keys)
     ))
 }
 
@@ -1543,16 +1587,15 @@ impl Ports for Live {
         let roster = read_name_roster(&paths)?;
         let names = own_names();
         let hostnames = local_hostnames(&names);
-        let read = identity_owed_from(
+        let (owed, target) = identity_owed_from(
             &config,
             &identity_record()?,
             &paths,
             &hostnames,
             roster.as_ref(),
-        )?
-        .read;
-        let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
-        else {
+        )?;
+        let read = owed.read;
+        let Some((target, label)) = target else {
             return Ok(read);
         };
         let fleet = aterm_agent::fleet_name_for(&target, &|word| {
@@ -1577,10 +1620,12 @@ impl Ports for Live {
     fn sync_identity(&self) -> Result<String, String> {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
-        if swarm_disabled_at(&config)? {
+        let snapshot =
+            aterm_uds::atomic_file::ConfigFile::open(&config).map_err(|e| e.to_string())?;
+        let Some(identity) = read_enabled_identity_snapshot(&snapshot)? else {
             return Ok("left as it is: [swarm] enabled = false".to_owned());
-        }
-        if read_identity_config(&config)?.name == NameChoice::Off {
+        };
+        if identity.name == NameChoice::Off {
             return Ok("left as it is: [identity] name = false".to_owned());
         }
         let paths = vault_paths()?;
@@ -1597,8 +1642,7 @@ impl Ports for Live {
         )?;
         // The fleet name follows the same name: the vault's roster, the fleet and (under the
         // one password) the Mac's own names say one name (DESIGN-alab-swarm §3.2).
-        let Some((target, label)) = identity_target(&config, &paths, &hostnames, roster.as_ref())?
-        else {
+        let Some((target, label)) = identity_target_from(&identity.name, label) else {
             return Ok(keys);
         };
         let fleet = aterm_agent::follow_fleet_name(&target, &|word| {

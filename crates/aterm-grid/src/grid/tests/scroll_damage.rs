@@ -144,6 +144,29 @@ fn content_gen_advances_on_content_mutations() {
     assert!(g4 > g3, "scroll_region_up must advance content_gen");
 }
 
+/// An unscroll that pushes the only double-width row past the screen's foot leaves no
+/// double-width fast-path flag behind; one that keeps such a row (shifted down) keeps the flag.
+#[test]
+fn unscroll_rescans_the_double_width_flag() {
+    let mut grid = build_scrollback_grid(5, 10, 20, 10);
+    grid.set_row_line_size(4, crate::LineSize::DoubleWidth);
+    assert_eq!(grid.unscroll_from_scrollback(1), 1);
+    assert!(
+        !grid.has_any_double_width(),
+        "row 4 left the screen with the unscroll"
+    );
+    grid.set_row_line_size(0, crate::LineSize::DoubleWidth);
+    assert_eq!(grid.unscroll_from_scrollback(1), 1);
+    assert_eq!(
+        grid.row(1).map(|r| r.line_size()),
+        Some(crate::LineSize::DoubleWidth)
+    );
+    assert!(
+        grid.has_any_double_width(),
+        "control: row 0 is row 1 now, still double-width"
+    );
+}
+
 #[test]
 fn content_gen_unchanged_on_viewport_scroll() {
     let mut grid = build_scrollback_grid(5, 10, 20, 10);

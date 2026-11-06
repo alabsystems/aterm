@@ -251,6 +251,8 @@ pub(crate) fn pass_with(
         book.hold(&held, now);
     }
     let owed = !off
+        && !new_week
+        && book.sum_off == off
         && outbox.is_empty()
         && now >= book.flushed_at.saturating_add(book::ROUTINE_S)
         && (!book.uses_due(n, period, now)?.is_empty()
@@ -431,7 +433,7 @@ pub(crate) fn window(session: &Session<'_>, directory: &Directory, now: u64) -> 
         let log = Log::read_with(session, &store, scope, att::decode)?;
         ops.extend(
             log.eligible()
-                .iter()
+                .into_iter()
                 .filter_map(|(operation, command)| Op::from_eligible(epoch, operation, command)),
         );
     }

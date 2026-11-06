@@ -5,6 +5,230 @@
 use super::*;
 
 #[test]
+fn posting_collection_keeps_each_distinct_trigram_through_the_hash_transition() {
+    let mut rng = aterm_spec::rng::XorShift::new(0x5472_6967_7261_6d73);
+    for length in [3, 8, 16, 31, 32, 33, 64, 256, 1_024] {
+        let unit: String = (0..length)
+            .map(|_| char::from(b' ' + rng.index(95) as u8))
+            .collect();
+        for repeats in [1, 2, 16] {
+            let query = unit.repeat(repeats);
+            let distinct: std::collections::BTreeSet<_> = query
+                .as_bytes()
+                .windows(3)
+                .map(|b| [b[0], b[1], b[2]])
+                .collect();
+            let mut index = SearchIndex::new();
+            index.index_line(0, &query);
+            assert_eq!(index.literal_candidate_bound(&query, true), Some(1));
+            assert_eq!(
+                SearchIndex::take_last_unique_posting_lists(),
+                distinct.len(),
+                "length={length} repeats={repeats}"
+            );
+        }
+    }
+}
+
+#[test]
+fn anchored_literal_navigation_matches_batch_order_with_unicode_and_cell_gaps() {
+    let mut search = TerminalSearch::new();
+    for text in ["aaaa", "a日a\u{301}a KkΣςσİi", "👩🏽‍💻aa", ""] {
+        search.index_scrollback_line(text);
+    }
+    let mut cells = LineCells::new();
+    for i in 0..3 {
+        cells.push(i..i + 1, 5 + i * 2, 1);
+    }
+    search.index_numbered_cells_owned(std::iter::once((4, "aaa".to_owned(), cells)));
+    for query in [
+        "", "a", "A", "aa", "Aa", "aaa", "日", "\u{301}", "👩", "K", "Σ", "σ", "İ", "absent",
+    ] {
+        for case_sensitive in [true, false] {
+            let all = search
+                .search_results_opts(query, case_sensitive, false)
+                .unwrap()
+                .matches;
+            for line in [0, 1, 2, 3, 4, 5, usize::MAX] {
+                for col in [0, 1, 2, 3, 5, 7, 10, usize::MAX] {
+                    for inclusive in [false, true] {
+                        for wrap in [false, true] {
+                            for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+                                let anchor = (line, col);
+                                let eligible = |m: &&SearchMatch| {
+                                    let pos = (m.line, m.start_col);
+                                    match direction {
+                                        SearchDirection::Forward => {
+                                            if inclusive {
+                                                pos >= anchor
+                                            } else {
+                                                pos > anchor
+                                            }
+                                        }
+                                        SearchDirection::Backward => {
+                                            if inclusive {
+                                                pos <= anchor
+                                            } else {
+                                                pos < anchor
+                                            }
+                                        }
+                                    }
+                                };
+                                let (chosen, edge) = match direction {
+                                    SearchDirection::Forward => {
+                                        (all.iter().find(eligible), all.first())
+                                    }
+                                    SearchDirection::Backward => {
+                                        (all.iter().rev().find(eligible), all.last())
+                                    }
+                                };
+                                let expected = chosen.or(if wrap { edge } else { None });
+                                let found = search
+                                    .find_direction_opts(
+                                        query,
+                                        case_sensitive,
+                                        false,
+                                        DirectedFind {
+                                            anchor,
+                                            direction,
+                                            inclusive,
+                                            wrap,
+                                        },
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    found.as_ref(),
+                                    expected,
+                                    "q={query:?} case_sensitive={case_sensitive} anchor={anchor:?} {direction:?} inclusive={inclusive} wrap={wrap}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_navigation_visits_only_the_qualifying_identity_occurrence() {
+    const BYTES: usize = 32_768;
+    let mut search = TerminalSearch::new();
+    search.index_scrollback_line(&"a".repeat(BYTES));
+    for case_sensitive in [true, false] {
+        for query in ["a", "aa", "aaa"] {
+            for col in [0, 16, BYTES / 2, BYTES, usize::MAX] {
+                for inclusive in [false, true] {
+                    for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+                        let eligible = |start: &usize| match direction {
+                            SearchDirection::Forward => {
+                                if inclusive {
+                                    *start >= col
+                                } else {
+                                    *start > col
+                                }
+                            }
+                            SearchDirection::Backward => {
+                                if inclusive {
+                                    *start <= col
+                                } else {
+                                    *start < col
+                                }
+                            }
+                        };
+                        let mut starts = 0..BYTES - query.len() + 1;
+                        let expected = match direction {
+                            SearchDirection::Forward => starts.find(eligible),
+                            SearchDirection::Backward => starts.rev().find(eligible),
+                        };
+                        crate::iterators::take_literal_visits();
+                        SearchIndex::take_case_insensitive_match_visits();
+                        let found = search
+                            .find_direction_opts(
+                                query,
+                                case_sensitive,
+                                false,
+                                DirectedFind {
+                                    anchor: (0, col),
+                                    direction,
+                                    inclusive,
+                                    wrap: false,
+                                },
+                            )
+                            .unwrap();
+                        let visits = if case_sensitive {
+                            crate::iterators::take_literal_visits()
+                        } else {
+                            SearchIndex::take_case_insensitive_match_visits()
+                        };
+                        assert_eq!(found.map(|m| m.start_col), expected);
+                        assert!(
+                            visits <= 1,
+                            "query={query} col={col} inclusive={inclusive} direction={direction:?}: {visits} visits"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn eviction_partition_keeps_the_sorted_reference_suffix() {
+    for cap in [1, 2, 3, 4, 31, 128] {
+        let mut index = SearchIndex::with_max_cached_lines(cap);
+        let mut reference = Vec::new();
+        for row in (0..cap).rev() {
+            let line = row * 10 + 5;
+            index.index_line(line, "searchable");
+            reference.push(line);
+        }
+        index.index_line(3, "searchable");
+        reference.push(3);
+        reference.sort_unstable();
+        let retained = cap * 3 / 4;
+        let expected = &reference[reference.len() - retained..];
+        assert_eq!(index.lines.len(), retained);
+        let actual: Vec<_> = index
+            .search_with_positions("searchable")
+            .iter()
+            .map(|m| m.line)
+            .collect();
+        assert_eq!(actual, expected, "cap={cap}");
+        assert_eq!(
+            index.lowest_retained_line(),
+            expected.first().copied().unwrap_or((cap - 1) * 10 + 6)
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual before/after automatic eviction measurement"]
+fn automatic_eviction_cost() {
+    for rows in [32_768, 100_000] {
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..16 {
+            let mut index = SearchIndex::with_capacity(rows + 1);
+            index.set_max_cached_lines(rows + 1);
+            for row in 0..rows {
+                index.index_line(row * 7, "searchable retained history");
+            }
+            index.set_max_cached_lines(rows);
+            let began = std::time::Instant::now();
+            index.index_line(rows * 7, "searchable retained history");
+            total += began.elapsed();
+            let retained = rows * 3 / 4;
+            assert_eq!(index.lowest_retained_line(), (rows + 1 - retained) * 7);
+            assert_eq!(index.search_with_positions("searchable").len(), retained);
+        }
+        eprintln!(
+            "automatic_eviction rows={rows} mean_ns={}",
+            total.as_nanos() / 16
+        );
+    }
+}
+
+#[test]
 fn empty_query_search_with_positions() {
     let mut index = SearchIndex::new();
     index.index_line(0, "test content");
@@ -687,15 +911,17 @@ fn case_insensitive_repeated_prefix_uses_linear_matcher_path() {
     let query = format!("{}b", "a".repeat(512));
 
     let _ = SearchIndex::take_case_insensitive_lowered_lines();
+    let _ = SearchIndex::take_case_insensitive_candidate_visits();
     let matches = index
         .search_with_positions_opts(&query, false, false)
         .unwrap();
     assert!(matches.is_empty());
     assert_eq!(
         SearchIndex::take_case_insensitive_lowered_lines(),
-        1,
-        "the trigram-positive repeated-prefix miss is scanned once by the linear matcher"
+        0,
+        "ASCII text uses the folded byte view without a lowercase copy"
     );
+    assert_eq!(SearchIndex::take_case_insensitive_candidate_visits(), 1);
 
     index.index_line(1, &query);
     let _ = SearchIndex::take_case_insensitive_lowered_lines();
@@ -704,7 +930,49 @@ fn case_insensitive_repeated_prefix_uses_linear_matcher_path() {
         .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].line, 1);
-    assert_eq!(SearchIndex::take_case_insensitive_lowered_lines(), 2);
+    assert_eq!(SearchIndex::take_case_insensitive_lowered_lines(), 0);
+    assert_eq!(SearchIndex::take_case_insensitive_candidate_visits(), 2);
+}
+
+#[test]
+fn previous_case_insensitive_match_stops_at_the_rightmost_occurrence() {
+    for query in ["a", "aa", "service-worker"] {
+        let unit = format!("{} ", query.to_ascii_uppercase());
+        let text = unit.repeat(8192);
+        let mut search = TerminalSearch::new();
+        search.index_scrollback_line(&text);
+        for col in [0, 1, unit.len() * 4096, usize::MAX] {
+            for inclusive in [false, true] {
+                let _ = SearchIndex::take_case_insensitive_match_visits();
+                let found = search
+                    .find_direction_opts(
+                        query,
+                        false,
+                        false,
+                        DirectedFind {
+                            anchor: (0, col),
+                            direction: SearchDirection::Backward,
+                            inclusive,
+                            wrap: false,
+                        },
+                    )
+                    .unwrap();
+                let ceiling = if inclusive {
+                    Some(col)
+                } else {
+                    col.checked_sub(1)
+                };
+                let expected =
+                    ceiling.map(|col| col.min(text.len() - unit.len()) / unit.len() * unit.len());
+                assert_eq!(found.map(|m| m.start_col), expected);
+                assert_eq!(
+                    SearchIndex::take_case_insensitive_match_visits(),
+                    usize::from(expected.is_some()),
+                    "previous-match navigation visits only its nearest qualifying occurrence"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1327,29 +1595,34 @@ fn occurrence_frame_keeps_zero_width_only_lines_narrable() {
         ("x\u{0301}y combining acute", "\u{0301}", "\u{0301}y"),
     ];
     for &(text, short, grown) in cases {
-        let mut index = SearchIndex::new();
-        index.index_line(0, text);
-        index.index_line(1, "unrelated");
+        for case_sensitive in [true, false] {
+            let mut index = SearchIndex::new();
+            index.index_line(0, text);
+            index.index_line(1, "unrelated");
 
-        let step_short = index.search_literal_narrowed(short, false, None);
-        assert!(
-            step_short.results.matches.is_empty(),
-            "precondition ({text:?}): {short:?} resolves to zero display columns and is dropped"
-        );
-        let frame = step_short
-            .occurrence_lines
-            .expect("uncapped walk must produce a frame");
-        assert!(
-            frame.contains(0),
-            "the occurrence frame must retain {text:?} despite zero reported matches"
-        );
+            let step_short = index.search_literal_narrowed(short, case_sensitive, None);
+            assert!(
+                step_short.results.matches.is_empty(),
+                "precondition ({text:?}): {short:?} resolves to zero display columns and is dropped"
+            );
+            let frame = step_short
+                .occurrence_lines
+                .expect("uncapped walk must produce a frame");
+            assert!(
+                frame.contains(0),
+                "the occurrence frame must retain {text:?} despite zero reported matches"
+            );
 
-        let step_grown = index.search_literal_narrowed(grown, false, Some(&frame));
-        assert_eq!(step_grown.results, batch_forward(&index, grown, false));
-        assert!(
-            step_grown.results.matches.iter().any(|m| m.line == 0),
-            "{grown:?} crossing the cluster boundary is a real, reported match on {text:?}"
-        );
+            let step_grown = index.search_literal_narrowed(grown, case_sensitive, Some(&frame));
+            assert_eq!(
+                step_grown.results,
+                batch_forward(&index, grown, case_sensitive)
+            );
+            assert!(
+                step_grown.results.matches.iter().any(|m| m.line == 0),
+                "{grown:?} crossing the cluster boundary is a real, reported match on {text:?}"
+            );
+        }
     }
 }
 

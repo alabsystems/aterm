@@ -20,6 +20,20 @@
 //! is minted while any mailbox in the directory is sealed: put the key back, or move the sealed
 //! mailboxes aside to start empty ones. Bus mail is untouched. WHAT IT DOES NOT PROTECT: the mail
 //! from a process running as this user, or in a copy of the whole directory, key included.
+//!
+//! WITH THE MESH ON (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §11 C6) this mailbox is the way
+//! pre-R3 Macs reach this one, and this one them, until D7 deletes it:
+//! - **The fabric inbox holds the unread mail.** Each transaction (the first is the one the
+//!   session's first start takes, [`restore`] at adoption) takes every unread row this process has
+//!   not yet imported into the session's ring as an ordinary row ([`super::InboxRow::fleet`]).
+//!   Listing it there ([`super::cmd_inbox`], `inbox seen`) marks the row listed in the sealed
+//!   file ([`mark_listed`]), so it is imported once: no restart and no successor takes it again.
+//!   The mark is the listing, never the import, because the ring is not carried: a successor
+//!   offers again what the reader had not seen, as the bridge does for bus mail. A message is
+//!   still answered by `post re=f<id>`, which its sender reads on its next drive.
+//! - **A post to a pre-R3 Mac goes by direct fleet mail** ([`carry`]): a Mac this one never
+//!   heard a presence row from ([`PeerMail::Fleet`]) has no mesh mail route, so `post
+//!   to=@<sid>@<node>` drives it and posts into this mailbox's twin there.
 
 use super::{FabricSession, serving_driver};
 use serde::{Deserialize, Serialize};
@@ -31,7 +45,7 @@ const TEXT: usize = 4096;
 /// Capture the release policy once when the session is created.
 #[cfg(unix)]
 pub(super) struct MeshPolicy {
-    enabled: bool,
+    pub(super) enabled: bool,
 }
 
 #[cfg(unix)]
@@ -42,6 +56,35 @@ impl Default for MeshPolicy {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+impl MeshPolicy {
+    /// The mesh on, whatever the switch says: a test's session.
+    pub(super) const fn on() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// How another Mac takes a session's mail, with the mesh on (§11 C6).
+///
+/// A Mac speaks the mesh mail route exactly when this Mac has heard its presence row: rows exist
+/// only on builds with the mesh on, the route ships in the same cut (waves B and C ship together,
+/// decision 2026-11-05), and a row decodes only at the version C3 gave it. A build string or the
+/// fleet book's version names no release before its cut, so neither can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerMail {
+    /// This Mac heard its presence row: mail goes on the bus, one hop (C3).
+    Mesh,
+    /// No presence row of it was heard here, a pre-R3 Mac: direct fleet mail reaches it
+    /// ([`carry`]). A Mac on R3 not heard yet takes direct fleet mail too, until D7.
+    Fleet,
+}
+
+/// A direct message as this process imported it into its session's ring: its id and key, which
+/// name it in its mailbox whatever becomes of the ring's row, and which the mesh's rewrite of
+/// its sender's node (B1, [`rewrite_nodes`]) leaves as they were.
+#[cfg(unix)]
+pub(crate) type Imported = (u64, String);
 #[cfg(unix)]
 const BUSY: &str = "another direct-mail operation holds this mailbox";
 /// The largest mailbox, as the TOML that is sealed.
@@ -213,6 +256,8 @@ thread_local! {
     static TIMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// A negative control's switch: this thread's refreshes ring no waiter.
     static UNRUNG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A negative control's switch: this thread's ring listings write no mark ([`mark_listed`]).
+    static UNMARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Answer a reader from the cache when no transaction is needed to know the mailbox: `None`
@@ -634,12 +679,187 @@ fn transaction_waiting<T>(
         write_mailbox(dir, name, &boxed, &mut key)?;
         stamp = self::stamp(&path).ok();
     }
+    // Under the private lock, as the cache is: what entered the ring is what the file holds.
+    let imported = ctx.fabric().mesh.enabled && import(ctx, &boxed);
     // Refresh under the private lock so an older read cannot overwrite a newer write's cache.
     let cached = cache(ctx, &boxed, stamp);
-    if changed || cached {
+    if changed || cached || imported {
         self::changed(ctx);
     }
     Ok((result, changed))
+}
+
+/// With the mesh on, take into the session's ring every unread message of `boxed` this process
+/// has not imported, and forget the ones the mailbox no longer holds (§11 C6). Whether a row
+/// entered. A row waits out a committing update's fence as a bridge's delivery does.
+#[cfg(unix)]
+fn import(ctx: &dyn FabricSession, boxed: &Mailbox) -> bool {
+    let fabric = ctx.fabric();
+    let mut inbox = fabric.wait_fenced_delivery(fabric.lock(), ctx.self_id().as_str(), None);
+    inbox.fleet_imported.retain(|(id, key)| {
+        boxed
+            .rows
+            .iter()
+            .any(|row| row.id == *id && row.key == *key)
+    });
+    let mut entered = false;
+    for row in boxed.rows.iter().filter(|row| !row.listed) {
+        if inbox.fleet_imported.insert((row.id, row.key.clone())) {
+            inbox.import_fleet(row.id, &row.node, &row.kind, &row.text);
+            entered = true;
+        }
+    }
+    entered
+}
+
+/// Mark the imported messages `ids`, which the session's ring has now listed, listed in the
+/// sealed mailbox (§11 C6): the import's mark, so no later start, restart or successor imports
+/// them again. Nothing to mark takes no transaction.
+/// # Errors
+/// The mailbox is busy past a minute, unreadable or malformed: the messages stay unlisted there,
+/// and the next start offers them again.
+pub(crate) fn mark_listed(ctx: &dyn FabricSession, ids: &[u64]) -> Result<(), String> {
+    #[cfg(all(test, unix))]
+    if UNMARKED.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    transaction(ctx, |boxed| {
+        let mut moved = false;
+        for row in boxed.rows.iter_mut().filter(|row| ids.contains(&row.id)) {
+            moved |= !row.listed;
+            row.listed = true;
+        }
+        Ok(((), moved))
+    })
+    .map(|_| ())
+}
+
+/// A post to a session on a pre-R3 Mac ([`PeerMail::Fleet`]), as `post` read it.
+pub(crate) struct Carry<'a> {
+    /// The session, on `node`.
+    pub sid: &'a str,
+    /// The Mac.
+    pub node: &'a str,
+    pub kind: &'a str,
+    /// The idempotency key the poster gave, if any.
+    pub key: Option<&'a str>,
+    pub text: &'a str,
+    /// The text came on the post's line, not as `len=` bytes.
+    pub inline: bool,
+    /// The post asks nothing direct fleet mail cannot carry: no `re=`, `dl=`, `via=` or
+    /// `--wait-ack`.
+    pub plain: bool,
+}
+
+/// Carry `post` by direct fleet mail (§11 C6): one fleet drive to its Mac, which posts it into
+/// the session's mailbox there as `fleet:<this node>`, and keeps the session's reply for this
+/// Mac's next drive (`inbox fleet` there). A post with no key gets one of this session's
+/// (`<sid>.<16 hex>`), which the reply names, so it can be posted again once.
+pub(crate) fn carry(ctx: &dyn FabricSession, post: &Carry<'_>) -> String {
+    if !kind(post.kind) {
+        return refusal(format!(
+            "{} is a pre-R3 Mac, reached by direct fleet mail, which takes kind=ask, task, note, \
+             answer or report",
+            post.node
+        ));
+    }
+    if !post.plain {
+        return refusal(format!(
+            "{} is a pre-R3 Mac, reached by direct fleet mail, which carries no re=, dl=, via= \
+             or --wait-ack",
+            post.node
+        ));
+    }
+    if !post.inline
+        || post.text.is_empty()
+        || post.text.len() > TEXT
+        || post.text.contains(['\n', '\r'])
+    {
+        return refusal(format!(
+            "{} is a pre-R3 Mac, reached by direct fleet mail, which takes inline text of \
+             1..{TEXT} bytes on one line",
+            post.node
+        ));
+    }
+    let key = match post.key {
+        Some(key) => key.to_owned(),
+        None => match minted_key(ctx) {
+            Ok(key) => key,
+            Err(why) => return refusal(why),
+        },
+    };
+    let request = format!(
+        "@{} post key={key} kind={} -- {}",
+        post.sid, post.kind, post.text
+    );
+    let answer = match ctx.fleet_drive(post.node, &request) {
+        Ok(answer) => answer,
+        Err(why) => {
+            return refusal(format!(
+                "{} is a pre-R3 Mac, reached by direct fleet mail, and no drive reached it: {why}",
+                post.node
+            ));
+        }
+    };
+    let answer = answer.trim_end_matches(['\r', '\n']);
+    let mut words = answer.split(' ');
+    match (
+        words.next(),
+        words.next().and_then(id),
+        words.next(),
+        words.next(),
+    ) {
+        (Some("OK"), Some(id), dup @ (None | Some("dup=1")), None) => {
+            let to = format!("@{}@{}", post.sid, post.node);
+            // A duplicate is the message an earlier post carried, already on the log.
+            if dup.is_none() {
+                ctx.record_fact(
+                    "post",
+                    super::FabricFact::FleetMailOut {
+                        id,
+                        kind: post.kind,
+                        to: &to,
+                        idem: &key,
+                    },
+                );
+            }
+            format!(
+                "OK fleet=f{id} to={to} key={key}{}\n",
+                if dup.is_some() { " dup=1" } else { "" }
+            )
+        }
+        _ => refusal(format!(
+            "{} answered the direct fleet mail: {}",
+            post.node,
+            answer.chars().take(512).collect::<String>()
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn minted_key(_ctx: &dyn FabricSession) -> Result<String, String> {
+    Err("direct fleet mail is available on Unix".to_owned())
+}
+
+/// A key for a post that gave none ([`carry`]): this session's sid and 16 random hex digits, so
+/// no other session of this Mac, which every one shares as the sender there, names it.
+#[cfg(unix)]
+fn minted_key(ctx: &dyn FabricSession) -> Result<String, String> {
+    let mut nonce = [0u8; 8];
+    aterm_uds::rand::fill(&mut nonce)
+        .map_err(|e| format!("no key could be made for the direct fleet mail: {e}"))?;
+    let mut key = format!("{}.", ctx.self_id().as_str());
+    for byte in nonce {
+        key.push_str(&format!("{byte:02x}"));
+    }
+    if super::valid_key(&key) {
+        Ok(key)
+    } else {
+        Err("this session's id makes no direct fleet mail key".to_owned())
+    }
 }
 
 #[cfg(unix)]
@@ -1180,6 +1400,9 @@ mod tests {
         assert!(!valid_node("0123456789abcdef"));
     }
 
+    /// How a test serves a fleet drive: the Mac and the request line in, the answer out.
+    type Drive = Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+
     struct Session {
         sid: SessionId,
         fabric: SessionFabric,
@@ -1187,6 +1410,11 @@ mod tests {
         facts: std::sync::Mutex<Vec<String>>,
         wakes: std::sync::atomic::AtomicU64,
         ready: std::sync::atomic::AtomicBool,
+        /// The Macs whose presence row this session's Mac heard (§11 C6).
+        heard: Vec<String>,
+        drive: Option<Drive>,
+        /// Every fleet drive asked for: the Mac and the request line.
+        drives: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl FabricSession for Session {
@@ -1216,6 +1444,22 @@ mod tests {
         fn fleet_mail_ready(&self) -> bool {
             self.ready.load(std::sync::atomic::Ordering::SeqCst)
         }
+        fn peer_mail(&self, node: &str) -> PeerMail {
+            if self.heard.iter().any(|heard| heard == node) {
+                PeerMail::Mesh
+            } else {
+                PeerMail::Fleet
+            }
+        }
+        fn fleet_drive(&self, node: &str, request: &str) -> Result<String, String> {
+            self.drives
+                .lock()
+                .unwrap()
+                .push((node.to_owned(), request.to_owned()));
+            self.drive
+                .as_ref()
+                .map_or_else(|| Err("no drive".to_owned()), |drive| drive(node, request))
+        }
     }
 
     fn session(path: &std::path::Path) -> Session {
@@ -1226,6 +1470,20 @@ mod tests {
             facts: Default::default(),
             wakes: Default::default(),
             ready: std::sync::atomic::AtomicBool::new(true),
+            heard: Vec::new(),
+            drive: None,
+            drives: Default::default(),
+        }
+    }
+
+    /// A session of a process whose mesh switch is on: an R3 aterm.
+    fn meshed(path: &std::path::Path) -> Session {
+        Session {
+            fabric: SessionFabric {
+                mesh: MeshPolicy::on(),
+                ..SessionFabric::default()
+            },
+            ..session(path)
         }
     }
 
@@ -1235,6 +1493,236 @@ mod tests {
             host: "peer.local".to_owned(),
         });
         f()
+    }
+
+    /// A message a pre-R3 Mac left unread in `path`'s mailbox, taken by an earlier build (the
+    /// mesh off); then R3's first start on it, whose inbox lists it; then a restart's. What each
+    /// of the two inboxes said.
+    fn first_start_then_restart(path: &std::path::Path) -> (String, String) {
+        let earlier = session(path);
+        assert_eq!(
+            as_node("a", || post(&earlier, "key=held kind=ask -- RETAINED")),
+            "OK f1\n"
+        );
+        drop(earlier);
+        let first = meshed(path);
+        assert!(restore(&first), "the first start's transaction runs");
+        let listed = crate::cmd_inbox(&first, "");
+        drop(first);
+        let again = meshed(path);
+        assert!(restore(&again), "the restart's transaction runs");
+        (listed, crate::cmd_inbox(&again, ""))
+    }
+
+    #[test]
+    fn a_retained_unread_message_enters_the_fabric_inbox_once_and_not_again_after_a_restart() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("private/inbox.toml");
+        let (listed, restarted) = first_start_then_restart(&path);
+        assert_eq!(listed.matches("RETAINED").count(), 1, "{listed}");
+        let row = listed
+            .lines()
+            .find(|line| line.contains("RETAINED"))
+            .unwrap();
+        assert!(
+            row.starts_with("msg 1 off=- ")
+                && row.contains(&format!(" from=fleet:{} ", "a".repeat(32)))
+                && row.contains(" kind=ask trust=agent fleet=f1 "),
+            "an ordinary ring row, answerable by its mailbox id: {row}"
+        );
+        assert!(
+            !listed.contains("msg f1"),
+            "no page of the mailbox follows the ring: {listed}"
+        );
+        assert!(
+            !restarted.contains("RETAINED"),
+            "imported once, not again after a restart: {restarted}"
+        );
+        // Kept for its sender: the answer waits there for the pre-R3 Mac's next drive.
+        let after = meshed(&path);
+        assert_eq!(
+            post(&after, "re=f1 key=r kind=answer -- ANSWERED"),
+            "OK f1 reply=1\n"
+        );
+        let read = as_node("a", || inbox(&after, "", false));
+        assert!(read.contains("reply_text=ANSWERED"), "{read}");
+
+        // Negative control: with no listing mark, the restart takes the message again.
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        UNMARKED.with(|unmarked| unmarked.set(true));
+        let (listed, restarted) =
+            first_start_then_restart(&scratch.path().join("private/inbox.toml"));
+        UNMARKED.with(|unmarked| unmarked.set(false));
+        assert_eq!(listed.matches("RETAINED").count(), 1, "{listed}");
+        assert_eq!(
+            restarted.matches("RETAINED").count(),
+            1,
+            "the control imports it again: {restarted}"
+        );
+    }
+
+    #[test]
+    fn an_arrival_with_the_mesh_on_is_one_ring_row_that_wakes_the_inbox_wait_and_counts_once() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let receiver = meshed(&scratch.path().join("private/inbox.toml"));
+        assert_eq!(
+            as_node("a", || post(&receiver, "key=one kind=task -- ARRIVED")),
+            "OK f1\n"
+        );
+        assert_eq!(
+            crate::cmd_await_inbox(&receiver, &["since=0"], 0),
+            "OK inbox 1\n",
+            "the ring row latches the wait, with no mailbox form"
+        );
+        let facts = receiver.fabric.mail_facts();
+        assert_eq!(facts.unread, 1, "counted in the ring alone");
+        assert_eq!(
+            facts.last.unwrap().from,
+            format!("fleet:{}", "a".repeat(32))
+        );
+        assert_eq!(
+            receiver
+                .fabric
+                .mail_since(0, &crate::MailFilter::default())
+                .rows
+                .len(),
+            0,
+            "a subscriber is told of it by its mailbox id alone"
+        );
+        assert_eq!(
+            receiver
+                .fabric
+                .direct_mail_since(0, &crate::MailFilter::default())
+                .1
+                .len(),
+            1
+        );
+        assert!(
+            restore(&receiver),
+            "a refresh's transaction takes no second row"
+        );
+        assert_eq!(receiver.fabric.last_msg_id(), 1);
+        assert_eq!(crate::cmd_inbox_seen(&receiver, "1 handled"), "OK seen=1\n");
+        assert!(
+            receiver.fabric.lock().receipts.is_empty(),
+            "no bus receipt is owed to direct fleet mail"
+        );
+        let successor = meshed(&receiver.path);
+        assert!(restore(&successor));
+        assert_eq!(
+            successor.fabric.last_msg_id(),
+            0,
+            "seen in the ring, so a successor takes it no more"
+        );
+    }
+
+    /// The pre-R3 Mac `n-…bb`'s session `s-87654321`, served as a fleet drive serves it (its
+    /// mesh off), and an R3 session whose Mac heard `n-…aa`'s presence row and drives `n-…bb`.
+    fn pre_r3_pair(scratch: &std::path::Path) -> (std::sync::Arc<Session>, Session) {
+        let there = std::sync::Arc::new(session(&scratch.join("there/s-87654321.toml")));
+        let served = std::sync::Arc::clone(&there);
+        let here = Session {
+            heard: vec![format!("n-{}", "a".repeat(16))],
+            drive: Some(Box::new(move |node, request| {
+                assert_eq!(node, format!("n-{}", "b".repeat(16)));
+                let rest = request
+                    .strip_prefix("@s-87654321 post ")
+                    .ok_or_else(|| format!("not a post to the session: {request}"))?;
+                Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
+            })),
+            ..meshed(&scratch.join("here/inbox.toml"))
+        };
+        (there, here)
+    }
+
+    #[test]
+    fn a_post_to_a_pre_r3_mac_goes_by_direct_fleet_mail() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let (there, here) = pre_r3_pair(scratch.path());
+        let to = format!("to=@s-87654321@n-{}", "b".repeat(16));
+        assert_eq!(
+            crate::cmd_post(&here, &format!("{to} kind=ask key=q1 -- ACROSS"), None),
+            format!("OK fleet=f1 to=@s-87654321@n-{} key=q1\n", "b".repeat(16))
+        );
+        assert_eq!(
+            crate::cmd_post(&here, &format!("{to} kind=ask key=q1 -- ACROSS"), None),
+            format!(
+                "OK fleet=f1 to=@s-87654321@n-{} key=q1 dup=1\n",
+                "b".repeat(16)
+            ),
+            "the key holds there: posted again, it lands once"
+        );
+        let keyless = crate::cmd_post(&here, &format!("{to} kind=note -- KEYLESS"), None);
+        assert!(
+            keyless.starts_with(&format!(
+                "OK fleet=f2 to=@s-87654321@n-{} key=s-12345678.",
+                "b".repeat(16)
+            )),
+            "a key of this session's is made and named: {keyless}"
+        );
+        let facts = here.facts.lock().unwrap().clone();
+        assert!(
+            facts.len() == 2
+                && facts[0].starts_with("f1 to=")
+                && facts[0].ends_with(" kind=ask key=q1")
+                && facts[1].starts_with("f2 to=")
+                && facts[1].contains(" kind=note key=s-12345678."),
+            "each message carried is one fact on this session's log, a duplicate none: {facts:?}"
+        );
+        let page = crate::cmd_inbox(&*there, "");
+        assert!(
+            page.contains(&format!("msg f1 from=fleet:{} kind=ask", "c".repeat(32)))
+                && page.contains("text=ACROSS")
+                && page.contains("text=KEYLESS"),
+            "it is in the pre-R3 Mac's direct mailbox, from this Mac: {page}"
+        );
+        assert!(
+            here.fabric.lock().posts.is_empty(),
+            "nothing waits for a bridge here"
+        );
+        for refused in [
+            format!("{to} kind=ack re=7 -- receipt"),
+            format!("{to} kind=note re=7 -- answer by offset"),
+            format!("{to} kind=note dl=5 -- deadline"),
+        ] {
+            let reply = crate::cmd_post(&here, &refused, None);
+            assert!(reply.starts_with("ERR fleet-mail: "), "{refused}: {reply}");
+        }
+        assert!(
+            crate::cmd_post(
+                &here,
+                &format!("{to} kind=note len=4"),
+                Some(b"BODY".to_vec())
+            )
+            .starts_with("ERR fleet-mail: "),
+            "direct fleet mail takes inline text"
+        );
+        assert_eq!(
+            here.drives.lock().unwrap().len(),
+            3,
+            "a refusal drives nothing"
+        );
+
+        // Control: a Mac whose presence row was heard takes the post on the bus, undriven.
+        let heard = format!("to=@s-87654321@n-{}", "a".repeat(16));
+        assert_eq!(
+            crate::cmd_post(&here, &format!("{heard} kind=note -- ON-THE-BUS"), None),
+            "OK 1\n"
+        );
+        assert_eq!(here.fabric.lock().posts.len(), 1);
+        assert_eq!(here.drives.lock().unwrap().len(), 3);
+
+        // Control: with the mesh off, the unheard Mac is posted on the bus as before.
+        let off = Session {
+            drive: None,
+            ..session(&scratch.path().join("off/inbox.toml"))
+        };
+        assert_eq!(
+            crate::cmd_post(&off, &format!("{to} kind=note -- MESH-OFF"), None),
+            "OK 1\n"
+        );
+        assert_eq!(off.fabric.lock().posts.len(), 1);
+        assert!(off.drives.lock().unwrap().is_empty());
     }
 
     #[test]

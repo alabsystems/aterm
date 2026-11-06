@@ -124,6 +124,7 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
             guard,
             &spawn,
             None,
+            None,
         )
     };
     let inert = Arc::new(Mutex::new(AutoRenewGuard::default()));

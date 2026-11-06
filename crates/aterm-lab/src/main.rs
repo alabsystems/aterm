@@ -778,6 +778,12 @@ Outside any lab (no jail, no stub):
                                  drives every other and is read for whom its heartbeat reached (--one-url: F8's negative
                                  control; --minter-away: a1's instance stops before the heal; --record: write
                                  docs/measured/, its name carrying --label's WORD)
+  swarm e2e [--aterm PATH] [--keep]
+                                 one-mesh E2's membership checks no other lane stages: a drive by a Mac's roster
+                                 label and a fleet survey while a writer holds the vault's state lock (N1, N2), and
+                                 founders an admin approved by code (seatless, S1), one seated by its own proof under
+                                 its own label and one by a person's Allow, then a rotation that carries both and drops
+                                 the third, which nothing seated
   mesh churn [--n N] [--seed S] [--minutes M] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]
                                  found a membership log on N private Macs (default 30) on loopback, each its own vault
                                  server and subscriber on the run's genesis; let each in by Allow and the phrase, stop

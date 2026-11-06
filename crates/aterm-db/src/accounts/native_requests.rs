@@ -123,21 +123,27 @@ impl Requests {
                 let local = session.peer_writer(session.actor())?;
                 let members = session.observed_account_targets()?;
                 let log = Log::read_with(session, store, scope, decode)?;
+                let mut writers =
+                    std::collections::BTreeMap::from([(session.actor(), Some(local.clone()))]);
                 let mut requests = Vec::new();
                 for (operation, decoded) in log.eligible() {
                     if Instant::now() >= self.deadline {
                         return Err(Error::new("native request observation expired"));
                     }
-                    let (target, policy) = body(&decoded)?;
+                    let (target, policy) = body(decoded)?;
                     if filter
                         .is_some_and(|(expected, digest)| *expected != target || digest != policy)
                     {
                         continue;
                     }
-                    if command(operation.header.actor, &target, policy) != decoded {
+                    if command(operation.header.actor, &target, policy) != *decoded {
                         continue;
                     }
-                    let Ok(requester) = session.peer_writer(operation.header.actor) else {
+                    let Some(requester) = writers
+                        .entry(operation.header.actor)
+                        .or_insert_with(|| session.peer_writer(operation.header.actor).ok())
+                        .clone()
+                    else {
                         continue;
                     };
                     requests.push(Request {

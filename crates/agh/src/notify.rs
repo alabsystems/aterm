@@ -88,7 +88,10 @@ fn hashed_key(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     let digest = hasher.finalize();
-    format!("agh-{}", aterm_codec::hex::encode_lower(&digest[..8]))
+    let mut out = String::with_capacity(20);
+    out.push_str("agh-");
+    aterm_codec::hex::push_lower(&mut out, &digest[..8]);
+    out
 }
 
 /// A number's decimal, or nothing.
@@ -100,7 +103,12 @@ fn decimal<T: std::fmt::Display>(value: Option<T>) -> String {
 /// caller redacts it first, because encoding writes a blank `%20`, which the redactor's
 /// `bearer` and `basic` rules no longer see as a blank.
 fn encode_condition(slug: &str) -> String {
-    aterm_codec::pct::encode(slug).replace('+', "%2B")
+    let encoded = aterm_codec::pct::encode(slug);
+    if encoded.contains('+') {
+        encoded.replace('+', "%2B")
+    } else {
+        encoded
+    }
 }
 
 /// A write's event as the body writes it: redacted, then `pct::encode`d, so it holds no
@@ -136,16 +144,18 @@ impl Notice {
     #[must_use]
     pub fn wait(repo: &Slug, tag: &str, held: &[&str], n: Option<u32>, id: Option<u64>) -> Notice {
         let join = |redact: bool| {
-            held.iter()
-                .map(|slug| {
-                    if redact {
-                        encode_condition(&Redactor::shapes(slug))
-                    } else {
-                        encode_condition(slug)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("+")
+            let mut out = String::new();
+            for (i, slug) in held.iter().enumerate() {
+                if i > 0 {
+                    out.push('+');
+                }
+                if redact {
+                    out.push_str(&encode_condition(&Redactor::shapes(slug)));
+                } else {
+                    out.push_str(&encode_condition(slug));
+                }
+            }
+            out
         };
         let key = hashed_key(&[
             Topic::Release.as_str(),
@@ -252,23 +262,24 @@ impl Notice {
     /// the blank between two words (a tag ending `bearer` keeps the `event=` word after it).
     #[must_use]
     pub fn body(&self) -> String {
-        let mut words = vec![
-            "v=1".to_string(),
-            format!("repo={}", self.repo),
-            format!("tag={}", encode_tag(&Redactor::shapes(&self.tag))),
-            format!("event={}", self.event),
-        ];
+        let mut out = String::new();
+        let mut push_word = |word: &str| {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&Redactor::shapes(word));
+        };
+        push_word("v=1");
+        push_word(&format!("repo={}", self.repo));
+        push_word(&format!("tag={}", encode_tag(&Redactor::shapes(&self.tag))));
+        push_word(&format!("event={}", self.event));
         if let Some(n) = self.n {
-            words.push(format!("n={n}"));
+            push_word(&format!("n={n}"));
         }
         if let Some(id) = self.id {
-            words.push(format!("id={id}"));
+            push_word(&format!("id={id}"));
         }
-        words
-            .iter()
-            .map(|word| Redactor::shapes(word))
-            .collect::<Vec<_>>()
-            .join(" ")
+        out
     }
 
     /// `@{sid} post to=say:{topic} kind=note key={key} -- {body}`, built from `body()`, so it

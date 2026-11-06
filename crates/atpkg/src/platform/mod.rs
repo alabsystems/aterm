@@ -6,6 +6,28 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Rename only where nothing stands at the destination, replacing no entry.
+#[cfg(unix)]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    aterm_dirfd::renameat_with(
+        aterm_dirfd::CWD,
+        from,
+        aterm_dirfd::CWD,
+        to,
+        aterm_dirfd::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
+}
+
+/// Off Unix, directories cannot be renamed over an existing entry.
+#[cfg(not(unix))]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(from, to)
+}
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

@@ -369,6 +369,7 @@ fn strict_head(head: &Value) -> bool {
         "mem",
         "margin",
         "cores",
+        "rank",
         "disk",
         "quiet",
         "quiet_policy",

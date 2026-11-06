@@ -430,27 +430,30 @@ fn short_key_or_mark(inner: &str) -> bool {
 
 /// `text` with each run of `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more replaced by `…`.
 fn mask_long_words(text: &str) -> String {
-    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut run = String::new();
-    for c in text.chars() {
-        if word(c) {
-            run.push(c);
-            continue;
-        }
-        out.push_str(if run.len() >= TOKEN_FLOOR {
-            "…"
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if word(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && word(bytes[i]) {
+                i += 1;
+            }
+            out.push_str(if i - start >= TOKEN_FLOOR {
+                "…"
+            } else {
+                &text[start..i]
+            });
         } else {
-            &run
-        });
-        run.clear();
-        out.push(c);
+            i += 1;
+            while i < bytes.len() && !word(bytes[i]) {
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+        }
     }
-    out.push_str(if run.len() >= TOKEN_FLOOR {
-        "…"
-    } else {
-        &run
-    });
     out
 }
 
@@ -1908,11 +1911,15 @@ impl ConfigFault {
     /// `faults` as one text: each `{rule}: {what}`, joined with `; `.
     #[must_use]
     pub(crate) fn list(faults: &[ConfigFault]) -> String {
-        faults
-            .iter()
-            .map(|f| format!("{}: {}", f.rule, f.what))
-            .collect::<Vec<_>>()
-            .join("; ")
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (i, f) in faults.iter().enumerate() {
+            if i > 0 {
+                out.push_str("; ");
+            }
+            let _ = write!(out, "{}: {}", f.rule, f.what);
+        }
+        out
     }
 }
 

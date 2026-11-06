@@ -177,11 +177,22 @@ impl RouteFacts {
         (network_of(self.address, self.prefix), self.prefix)
     }
 
+    /// Calls `f` with the subnet as `a.b.c.d/n` without allocating on the heap.
+    pub(crate) fn with_subnet_words<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        use std::io::Write as _;
+        let (net, prefix) = self.subnet();
+        let mut buf = [0u8; 24];
+        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+        let _ = write!(cursor, "{net}/{prefix}");
+        let len = usize::try_from(cursor.position()).unwrap_or(0);
+        let text = std::str::from_utf8(&buf[..len]).unwrap_or("");
+        f(text)
+    }
+
     /// The subnet as `a.b.c.d/n`.
     #[must_use]
     pub fn subnet_words(&self) -> String {
-        let (net, prefix) = self.subnet();
-        format!("{net}/{prefix}")
+        self.with_subnet_words(str::to_owned)
     }
 
     /// Whether `addr` lies on this route's subnet.
@@ -267,7 +278,7 @@ impl NetworkId {
         h.write(b"aterm-netplace/1 strong\0");
         h.write(hw);
         h.write_u8(0);
-        h.write(route.subnet_words().as_bytes());
+        route.with_subnet_words(|subnet| h.write(subnet.as_bytes()));
         Some(Self(format!("n{:016x}", h.finish())))
     }
 
@@ -276,7 +287,7 @@ impl NetworkId {
     pub fn weak(route: &RouteFacts) -> Self {
         let mut h = aterm_hash::Fnv1a64::new();
         h.write(b"aterm-netplace/1 weak\0");
-        h.write(route.subnet_words().as_bytes());
+        route.with_subnet_words(|subnet| h.write(subnet.as_bytes()));
         h.write_u8(0);
         if let Some(gateway) = route.gateway {
             h.write(&gateway.octets());
@@ -630,7 +641,7 @@ impl Stay {
             (Some(id), Some(network)) if network.is_strong() => *network == id,
             _ => {
                 self.gateway == route.gateway
-                    && self.subnet.as_deref() == Some(route.subnet_words().as_str())
+                    && route.with_subnet_words(|subnet| self.subnet.as_deref() == Some(subnet))
             }
         }
     }

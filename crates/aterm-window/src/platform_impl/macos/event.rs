@@ -82,7 +82,9 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     if result_len == 0 {
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
-    let chars = String::from_utf16_lossy(&string[0..result_len as usize]);
+    let chars = String::from_utf16_lossy(
+        &string[..crate::platform_impl::reported_len(result_len as usize, string.len())],
+    );
     Key::Character(SmolStr::new(chars))
 }
 
@@ -175,7 +177,8 @@ impl LayoutKeys for CurrentLayout {
         if status != 0 {
             return None;
         }
-        let mut chars = char::decode_utf16(string[..len as usize].iter().copied());
+        let typed = &string[..crate::platform_impl::reported_len(len as usize, string.len())];
+        let mut chars = char::decode_utf16(typed.iter().copied());
         match (chars.next(), chars.next()) {
             (Some(Ok(c)), None) => Some(c),
             _ => None,

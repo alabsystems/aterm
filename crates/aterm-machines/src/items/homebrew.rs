@@ -110,8 +110,8 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && !name.starts_with('-')
-        && !name.starts_with('/')
         && !name.contains("..")
+        && name.split('/').all(|seg| !seg.is_empty() && seg != ".")
         && name.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'@' | b'+' | b'.' | b'_' | b'/' | b'-')
         });
@@ -1012,5 +1012,17 @@ mod tests {
             "{:#?}",
             sys.calls()
         );
+    }
+
+    #[test]
+    fn formula_names_reject_local_path_segments_and_empty_slash_parts() {
+        for valid in ["jq", "python@3.13", "oven-sh/bun/bun", "g++", "node.js"] {
+            check_name(valid).unwrap();
+        }
+        for invalid in [
+            "", ".", "./jq", "jq/.", "jq/", "/jq", "tap//jq", "tap/./jq", "../jq", "-jq",
+        ] {
+            assert!(check_name(invalid).is_err(), "{invalid:?}");
+        }
     }
 }

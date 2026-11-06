@@ -330,7 +330,7 @@ impl TerminalHandler<'_> {
                 if key != "Cwd" || value.is_empty() {
                     return;
                 }
-                if value.len() > MAX_CWD_PATH_BYTES {
+                if !super::handler_osc::reported_cwd_is_storable(value) {
                     return;
                 }
                 self.shell.held_cwd = None;
@@ -388,9 +388,12 @@ impl TerminalHandler<'_> {
             }
             _ if spare.recorded => true,
             START_RC_KEY => {
-                let ok = !value.is_empty() && value.len() <= MAX_CWD_PATH_BYTES;
+                let rc = (!value.is_empty() && value.len() <= MAX_CWD_PATH_BYTES)
+                    .then(|| Self::unescape_vscode_string(value))
+                    .filter(|rc| super::handler_osc::reported_cwd_is_storable(rc));
+                let ok = rc.is_some();
                 if ok {
-                    spare.pending_rc = Some(Self::unescape_vscode_string(value));
+                    spare.pending_rc = rc;
                 }
                 ok
             }
@@ -1089,6 +1092,24 @@ mod spare_mark_tests {
     }
 
     #[test]
+    fn a_start_rc_that_unescapes_to_a_nul_is_refused() {
+        let id = id();
+        let mut t = gated();
+        t.process(&p("AtermStartRc=/tmp\\x00bad", &id));
+        assert_eq!(t.spare_marks_refused(), 1);
+        t.process(&p("AtermStart=cold", &id));
+        assert_eq!(t.take_start_mark().map(|m| m.rc_dir), Some(None));
+
+        let mut t = gated();
+        record(&mut t, "/tmp\\x20ok", "pre:0,s:0,j:0,r:0", "cold");
+        assert_eq!(t.spare_marks_refused(), 0);
+        assert_eq!(
+            t.take_start_mark().and_then(|m| m.rc_dir).as_deref(),
+            Some("/tmp ok")
+        );
+    }
+
+    #[test]
     fn a_start_record_carries_the_startup_roots_it_names() {
         let id = id();
         let mut t = gated();
@@ -1293,6 +1314,23 @@ mod reported_cwd_tests {
             .as_bytes(),
         );
         assert_eq!(t.current_working_directory(), Some("/home/me/docs"));
+        let oversized = format!("/{}", "a".repeat(super::MAX_CWD_PATH_BYTES));
+        t.process(
+            format!(
+                "\x1b]633;P;Cwd={oversized};id={}\x07",
+                ShellIntegrationNonce(KEY).to_hex()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(t.current_working_directory(), Some("/home/me/docs"));
+        assert_eq!(
+            t.shell
+                .current_mark
+                .as_ref()
+                .and_then(|m| m.working_directory.as_deref()),
+            Some("/home/me/docs"),
+            "the prompt's mark keeps the stored folder"
+        );
         t.process(&signed("A"));
         assert_eq!(t.current_working_directory(), Some("/home/me/docs"));
     }

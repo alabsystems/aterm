@@ -62,6 +62,8 @@ pub mod notify_need;
 pub mod pct;
 /// `aterm fabric halt|inbox|post` — a person speaking for themself, under a cap of their own.
 pub mod person;
+/// A person's key: the seal that carries a person's post to another Mac as the person's.
+pub mod person_key;
 mod pipeline;
 pub mod presence;
 /// The live view of who advertises which session.
@@ -76,6 +78,8 @@ mod sim;
 pub mod state;
 pub mod subject;
 pub mod transport;
+/// An unverifiable reservation holds its own sender, not the link (critic item F21).
+mod unverified_hold;
 /// How long the bridge's loop waits on the broker, counted where it blocks.
 pub mod wait_tally;
 

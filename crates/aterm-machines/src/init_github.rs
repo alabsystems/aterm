@@ -31,9 +31,9 @@ pub use native::InitialRepositoryInputs;
 /// entries must not invalidate a clone whose source and credential remain unchanged.
 pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", "github-repositories.json"];
 
-/// Whether the git every clone runs ([`crate::items::github::installed_git`]: the Command Line
-/// Tools', else Xcode's) is installed: the initial repositories wait on it
-/// ([`crate::init_observe::Wait::CommandLineTools`]) until it is.
+/// Whether Git is ready ([`crate::items::github::installed_git`]): managed Git is preferred,
+/// with developer-tools or system Git as fallbacks. Repositories wait on
+/// [`crate::init_observe::Wait::GitReadiness`] until one is available.
 #[must_use]
 pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
@@ -524,7 +524,7 @@ pub(super) fn auth_ready(
     let Ok(token) = read_token(sys, user, config) else {
         return Ok(None);
     };
-    let git = Git::new(sys);
+    let git = Git::for_user(sys, user);
     if !git.installed(sys) {
         return Err(NEEDS_GIT.into());
     }
@@ -553,7 +553,7 @@ impl Auth {
     /// The token, and what aterm's route hands back for it; the probe's answer where it cannot
     /// read them.
     fn read(&self, sys: &dyn System) -> Result<(Secret, Lookups), Probe> {
-        let git = Git::new(sys);
+        let git = Git::for_user(sys, &self.user);
         if !git.installed(sys) {
             return Err(Probe::Unusable {
                 why: NEEDS_GIT.into(),
@@ -665,7 +665,7 @@ fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, 
             }
         })?;
     let result = token(&bytes, config.token_key.as_deref());
-    scrub(&mut bytes);
+    aterm_uds::secret::scrub(&mut bytes);
     result.map_err(|why| TokenUnread { absent: false, why })
 }
 
@@ -692,14 +692,6 @@ fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {
         return Err("GitHub token must be one nonempty literal token; shell expansion and multiline values are refused".into());
     }
     Secret::new(value.as_bytes()).map_err(|_| "GitHub token is too long".into())
-}
-
-fn scrub(bytes: &mut [u8]) {
-    for byte in bytes {
-        // SAFETY: the mutable slice owns each live byte. Volatile writes prevent
-        // removal of the clearing when this temporary input buffer is dropped.
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
 }
 
 /// What other modules' tests script of the GitHub stage.

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::line::{Admitted, Fix, Hop, Line};
 use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
@@ -21,6 +22,17 @@ const NEXT: &str = "dddddddddddddddddddddddddddddddddddddddd";
 /// The re-run as R's own cutter: its pid and start, as the claim it takes over names them.
 const RERUN: (u32, &str) = (4343, "Thu Oct  9 02:01:00 2026");
 const BUMP2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+/// Landed, non-merge fixes on main, after the line's base.
+const FIX: &str = "1111111111111111111111111111111111111111";
+const FIX2: &str = "2222222222222222222222222222222222222222";
+/// Main's movement past the base that is no fix of the line's.
+const N2: &str = "3333333333333333333333333333333333333333";
+const N3: &str = "4444444444444444444444444444444444444444";
+
+/// The hop the fake makes of `fix`.
+fn hop_of(fix: &str) -> String {
+    format!("9{}", &fix[1..])
+}
 
 struct World {
     dir: aterm_tempfile::TempDir,
@@ -99,8 +111,16 @@ struct World {
     undelivered: usize,
     /// Free GiB on the clone's disk.
     free: u64,
+    /// What this machine's last releases wrote, as the release's record keeps it.
+    disk_record: aterm_capacity::Footprints,
+    /// The release's disk claim is refused with this.
+    claim_refusal: Option<Refusal>,
     /// The cut's read-only pre-claim gates' refusals.
     cut_gate_refusals: Vec<Refusal>,
+    /// The cut's gates of R's own tree, by R: their refusals.
+    head_gate_refusals: BTreeMap<String, Vec<Refusal>>,
+    /// Each R the cut's gates of R's own tree were asked of, in order.
+    head_gated: Vec<String>,
     publisher_lease_held: bool,
     /// The receipt judges cannot answer.
     judge_down: bool,
@@ -130,6 +150,8 @@ struct World {
     /// The prover the world resolves (TRUST_STAGE2_BIN, the journal's, the store's).
     prover: Prover,
     lease_error: Option<String>,
+    /// Why step 1's build-inputs seal cannot be taken.
+    seal_error: Option<String>,
     /// The engine's code now, and the engine that staged the attestation in publish/.out.
     engine: String,
     staged_by: Option<String>,
@@ -144,6 +166,16 @@ struct World {
     /// A peer's `pub stage aterm` moved the staging tier's main since R was attested; a
     /// stage of R attests it as it is again.
     candidate_missing: bool,
+    /// The commits `--fix` cannot carry ([`crate::line::admit`]'s refusals).
+    unfit: BTreeMap<String, Refusal>,
+    /// Commits whose tree has no `crates/aterm-release/src/line.rs`.
+    pre_line: BTreeSet<String>,
+    /// git cannot read the line's head's tree.
+    tree_unread: bool,
+    /// Why carrying fails (a conflict, a record push that cannot land).
+    carry_refusal: Option<Refusal>,
+    /// The meaning check's answer ([`crate::line::verify`]).
+    line_verify: Result<String, Refusal>,
 }
 
 impl World {
@@ -206,7 +238,11 @@ impl World {
             withdrawn: Vec::new(),
             undelivered: 0,
             free: 500,
+            disk_record: aterm_capacity::Footprints::default(),
+            claim_refusal: None,
             cut_gate_refusals: Vec::new(),
+            head_gate_refusals: BTreeMap::new(),
+            head_gated: Vec::new(),
             publisher_lease_held: false,
             judge_down: false,
             stage_sync_fails: false,
@@ -222,6 +258,7 @@ impl World {
             landing_fails: false,
             prover: prover(),
             lease_error: None,
+            seal_error: None,
             engine: "e7e7e7e7e7".into(),
             staged_by: None,
             running_at_prepared: None,
@@ -229,6 +266,11 @@ impl World {
             child_note_at_stage: false,
             ls_remote_down: false,
             candidate_missing: false,
+            unfit: BTreeMap::new(),
+            pre_line: BTreeSet::new(),
+            tree_unread: false,
+            carry_refusal: None,
+            line_verify: Ok("the line verifies".into()),
         }
     }
 
@@ -384,6 +426,10 @@ impl Backend for World {
         self.calls.push("lease".into());
         self.lease_error.clone().map_or(Ok(()), Err)
     }
+    fn seal_inputs(&mut self) -> Result<(), String> {
+        self.calls.push("seal-inputs".into());
+        self.seal_error.clone().map_or(Ok(()), Err)
+    }
     fn cleared_env(&mut self) -> Vec<String> {
         Vec::new()
     }
@@ -463,6 +509,77 @@ impl Backend for World {
     }
     fn is_dir(&mut self, _path: &Path) -> bool {
         true
+    }
+    fn tree_has(&mut self, rev: &str, path: &str) -> Result<bool, Refusal> {
+        assert_eq!(path, crate::release::LINE_SOURCE);
+        if self.tree_unread {
+            return Err(Refusal::new(
+                format!("this clone lacks commit {}", &rev[..4]),
+                "fetch origin, then run the release again",
+            )
+            .could_not_run());
+        }
+        Ok(!self.pre_line.contains(rev))
+    }
+    fn fix_of(&mut self, line: &Line, rev: &str) -> Result<Admitted, Refusal> {
+        let named = || {
+            Refusal::new(
+                format!("--fix {rev:?} names no commit of this clone"),
+                "fetch",
+            )
+        };
+        let commit = self.rev(rev).ok_or_else(named)?;
+        if line.carried(&commit) {
+            return Ok(Admitted::Carried);
+        }
+        if let Some(refusal) = self.unfit.get(&commit) {
+            return Err(refusal.clone());
+        }
+        if self.is_ancestor(&commit, line.head()) {
+            return Err(Refusal::new(
+                format!("{} is already in the line", &commit[..4]),
+                "drop it from --fix",
+            ));
+        }
+        Ok(Admitted::Fix(Fix {
+            subject: format!("fix {}", &commit[..4]),
+            commit,
+            paths: vec!["src/fixed.rs".into()],
+        }))
+    }
+    /// Each hop and then the record merge join the (linear) history, so the head is on main.
+    fn carry(&mut self, line: &Line, fixes: &[Fix]) -> Result<(Vec<Hop>, String), Refusal> {
+        self.calls.push("carry".into());
+        if let Some(refusal) = self.carry_refusal.clone() {
+            return Err(refusal);
+        }
+        let main = self.versions.get(&self.tip()).cloned().unwrap_or_default();
+        let hops: Vec<Hop> = fixes
+            .iter()
+            .map(|fix| Hop {
+                commit: hop_of(&fix.commit),
+                carries: fix.commit.clone(),
+                why: fix.subject.clone(),
+                paths: fix.paths.clone(),
+            })
+            .collect();
+        for hop in &hops {
+            self.history.push(hop.commit.clone());
+            self.versions
+                .insert(hop.commit.clone(), line.version.clone());
+        }
+        let head = hops.last().map_or(line.head(), |hop| hop.commit.as_str());
+        let merge = format!("8{}", &head[1..]);
+        self.history.push(merge.clone());
+        self.versions.insert(merge.clone(), main);
+        Ok((
+            hops,
+            format!("recorded on main by the merge {}", &merge[..4]),
+        ))
+    }
+    fn verify_line(&mut self, _line: &Line) -> Result<String, Refusal> {
+        self.calls.push("verify-line".into());
+        self.line_verify.clone()
     }
     fn sync(&mut self) -> Result<String, Refusal> {
         self.calls.push("sync".into());
@@ -568,6 +685,16 @@ impl Backend for World {
     fn disk(&mut self) -> (Option<u64>, bool) {
         (Some(self.free), true)
     }
+    fn disk_record(&mut self) -> aterm_capacity::Footprints {
+        self.disk_record.clone()
+    }
+    fn claim_disk(&mut self, bytes: u64, _why: &str) -> Result<(), Refusal> {
+        self.calls.push(format!("disk-claim {}", bytes >> 30));
+        self.claim_refusal.clone().map_or(Ok(()), Err)
+    }
+    fn let_disk_go(&mut self, passed: bool) {
+        self.calls.push(format!("disk-let-go {passed}"));
+    }
     fn commit_gates(&mut self, _c: &Candidate, dry: bool) -> Vec<Refusal> {
         self.calls.push(
             if dry {
@@ -591,6 +718,13 @@ impl Backend for World {
             refusals.push(lease_held());
         }
         refusals
+    }
+    fn head_gates(&mut self, c: &Candidate) -> Vec<Refusal> {
+        self.head_gated.push(c.commit.clone());
+        self.head_gate_refusals
+            .get(&c.commit)
+            .cloned()
+            .unwrap_or_default()
     }
     fn stage_fixtures(
         &mut self,
@@ -890,6 +1024,35 @@ fn a_toolchain_lease_failure_stops_before_any_release_work() {
     assert_eq!(world.observations, ["observe-operational", "prover"]);
 }
 
+/// Step 1 seals the build inputs under the lease it just took, and a seal that cannot be taken
+/// stops the release there with the build inputs' remedy, not the lease's. CONTROL: a lease
+/// that fails stops before the seal (`a_toolchain_lease_failure_stops_…`), and a dry run takes
+/// neither.
+#[test]
+fn a_build_inputs_seal_failure_stops_step_one_with_its_own_remedy() {
+    let mut world = World::new();
+    world.seal_error = Some("build input changed while it was hashed: /sdk/usr".into());
+    let (code, last) = world.run(bump());
+    assert_ne!(code, 0);
+    assert!(
+        last.contains("build input changed while it was hashed"),
+        "{last}"
+    );
+    assert!(
+        last.ends_with(". restore the release build inputs and retry"),
+        "{last}"
+    );
+    assert_eq!(world.calls, ["lease", "seal-inputs"]);
+    let mut dry = World::new();
+    dry.seal_error = Some("never asked".into());
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert_eq!((dry.count("lease"), dry.count("seal-inputs")), (0, 0));
+}
+
 #[test]
 fn operational_observation_precedes_prover_network_and_provisioning() {
     let mut world = World::new();
@@ -919,7 +1082,10 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .calls
         .iter()
         .map(String::as_str)
-        .filter(|c| !matches!(*c, "audit" | "lease" | "cut-gates") && !c.starts_with("ls-remote"))
+        .filter(|c| {
+            !matches!(*c, "audit" | "lease" | "seal-inputs" | "cut-gates")
+                && !c.starts_with("ls-remote")
+        })
         .collect();
     assert_eq!(
         order,
@@ -928,12 +1094,14 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "bump",
             "move cccc",
             "validation-tools",
+            "disk-claim 30",
             "commit-gates",
             "stage",
             "reserve",
             "build",
             "stage-fixtures",
             "verify",
+            "disk-let-go true",
             "sync",
             "engine-now",
             "candidate-now",
@@ -965,6 +1133,93 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     assert!(
         !w.release_dir().join(RUNNING_FILE).exists(),
         "the claim goes with the run"
+    );
+}
+
+/// A RELEASE CLAIMS ITS DISK ONCE, BEFORE ANYTHING OF IT WRITES, AND LETS GO WHEN VERIFY ENDS:
+/// one claim, sized from what this machine's recorded releases wrote (45 GiB, above the 30 GiB
+/// warm floor) or, with none recorded, the floor, taken before the stage and the build and ended
+/// as verify ends, passed or not, before the publish. A verified candidate and a dry run claim
+/// nothing; a refused claim stops the run at the stage before anything writes. NEGATIVE
+/// CONTROLS: ending the claim before verify, or sizing it without the record, fails here.
+#[test]
+fn a_release_claims_its_disk_once_before_it_writes_and_lets_go_when_verify_ends() {
+    let gib = 1u64 << 30;
+    let mut w = World::new();
+    w.disk_record.push(aterm_capacity::Footprint {
+        peak: 45 * gib,
+        grew: 45 * gib,
+        at_ms: 1,
+        dirs: None,
+        scope: atpkg::admit_disk::scope_tag(crate::release_disk::SCOPE),
+    });
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}");
+    let at = |w: &World, call: &str| w.calls.iter().position(|c| c == call);
+    assert_eq!(w.count("disk-claim 45"), 1, "{:?}", w.calls);
+    assert!(
+        at(&w, "disk-claim 45") < at(&w, "stage") && at(&w, "stage") < at(&w, "build"),
+        "{:?}",
+        w.calls
+    );
+    let go = at(&w, "disk-let-go true").expect("the claim ends once verify passed");
+    assert!(
+        at(&w, "verify") < Some(go) && Some(go) < at(&w, "publish"),
+        "{:?}",
+        w.calls
+    );
+
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0, "a verified candidate");
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("disk-claim")),
+        "{:?}",
+        w.calls
+    );
+
+    let mut w = World::new();
+    w.verify_passes = false;
+    w.verify_code = 3;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert_eq!(
+        (w.count("disk-claim 30"), w.count("disk-let-go false")),
+        (1, 1),
+        "nothing recorded: the warm floor, and a verify that could not run ends it unpassed: {:?}",
+        w.calls
+    );
+
+    let mut w = World::new();
+    w.audits = VecDeque::from([owner_gap()]);
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("disk-claim")),
+        "{:?}",
+        w.calls
+    );
+    assert!(
+        w.out.iter().any(|l| l.contains("disk: would claim 30 GiB")),
+        "{:#?}",
+        w.out
+    );
+
+    let mut w = World::new();
+    w.claim_refusal = Some(Refusal::new(
+        "the release's 30 GiB can never fit on /c",
+        "free space, then re-run",
+    ));
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(last.starts_with("REFUSED at 4/11 stage"), "{last}");
+    assert_eq!(
+        (w.count("stage"), w.count("build"), w.count("verify")),
+        (0, 0, 0),
+        "{:?}",
+        w.calls
     );
 }
 
@@ -1376,6 +1631,9 @@ fn a_bare_rerun_keeps_the_ready_candidate() {
     assert_eq!(w.count("verify"), 0);
 }
 
+/// A published line, or one whose build is claimed, is the cut's: neither `--commit` nor
+/// `--fix` changes it, and nothing is carried. NEGATIVE CONTROL: drop `refuse_published` from
+/// `--fix`'s candidate, and the published line takes a hop.
 #[test]
 fn a_published_candidate_cannot_be_replaced() {
     let mut w = World::new();
@@ -1394,6 +1652,652 @@ fn a_published_candidate_cannot_be_replaced() {
         w.journal().unwrap().commit,
         BUMP,
         "the published candidate stays"
+    );
+
+    let fix = ReleaseOptions {
+        fix: vec![NEXT.into()],
+        ..mac()
+    };
+    let (code, last) = w.run(fix.clone());
+    assert!(
+        code == 1 && last.contains("is already published"),
+        "published: {last}"
+    );
+    w.published.clear();
+    w.newest = Some(OLD.into());
+    w.cut = Some(CutState {
+        version: "0.6.0".into(),
+        build: 1_791_600_000,
+        finished: false,
+    });
+    let (code, last) = w.run(fix);
+    assert!(
+        code == 1 && last.contains("is already published"),
+        "claimed: {last}"
+    );
+    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert_eq!(w.journal().unwrap().commit, BUMP, "the cut's line stays");
+}
+
+/// A line started at G (the bump) went red; main then moved by three commits and the fix
+/// landed. `--fix` carries the fix onto G as hop 1 and the run resumes at the new head: the
+/// release never re-selects origin/main's tip. THE INSTRUMENT (A18's): re-selections from main
+/// after the line started, counted as the commits the clone was moved to that are not the
+/// line's own — 0 here, where `--commit origin/main` (the remedy before lines) moved it to the
+/// tip, one re-selection absorbing main's three commits. `verify release` runs once per head.
+/// NEGATIVE CONTROLS: carry onto a line started at origin/main's tip (a re-selection), and the
+/// base is the tip; say `--commit origin/main` after a red, and the remedy names no `--fix`.
+#[test]
+fn a_fix_after_a_red_carries_a_landed_commit_and_never_reselects_main() {
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 6/11 verify"),
+        "{last}"
+    );
+    assert!(
+        last.contains("--fix") && !last.contains("--commit origin/main"),
+        "a red's way out is a hop: {last}"
+    );
+    let started = w.journal().unwrap();
+    assert_eq!(started.line(), Line::start("0.6.0", BUMP, started.started));
+    assert_eq!(started.line.as_ref(), Some(&started.line()), "journaled");
+
+    for moved in [NEXT, N2, N3, FIX] {
+        w.history.push(moved.into());
+        w.versions.insert(moved.into(), "0.6.0".into());
+    }
+    w.verify_code = 0;
+    w.verify_passes = true;
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let hop = hop_of(FIX);
+    assert!(
+        last.starts_with(&format!(
+            "RELEASED aterm 0.6.0 (build 1791600000) from {}",
+            &hop[..9]
+        )),
+        "{last}"
+    );
+    let j = w.journal().unwrap();
+    let line = j.line.clone().expect("the journal keeps the line");
+    assert_eq!(line.base, BUMP, "the line never rebases");
+    assert_eq!(line.started, started.started, "one line, started once");
+    let carried: Vec<&str> = line.hops.iter().map(|h| h.carries.as_str()).collect();
+    assert_eq!(carried, [FIX]);
+    assert_eq!(
+        (j.commit.as_str(), line.head()),
+        (hop.as_str(), hop.as_str())
+    );
+
+    let own: Vec<String> = std::iter::once(line.base.clone())
+        .chain(line.hops.iter().map(|h| h.commit.clone()))
+        .collect();
+    let moves: Vec<&str> = w
+        .calls
+        .iter()
+        .filter_map(|c| c.strip_prefix("move "))
+        .collect();
+    let reselections = moves
+        .iter()
+        .filter(|m| !own.iter().any(|c| c.starts_with(**m)))
+        .count();
+    assert_eq!(reselections, 0, "moves {moves:?}, line {own:?}");
+    assert_eq!(moves, [&BUMP[..4], &hop[..4]]);
+    assert_eq!(
+        (w.count("bump"), w.count("carry"), w.count("verify")),
+        (1, 1, 2),
+        "{:?}",
+        w.calls
+    );
+}
+
+/// `--fix` naming a commit a hop carries already carries nothing and resumes the line as it
+/// is, journal and all. NEGATIVE CONTROL: refuse a carried commit instead of dropping it, and
+/// the run stops at step 1.
+#[test]
+fn a_fix_the_line_carries_resumes_it_as_it_is() {
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let _ = w.run(bump());
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    let fix = ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    };
+    let (code, last) = w.run(fix.clone());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 6/11 verify"),
+        "red at the hop too: {last}"
+    );
+    let before = w.journal().unwrap();
+    assert_eq!(before.commit, hop_of(FIX));
+
+    w.verify_code = 0;
+    w.verify_passes = true;
+    w.calls.clear();
+    let (code, last) = w.run(fix);
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert!(
+        w.out
+            .iter()
+            .any(|l| l.contains("every commit --fix names is carried already")),
+        "{:#?}",
+        w.out
+    );
+    let after = w.journal().unwrap();
+    assert_eq!(
+        (after.commit.as_str(), after.line.as_ref()),
+        (before.commit.as_str(), before.line.as_ref())
+    );
+}
+
+/// With an unpublished line in the clone, `--commit` naming another commit (main's tip, the
+/// remedy before lines) refuses and names `--fix` and `--forget`; the journal is untouched.
+/// `--commit` naming the line's head resumes it. NEGATIVE CONTROL: remove the refusal, and
+/// `--commit origin/main` takes main's tip as the candidate again (a re-selection).
+#[test]
+fn commit_on_an_unpublished_line_refuses_naming_fix_and_forget() {
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let _ = w.run(bump());
+    let before = w.journal().unwrap();
+    w.history.push(NEXT.into());
+    w.versions.insert(NEXT.into(), "0.6.0".into());
+    for rev in ["origin/main", NEXT] {
+        let (code, last) = w.run(ReleaseOptions {
+            commit: Some(rev.into()),
+            ..mac()
+        });
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 1/11 checks"),
+            "{rev}: {last}"
+        );
+        assert!(
+            last.contains(&format!("line v0.6.0 at {}", &BUMP[..9]))
+                && last.contains("--fix <its commit>")
+                && last.contains("--forget"),
+            "{rev}: {last}"
+        );
+        assert_eq!(w.journal().unwrap(), before, "{rev}");
+    }
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("move dddd")),
+        "{:?}",
+        w.calls
+    );
+
+    w.verify_code = 0;
+    w.verify_passes = true;
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some(BUMP.into()),
+        ..mac()
+    });
+    assert_eq!(code, 0, "the head resumes: {last}");
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+}
+
+/// `--fix` needs this clone's unfinished line: with no journal it refuses at step 1 and
+/// changes nothing, and a line whose head predates lines (its tree has no line.rs, so the
+/// cutter its run re-runs as keeps no line) refuses too; a tree git cannot read could not run,
+/// and names no `--forget`. NEGATIVE CONTROL: drop the `tree_has` test, and the old head takes
+/// a hop.
+#[test]
+fn fix_needs_this_clones_unfinished_line_whose_head_knows_lines() {
+    let mut w = World::new();
+    w.history.push(FIX.into());
+    let fix = ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    };
+    let (code, last) = w.run(fix.clone());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 1/11 checks"),
+        "{last}"
+    );
+    assert!(
+        last.contains("has none") && last.contains("--bump"),
+        "{last}"
+    );
+    assert!(w.journal().is_none());
+
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let _ = w.run(bump());
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.pre_line.insert(BUMP.into());
+    let (code, last) = w.run(fix.clone());
+    assert!(
+        code == 1 && last.contains("predates release lines"),
+        "{last}"
+    );
+    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+
+    w.pre_line.clear();
+    w.tree_unread = true;
+    let (code, last) = w.run(fix);
+    assert!(
+        code == 3
+            && last.starts_with("REFUSED at 1/11 checks: COULD NOT RUN — this clone lacks commit")
+            && !last.contains("--forget"),
+        "a tree git cannot read is no line to drop: {last}"
+    );
+    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+}
+
+/// A line whose meaning check fails ([`crate::line::verify`]) is never exported: the stage
+/// refuses before `pub stage` (and before the private export of `--qualify`). NEGATIVE
+/// CONTROL: drop `line_holds` before the remote stage, and `pub stage` runs.
+#[test]
+fn a_line_that_fails_its_meaning_check_is_never_exported() {
+    for qualify in [false, true] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        w.verify_code = 1;
+        w.verify_passes = false;
+        let start = ReleaseOptions {
+            qualify,
+            commit: Some(TIP.into()),
+            ..mac()
+        };
+        let _ = w.run(start);
+        w.history.push(FIX.into());
+        w.versions.insert(FIX.into(), "0.6.0".into());
+        w.line_verify = Err(Refusal::new(
+            "hop 1's tree is not 1111's patch onto the previous head",
+            "drop the line",
+        ));
+        w.calls.clear();
+        let (code, last) = w.run(ReleaseOptions {
+            qualify,
+            fix: vec![FIX.into()],
+            ..mac()
+        });
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 4/11 stage"),
+            "qualify {qualify}: {last}"
+        );
+        assert!(last.contains("is not 1111's patch"), "{last}");
+        assert_eq!(
+            (w.count("carry"), w.count("verify-line")),
+            (1, 1),
+            "{:?}",
+            w.calls
+        );
+        assert_eq!(
+            (w.count("stage"), w.count("qualify")),
+            (0, 0),
+            "qualify {qualify}: {:?}",
+            w.calls
+        );
+    }
+}
+
+/// A line started by `--bump` whose `verify release` went red, then FIX landed on main and
+/// `verify release` turns green.
+fn red_line() -> World {
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 6/11 verify"),
+        "{last}"
+    );
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.verify_code = 0;
+    w.verify_passes = true;
+    w
+}
+
+fn fix(commits: &[&str]) -> ReleaseOptions {
+    ReleaseOptions {
+        fix: commits.iter().map(|c| (*c).to_string()).collect(),
+        ..mac()
+    }
+}
+
+/// A dry `--fix` plans the head step 3 would make: it carries, moves and journals nothing, and
+/// reads none of the old head's journaled facts (its preflight, its reserved build) as the new
+/// head's, so it agrees with the real run, which journals the new head afresh — going ahead,
+/// and refusing at the preflight. NEGATIVE CONTROL: let the journal's facts stand for R while
+/// fixes are still to carry, and the dry run reads the preflight off the journal and says the
+/// red head's build is reserved, going ahead where the real run refuses.
+#[test]
+fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
+    let dry = ReleaseOptions {
+        dry_run: true,
+        ..fix(&[FIX])
+    };
+
+    let mut w = red_line();
+    let before = w.journal().unwrap();
+    assert!(
+        before.has(crate::release::COMMIT_GATES) && before.reserved.is_some(),
+        "the red head's own facts: {before:?}"
+    );
+    w.calls.clear();
+    let (code, last) = w.run(dry.clone());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.contains("a real run would go ahead"), "{last}");
+    assert_eq!(w.journal().unwrap(), before, "a dry run journals nothing");
+    for call in [
+        "carry",
+        "stage",
+        "reserve",
+        "build",
+        "verify",
+        "verify-line",
+    ] {
+        assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
+    }
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("move")),
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        w.count("commit-gates-dry"),
+        1,
+        "the preflight is asked, not read off the old head's journal: {:?}",
+        w.calls
+    );
+    let said = |needle: &str| w.out.iter().any(|l| l.contains(needle));
+    for needle in [
+        "would carry 111111111 onto the line's head ccccccccc",
+        "asked of the line's head ccccccccc before the carry",
+        "would reserve build n",
+        "the line's new head is not made yet",
+        "pub stage aterm --commit <the line's new head>",
+        "would check the line's new head with line::verify",
+    ] {
+        assert!(said(needle), "{needle}: {:#?}", w.out);
+    }
+    assert!(
+        !said("(this release's journal)"),
+        "no fact of the old head is the new head's: {:#?}",
+        w.out
+    );
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+
+    let mut w = red_line();
+    w.blocks = vec![Refusal::new(
+        "changelog: CHANGELOG.md has no 0.6.0 section",
+        "add it on main",
+    )];
+    let before = w.journal().unwrap();
+    let (code, dry_last) = w.run(dry);
+    assert_eq!(code, 1, "{dry_last}\n{:#?}", w.out);
+    assert!(
+        dry_last.contains("would refuse at 4/11 stage: the preflight BLOCKED"),
+        "{dry_last}"
+    );
+    assert_eq!(w.journal().unwrap(), before);
+    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    let (code, last) = w.run(fix(&[FIX]));
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 4/11 stage: the preflight BLOCKED"),
+        "the real run refuses where the dry one said: {last}"
+    );
+}
+
+/// The cut's gates of R's own tree (its handoff fixtures and policy) are asked at step 1 of the
+/// head the release goes on with: a bare re-run of a head that fails them refuses there, naming
+/// `--fix`, and that `--fix` is not refused by the head it replaces: step 3 carries it, and the
+/// new head meets those gates. NEGATIVE CONTROL: ask them of the old head while its fixes are
+/// still to carry, and `--fix` refuses at step 1 with the remedy that named it.
+#[test]
+fn a_fix_is_never_judged_by_the_head_it_replaces() {
+    let mut w = red_line();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(fix(&[FIX]));
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 6/11 verify"),
+        "{last}"
+    );
+    let hop1 = hop_of(FIX);
+    w.head_gate_refusals.insert(
+        hop1.clone(),
+        vec![Refusal::new(
+            "handoff policy: v0.6.0 moves the handoff policy without its fixture",
+            "land the fixture on main",
+        )],
+    );
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 1
+            && last.starts_with("REFUSED at 1/11 checks: the cut would refuse")
+            && last.contains("--fix <the fix's own non-merge commit>"),
+        "{last}"
+    );
+    assert!(
+        w.out.iter().any(|l| l.contains("handoff policy")),
+        "{:#?}",
+        w.out
+    );
+
+    w.history.push(FIX2.into());
+    w.versions.insert(FIX2.into(), "0.6.0".into());
+    w.verify_code = 0;
+    w.verify_passes = true;
+    w.head_gated.clear();
+    let (code, last) = w.run(fix(&[FIX2]));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let hop2 = hop_of(FIX2);
+    assert_eq!(w.count("carry"), 2, "{:?}", w.calls);
+    assert_eq!(w.journal().unwrap().commit, hop2);
+    assert!(
+        !w.head_gated.is_empty() && w.head_gated.iter().all(|c| *c == hop2),
+        "asked of the new head alone: {:?}",
+        w.head_gated
+    );
+}
+
+/// A carry that cannot be made (a conflict, a record that cannot land) refuses at step 3 with
+/// its own words: the journal keeps the line as it was, the clone is moved nowhere, and nothing
+/// is staged or verified. NEGATIVE CONTROL: swallow the carry's refusal, and the red head is
+/// staged and verified again.
+#[test]
+fn a_carry_that_cannot_be_made_refuses_at_step_three_and_keeps_the_line() {
+    let mut w = red_line();
+    let before = w.journal().unwrap();
+    w.carry_refusal = Some(Refusal::new(
+        "111111111111 (fix 1111) does not carry onto the line's head: it conflicts in \
+         src/fixed.rs",
+        "author it on ccccccccc and land it",
+    ));
+    w.calls.clear();
+    let (code, last) = w.run(fix(&[FIX]));
+    assert!(
+        code == 1
+            && last.starts_with("REFUSED at 3/11 commit")
+            && last.contains("it conflicts in src/fixed.rs"),
+        "{last}"
+    );
+    assert_eq!(w.journal().unwrap(), before, "the line is kept as it was");
+    assert_eq!(w.count("carry"), 1, "{:?}", w.calls);
+    assert!(
+        !w.calls.iter().any(|c| c.starts_with("move")),
+        "{:?}",
+        w.calls
+    );
+    for call in ["commit-gates", "verify-line", "stage", "verify"] {
+        assert_eq!(w.count(call), 0, "{call}: {:?}", w.calls);
+    }
+}
+
+/// Every commit `--fix` names is admitted before anything is carried: one that cannot be (a
+/// merge, off main, a frozen path: `line::admit`'s refusals), or a name that is no commit,
+/// refuses at step 1 and carries none of them, the admissible ones included. NEGATIVE CONTROL:
+/// skip a commit admission refuses, and the run carries the rest.
+#[test]
+fn a_fix_admission_refuses_at_step_one_and_carries_nothing() {
+    let mut w = red_line();
+    w.history.push(FIX2.into());
+    w.versions.insert(FIX2.into(), "0.6.0".into());
+    let before = w.journal().unwrap();
+    w.unfit.insert(
+        FIX.into(),
+        Refusal::new(
+            "111111111111 is a merge: a hop carries one non-merge commit",
+            "name the landing's own commits",
+        ),
+    );
+    for named in [vec![FIX], vec![FIX2, FIX], vec!["no-such-commit"]] {
+        let (code, last) = w.run(fix(&named));
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 1/11 checks"),
+            "{named:?}: {last}"
+        );
+        let why = if named.contains(&FIX) {
+            "is a merge"
+        } else {
+            "names no commit of this clone"
+        };
+        assert!(last.contains(why), "{named:?}: {last}");
+        assert_eq!(w.count("carry"), 0, "{named:?}: {:?}", w.calls);
+        assert_eq!(w.journal().unwrap(), before, "{named:?}");
+    }
+}
+
+/// A hop origin/main no longer holds (main rewritten without the line's record merge) cannot
+/// ship: step 1 says so and names `--forget`, whether the clone's main is still at the hop or
+/// was reset to origin/main. A commit with no hop that main lacks is to be landed instead.
+/// NEGATIVE CONTROL: name no line, and the hop's clone is told to push its main.
+#[test]
+fn a_hop_main_no_longer_holds_drops_the_line() {
+    let mut w = red_line();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let _ = w.run(fix(&[FIX]));
+    let hop = hop_of(FIX);
+    let merge = format!("8{}", &hop[1..]);
+    assert_eq!(w.journal().unwrap().commit, hop);
+    w.history.retain(|c| *c != hop && *c != merge);
+    let before = w.journal().unwrap();
+    for at in ["its hop", "origin/main"] {
+        if at == "origin/main" {
+            w.head = w.tip();
+        }
+        assert_eq!(w.head == hop, at == "its hop");
+        let (code, last) = w.run(mac());
+        assert!(
+            code == 1
+                && last.starts_with("REFUSED at 1/11 checks")
+                && last.contains("no longer holds the line's record merge")
+                && last.contains("--forget"),
+            "{at}: {last}"
+        );
+        assert!(!last.contains("git push origin main"), "{at}: {last}");
+        assert_eq!(w.journal().unwrap(), before, "{at}");
+    }
+
+    let mut w = World::new();
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let _ = w.run(bump());
+    w.history.retain(|c| c != BUMP);
+    w.head = w.tip();
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 1
+            && last.contains("is not on origin/main")
+            && last.contains("land it on main first"),
+        "{last}"
+    );
+}
+
+/// A remedy that starts a line (`--commit`, `--bump`) names `--forget` first while this clone
+/// holds an unfinished line, which `--commit` refuses to replace and `--bump` resumes: the
+/// predecessor's claim missing from the line's history, an unfinished cut of another version.
+/// The remedy then goes through; with no line held it is the bare command. NEGATIVE CONTROL:
+/// drop the `--forget`, and the remedy's `--commit` refuses with "only starts a line".
+#[test]
+fn a_remedy_that_starts_a_line_drops_the_held_line_first() {
+    let mut w = red_line();
+    w.history.push(NEXT.into());
+    w.versions.insert(NEXT.into(), "0.6.0".into());
+    w.origin_tags.insert("v0.5.0".into(), NEXT.into());
+    let before = w.journal().unwrap();
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 1 && last.contains("does not contain v0.5.0's claim commit"),
+        "{last}"
+    );
+    let remedy = format!(
+        "{} --forget, then {} --commit origin/main",
+        crate::ledger::RELEASE_COMMAND,
+        crate::ledger::RELEASE_COMMAND
+    );
+    assert!(last.contains(&remedy), "{last}");
+    assert_eq!(w.journal().unwrap(), before);
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some("origin/main".into()),
+        ..mac()
+    });
+    assert!(
+        code == 1 && last.contains("only starts a line"),
+        "the remedy without --forget is a dead end: {last}"
+    );
+    let (code, last) = w.run(ReleaseOptions {
+        forget: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    let (code, last) = w.run(ReleaseOptions {
+        commit: Some("origin/main".into()),
+        ..mac()
+    });
+    assert_eq!(code, 0, "the remedy goes through: {last}\n{:#?}", w.out);
+
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.origin_tags.insert("v0.5.0".into(), NEXT.into());
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 1
+            && last.contains("does not contain v0.5.0's claim commit")
+            && last.contains(&format!(
+                "after that claim: {} --commit origin/main",
+                crate::ledger::RELEASE_COMMAND
+            ))
+            && !last.contains("--forget"),
+        "no line is held: {last}"
+    );
+
+    let mut w = red_line();
+    w.cut = Some(CutState {
+        version: "0.5.0".into(),
+        build: 1_791_400_000,
+        finished: false,
+    });
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 1
+            && last.contains("holds an unfinished cut of v0.5.0")
+            && last.contains(&format!(
+                "finish it: {} --forget, then {} --commit <its published commit>",
+                crate::ledger::RELEASE_COMMAND,
+                crate::ledger::RELEASE_COMMAND
+            )),
+        "{last}"
     );
 }
 
@@ -1771,6 +2675,16 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
             &last,
             "the final line is the last line"
         );
+        let closed = w.out[w.out.len() - 2]
+            .strip_prefix("release-event: ")
+            .map(|event| aterm_json::from_str::<aterm_json::Value>(event).expect("an event"))
+            .unwrap_or_default();
+        assert_eq!(
+            (closed["stage"].as_str(), closed["outcome"].as_str()),
+            (line.split_whitespace().nth(3), Some("INTERRUPTED")),
+            "the step's record closes before the final line: {:?}",
+            w.out
+        );
         assert!(!w.release_dir().join(RUNNING_FILE).exists(), "{line}");
         assert_eq!(w.count(never), 0, "{line}: {:?}", w.calls);
 
@@ -1937,21 +2851,29 @@ fn a_check_that_could_not_run_keeps_the_ask_open() {
 }
 
 #[test]
-fn asks_are_carried_over_a_replaced_candidate_and_withdrawn_by_forget() {
+fn asks_are_carried_over_each_new_head_and_withdrawn_by_forget() {
     let mut w = World::new();
     w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
     let _ = w.run(bump());
     assert_eq!(w.journal().unwrap().asks, ["release.notary"]);
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
-    w.audits = VecDeque::from([owner_gap(), machine_gap()]);
     let (code, _) = w.run(ReleaseOptions {
         commit: Some(NEXT.into()),
         ..mac()
     });
+    assert_eq!(code, 1, "--commit only starts a line");
+    assert_eq!(w.journal().unwrap().commit, BUMP);
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.audits = VecDeque::from([owner_gap(), machine_gap()]);
+    let (code, _) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..mac()
+    });
     assert_eq!(code, 1);
     let j = w.journal().unwrap();
-    assert_eq!(j.commit, NEXT);
+    assert_eq!(j.commit, hop_of(FIX));
     assert_eq!(j.asks, ["release.notary"], "carried, not asked again");
     assert_eq!(w.asks, ["release.notary"]);
     let forget = ReleaseOptions {
@@ -2151,6 +3073,7 @@ fn forget_takes_no_flag_it_would_ignore() {
         &["release", "--forget", "--mac-only"],
         &["release", "--forget", "--prepare"],
         &["release", "--forget", "--qualify"],
+        &["release", "--forget", "--fix", "abc"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
@@ -2629,7 +3552,7 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
     .iter()
     .map(Into::into)
     .collect();
-    let again = opts.anchored(&start).anchored_args(args);
+    let again = opts.anchored(&start).rerun_args(args);
     let want: Vec<std::ffi::OsString> = vec![
         "release".into(),
         "--engine".into(),
@@ -2644,6 +3567,56 @@ fn relative_path_flags_are_anchored_once_where_the_release_started() {
         "/abs/linux".into(),
     ];
     assert_eq!(again, want);
+}
+
+/// The re-run as R's own cutter is handed no `--fix`: it resumes the head the journal names,
+/// whose hops this run made, and every other flag is passed on. NEGATIVE CONTROL: keep `--fix`
+/// and its commits in `rerun_args`, and they reach the re-run.
+#[test]
+fn the_rerun_is_handed_no_fix_and_resumes_the_journaled_head() {
+    let args = [
+        "release",
+        "--fix",
+        FIX,
+        FIX2,
+        "--mac-only",
+        "--fix",
+        N2,
+        "--verbose",
+    ];
+    let again = mac().rerun_args(args.iter().map(Into::into).collect());
+    let want: Vec<std::ffi::OsString> = ["release", "--mac-only", "--verbose"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(again, want);
+}
+
+/// `--fix` takes one or more commits, may be repeated, and combines with no flag that starts a
+/// line (`--bump`, `--commit`) or ends the run (`--forget`, `--abandon`). NEGATIVE CONTROL: drop
+/// the `--bump`/`--commit` refusal, and `--fix a --bump` parses.
+#[test]
+fn fix_takes_its_commits_and_no_flag_that_starts_a_line() {
+    let parse = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        crate::cli::parse(&args)
+    };
+    assert!(matches!(
+        parse(&["release", "--fix", "a1", "b2", "--mac-only", "--fix", "c3", "--dry-run"]),
+        Ok(crate::cli::Cmd::Release(o))
+            if o.fix == ["a1", "b2", "c3"] && o.linux.mac_only && o.dry_run
+    ));
+    for bad in [
+        &["release", "--fix"][..],
+        &["release", "--fix", "--mac-only"],
+        &["release", "--fix", "a1", "--bump"],
+        &["release", "--bump", "--fix", "a1"],
+        &["release", "--commit", "origin/main", "--fix", "a1"],
+        &["release", "--fix", "a1", "--commit", "b2"],
+        &["release", "--abandon", "v0.6.0", "--fix", "a1"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
 }
 
 #[test]
@@ -2732,6 +3705,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
         version: "0.6.0".into(),
         why: String::new(),
         bump_from: None,
+        carry: Vec::new(),
     };
     let mut real = Real::new(&repo, None, true, false).expect("a backend");
     real.build_inputs = || Ok("fixture inputs".into());

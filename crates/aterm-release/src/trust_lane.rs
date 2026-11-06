@@ -830,14 +830,14 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
     text.lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
+            let mut f = l.split('\t');
             Some((
-                (*f.first()?).to_string(),
+                f.next()?.to_string(),
                 Cost {
-                    cpu: parse_uint(f.get(1)?)?,
-                    wall: parse_uint(f.get(2)?)?,
-                    maxrss: parse_uint(f.get(3)?)?,
-                    when: f.get(4).map_or_else(String::new, |w| (*w).to_string()),
+                    cpu: parse_uint(f.next()?)?,
+                    wall: parse_uint(f.next()?)?,
+                    maxrss: parse_uint(f.next()?)?,
+                    when: f.next().map_or_else(String::new, str::to_string),
                 },
             ))
         })
@@ -1481,7 +1481,9 @@ pub fn record(
         crate::durable::write_fresh(&beside("budget"), format!("{}\n", budget.as_secs()))?;
     }
     let text = crate::durable::read_file(log).unwrap_or_default();
-    let refused = String::from_utf8_lossy(&text).contains(trust_facts::TRUSTD_REFUSED);
+    let refused = text
+        .windows(trust_facts::TRUSTD_REFUSED.len())
+        .any(|w| w == trust_facts::TRUSTD_REFUSED.as_bytes());
     if refused {
         crate::durable::write_fresh(&beside("trustd"), format!("{}\n", probe()))?;
     }
@@ -1868,7 +1870,8 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     if mine.as_ref() == Some(&root) {
         prepare_cache_lock(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     }
-    let me = named_lock::Holder::me(&run_verb(&cfg.scope), &canonical_repo(cfg));
+    let canonical_repo = canonical_repo(cfg);
+    let me = named_lock::Holder::me(&run_verb(&cfg.scope), &canonical_repo);
     let wait = if cfg.no_wait {
         named_lock::Wait::No
     } else {
@@ -1888,7 +1891,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     };
     if let Some(mine) = &mine {
         if *mine == root {
-            write_checkout_record(&root, &canonical_repo(cfg))
+            write_checkout_record(&root, &canonical_repo)
                 .map_err(|e| format!("{}: {e}", root.join(CHECKOUT_RECORD).display()))?;
             use std::os::unix::fs::MetadataExt as _;
             let stable_lock = lock
@@ -1899,12 +1902,11 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
                 .is_some_and(|(held, named)| {
                     (held.dev(), held.ino()) == (named.dev(), named.ino())
                 });
-            if !stable_lock
-                || cleanup_checkout(&root).as_deref() != Some(canonical_repo(cfg).as_path())
+            if !stable_lock || cleanup_checkout(&root).as_deref() != Some(canonical_repo.as_path())
             {
                 return Err(format!("{}: fallback cache custody changed", root.display()).into());
             }
-        } else if cleanup_checkout(mine).as_deref() == Some(canonical_repo(cfg).as_path())
+        } else if cleanup_checkout(mine).as_deref() == Some(canonical_repo.as_path())
             && retire(mine, &me)
         {
             let _ = writeln!(
@@ -2601,8 +2603,8 @@ fn clear_slots(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut kept = Vec::new();
     let mut first = Ok(());
     for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(n) = slot_number(&name) else {
+        let file_name = e.file_name();
+        let Some(n) = file_name.to_str().and_then(slot_number) else {
             continue;
         };
         let p = e.path();
@@ -2640,7 +2642,10 @@ fn held_slots(root: &Path) -> Vec<PathBuf> {
     };
     rd.flatten()
         .filter(|e| {
-            slot_number(&e.file_name().to_string_lossy()).is_some_and(|n| slot_held(root, n))
+            e.file_name()
+                .to_str()
+                .and_then(slot_number)
+                .is_some_and(|n| slot_held(root, n))
         })
         .map(|e| e.path())
         .collect()
@@ -2869,8 +2874,11 @@ fn reap_stale_checks_with(
     };
     let here = dir_id(root);
     for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(n) = name.strip_prefix(".check.") else {
+        let file_name = e.file_name();
+        let Some(n) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".check."))
+        else {
             continue;
         };
         let slot = root.join(format!("j{n}"));
@@ -3388,7 +3396,10 @@ fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
     }
     for entry in fs::read_dir(root)? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with(".check.")
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".check."))
             && owned_cache_file(&entry.path()).is_none()
         {
             return Err(refused());
@@ -3439,7 +3450,12 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
         .tempdir_in(root)?;
     let at = scratch.path().join("record");
     let mut file = crate::durable::open_create_new(&at)?;
-    file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    if file
+        .metadata()
+        .map_or(true, |m| m.permissions().mode() & 0o7777 != 0o644)
+    {
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
     file.write_all(&checkout_record(repo))?;
     drop(file);
     fs::rename(at, marker)
@@ -3455,7 +3471,11 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     owned_cache_file(&dir.join(".run.lock"))?;
     for entry in fs::read_dir(dir).ok()? {
         let entry = entry.ok()?;
-        if entry.file_name().to_string_lossy().starts_with(".check.") {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".check."))
+        {
             owned_cache_file(&entry.path())?;
         }
     }

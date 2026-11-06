@@ -907,6 +907,10 @@ pub(super) fn encode_frontier(bound: RecordsBound, ids: &[Digest]) -> Vec<u8> {
 }
 
 fn knowledge(store: &Records) -> Vec<Digest> {
+    knowledge_and_set(store).0
+}
+
+fn knowledge_and_set(store: &Records) -> (Vec<Digest>, BTreeSet<Digest>) {
     let mut ids = store.frontier();
     let mut seen: BTreeSet<_> = ids.iter().copied().collect();
     // Every head remains represented. Bounded ancestry checkpoints let a peer
@@ -916,10 +920,18 @@ fn knowledge(store: &Records) -> Vec<Digest> {
             ids.push(id);
         }
     }
-    ids
+    (ids, seen)
 }
 
 fn decode_frontier(endpoint: &Endpoint, peer: &mut Metadata, wire: &[u8]) -> Result<Vec<Digest>> {
+    decode_frontier_and_set(endpoint, peer, wire).map(|(ids, _)| ids)
+}
+
+fn decode_frontier_and_set(
+    endpoint: &Endpoint,
+    peer: &mut Metadata,
+    wire: &[u8],
+) -> Result<(Vec<Digest>, BTreeSet<Digest>)> {
     if wire.len() < 13 || &wire[..4] != b"AFR4" {
         return Err(Error::new("invalid Commons frontier"));
     }
@@ -931,11 +943,11 @@ fn decode_frontier(endpoint: &Endpoint, peer: &mut Metadata, wire: &[u8]) -> Res
     }
     let ids: Vec<Digest> = wire[13..].as_chunks::<32>().0.to_vec();
     let mut seen = BTreeSet::new();
-    if !ids.iter().all(|id| seen.insert(id)) {
+    if !ids.iter().all(|id| seen.insert(*id)) {
         return Err(Error::new("Commons frontier repeats an id"));
     }
     peer.bound = bound;
-    Ok(ids)
+    Ok((ids, seen))
 }
 
 fn send_batch(
@@ -1131,16 +1143,15 @@ fn repair_records(
             return Ok((total, Ending::Interrupted));
         }
         let (store, bound) = load_records(endpoint)?;
-        let ids = knowledge(&store);
+        let (ids, ours) = knowledge_and_set(&store);
         let frontier = trade(
             stream,
             side,
             &encode_frontier(bound, &ids),
             13 + bound.held as usize * 32,
         )?;
-        let theirs = decode_frontier(endpoint, peer, &frontier)?;
-        let remote: BTreeSet<_> = theirs.iter().copied().collect();
-        let key = repair_key(bound, peer.bound, &ids.iter().copied().collect(), &remote);
+        let (theirs, remote) = decode_frontier_and_set(endpoint, peer, &frontier)?;
+        let key = repair_key(bound, peer.bound, &ours, &remote);
         let missing = store.missing(&theirs);
         let now = Instant::now();
         let offered = if hint.offers(&key, now) {

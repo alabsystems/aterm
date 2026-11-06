@@ -21,11 +21,17 @@ thread_local! {
 /// # Errors
 /// The executor's error, or the command's spawn, read or wait error.
 pub fn output(command: &mut Command) -> io::Result<Output> {
-    let executor = EXECUTOR.with(|slot| slot.borrow().clone());
-    match executor {
+    match current() {
         Some(executor) => executor(command),
         None => command.output(),
     }
+}
+
+/// The executor [`with_executor`] installed on this thread, if any: a walk that starts threads of
+/// its own installs it on each, so their commands stay in the caller's custody.
+#[must_use]
+pub fn current() -> Option<Arc<Executor>> {
+    EXECUTOR.with(|slot| slot.borrow().clone())
 }
 
 /// Run `walk` under a caller-owned command executor on this thread.

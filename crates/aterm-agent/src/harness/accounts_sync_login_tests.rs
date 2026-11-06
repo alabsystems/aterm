@@ -667,7 +667,7 @@ fn a_default_row_the_check_finds_signed_out_stays_signed_out_and_is_checked_once
     let kept = Arc::clone(&lines);
     let mut fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     fx.spawn_vault = &inline;
-    fx.default_check = counted_signed_out;
+    fx.default_check = |home, _scope| counted_signed_out(home);
     fx.log = Arc::new(move |line: &str| kept.lock().unwrap().push(line.to_owned()));
     for at in [NOW + 200, NOW + 300, NOW + 400] {
         heal_default_login_in_upkeep(&desk.home, &desk.state, &desk.roster(), at, &fx);
@@ -683,6 +683,82 @@ fn a_default_row_the_check_finds_signed_out_stays_signed_out_and_is_checked_once
         store.load(NOW + 400).unwrap().0.account("m2-2").auth,
         accounts::Auth::SignedOut
     );
+}
+
+#[test]
+fn default_check_claims_retire_on_unstarted_refused_cancelled_or_unwound_work() {
+    for mode in 0..6 {
+        let desk = Desk::new("m2");
+        repointed_with_a_stale_sign_out(&desk, NOW + 20);
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let queued = Mutex::new(Vec::<Box<dyn FnOnce() + Send>>::new());
+        let spawn = |work: Box<dyn FnOnce() + Send>| match mode {
+            1 => {
+                drop(work);
+                Err(io::Error::other("synthetic refusal"))
+            }
+            3 | 4 => {
+                work();
+                Ok(())
+            }
+            _ => {
+                queued.lock().unwrap().push(work);
+                Ok(())
+            }
+        };
+        let fetch = |_: &Env, _: &str| -> Result<String, String> {
+            panic!("default check fetched a roster")
+        };
+        let renew = |_: Box<dyn FnOnce() + Send>| -> io::Result<()> {
+            panic!("default check started a renewal")
+        };
+        let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
+        let mut fx = upkeep_effects(&fetch, &renew, &cooldown, &rediscovery, &guard);
+        fx.spawn_vault = &spawn;
+        fx.default_check = if mode == 3 {
+            |_, _| panic!("synthetic check unwind")
+        } else {
+            |home, scope| {
+                assert!(scope.is_some());
+                checks_signed_out(home)
+            }
+        };
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_scope_effects(scope, fx, |fx| {
+                heal_default_login_in_upkeep(
+                    &desk.home,
+                    &desk.state,
+                    &desk.roster(),
+                    NOW + 100,
+                    fx,
+                );
+            });
+        }));
+        assert_eq!(ran.is_err(), mode == 3);
+        let pause = lifetime.pause().unwrap();
+        if matches!(mode, 0 | 2 | 5) {
+            assert_eq!(queued.lock().unwrap().len(), 1);
+            assert!(guard.lock().unwrap().default_checked.is_some());
+        }
+        if mode == 5 {
+            guard.lock().unwrap().default_checked = Some(("newer-row".to_owned(), NOW + 50));
+        }
+        if mode == 2 {
+            queued.lock().unwrap().pop().unwrap()();
+        } else {
+            queued.lock().unwrap().clear();
+        }
+        let drained = pause.try_wait().expect("all actual work has retired");
+        let current = guard.lock().unwrap().default_checked.clone();
+        match mode {
+            4 => assert!(current.is_some(), "a completed check stays recorded"),
+            5 => assert_eq!(current, Some(("newer-row".to_owned(), NOW + 50))),
+            _ => assert_eq!(current, None),
+        }
+        assert!(drained.resume().is_ok());
+    }
 }
 
 /// CONTROL of [`a_default_row_the_roster_already_named_is_healed_by_one_check`]: a sign-out on
@@ -1001,21 +1077,24 @@ fn sync_pass(desk: &Desk, fx: &UpkeepEffects<'_>, now: i64) {
 
 pub(super) fn upkeep_effects<'a>(
     fetch: &'a Fetch<'a>,
-    spawn: &'a SpawnRenewal,
+    spawn: &'a SpawnRenewal<'a>,
     cooldown: &'a Mutex<Option<Instant>>,
     rediscovery: &'a Mutex<Rediscovery>,
     guard: &'a Arc<Mutex<AutoRenewGuard>>,
 ) -> UpkeepEffects<'a> {
     UpkeepEffects {
+        scope: None,
         fetch,
         spawn_renewal: spawn,
         sync_cooldown: cooldown,
         rediscovery,
         renew_guard: guard,
         find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
-        default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
         mailbox: &ladder_mailbox_files,
         log: Arc::new(|_: &str| {}),
         run_attempt: None,
@@ -1515,6 +1594,7 @@ fn a_roster_with_no_source_is_not_synced_for_a_moved_default_login() {
         (&desk.roster(), &desk.config.join("aterm.toml")),
         NOW,
         &rediscovery,
+        None,
     ));
     assert_eq!(fs::read_to_string(desk.roster()).unwrap(), hand);
 }

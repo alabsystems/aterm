@@ -10057,6 +10057,10 @@ pub(super) fn agy_snapshot(
     agy::snapshot(opts, tab, pid, start, shell, args, &Live)
 }
 
+pub(super) fn agy_conversation_held(config: &Path, pid: u32) -> Option<Option<String>> {
+    agy::conversation_held(config, pid, &Live)
+}
+
 pub(super) fn agy_look_at_exit(
     opts: &Opts,
     snap: &super::relaunch::Snapshot,
@@ -11817,6 +11821,10 @@ pub(super) fn model_and_mark(recent: Option<&(String, u64)>) -> (String, u64) {
 /// The step that closes a restart whose relaunch line was not typed since the agent's last end,
 /// once a process aterm did not start holds the conversation in its tab ([`resumed_by_another`]).
 pub const RESUMED_BY_ANOTHER: &str = "done:resumed-by-another";
+
+/// Why a relaunch whose agy holds no lock on its conversation is failed: it started a fresh one, or
+/// another agy has that conversation open (`refused:started-fresh`).
+pub const STARTED_FRESH: &str = "started-fresh";
 
 /// Why a restart whose conversation came back in its tab on an older build than its target, by a
 /// launch it never typed, is stopped ([`resumed_by_another`]).

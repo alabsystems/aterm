@@ -221,8 +221,8 @@ const ALIGN: usize = 256;
 /// Row byte stride padded to the 256-byte `copy_texture_to_buffer` alignment.
 #[inline]
 pub(crate) const fn padded_bytes_per_row(width: usize) -> usize {
-    let unpadded = width * 4;
-    unpadded.div_ceil(ALIGN) * ALIGN
+    let unpadded = width.saturating_mul(4);
+    unpadded.div_ceil(ALIGN).saturating_mul(ALIGN)
 }
 
 /// Unpacks a padded RGBA8 readback buffer into an `aterm_render::Frame`.

@@ -700,12 +700,6 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
     })
 }
 
-fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
-    run_child(ctx, r, label, cmd, |r, run, label| {
-        r.decide_child(run, label)
-    })
-}
-
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     let env = crate::findings::rerun_env(cmd, ctx.test_thread_override());
     let features = crate::testrun::feature_args(cmd);
@@ -730,12 +724,84 @@ fn run_child(
     out.ok
 }
 
-fn run_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
+/// One pure compile call ([`run_compile`]): its run, its compiler stdout apart from its
+/// diagnostics, and the compile line its report gives it.
+struct Compile {
+    run: exec::Run,
+    stdout: Result<String, String>,
+    line: String,
+}
+
+/// The step a stage's compile lines name: its report's title up to its first ` (`
+/// (`test compile`, `tippy lint`, `checkers compile`).
+pub(crate) fn step_of(r: &Report) -> &str {
+    r.title.split(" (").next().unwrap_or(&r.title).trim()
+}
+
+/// Run `cmd`, a call that compiles and runs nothing it built, with Cargo's messages on a stdout
+/// of its own ([`crate::compile_account::with_message_format`], [`exec::run_machine`]), and
+/// account for it ([`crate::compile_account::Account`]) as call `call` of `step`: its
+/// `compile-finished` event goes to stderr at once, its line to its caller for its report. Never
+/// a call that runs tests or programs: their stdout is theirs.
+fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
+    let cmd = crate::compile_account::with_message_format(cmd.clone());
+    let began = std::time::Instant::now();
+    let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env());
+    let account = crate::compile_account::Account::of(
+        step,
+        call,
+        stdout.as_deref().ok(),
+        run.usage,
+        began.elapsed(),
+    );
+    eprintln!("{}", account.event());
+    Compile {
+        run,
+        stdout,
+        line: format!("  {}", account.line()),
+    }
+}
+
+/// `run`'s output with what its compiler printed on stdout for a person (`human`, Cargo's
+/// messages taken out) put back ahead of it, each stream under a heading of its own; unchanged
+/// when there is none. Stream order is kept within each capture; the headings claim no
+/// interleaving.
+fn rejoin(run: &mut exec::Run, human: String) {
+    if human.is_empty() {
+        return;
+    }
+    let mut joined = format!("--- compiler stdout ---\n{human}");
+    if !run.output.is_empty() {
+        joined.push_str("\n--- compiler stderr / executor diagnostics ---\n");
+        joined.push_str(&run.output);
+    }
+    run.output = joined;
+}
+
+/// Run a pure compile call ([`run_compile`]) and decide its row ([`Report::decide_child`]): its
+/// output, its compile line, then its row.
+fn compile_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
+    let Compile {
+        mut run,
+        stdout,
+        line,
+    } = run_compile(ctx, step_of(r), label, cmd);
+    if let Ok(stdout) = &stdout {
+        rejoin(&mut run, crate::compile_account::human(stdout));
+    }
+    r.raw(run.output.as_str());
+    r.raw(line);
+    r.decide_child(&run, label);
+    run.ok
+}
+
+/// [`compile_labeled`], skipped on an empty change cone.
+fn compile_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
     if ctx.scope.selects_nothing() {
         r.skip(format!("{label} {EMPTY_CONE}"));
         return;
     }
-    run_labeled(ctx, r, label, cmd);
+    compile_labeled(ctx, r, label, cmd);
 }
 
 /// Why a selection-reading stage did nothing on an empty change cone, and the fix.
@@ -963,7 +1029,9 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
         }
     };
     let began = std::time::SystemTime::now();
-    let (compiled, _, artifacts) = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
+    let (compiled, _, artifacts, script_runs) =
+        compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
+    crate::disk::note_used(ctx, &artifacts, &script_runs);
     if !compiled {
         ctx.test_compile_failed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1014,23 +1082,30 @@ fn said_on(ctx: &Ctx, index: usize, said: String) {
         .or_insert(said);
 }
 
-/// What a test compile's child did: whether it passed, the test executables it built, and every
-/// artifact it reported ([`crate::shape::artifacts`]).
+/// What a test compile's child did: whether it passed, the test executables it built, every
+/// artifact it reported ([`crate::shape::artifacts`]), and the `out_dir` of every build script it
+/// ran ([`crate::shape::script_runs`]).
 type Compiled = (
     bool,
     Result<Vec<crate::testrun::TestExe>, String>,
     Vec<crate::shape::Artifact>,
+    Vec<String>,
 );
 
 fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
-    let exec::MachineRun { mut run, stdout } = exec::run_machine(compile, ctx.exec_env());
+    let Compile {
+        mut run,
+        stdout,
+        line,
+    } = run_compile(ctx, step_of(r), label, compile);
     let mut stdout = match stdout {
         Ok(stdout) => stdout,
         Err(why) => {
             r.raw(run.output.as_str());
+            r.raw(line);
             r.decide_child(&run, label);
             r.cannot_run(&why);
-            return (false, Err(why), Vec::new());
+            return (false, Err(why), Vec::new(), Vec::new());
         }
     };
     for event in crate::report::compile_unit_events(label, &stdout) {
@@ -1038,19 +1113,13 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
         r.raw(event);
     }
     let artifacts = crate::shape::artifacts(&stdout);
+    let script_runs = crate::shape::script_runs(&stdout);
     let exes = crate::testrun::take_test_executables(&mut stdout);
-    // Stream order is preserved within each capture; these headings do not claim interleaving.
-    if !stdout.is_empty() {
-        stdout.insert_str(0, "--- compiler stdout ---\n");
-    }
-    if !run.output.is_empty() {
-        stdout.push_str("\n--- compiler stderr / executor diagnostics ---\n");
-        stdout.push_str(&run.output);
-    }
-    run.output = stdout;
+    rejoin(&mut run, stdout);
     r.raw(run.output.as_str());
+    r.raw(line);
     r.decide_child(&run, label);
-    (run.ok, exes, artifacts)
+    (run.ok, exes, artifacts, script_runs)
 }
 
 /// After call `part` of a shaped test compile, which began at `began`, passed with `artifacts`: a
@@ -1133,11 +1202,20 @@ fn build_to_drive(
     build_label: String,
     drive: &str,
 ) -> bool {
-    let build = exec::run(&main_build_cmd(ctx, args), ctx.exec_env());
+    let Compile {
+        run: mut build,
+        stdout,
+        line,
+    } = run_compile(ctx, step_of(r), &build_label, &main_build_cmd(ctx, args));
     if build.ok {
+        r.raw(line);
         return true;
     }
+    if let Ok(stdout) = &stdout {
+        rejoin(&mut build, crate::compile_account::human(stdout));
+    }
     r.raw(build.output.as_str());
+    r.raw(line);
     r.fail_child(&build, build_label);
     if build.environment_failure().is_none() {
         not_run_behind(
@@ -1174,7 +1252,7 @@ fn test(ctx: &Ctx, r: &mut Report) {
         return;
     }
     // The recording Cargo pass checks freshness and supplies its own target metadata.
-    crate::testrun::run_tests(ctx, r, &run_label, &run);
+    crate::testrun::run_tests(ctx, r, &run_label, &run, crate::checks::Check::Test);
 }
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
@@ -1221,7 +1299,7 @@ fn measure_prebuild(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let (label, cmd) = measuring_targo(ctx, measure_prebuild_args());
-    run_labeled(ctx, r, &label, &cmd.demoted());
+    compile_labeled(ctx, r, &label, &cmd.demoted());
 }
 
 fn measuring_tests(ctx: &Ctx, r: &mut Report) {
@@ -1651,27 +1729,29 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
     for pass in tippy_passes(&ctx.scope) {
-        run_scoped(
+        compile_scoped(
             ctx,
             r,
             &format!("tippy {} -D warnings{borrowed}", pass.label),
             &tippy_cmd(ctx, &bin, pass.args),
         );
+        crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
     if ctx.release
         && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
     {
-        run_scoped(
+        compile_scoped(
             ctx,
             r,
             &format!("tippy required-features targets -D warnings{borrowed}"),
             &tippy_cmd(ctx, &bin, args),
         );
+        crate::red_now(ctx, crate::checks::Check::Lint, r);
     }
     if ctx.release
         && let Some(args) = tippy_release_args(&ctx.scope)
     {
-        run_scoped(
+        compile_scoped(
             ctx,
             r,
             &format!("tippy -p {SHIPPED} --release -D warnings{borrowed}"),
@@ -1947,7 +2027,7 @@ fn checkers_compile(ctx: &Ctx, r: &mut Report) {
     let args = spec_checkers_args(&ctx.scope);
     let label = format!("targo {} --no-run", args[1..].join(" "));
     let cmd = spec_checkers_cmd(ctx).arg("--no-run").demoted();
-    if !run_labeled(ctx, r, &label, &cmd) {
+    if !compile_labeled(ctx, r, &label, &cmd) {
         ctx.checkers_compile_failed
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1985,7 +2065,13 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    crate::testrun::run_tests(ctx, r, &label, &spec_checkers_cmd(ctx));
+    crate::testrun::run_tests(
+        ctx,
+        r,
+        &label,
+        &spec_checkers_cmd(ctx),
+        crate::checks::Check::Checkers,
+    );
 }
 
 /// Did a passing test run not run [`crate::checks::GOLDEN`]'s test? A release's run reads this over
@@ -2254,7 +2340,7 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    if !run_labeled(ctx, r, CODEX_ATERM_BUILD_LABEL, &codex_aterm_build_cmd(ctx)) {
+    if !compile_labeled(ctx, r, CODEX_ATERM_BUILD_LABEL, &codex_aterm_build_cmd(ctx)) {
         r.cannot_run(format!(
             "{name} — the build above failed, so this proof has no fresh aterm to drive{}",
             NOT_RUN_BEHIND
@@ -2350,7 +2436,7 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
         r.cannot_run(format!("{name} — {}", ctx.tools.missing_targo_label()));
         return;
     }
-    if !run_labeled(ctx, r, LINUX_LAB_BUILD_LABEL, &linux_lab_build_cmd(ctx)) {
+    if !compile_labeled(ctx, r, LINUX_LAB_BUILD_LABEL, &linux_lab_build_cmd(ctx)) {
         r.cannot_run(format!(
             "{name} — the build above failed, so there is no lab to run the lane{}",
             NOT_RUN_BEHIND
@@ -2586,6 +2672,99 @@ mod tests {
         )
     }
 
+    /// A PURE COMPILE CALL WRITES ITS COMPILE LINE (A1): its Cargo arguments get the message
+    /// format before their `--` (the lint driver's arguments after it are left alone), its units
+    /// come from its artifact messages (2 fresh, 1 compiled, 1 with no `fresh` unknown), its
+    /// output bytes from the 3 MiB file the compiled one names (not the 5 MiB a fresh one names,
+    /// nor the file the unknown one names, which is gone), and its row is decided as
+    /// before, on its rendered diagnostics, with no machine message in its report and what it
+    /// printed for a person kept. A flag already given is not given twice, and a call with no
+    /// `--` gets it last. NEGATIVE CONTROLS: the flag after `--` (where the lint driver would get
+    /// it) fails the stand-in; the call's stdout put back whole puts `{"reason"` in the report.
+    #[cfg(unix)]
+    #[test]
+    fn a_pure_compile_call_writes_its_line_and_keeps_cargos_messages_out_of_its_report() {
+        let root = crate::mktemp_dir("atv-compile-line").expect("scratch");
+        let rlib = root.join("liba.rlib");
+        std::fs::write(&rlib, vec![0_u8; 3 << 20]).expect("rlib");
+        std::fs::write(root.join("b.rlib"), vec![0_u8; 5 << 20]).expect("a fresh unit's rlib");
+        let artifact = |name: &str, fresh: &str, file: &std::path::Path| {
+            format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\",\"kind\":[\"lib\"]}},{fresh}\"filenames\":[\"{}\"]}}",
+                file.display()
+            )
+        };
+        let wire = [
+            artifact("a", "\"fresh\":false,", &rlib),
+            artifact("b", "\"fresh\":true,", &root.join("b.rlib")),
+            artifact("c", "\"fresh\":true,", &root.join("c.rlib")),
+            artifact("d", "", &root.join("gone.rlib")),
+            "{\"reason\":\"build-finished\",\"success\":true}".to_owned(),
+        ]
+        .join("\n");
+        std::fs::write(root.join("wire"), format!("{wire}\n")).expect("wire");
+        let c = Ctx::new(
+            root.clone(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            root.clone(),
+        );
+        let script = "[ \"$1 $2 $3\" = \"--keep-going --message-format=json-render-diagnostics --\" ] \
+                      || { echo \"flag misplaced: $*\" >&2; exit 3; }; /bin/cat wire; \
+                      echo 'a person reads this'; echo 'warning: rendered for a person' >&2";
+        let cmd = Cmd::new("/bin/sh").args([
+            "-c",
+            script,
+            "compile-fixture",
+            "--keep-going",
+            "--",
+            "-D",
+            "warnings",
+        ]);
+        let mut r = Report::new("tippy lint (-p a)");
+        assert!(compile_labeled(&c, &mut r, "tippy -p a", &cmd));
+        let block = r.render();
+        assert!(
+            block.contains("  compile tippy lint/tippy -p a: 2 fresh / 1 compiled / 1 unknown, ")
+                && block.contains(&format!(", {} out", aterm_capacity::size(3 << 20))),
+            "{block}"
+        );
+        assert!(!block.contains("{\"reason\""), "{block}");
+        assert!(
+            block.contains("a person reads this") && block.contains("rendered for a person"),
+            "{block}"
+        );
+        assert_eq!(
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [crate::Outcome::Ok]
+        );
+        let flagged = |args: &[&str]| {
+            crate::compile_account::with_message_format(Cmd::new("targo").args(args.to_vec()))
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            flagged(&["build", "--message-format=json", "--", "-x"]),
+            ["build", "--message-format=json", "--", "-x"]
+        );
+        assert_eq!(
+            flagged(&["build", "-q"]),
+            ["build", "-q", crate::compile_account::MESSAGE_FORMAT]
+        );
+        assert_eq!(
+            flagged(&["test", "--", "--message-format=x"]),
+            [
+                "test",
+                crate::compile_account::MESSAGE_FORMAT,
+                "--",
+                "--message-format=x"
+            ]
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
     #[cfg(unix)]
     #[test]
     fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
@@ -2610,11 +2789,23 @@ mod tests {
             let cmd =
                 Cmd::new("/bin/sh").args(["-c", script, "machine-fixture", &code.to_string()]);
             let mut report = Report::new("machine stream");
-            let (ok, exes, artifacts) = compile_tests(&c, &mut report, "machine stream", &cmd);
+            let (ok, exes, artifacts, _) = compile_tests(&c, &mut report, "machine stream", &cmd);
             assert_eq!(ok, code == 0);
             let exes = exes.expect("complete wire");
             let raw = report.render();
             assert!(raw.contains("human stdout") && raw.contains("human stderr"));
+            // The test compile is a compile call: one line, its units read from stdout alone.
+            let units = if source == "stdout" {
+                ": 0 fresh / 1 compiled, "
+            } else {
+                ": 0 fresh / 0 compiled, "
+            };
+            let lines = compile_lines(&raw, "machine stream/machine stream");
+            if lines.len() != 1 || !lines[0].contains(units) {
+                failures.push(format!(
+                    "{source}/exit{code}: compile lines {lines:?}; expected one with {units:?}"
+                ));
+            }
             let expected = usize::from(source == "stdout");
             let causes = raw.matches("\"rebuild_reason\":\"changed-env\"").count();
             if (exes.len(), artifacts.len(), causes) != (expected, expected, expected) {
@@ -2632,9 +2823,15 @@ mod tests {
                 &code.to_string(),
             ]);
             let mut report = Report::new("invalid machine stream");
-            let (ok, exes, artifacts) = compile_tests(&c, &mut report, "invalid stream", &cmd);
+            let (ok, exes, artifacts, _) = compile_tests(&c, &mut report, "invalid stream", &cmd);
             assert!(!ok);
             assert!(exes.is_err() && artifacts.is_empty());
+            let raw = report.render();
+            let lines = compile_lines(&raw, "invalid machine stream/invalid stream");
+            assert!(
+                lines.len() == 1 && lines[0].contains(": units unreported, "),
+                "{raw}"
+            );
             let actual = if code == 0 {
                 crate::Outcome::Ok
             } else {
@@ -2651,6 +2848,79 @@ mod tests {
         }
         std::fs::remove_dir_all(&root).expect("cleanup");
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The compile lines of `call` (`<step>/<label>`) in a rendered report.
+    fn compile_lines<'a>(block: &'a str, call: &str) -> Vec<&'a str> {
+        let head = format!("  compile {call}: ");
+        block.lines().filter(|l| l.starts_with(&head)).collect()
+    }
+
+    /// A DRIVEN BINARY'S BUILD WRITES ITS ONE COMPILE LINE, BUILT OR NOT: the build of a binary a
+    /// stage drives is a compile call ([`run_compile`]) whose line, its units and the bytes it
+    /// wrote read from Cargo's messages, stands in its report whether the build passes (the line
+    /// alone, no row) or fails (its output with what it printed for a person, the line, its FAIL
+    /// row and the row of what it kept from running), and no Cargo message reaches the report.
+    #[cfg(unix)]
+    #[test]
+    fn a_driven_binarys_build_writes_its_compile_line_whether_it_builds_or_not() {
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-drive-build").expect("mktemp"))
+            .expect("real");
+        std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+        let built = tmp.join("libdriven.rlib");
+        std::fs::write(&built, vec![0_u8; 2 << 20]).expect("rlib");
+        let targo = tmp.join("bin/targo");
+        let mut c = Ctx::new(
+            tmp.clone(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            tmp.join("scratch"),
+        );
+        c.tools.targo = targo.clone();
+        for code in [0, 1] {
+            crate::standin_body(
+                &targo,
+                &format!(
+                    "printf '%s\\n' '{{\"reason\":\"compiler-artifact\",\"fresh\":false,\"filenames\":[\"{}\"]}}'\n\
+                     echo 'printed for a person'\nexit {code}",
+                    built.display()
+                ),
+            );
+            let mut r = Report::new("redraw conformance (the verb matrix)");
+            let ok = build_to_drive(
+                &c,
+                &mut r,
+                vec!["build".into(), "--bin".into(), "driven".into()],
+                "targo build --bin driven".into(),
+                "the verb matrix",
+            );
+            assert_eq!(ok, code == 0);
+            let block = r.render();
+            let lines = compile_lines(&block, "redraw conformance/targo build --bin driven");
+            let out = format!(", {} out", aterm_capacity::size(2 << 20));
+            assert!(
+                lines.len() == 1
+                    && lines[0].contains(": 0 fresh / 1 compiled, ")
+                    && lines[0].ends_with(&out),
+                "{block}"
+            );
+            assert!(!block.contains("{\"reason\""), "{block}");
+            let outcomes: Vec<crate::Outcome> = r.outcomes().map(|(o, _)| o).collect();
+            if code == 0 {
+                assert!(outcomes.is_empty(), "{block}");
+            } else {
+                assert_eq!(
+                    outcomes,
+                    [
+                        crate::Outcome::Fail(crate::Severity::GateFailed),
+                        crate::Outcome::Fail(crate::Severity::CouldNotRun)
+                    ],
+                    "{block}"
+                );
+                assert!(block.contains("printed for a person"), "{block}");
+            }
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     fn fixture_gated() -> Vec<(String, String)> {
@@ -2878,6 +3148,7 @@ mod tests {
             output: output.to_string(),
             code,
             spawn_error: None,
+            usage: None,
         };
         let full = exec::ENOSPC_SENTENCE;
         for (code, output, want) in [
@@ -3331,6 +3602,7 @@ mod tests {
                 ),
                 code: Some(101),
                 spawn_error: None,
+                usage: None,
             };
             crate::testrun::serial_feature_reruns(&mut failed, &features);
             let findings = crate::findings::test_findings("test", &failed.output, &[]);
@@ -3446,6 +3718,7 @@ mod tests {
                 output,
                 code: Some(i32::from(!ok)),
                 spawn_error: None,
+                usage: None,
             }
         };
         let compared = "renderer::frame_record_tests::armed_frames_hold_to_their_cpu_twins";
@@ -4243,6 +4516,110 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// THE TEST COMPILE NOTES WHAT IT USED, which a release run over the workspace that passes
+    /// keeps ([`crate::disk::keep_used`], `atpkg::build_cache::stale::USED`): from its child's
+    /// messages, the unit of a test it built in the build directory, the unit of a bin a test
+    /// needs, which cargo named by its copy in the target alone, and the unit of a build script it
+    /// ran, with the package it built tests of. NEGATIVE CONTROL: a compile whose child reported
+    /// nothing keeps no record.
+    #[cfg(unix)]
+    #[test]
+    fn the_test_compile_notes_what_it_used_for_the_release_record() {
+        let tmp =
+            std::fs::canonicalize(crate::mktemp_dir("atv-used").expect("mktemp")).expect("real");
+        std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+        let leaf = tmp.join("cache/.cargo-build");
+        let target = tmp.join("target");
+        let [test, bin, script] = ["1111111111111111", "2222222222222222", "3333333333333333"];
+        let out = |hash: &str| leaf.join("debug/build/atpkg").join(hash).join("out");
+        let ran = out(bin).join("atpkg_abrew");
+        std::fs::create_dir_all(out(bin)).expect("the bin's unit");
+        std::fs::write(&ran, b"the bin the tests ran").expect("the bin");
+        std::fs::create_dir_all(target.join("debug")).expect("the target");
+        let copy = target.join("debug/atpkg-abrew");
+        std::fs::write(&copy, b"the bin the tests ran").expect("its copy");
+        let at = std::fs::metadata(&ran)
+            .and_then(|m| m.modified())
+            .expect("written");
+        std::fs::File::options()
+            .write(true)
+            .open(&copy)
+            .and_then(|f| f.set_modified(at))
+            .expect("its copy's time");
+        let id = "path+file:///w/aterm/crates/atpkg#0.155.0";
+        let artifact = |file: &std::path::Path, test: bool| {
+            aterm_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": id,
+                "target": {"kind": [if test { "lib" } else { "bin" }], "name": "atpkg"},
+                "profile": {"test": test},
+                "filenames": [file.display().to_string()],
+                "executable": file.display().to_string(),
+                "fresh": true,
+            })
+            .to_string()
+        };
+        let wire = [
+            artifact(&out(test).join(format!("atpkg-{test}")), true),
+            artifact(&copy, false),
+            aterm_json::json!({
+                "reason": "build-script-executed",
+                "package_id": id,
+                "out_dir": out(script).display().to_string(),
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        let targo = tmp.join("bin/targo");
+        crate::standin_body(
+            &targo,
+            &format!("/bin/cat '{}'", tmp.join("wire").display()),
+        );
+        let compiled = |wire: &str| {
+            std::fs::write(tmp.join("wire"), wire).expect("the wire");
+            let mut c = Ctx::new(
+                tmp.clone(),
+                Scope::workspace(),
+                EnvSnapshot {
+                    cargo_target_dir: Some(target.clone()),
+                    ..EnvSnapshot::default()
+                },
+                tmp.join("scratch"),
+            )
+            .with_checkers_in_tests(true);
+            c.tools.targo = targo.clone();
+            c.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+            let spec = crate::plan::declared(&c.scope).remove(0);
+            let mut r = Report::new(spec.title.clone());
+            test_compile(&c, &spec, &mut r);
+            assert!(
+                r.outcomes().all(|(o, _)| o == crate::Outcome::Ok),
+                "{}",
+                r.render()
+            );
+            c
+        };
+        let record = leaf.join(atpkg::build_cache::stale::USED);
+        let c = compiled("");
+        assert_eq!(
+            crate::disk::keep_used(&c, true),
+            None,
+            "it reported nothing"
+        );
+        assert!(!record.exists());
+
+        let c = compiled(&wire);
+        assert!(crate::disk::keep_used(&c, true).is_some(), "kept");
+        let kept = atpkg::build_cache::stale::Used::decode(&std::fs::read(&record).expect("kept"))
+            .expect("a record");
+        assert_eq!(
+            kept.profiles.get("debug").cloned().unwrap_or_default(),
+            [test, bin, script].map(str::to_owned).into()
+        );
+        assert_eq!(kept.members, ["atpkg".to_owned()].into());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         let c = ctx(Scope::workspace());
@@ -4343,6 +4720,7 @@ mod tests {
             output: output.to_string(),
             code,
             spawn_error: None,
+            usage: None,
         };
         let missing = run(
             Some(3),
@@ -4630,6 +5008,7 @@ mod tests {
             output,
             code: Some(if ok { 0 } else { 101 }),
             spawn_error: None,
+            usage: None,
         };
         let mut r = Report::new("measuring");
         decide_measuring_child(&mut r, &run, "measuring matrices", subject);
@@ -5134,8 +5513,14 @@ mod tests {
         let verdict_over = |(outcome, label): (Outcome, String)| {
             let mut r = Report::new("linux");
             r.record(outcome, label);
-            let result =
-                crate::report::judge(crate::checks::Check::Linux, &[&r], 1.0, "", String::new());
+            let result = crate::report::judge(
+                crate::checks::Check::Linux,
+                &[&r],
+                1.0,
+                "",
+                String::new(),
+                None,
+            );
             crate::report::verdict(&[result], false, 1.0)
         };
         let (line, code) = verdict_over(linux_lane_outcome(Some(3), transcript));

@@ -203,9 +203,20 @@ impl Held {
         }
     }
 
+    /// One table's: the operation ids it retains, as aterm-db's `InventorySummary` counts and
+    /// fingerprints them, so a row's table equals what a Commons repair report says of it.
+    #[must_use]
+    pub fn table(ids: &BTreeSet<[u8; 32]>) -> Self {
+        let summary = aterm_db::replica::InventorySummary::of(ids);
+        Self {
+            digest: summary.fingerprint,
+            count: u64::try_from(summary.count).unwrap_or(u64::MAX),
+        }
+    }
+
     /// The lab tables': each table's own count and fingerprint of the operation ids it retains
-    /// (aterm-db's `InventorySummary`), keyed by the table's identity digest (`Scope::digest`).
-    /// The count is every table's operations.
+    /// ([`Self::table`]), keyed by the table's identity digest (`Scope::digest`). The count is
+    /// every table's operations.
     #[must_use]
     pub fn tables(tables: &BTreeMap<[u8; 32], Self>) -> Self {
         let count = tables
@@ -256,11 +267,12 @@ pub struct PresenceRow {
 #[must_use]
 pub fn row_topics<'a>(held: impl IntoIterator<Item = &'a String>) -> Vec<String> {
     held.into_iter()
+        .map(String::as_str)
         .filter(|topic| aterm_types::fabric_grammar::is_topic(topic))
-        .cloned()
-        .collect::<BTreeSet<String>>()
+        .collect::<BTreeSet<&str>>()
         .into_iter()
         .take(TOPICS_MAX)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -441,9 +453,15 @@ impl PresenceRow {
         }
         put_held(&mut out, self.membership);
         put_held(&mut out, self.tables);
-        let topics = row_topics(&self.topics);
-        put_varint(&mut out, u64::try_from(topics.len()).unwrap_or(0));
-        for topic in &topics {
+        let topics: BTreeSet<&str> = self
+            .topics
+            .iter()
+            .map(String::as_str)
+            .filter(|topic| aterm_types::fabric_grammar::is_topic(topic))
+            .collect();
+        let topic_count = topics.len().min(TOPICS_MAX);
+        put_varint(&mut out, u64::try_from(topic_count).unwrap_or(0));
+        for topic in topics.into_iter().take(TOPICS_MAX) {
             out.push(u8::try_from(topic.len()).unwrap_or(u8::MAX));
             out.extend_from_slice(topic.as_bytes());
         }
@@ -483,7 +501,7 @@ impl PresenceRow {
         if n > u64::try_from(TOPICS_MAX).unwrap_or(u64::MAX) {
             return Err(RowError::Topic);
         }
-        let mut topics: Vec<String> = Vec::new();
+        let mut topics: Vec<String> = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         for _ in 0..n {
             let len = usize::from(r.byte()?);
             let topic = std::str::from_utf8(r.take(len)?).map_err(|_| RowError::Topic)?;
@@ -996,22 +1014,22 @@ impl Shared {
     /// owner's producer id, its envelope verifies under its owner's node key (this Mac's own, or
     /// a current seat's whose principal the subject names), and its body is a presence row.
     /// Answers its owner, its sequence number and the row.
-    fn judge(
+    fn judge<'a>(
         &self,
-        subject: &str,
+        subject: &'a str,
         origin: Option<(u64, u64)>,
         body: &[u8],
-    ) -> Result<(String, u64, PresenceRow), Refusal> {
+    ) -> Result<(&'a str, u64, PresenceRow), Refusal> {
         let Ok(Subject::Now {
-            node,
+            node: _,
             now: Now::Presence,
         }) = Subject::parse(subject)
         else {
             return Err(Refusal::Subject);
         };
-        let principal = node.to_string();
+        let principal = &subject[3..21];
         let (pid, seq) = origin.ok_or(Refusal::Unstamped)?;
-        if pid != astream_broker::producer_id_of(&principal) {
+        if pid != astream_broker::producer_id_of(principal) {
             return Err(Refusal::Producer);
         }
         let me = &self.mesh.me;
@@ -1020,21 +1038,8 @@ impl Shared {
                 return Err(Refusal::Signature);
             }
         } else {
-            let mut seated = false;
-            let verified = self
-                .mesh
-                .seats()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|key| astream_broker::identity_principal(key) == principal)
-                .any(|key| {
-                    seated = true;
-                    astream_broker::origin::verify(&key, subject, seq, body)
-                });
-            if !seated {
-                return Err(Refusal::NotSeated);
-            }
-            if !verified {
+            let key = self.mesh.seat_key(principal).ok_or(Refusal::NotSeated)?;
+            if !astream_broker::origin::verify(&key, subject, seq, body) {
                 return Err(Refusal::Signature);
             }
         }
@@ -1065,12 +1070,14 @@ impl Shared {
         let took = self
             .board
             .lock_or_recover()
-            .offer(&principal, seq, row, live, now, wall);
-        self.report(&Event::Took {
-            principal,
-            seq,
-            took,
-        });
+            .offer(principal, seq, row, live, now, wall);
+        if let Some(observe) = &self.observe {
+            observe(&Event::Took {
+                principal: principal.to_owned(),
+                seq,
+                took,
+            });
+        }
         if took == Took::Advanced {
             self.write_seen(now);
         }
@@ -1079,12 +1086,7 @@ impl Shared {
     /// The current seats' principals, this Mac's among them; `None` before the standings were
     /// read.
     fn current_seats(&self) -> Option<BTreeSet<String>> {
-        let mut seats: BTreeSet<String> = self
-            .mesh
-            .seats()?
-            .iter()
-            .map(astream_broker::identity_principal)
-            .collect();
+        let mut seats: BTreeSet<String> = self.mesh.seats_by_principal()?.into_keys().collect();
         seats.insert(self.mesh.me.principal.clone());
         Some(seats)
     }
@@ -1195,9 +1197,7 @@ impl Presence {
         let key = if principal == mesh.me.principal {
             mesh.me.key
         } else {
-            mesh.seats()?
-                .into_iter()
-                .find(|key| astream_broker::identity_principal(key) == principal)?
+            mesh.seat_key(principal)?
         };
         let now = mesh.clock.now();
         let board = self.shared.board.lock_or_recover();
@@ -1228,25 +1228,35 @@ impl Shared {
     /// [`Presence::seats`].
     pub(crate) fn seats(&self) -> Vec<Seat> {
         let mesh = &self.mesh;
-        let mut keys = mesh.seats().unwrap_or_default();
-        keys.insert(mesh.me.key);
+        let mut keys = mesh.seats_by_principal().unwrap_or_default();
+        keys.insert(mesh.me.principal.clone(), mesh.me.key);
         let now = mesh.clock.now();
         let board = self.board.lock_or_recover();
-        let mut seats: Vec<Seat> = keys
-            .into_iter()
-            .map(|key| {
-                let principal = astream_broker::identity_principal(&key);
-                Seat {
-                    me: key == mesh.me.key,
-                    standing: board.standing(&principal, now),
-                    row: board.row(&principal).map(|(seq, row)| (seq, row.clone())),
-                    principal,
-                    key,
-                }
+        keys.into_iter()
+            .map(|(principal, key)| Seat {
+                me: key == mesh.me.key,
+                standing: board.standing(&principal, now),
+                row: board.row(&principal).map(|(seq, row)| (seq, row.clone())),
+                principal,
+                key,
             })
-            .collect();
-        seats.sort_by(|a, b| a.principal.cmp(&b.principal));
+            .collect()
+    }
+
+    /// [`Mesh::holders`].
+    pub(crate) fn holders(&self) -> BTreeSet<String> {
+        let Some(seats) = self.mesh.seats_by_principal() else {
+            return BTreeSet::new();
+        };
+        let board = self.board.lock_or_recover();
         seats
+            .into_keys()
+            .filter(|principal| {
+                board
+                    .row(principal)
+                    .is_some_and(|(_, row)| !row.topics.is_empty())
+            })
+            .collect()
     }
 }
 

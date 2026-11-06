@@ -229,6 +229,8 @@ pub const fn row_state(published: bool, staged: bool, latched: bool, buildable: 
 pub enum Class {
     /// Built here.
     Plain,
+    /// An upstream archive with declared GNU targets, acquired and qualified without recipes.
+    Bottle,
     /// A sysroot bundle.
     Bundle,
     /// Vendor-direct (`atpkg::vendor_direct::is_vendor`).
@@ -251,6 +253,7 @@ impl Class {
             }) => Self::AppleOnly,
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
+            Some(Shape::Bottle(b)) if !b.linux.is_empty() => Self::Bottle,
             Some(Shape::Package(_) | Shape::Bottle(_)) => Self::Vendor,
             None => Self::Unknown,
         }
@@ -259,6 +262,7 @@ impl Class {
     const fn word(self) -> &'static str {
         match self {
             Self::Plain => "plain",
+            Self::Bottle => "bottle",
             Self::Bundle => "bundle",
             Self::Vendor => "vendor",
             Self::AppleOnly => "apple-only",
@@ -571,6 +575,20 @@ impl Run<'_> {
                 }
             }
         }
+        let mut source_caps = Vec::new();
+        for target in &opts.triples {
+            let declared = programs::PROGRAMS.iter().any(|definition| matches!(definition.shape, Shape::Bottle(bottle) if bottle.linux.contains(target)));
+            if declared {
+                match self.deps.packer.can_pack_bottle(*target) {
+                    Ok(()) => source_caps.push(*target),
+                    Err(why) => self
+                        .tx
+                        .say(format!("upstream C SDK unavailable for {target}: {why}")),
+                }
+            }
+        }
+        self.tx
+            .say(format!("upstream C SDK can pack {}", names(&source_caps)));
         self.tx.say(format!(
             "builder is {}; atpkg serves {}; this box can pack {}",
             opts.host,
@@ -583,10 +601,10 @@ impl Run<'_> {
         ));
         for (t, why) in &cannot {
             self.tx.say(format!(
-                "skipped target {t} — {why}; its rows must come from a builder that has it"
+                "Rust builder skipped target {t} — {why}; its Rust rows must come from a builder that has it"
             ));
         }
-        if can.is_empty() {
+        if can.is_empty() && source_caps.is_empty() {
             return Err(Error::refused(format!(
                 "this builder can produce NONE of {} — nothing to stage",
                 names(&opts.triples)
@@ -611,18 +629,47 @@ impl Run<'_> {
         })?;
         let reference = if can.contains(&opts.host) {
             opts.host
+        } else if can.is_empty() {
+            source_caps[0]
         } else {
             can[0]
         };
-        let (kept, dropped) = narrow(&channel, &can, reference, n);
+        let rust_caps = can.clone();
+        let (kept, dropped) = if can.is_empty() {
+            (vec![reference], Vec::new())
+        } else {
+            narrow(&channel, &can, reference, n)
+        };
         for (t, why) in dropped {
             self.tx
                 .warn(format!("narrowing this run to {reference} — {why}"));
             cannot.push((t, why));
         }
-        let can = kept;
-        let pins = crate::pins::for_targets(&channel, &can)?;
-        self.state.check_pins(&can, &pins, n, self.tx)?;
+        let pin_can = kept;
+        let rust_can: Vec<_> = pin_can
+            .iter()
+            .copied()
+            .filter(|target| rust_caps.contains(target))
+            .collect();
+        let pins = crate::pins::for_targets(&channel, &pin_can)?;
+        self.state.check_pins(&pin_can, &pins, n, self.tx)?;
+        let source_serves = |name: &str, build: Build, target: Triple| {
+            source_caps.contains(&target)
+                && programs::get(name).is_some_and(|definition| matches!(definition.shape, Shape::Bottle(bottle) if bottle.linux.contains(&target)))
+                && channel.for_target(target.as_str()).pin.get(name) == Some(&build)
+        };
+        let can: Vec<_> = opts
+            .triples
+            .iter()
+            .copied()
+            .filter(|target| {
+                rust_can.contains(target)
+                    || pins
+                        .iter()
+                        .any(|(name, build)| source_serves(name, *build, *target))
+            })
+            .collect();
+        cannot.retain(|(target, _)| !can.contains(target));
         let groups = super::hold::groups_of(&head.index, pins.keys().map(String::as_str))?;
 
         let staged_dir = self.state.root.join(format!("staged-index-{n}"));
@@ -687,7 +734,11 @@ impl Run<'_> {
                             d.published_rows.contains(t),
                             d.staged_rows.contains(t),
                             latched,
-                            can.contains(t),
+                            if class == Class::Bottle {
+                                source_serves(&name, build, *t)
+                            } else {
+                                rust_can.contains(t)
+                            },
                         ),
                     );
                 }
@@ -757,7 +808,7 @@ impl Run<'_> {
         let mut signed_earlier: Vec<&Program> = Vec::new();
         let mut unsignable: Vec<(&Program, String)> = Vec::new();
         for p in &programs {
-            if p.class != Class::Plain {
+            if !matches!(p.class, Class::Plain | Class::Bottle) {
                 continue;
             }
             let staged = staged_manifest(&staged_dir, &p.name, p.build);
@@ -1004,7 +1055,7 @@ impl Run<'_> {
         }
 
         let index_floor = n;
-        self.state.record(index_floor, &can, &pins)?;
+        self.state.record(index_floor, &pin_can, &pins)?;
         let staged_names = outcome.staged.clone();
         outcome.table = programs.clone().into_iter().zip(decisions).collect();
         if self.failures {
@@ -1134,51 +1185,53 @@ impl Run<'_> {
         let (name, build) = (p.name.clone(), p.build);
         let slug = ctx.staging_slug(&p.repo);
         let clone = self.state.root.join("progs").join(&p.repo);
-        self.tx
-            .say(format!("[{name}@{build}] preparing source clone of {slug}"));
-        let prepared = if clone.join(".git").exists() {
-            ctx.hosts
-                .staging
-                .fetch_repo(&slug, &clone)
-                .map_err(|e| format!("git fetch failed in the {} clone: {e}", p.repo))
-        } else {
-            std::fs::create_dir_all(self.state.root.join("progs"))
-                .map_err(|e| e.to_string())
-                .and_then(|()| {
-                    ctx.hosts
-                        .staging
-                        .clone_repo(&slug, &clone)
-                        .map_err(|e| format!("clone of {slug} failed: {e}"))
-                })
-        };
-        if let Err(why) = prepared {
-            self.block(staged_dir, p, None, &why, n);
-            return Ok(false);
-        }
-        let sha = match super::resolve::resolve_commit(&clone, build) {
-            Ok(sha) => sha,
-            Err(e) => {
+        if p.class != Class::Bottle {
+            self.tx
+                .say(format!("[{name}@{build}] preparing source clone of {slug}"));
+            let prepared = if clone.join(".git").exists() {
+                ctx.hosts
+                    .staging
+                    .fetch_repo(&slug, &clone)
+                    .map_err(|e| format!("git fetch failed in the {} clone: {e}", p.repo))
+            } else {
+                std::fs::create_dir_all(self.state.root.join("progs"))
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        ctx.hosts
+                            .staging
+                            .clone_repo(&slug, &clone)
+                            .map_err(|e| format!("clone of {slug} failed: {e}"))
+                    })
+            };
+            if let Err(why) = prepared {
+                self.block(staged_dir, p, None, &why, n);
+                return Ok(false);
+            }
+            let sha = match super::resolve::resolve_commit(&clone, build) {
+                Ok(sha) => sha,
+                Err(e) => {
+                    self.block(
+                        staged_dir,
+                        p,
+                        None,
+                        &format!("could not resolve pin {build} to a commit — {e}"),
+                        n,
+                    );
+                    return Ok(false);
+                }
+            };
+            self.tx
+                .say(format!("[{name}@{build}] pinned commit is {sha}"));
+            if let Err(e) = crate::git::run(&clone, &["checkout", "--force", "--detach", &sha]) {
                 self.block(
                     staged_dir,
                     p,
                     None,
-                    &format!("could not resolve pin {build} to a commit — {e}"),
+                    &format!("checkout of {sha} failed: {e}"),
                     n,
                 );
                 return Ok(false);
             }
-        };
-        self.tx
-            .say(format!("[{name}@{build}] pinned commit is {sha}"));
-        if let Err(e) = crate::git::run(&clone, &["checkout", "--force", "--detach", &sha]) {
-            self.block(
-                staged_dir,
-                p,
-                None,
-                &format!("checkout of {sha} failed: {e}"),
-                n,
-            );
-            return Ok(false);
         }
         let dir = staged_dir.join(&name);
         let staged = staged_manifest(staged_dir, &name, build);
@@ -1193,9 +1246,14 @@ impl Run<'_> {
         };
         crate::identity::copy_regular_file(&from, &base)
             .map_err(|e| Error::io(format!("copy {}", from.display()), &e))?;
+        let upstream_version = if p.class == Class::Bottle {
+            Some(rows::local(&base)?.version)
+        } else {
+            None
+        };
         let mut any = false;
         for t in p.need() {
-            let env = if t == self.opts.host {
+            let env = if t == self.opts.host || p.class == Class::Bottle {
                 Vec::new()
             } else {
                 match self.deps.builder.env_for(t) {
@@ -1208,22 +1266,42 @@ impl Run<'_> {
                 }
             };
             let out = staged_dir.join(".work").join(&name).join(t.as_str());
-            let packed = self.deps.packer.pack(
-                ctx,
-                &PackRequest {
-                    program: name.clone(),
-                    checkout: clone.clone(),
-                    triple: t,
-                    build: Some(build),
-                    merge_from: Some(base.clone()),
-                    toolchain: None,
-                    out: out.clone(),
-                    signing: Signing::Unsigned,
-                    upload: false,
-                    env,
-                },
-            );
-            let outcome = match packed {
+            let packed = if let Some(version) = &upstream_version {
+                self.deps
+                    .packer
+                    .pack_bottle(
+                        ctx,
+                        &crate::artifact::bottle::upstream::Request {
+                            program: name.clone(),
+                            version: version.clone(),
+                            build,
+                            triple: t,
+                            merge_from: Some(base.clone()),
+                            out: out.clone(),
+                        },
+                    )
+                    .map(|outcome| (outcome.build, outcome.asset, outcome.manifest))
+            } else {
+                self.deps
+                    .packer
+                    .pack(
+                        ctx,
+                        &PackRequest {
+                            program: name.clone(),
+                            checkout: clone.clone(),
+                            triple: t,
+                            build: Some(build),
+                            merge_from: Some(base.clone()),
+                            toolchain: None,
+                            out: out.clone(),
+                            signing: Signing::Unsigned,
+                            upload: false,
+                            env,
+                        },
+                    )
+                    .map(|outcome| (outcome.build, outcome.asset, outcome.manifest))
+            };
+            let (outcome_build, outcome_asset, outcome_manifest) = match packed {
                 Ok(o) => o,
                 Err(e) => {
                     self.block(
@@ -1237,8 +1315,8 @@ impl Run<'_> {
                     continue;
                 }
             };
-            let carries = rows::local(&outcome.manifest).map(|m| rows::targets(&m).contains(&t));
-            if outcome.build != build || !matches!(carries, Ok(true)) {
+            let carries = rows::local(&outcome_manifest).map(|m| rows::targets(&m).contains(&t));
+            if outcome_build != build || !matches!(carries, Ok(true)) {
                 self.block(
                     staged_dir,
                     p,
@@ -1251,15 +1329,14 @@ impl Run<'_> {
             }
             std::fs::create_dir_all(&dir)
                 .map_err(|e| Error::io(format!("mkdir {}", dir.display()), &e))?;
-            let asset_name = outcome
-                .asset
+            let asset_name = outcome_asset
                 .file_name()
                 .map(|n| n.to_os_string())
                 .ok_or_else(|| Error::refused("the pack's asset names no file"))?;
-            move_file(&outcome.asset, &dir.join(asset_name))?;
-            crate::identity::copy_regular_file(&outcome.manifest, &staged)
+            move_file(&outcome_asset, &dir.join(asset_name))?;
+            crate::identity::copy_regular_file(&outcome_manifest, &staged)
                 .map_err(|e| Error::io(format!("stage {}", staged.display()), &e))?;
-            crate::identity::copy_regular_file(&outcome.manifest, &base)
+            crate::identity::copy_regular_file(&outcome_manifest, &base)
                 .map_err(|e| Error::io(format!("copy {}", base.display()), &e))?;
             let _ = std::fs::remove_file(staged.with_extension("toml.sig"));
             let _ = std::fs::remove_dir_all(&out);
@@ -1620,6 +1697,11 @@ fn render(p: &Program, d: &Decision, staged_name: &str) -> String {
             "APPLE-ONLY: a harness ships Apple silicon only — no Linux row is built".into()
         }
         Decision::Unknown => format!("UNKNOWN: not a PROGRAMS row — human decision{note}"),
+        Decision::Build { held } if p.class == Class::Bottle => format!(
+            "BUILD{}: build pinned upstream source, qualify {}, merge manifest, stage{note}",
+            hold(held),
+            triples(&[RowState::Absent])
+        ),
         Decision::Build { held } => format!(
             "BUILD{}: resolve pinned commit, pack {}, merge manifest, stage{note}",
             hold(held),

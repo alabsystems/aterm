@@ -19,7 +19,9 @@ pub struct GateSummary {
 }
 
 fn is_section_header(line: &str, section: &str) -> bool {
-    line.strip_prefix(&format!("## [{section}]"))
+    line.strip_prefix("## [")
+        .and_then(|rest| rest.strip_prefix(section))
+        .and_then(|rest| rest.strip_prefix(']'))
         .is_some_and(|rest| rest.trim().is_empty() || rest.starts_with([' ', '\t', '-']))
 }
 
@@ -412,19 +414,22 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
             "{CHANGELOG_FILE} has no \"## [{version}]\" section to extract"
         )));
     }
-    while lines.first().is_some_and(|l| l.trim().is_empty()) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    if lines.is_empty() {
+    let start = lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(lines.len());
+    let end = lines[start..]
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(start, |p| start + p + 1);
+    let trimmed = &lines[start..end];
+    if trimmed.is_empty() {
         return Err(Error::new(format!(
             "the \"## [{version}]\" section of {CHANGELOG_FILE} is empty — the roll \
              should have made that impossible; refusing to ship note-less"
         )));
     }
-    Ok(lines.join("\n"))
+    Ok(trimmed.join("\n"))
 }
 
 /// The GitHub release body: a standing newcomer preamble, then this release's changelog verbatim.
@@ -605,13 +610,19 @@ fn la_date(unix: i64, offset: i64) -> String {
 /// 0-based (start, end) line indices of a section: `start` is the `## [name]` header, `end`
 /// the next `## ` heading (or one past the last line).
 fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| is_section_header(l, section))?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.starts_with("## "))
-        .map_or(lines.len(), |p| start + 1 + p);
-    Some((start, end))
+    let mut start = None;
+    let mut count = 0;
+    for (idx, line) in text.lines().enumerate() {
+        count = idx + 1;
+        if let Some(s) = start {
+            if line.starts_with("## ") {
+                return Some((s, idx));
+            }
+        } else if is_section_header(line, section) {
+            start = Some(idx);
+        }
+    }
+    start.map(|s| (s, count))
 }
 
 #[cfg(test)]

@@ -303,6 +303,7 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
         let production = live_acts(
             crate::session_store::new_store(),
             a.tmp.path().join("no.sock").to_string_lossy().into_owned(),
+            Default::default(),
         );
         idle.hooks.acts.account_env = production.account_env;
         let mut observed = captured.clone();

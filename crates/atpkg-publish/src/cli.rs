@@ -45,6 +45,11 @@ pub const VERBS: &[Verb] = &[
         does: "stage, relocate, gate and sign an upstream bottle or binary archive (gh, git)",
     },
     Verb {
+        name: "pack-upstream",
+        synopsis: artifact::bottle::upstream::SYNOPSIS,
+        does: "acquire, build and qualify pinned GNU Git; unsigned, without upload",
+    },
+    Verb {
         name: "build-local",
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
         does: "development build of a program: unsigned, never packed or uploaded",
@@ -223,6 +228,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack-bundle" => artifact::bundle::run(ctx, rest),
         "pack-package" => artifact::package::run(ctx, rest),
         "pack-bottle" => artifact::bottle::run(ctx, rest),
+        "pack-upstream" => artifact::bottle::upstream::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),
         #[cfg(unix)]
         "harness-local" => crate::harness_local::run(ctx, rest),

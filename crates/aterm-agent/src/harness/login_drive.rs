@@ -600,6 +600,10 @@ pub enum Resume {
 
 /// Approves a sign-in's page ([`drive`]): the headless browser, or a test's stand-in.
 pub trait Approver {
+    /// The admitted automatic operation, retained by actual pipe-reader work.
+    fn work_scope(&self) -> Option<super::account_work::Scope> {
+        None
+    }
     /// Resume an unpublished native completion before requiring or starting a native child.
     /// A returned completion must be revalidated by `complete` before publication.
     fn resume(&mut self, _request: &Request<'_>, _deadline: Instant) -> Result<Resume, String> {
@@ -738,13 +742,76 @@ pub struct Spec<'a> {
 }
 
 pub(super) fn end(child: &mut aterm_uds::spawnfd::Child) {
-    // The process group this sign-in made for its own child, which is not yet reaped.
+    end_with(child, aterm_uds::spawnfd::Child::wait);
+}
+
+fn end_with(
+    child: &mut aterm_uds::spawnfd::Child,
+    mut wait: impl FnMut(&mut aterm_uds::spawnfd::Child) -> std::io::Result<std::process::ExitStatus>,
+) {
+    // Only the unreaped actual child can reserve this dedicated group's numeric identity.
+    // The bounded group operation is a signal attempt, not descendant-drain evidence.
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = aterm_uds::process::kill_group_until_empty(pid);
+    {
+        if child.is_reaped() {
+            return;
+        }
+        if child.owns_unreaped() {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = aterm_uds::process::kill_group_until_empty(pid);
+            }
+            if child.owns_unreaped() {
+                let _ = child.kill();
+            }
+        }
     }
+    #[cfg(not(unix))]
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        #[cfg(unix)]
+        if !child.owns_unreaped() && !child.is_reaped() {
+            // ECHILD is sticky in Child: neither numeric retry nor a new signal is allowed.
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if wait(child).is_ok() {
+            return;
+        }
+        // Work's deadline does not release the caller's admission/locks on uncertain wait.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct ProviderOwner(aterm_uds::spawnfd::Child);
+
+impl std::ops::Deref for ProviderOwner {
+    type Target = aterm_uds::spawnfd::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ProviderOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ProviderOwner {
+    fn drop(&mut self) {
+        end(&mut self.0);
+    }
+}
+
+fn spawn_reader(
+    work: Option<super::account_work::Scope>,
+    read: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let read: Box<dyn FnOnce() + Send> = match work {
+        Some(scope) => Box::new(scope.wrap(read)),
+        None => Box::new(read),
+    };
+    std::thread::Builder::new().spawn(read)
 }
 
 /// Runs `spec`'s child, hands its page to `approver` once its grammar named the URL (and, for a
@@ -769,16 +836,32 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         outcome: Outcome::NotRun(why),
         host: None,
     };
+    let work = approver.work_scope();
+    if work
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return not_run("automatic account work is cancelled".into());
+    }
     if let Err(why) = super::align::tie(&mut cmd) {
         return not_run(why);
     }
+    if work
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return not_run("automatic account work is cancelled".into());
+    }
     let mut child = match cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => ProviderOwner(child),
         Err(e) => return not_run(format!("{}: {e}", spec.program.display())),
     };
     if let Err(why) = super::align::tie_held() {
         end(&mut child);
-        return not_run(why);
+        return Drove {
+            outcome: Outcome::Unverified(why),
+            host: None,
+        };
     }
     let now = Instant::now();
     let deadline = now
@@ -808,7 +891,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         let said_done = Arc::clone(&said_done);
         let closed = Arc::clone(&closed);
         let done_phrases = done_phrases.clone();
-        std::thread::spawn(move || {
+        let read = move || {
             read_lines(stream, |line| {
                 let text = strip_ansi(&line);
                 if done_phrases.iter().any(|p| text.contains(p.as_str())) {
@@ -818,7 +901,15 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
             });
             closed.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(None);
-        });
+        };
+        if let Err(why) = spawn_reader(work.clone(), read) {
+            return Drove {
+                outcome: Outcome::Unverified(format!(
+                    "native sign-in pipe reader could not start: {why}"
+                )),
+                host: None,
+            };
+        }
     }
     drop(tx);
     let streams = open;
@@ -831,6 +922,15 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
     let mut exited_at: Option<Instant> = None;
     let grace = output_grace();
     loop {
+        if work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Drove {
+                outcome: Outcome::Unverified("automatic account work is cancelled".into()),
+                host,
+            };
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             end(&mut child);
@@ -1185,8 +1285,10 @@ pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = match cmd.spawn() {
-        Ok(child) => child,
+        Ok(child) => ProviderOwner(child),
         Err(e) => return Some(format!("{} did not start ({e})", sandbox.display())),
     };
     let now = Instant::now();
@@ -1198,8 +1300,7 @@ pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                end(&mut child);
                 return Some(format!(
                     "{} did not finish a try within {} s",
                     sandbox.display(),
@@ -1260,6 +1361,13 @@ pub fn sign_in_with(
         outcome: Outcome::NotRun(why),
         host: None,
     };
+    let work = approver.work_scope();
+    if work
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return not_run("automatic account work is cancelled".into());
+    }
     let Some(signin) = req.signin() else {
         return not_run("this CLI has no sign-in in this build".to_owned());
     };
@@ -1430,6 +1538,16 @@ pub fn sign_in_live(
     home: &Path,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Drove {
+    sign_in_live_scoped(req, home, var, None)
+}
+
+/// Drive a live sign-in with the caller's existing automatic operation lifetime.
+pub fn sign_in_live_scoped(
+    req: &Request<'_>,
+    home: &Path,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    work: Option<super::account_work::Scope>,
+) -> Drove {
     let program = program_of(req.cli, home);
     let mut approver = super::headless_oauth::VendorApprover::new(
         req.cli,
@@ -1437,7 +1555,8 @@ pub fn sign_in_live(
         req.row.email.as_deref(),
         &req.store.shared_dir(),
         Some(home),
-    );
+    )
+    .with_work(work);
     sign_in_with(
         req,
         (&program, &[]),

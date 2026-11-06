@@ -13,9 +13,12 @@
 //! first. The overlay ([`overlay`]) keeps the neighbours; the membership log decides who is an
 //! origin and whose streams are refused ([`logs::Standings`]).
 //!
+//! Tables move over the relay (B7b): the egress ([`egress`]) publishes every record that enters a
+//! store from this Mac, the ingest consumer ([`ingest`]) hands each record another Mac originated
+//! to its store's own checks, and the `Inventory` exchange ([`inventory`]) fills what the relay
+//! cannot, each over the stores the node service hands it ([`stores`]).
 //! [`presence`] supplies the origin-signed presence rows and their per-seat reading (B7c).
 //! [`mail`] runs the fabric's mail pushes over the same links, one hop to the addressed Mac (C3).
-//! [`egress`], [`ingest`] and [`inventory`] remain for B7b.
 //!
 //! Nothing here runs unless the node service is built with `aterm_types::mesh_switch::MESH` on:
 //! the node service opens a [`Mesh`] only then.
@@ -27,6 +30,7 @@
 aterm_durable::plain_durable_flushes_in_tests!();
 
 pub mod egress;
+mod flow;
 pub mod ingest;
 pub mod inventory;
 pub mod logs;
@@ -34,10 +38,13 @@ pub mod mail;
 pub mod overlay;
 pub mod presence;
 pub mod relay;
+pub mod stores;
 
+pub use flow::{Pushed, current};
 pub use logs::{Mesh, MeshConfig, MeshLog, Standings};
 pub use overlay::Attached;
 pub use relay::{Event, Published};
+pub use stores::Stores;
 
 #[cfg(test)]
 mod tests;

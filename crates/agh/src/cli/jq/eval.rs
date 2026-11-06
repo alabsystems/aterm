@@ -123,11 +123,9 @@ const fn type_name(value: &Value) -> &'static str {
 
 fn shown(value: &Value) -> String {
     let text = value.to_string();
-    let cut: String = text.chars().take(30).collect();
-    if cut.len() < text.len() {
-        format!("{} ({cut}...)", type_name(value))
-    } else {
-        format!("{} ({cut})", type_name(value))
+    match text.char_indices().nth(30) {
+        Some((byte_idx, _)) => format!("{} ({}...)", type_name(value), &text[..byte_idx]),
+        None => format!("{} ({text})", type_name(value)),
     }
 }
 
@@ -425,16 +423,18 @@ fn slice(target: &Value, lo: &Value, hi: &Value) -> Result<Value> {
             ))
         }
         Value::String(text) => {
-            let chars: Vec<char> = text.chars().collect();
-            let start = slice_index(lo, chars.len(), 0, false)?;
-            let end = slice_index(hi, chars.len(), chars.len(), true)?;
-            Ok(Value::String(
-                chars
-                    .get(start..end.max(start))
-                    .unwrap_or(&[])
-                    .iter()
-                    .collect(),
-            ))
+            let len = text.chars().count();
+            let start = slice_index(lo, len, 0, false)?;
+            let end = slice_index(hi, len, len, true)?.max(start);
+            let start_byte = text
+                .char_indices()
+                .nth(start)
+                .map_or(text.len(), |(i, _)| i);
+            let end_byte = text[start_byte..]
+                .char_indices()
+                .nth(end - start)
+                .map_or(text.len(), |(i, _)| start_byte + i);
+            Ok(Value::String(text[start_byte..end_byte].to_string()))
         }
         other => Err(runtime(&format!(
             "cannot index {} with object",
@@ -684,11 +684,14 @@ fn from_entries(input: &Value) -> Result<Value> {
 }
 
 fn any_all(items: &[Value], f: Option<&Ast>, env: Option<&Env<'_>>, want: bool) -> Result<bool> {
+    let Some(f) = f else {
+        // Same answer as the loop below: `want` on the first item whose
+        // truthiness is `want`, else `!want` (`any` wants true, `all` false).
+        let hit = items.iter().any(|item| truthy(item) == want);
+        return Ok(if hit { want } else { !want });
+    };
     for item in items {
-        let (outputs, status) = match f {
-            Some(f) => stream(f, item, env),
-            None => (vec![item.clone()], Ok(())),
-        };
+        let (outputs, status) = stream(f, item, env);
         if outputs.iter().any(|o| truthy(o) == want) {
             return Ok(want);
         }
@@ -985,45 +988,63 @@ fn call(
     Ok(())
 }
 
-fn tsv_cell(value: &Value) -> Result<String> {
-    Ok(match value {
-        Value::Null => String::new(),
+fn tsv_cell_into(out: &mut String, value: &Value) -> Result<()> {
+    use std::fmt::Write as _;
+    match value {
+        Value::Null => {}
         Value::String(text) => {
-            let mut cell = String::with_capacity(text.len());
+            out.reserve(text.len());
             for c in text.chars() {
                 match c {
-                    '\\' => cell.push_str("\\\\"),
-                    '\t' => cell.push_str("\\t"),
-                    '\n' => cell.push_str("\\n"),
-                    '\r' => cell.push_str("\\r"),
-                    '\0' => cell.push_str("\\0"),
-                    c => cell.push(c),
+                    '\\' => out.push_str("\\\\"),
+                    '\t' => out.push_str("\\t"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\0' => out.push_str("\\0"),
+                    c => out.push(c),
                 }
             }
-            cell
         }
-        Value::Number(_) | Value::Bool(_) => value.to_string(),
+        Value::Number(_) | Value::Bool(_) => {
+            let _ = write!(out, "{value}");
+        }
         other => {
             return Err(runtime(&format!(
                 "{} is not valid in a tsv row",
                 shown(other)
             )));
         }
-    })
+    }
+    Ok(())
 }
 
-fn csv_cell(value: &Value) -> Result<String> {
-    Ok(match value {
-        Value::Null => String::new(),
-        Value::String(text) => format!("\"{}\"", text.replace('"', "\"\"").replace('\0', "\\0")),
-        Value::Number(_) | Value::Bool(_) => value.to_string(),
+fn csv_cell_into(out: &mut String, value: &Value) -> Result<()> {
+    use std::fmt::Write as _;
+    match value {
+        Value::Null => {}
+        Value::String(text) => {
+            out.reserve(text.len() + 2);
+            out.push('"');
+            for c in text.chars() {
+                match c {
+                    '"' => out.push_str("\"\""),
+                    '\0' => out.push_str("\\0"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        Value::Number(_) | Value::Bool(_) => {
+            let _ = write!(out, "{value}");
+        }
         other => {
             return Err(runtime(&format!(
                 "{} is not valid in a csv row",
                 shown(other)
             )));
         }
-    })
+    }
+    Ok(())
 }
 
 fn format(name: &str, input: &Value) -> Result<String> {
@@ -1035,11 +1056,20 @@ fn format(name: &str, input: &Value) -> Result<String> {
                     shown(input)
                 )));
             };
-            let cells = items
-                .iter()
-                .map(if name == "tsv" { tsv_cell } else { csv_cell })
-                .collect::<Result<Vec<String>>>()?;
-            Ok(cells.join(if name == "tsv" { "\t" } else { "," }))
+            let is_tsv = name == "tsv";
+            let sep = if is_tsv { '\t' } else { ',' };
+            let mut out = String::new();
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(sep);
+                }
+                if is_tsv {
+                    tsv_cell_into(&mut out, item)?;
+                } else {
+                    csv_cell_into(&mut out, item)?;
+                }
+            }
+            Ok(out)
         }
         "json" => Ok(json_text(input)),
         "base64" => aterm_codec::base64::encode(tostring(input).as_bytes())

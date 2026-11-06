@@ -70,6 +70,11 @@ pub fn has_dot_segment(text: &str) -> bool {
 /// Returns whether `text`, after percent-decoding, contains a `.` or `..` path segment.
 #[must_use]
 pub(crate) fn has_encoded_dot_segment(text: &str) -> bool {
+    if !text.contains('%') {
+        return text
+            .split(['/', '\\'])
+            .any(|part| part == "." || part == "..");
+    }
     aterm_codec::pct::decode(text)
         .split(['/', '\\'])
         .any(|part| part == "." || part == "..")

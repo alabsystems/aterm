@@ -57,11 +57,17 @@ fn automatic_candidates(
     Ok(candidates)
 }
 
-fn current_authority(
+fn current_authority_with_prepared(
     home: &std::path::Path,
     source: accounts::shared::Source,
     row: &accounts::Row,
-) -> Result<std::sync::Arc<Approved>, String> {
+) -> Result<
+    (
+        std::sync::Arc<Approved>,
+        aterm_db::accounts::activations::Preparation,
+    ),
+    String,
+> {
     let paths = Paths::for_home(home);
     let expected = client::config(&paths)
         .map_err(|e| e.to_string())?
@@ -78,10 +84,11 @@ fn current_authority(
         account: source.account,
         decision,
     };
-    if approved.read(row)?.source != source {
+    let prepared = approved.prepared()?;
+    if approved.read_from(&prepared, row)?.source != source {
         return Err("shared renewal belongs to a different retained network".into());
     }
-    Ok(std::sync::Arc::new(approved))
+    Ok((std::sync::Arc::new(approved), prepared))
 }
 
 fn automatic_authority(
@@ -89,8 +96,8 @@ fn automatic_authority(
     source: accounts::shared::Source,
     row: &accounts::Row,
 ) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
-    let approved = current_authority(home, source, row)?;
-    if !providers::ordinary_renewal(&approved.prepared()?) {
+    let (approved, prepared) = current_authority_with_prepared(home, source, row)?;
+    if !providers::ordinary_renewal(&prepared) {
         return Err("shared account requires its prepared-provider login path".into());
     }
     Ok(approved)
@@ -101,8 +108,8 @@ fn checkpoint_authority(
     source: accounts::shared::Source,
     row: &accounts::Row,
 ) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
-    let approved = current_authority(home, source, row)?;
-    if !providers::claude_checkpoint(&approved.prepared()?) {
+    let (approved, prepared) = current_authority_with_prepared(home, source, row)?;
+    if !providers::claude_checkpoint(&prepared) {
         return Err("shared checkpoint is not a supported Claude preparation".into());
     }
     Ok(approved)
@@ -155,9 +162,12 @@ impl Authority for Approved {
         row: &accounts::Row,
         intent: &accounts::shared::Intent,
     ) -> Result<(), String> {
-        self.current(grant, row)?;
+        let prepared = self.prepared()?;
+        if self.read_from(&prepared, row)? != *grant {
+            return Err("shared renewal approval changed".into());
+        }
         if !matches!(
-            &self.prepared()?.decision().request().action,
+            &prepared.decision().request().action,
             aterm_secrets::commons::accounts::Action::Prepare(terms) if terms.intent.is_some()
         ) {
             return Ok(());
@@ -264,7 +274,7 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
         }
         Ok(cli::shared_renewal::run(
             &env,
-            &cli::LiveAccounts,
+            &cli::LiveAccounts::default(),
             &command.label,
             command.request,
             &authority,

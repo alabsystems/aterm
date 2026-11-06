@@ -173,7 +173,8 @@ pub struct Desk {
     pub chains_window: String,
     /// Session ID of the chains window's front tab.
     pub front_sid: String,
-    /// Observed `This Mac — …` menu rows.
+    /// Observed This Mac menu rows (`This Mac — …`, or `m8 Heron — …` once the title is read;
+    /// [`here_counts`]).
     pub here: Vec<(i64, String)>,
     /// Observed `presence` lines with ages masked.
     pub presence: Vec<(i64, String)>,
@@ -530,15 +531,30 @@ pub fn team_unmarked(shown: &str) -> &str {
 
 /// The section an Info row heads, by its words.
 fn section_of(label: &str) -> Option<&'static str> {
+    if here_counts(label).is_some() {
+        return Some("here");
+    }
     [
         ("Needs you (", "needs"),
         ("Done for you (", "done"),
-        ("This Mac", "here"),
         ("To look at (", "look"),
     ]
     .into_iter()
     .find(|(head, _)| label.starts_with(head))
     .map(|(_, s)| s)
+}
+
+/// This Mac's counts: what its row carries after ` — `, the row being led by `This Mac` or, once
+/// the title's reader has read it, by this machine's title (`m8 Heron`, `m0 Maize`: `m`, digits,
+/// then the nickname; `docs/DESIGN-machine-names-2026-11-04.md` §5.5).
+#[must_use]
+pub fn here_counts(label: &str) -> Option<&str> {
+    let (lead, counts) = label.split_once(" \u{2014} ")?;
+    let titled = lead.strip_prefix('m').is_some_and(|rest| {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest.as_bytes().get(digits).is_none_or(|b| *b == b' ')
+    });
+    (lead == "This Mac" || titled).then_some(counts)
 }
 
 /// Parses `statusmenu` rows from `chrome` under their section headers.
@@ -1922,12 +1938,9 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let rest = w.rest.as_deref();
     let here = rest.and_then(|r| quoted(r, "here"));
     let tabs: Option<usize> = rest.and_then(|r| word(r, "landed_tabs")?.parse().ok());
-    let counted = here.as_deref().and_then(|h| {
+    let counted = here.as_deref().and_then(here_counts).and_then(|h| {
         h.split(" \u{b7} ")
-            .find_map(|p| {
-                p.trim_start_matches("This Mac \u{2014} ")
-                    .strip_suffix(" landed")
-            })
+            .find_map(|p| p.strip_suffix(" landed"))
             .and_then(|n| n.parse::<usize>().ok())
     });
     let mut unread = Vec::new();
@@ -1981,14 +1994,12 @@ fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     if let Some(v) = totals_short(rest) {
         return v;
     }
-    let Some(counts) = quoted(rest, "here")
-        .as_deref()
-        .and_then(|h| h.strip_prefix("This Mac \u{2014} "))
-        .map(str::to_string)
-    else {
+    let Some((here, counts)) = quoted(rest, "here").and_then(|here| {
+        let counts = here_counts(&here)?.to_string();
+        Some((here, counts))
+    }) else {
         return Verdict::Unobserved("the menu's This Mac row was never read at rest".into());
     };
-    let here = format!("This Mac \u{2014} {counts}");
     if unread > 0 {
         return Verdict::Unobserved(format!(
             "{unread} open Land tab(s) whose status names no land_nudges=, so no hold of theirs was read; This Mac \"{here}\""

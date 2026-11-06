@@ -546,9 +546,9 @@ impl Where {
 }
 
 /// The raw candidates of each `(pk, col)` register and set element of `collection`.
-type Registers = BTreeMap<(String, String), (Vec<Digest>, BTreeMap<String, Vec<Digest>>)>;
+type Registers<'a> = BTreeMap<(&'a str, &'a str), (Vec<Digest>, BTreeMap<String, Vec<Digest>>)>;
 
-fn registers(collection: &Collection, cells: &Cells) -> Registers {
+fn registers<'a>(collection: &Collection, cells: &'a Cells) -> Registers<'a> {
     let mut out = Registers::new();
     for ((_, key), cell) in cells
         .range((collection.name.to_owned(), String::new())..)
@@ -559,9 +559,7 @@ fn registers(collection: &Collection, cells: &Cells) -> Registers {
         };
         let mut digests: Vec<Digest> = cell.candidates.iter().map(|c| c.operation).collect();
         digests.sort_unstable();
-        let entry = out
-            .entry((parsed.pk.to_owned(), parsed.col.to_owned()))
-            .or_default();
+        let entry = out.entry((parsed.pk, parsed.col)).or_default();
         match parsed.elem {
             Some(elem) => {
                 entry.1.insert(elem.to_owned(), digests);
@@ -637,9 +635,10 @@ pub fn export_opened(
             }
         }
         let mut seen = BTreeMap::new();
+        let row_protected = super::check::protected(row);
         for column in &columns {
             let (candidates, elements) = registers
-                .remove(&(pk.clone(), column.name.clone()))
+                .remove(&(pk.as_str(), column.name.as_str()))
                 .unwrap_or_default();
             let mut raw = row.raw.contains(&column.name);
             let secret = opened.is_some()
@@ -648,10 +647,10 @@ pub fn export_opened(
                 Source::Schema(schema) if secret && !raw => {
                     let field = row.fields.get(&column.name);
                     match opened.and_then(|o| o.get(&(pk.clone(), column.name.clone()))) {
-                        Some(values) if !super::check::protected(row) => show_opened(values),
+                        Some(values) if !row_protected => show_opened(values),
                         _ => {
                             // Unopened, or a protected row's: masked, and never typed over.
-                            raw = super::check::protected(row)
+                            raw = row_protected
                                 || field.is_some_and(
                                     |f| !matches!(f, Field::Value(c) if c.value.x.is_null()),
                                 );

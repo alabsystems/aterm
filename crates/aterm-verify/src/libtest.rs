@@ -102,16 +102,32 @@ pub(crate) fn has_ceiling_kill(log: &str) -> bool {
 
 /// libtest's opening count line (`running <n> test` or `running <n> tests`).
 fn libtest_banner(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("running ") else {
-        return false;
-    };
-    let Some(n) = rest
+    banner_count(line).is_some()
+}
+
+/// The count libtest's opening line ([`libtest_banner`]) says it runs; `None` for any other line
+/// (a count past `u64` included).
+fn banner_count(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("running ")?;
+    let n = rest
         .strip_suffix(" test")
-        .or_else(|| rest.strip_suffix(" tests"))
-    else {
-        return false;
-    };
-    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        .or_else(|| rest.strip_suffix(" tests"))?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// How many tests one test binary's log says libtest runs: the count of its first opening line
+/// ([`libtest_banner`], whole and at a line's start, read plain when the log is coloured), after
+/// its filter; `None` when it printed none (it never reached its harness, or it is not libtest).
+#[must_use]
+pub fn tests_run(log: &str) -> Option<u64> {
+    if log.contains('\x1b') {
+        return tests_run(&strip_ansi(log));
+    }
+    log.lines()
+        .find_map(|l| banner_count(l.trim_end_matches('\r')))
 }
 
 /// cargo's `--no-fail-fast` summary header (`error: <n> target(s) failed:`).
@@ -555,6 +571,35 @@ mod tests {
 
     const HEADER: &str = "     Running unittests src/lib.rs (target/debug/deps/x-abc)\n";
 
+    /// A binary's test count is its first opening line's, `running 1 test` or `running 133
+    /// tests`, coloured or not: a nested run a test prints later is not the binary's, nor is a
+    /// line that only begins or ends the same way. A log with no opening line (the binary died
+    /// before its harness) has none. NEGATIVE CONTROL: read from its last opening line, the
+    /// nested run's 1 answers for the binary's 133.
+    #[test]
+    fn a_binarys_test_count_is_its_first_opening_line() {
+        let log = format!(
+            "{HEADER}\nrunning 133 tests\ntest a ... ok\n  running 7 tests\nrunning 1 test\n\
+             test result: ok. 133 passed\n"
+        );
+        assert_eq!(tests_run(&log), Some(133));
+        assert_eq!(
+            tests_run("\u{1b}[0mrunning 1 test\u{1b}[0m\r\ntest a ... ok\n"),
+            Some(1)
+        );
+        for none in [
+            "",
+            "running tests\n",
+            "running 4 testers\n",
+            "warming 4 tests\n",
+            "running -1 tests\n",
+            "running 99999999999999999999999 tests\n",
+            "thread 'main' panicked\n",
+        ] {
+            assert_eq!(tests_run(none), None, "{none:?}");
+        }
+    }
+
     /// Each binary is read on its own, coloured or not: a target whose rows were
     /// all ignored or filtered out passed none even beside one that passed, a
     /// re-exec child's result is not its parent's, and a binary with no result
@@ -625,6 +670,7 @@ mod tests {
             output,
             code: Some(101),
             spawn_error: None,
+            usage: None,
         };
         let simulated = format!(
             "     Running link (target/debug/deps/link-abc)\n\nrunning 1 test\n\
@@ -809,6 +855,7 @@ mod tests {
                 output: log.clone(),
                 code: Some(101),
                 spawn_error: None,
+                usage: None,
             };
             (refusal_reasons(&log), run.environment_failure())
         };

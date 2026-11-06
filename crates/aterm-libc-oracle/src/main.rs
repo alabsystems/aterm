@@ -299,7 +299,8 @@ fn harvest_verb(root: PathBuf, args: Args) -> ExitCode {
     };
     let log_path = args.log.clone().unwrap_or_default();
     let log = match read_regular_file(&log_path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(bytes) => String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
         Err(error) => {
             eprintln!("aterm-libc-oracle: {}: {error}", log_path.display());
             return ExitCode::from(EXIT_USAGE);

@@ -289,8 +289,9 @@ impl fmt::Display for Outcome {
 /// The last `lines` lines of `text`.
 #[must_use]
 pub fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
+    let mut last: Vec<&str> = text.lines().rev().take(lines).collect();
+    last.reverse();
+    last.join("\n")
 }
 
 /// Which crate to document.

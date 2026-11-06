@@ -48,6 +48,42 @@ pub(crate) fn confirm_key(
     }
 }
 
+/// An editing key the person pressed in a confirmation's text field: AppKit would send it to
+/// aterm's own Edit menu, whose rows run their action on the front tab once the alert closes, so
+/// the alert's key watch sends it to the field's editor instead.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldEdit {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+/// The editing key `modifier_flags` and `chars_ignoring_modifiers` press: ⌘X, ⌘C, ⌘V or ⌘A with
+/// no other modifier, in either case of the letter (Caps Lock and the numeric-pad and function
+/// bits aside).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn field_edit(
+    modifier_flags: u64,
+    chars_ignoring_modifiers: Option<&str>,
+) -> Option<FieldEdit> {
+    const SHIFT: u64 = 1 << 17;
+    const CONTROL: u64 = 1 << 18;
+    const OPTION: u64 = 1 << 19;
+    const COMMAND: u64 = 1 << 20;
+    if modifier_flags & (SHIFT | CONTROL | OPTION | COMMAND) != COMMAND {
+        return None;
+    }
+    match chars_ignoring_modifiers?.to_ascii_lowercase().as_str() {
+        "x" => Some(FieldEdit::Cut),
+        "c" => Some(FieldEdit::Copy),
+        "v" => Some(FieldEdit::Paste),
+        "a" => Some(FieldEdit::SelectAll),
+        _ => None,
+    }
+}
+
 /// Whether a key a confirmation's key monitor sees could reach that confirmation, so a key a
 /// control client posted is dropped there: one that names the confirmation's own window
 /// (`attached`), or, while the confirmation is up (`outstanding`), one that names no window
@@ -131,6 +167,7 @@ pub(crate) fn confirmation_up() -> bool {
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     ConfirmKeyWatch, PasteConfirm, next_confirm_id, sheet_outstanding, watch_alert_keys,
+    watch_field_alert_keys,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys};
@@ -139,7 +176,7 @@ pub(crate) use macos::{ConfirmKeyWatch as PasswordKeyWatch, watch_password_keys}
 mod macos {
     use aterm_objc::{BlockPtr, Id, Obj, RcBlock, Sel, sel};
 
-    use super::{ConfirmKey, confirm_key};
+    use super::{ConfirmKey, FieldEdit, confirm_key, field_edit};
     use crate::appkit::consts::NS_EVENT_MASK_KEY_DOWN;
     use crate::appkit::{self, MainThread};
 
@@ -267,12 +304,36 @@ mod macos {
         unsafe { appkit::send_v_id(button, sel!(performClick:), Id::NIL) };
     }
 
+    /// Send `edit` to `field`'s editor, the text view AppKit lends the field while it is being
+    /// edited; `false` when the field is not being edited.
+    fn edit_field(field: &Obj, edit: FieldEdit) -> bool {
+        // SAFETY: `-[NSTextField currentEditor]` is `-(NSText *)`, +0 and nil while the field is
+        // not being edited, read on the main thread (the monitor runs there); the editor is an
+        // `NSText`, which implements `cut:`, `copy:`, `paste:` and `selectAll:`, each
+        // `-(void)(id)` taking a sender, nil here.
+        unsafe {
+            let editor = appkit::send_id(field.id(), sel!(currentEditor));
+            if editor.is_null() {
+                return false;
+            }
+            let action = match edit {
+                FieldEdit::Cut => sel!(cut:),
+                FieldEdit::Copy => sel!(copy:),
+                FieldEdit::Paste => sel!(paste:),
+                FieldEdit::SelectAll => sel!(selectAll:),
+            };
+            appkit::send_v_id(editor, action, Id::NIL);
+        }
+        true
+    }
+
     fn decide(
         event: Id,
         panel: &Obj,
         parent: Option<&Obj>,
         accept: &Obj,
         cancel: &Obj,
+        field: Option<&Obj>,
         mtm: MainThread,
     ) -> Id {
         let attached = confirmation_owns_event(event, panel.id(), parent.map(Obj::id), mtm);
@@ -296,6 +357,14 @@ mod macos {
         // SAFETY: the live event this monitor holds, main thread (`mtm`). The ledger keeps a key
         // it found, so asking here leaves it a posted key for a later dispatch it passes to.
         let posted = reaches && unsafe { posted_key(event) };
+        if attached
+            && !posted
+            && let Some(field) = field
+            && let Some(edit) = field_edit(modifier_flags, chars.as_deref())
+            && edit_field(field, edit)
+        {
+            return Id::NIL;
+        }
         match confirm_key(
             attached || posted,
             posted,
@@ -324,6 +393,28 @@ mod macos {
         accept: Obj,
         cancel: Obj,
     ) -> Option<ConfirmKeyWatch> {
+        watch(panel, parent, accept, cancel, None)
+    }
+
+    /// [`watch_alert_keys`] for an app-modal alert whose accessory is the text field `field`: the
+    /// person's ⌘X, ⌘C, ⌘V and ⌘A edit the field ([`field_edit`]) rather than reaching aterm's
+    /// Edit menu, and a key a control client posted still types nothing.
+    pub(crate) fn watch_field_alert_keys(
+        panel: Obj,
+        field: Obj,
+        accept: Obj,
+        cancel: Obj,
+    ) -> Option<ConfirmKeyWatch> {
+        watch(panel, None, accept, cancel, Some(field))
+    }
+
+    fn watch(
+        panel: Obj,
+        parent: Option<Obj>,
+        accept: Obj,
+        cancel: Obj,
+        field: Option<Obj>,
+    ) -> Option<ConfirmKeyWatch> {
         let handler = move |event: Id| -> Id {
             let pass_through = event;
             if event.is_null() {
@@ -333,7 +424,15 @@ mod macos {
                 return pass_through;
             };
             match aterm_objc::contain("alert key monitor", || {
-                decide(event, &panel, parent.as_ref(), &accept, &cancel, mtm)
+                decide(
+                    event,
+                    &panel,
+                    parent.as_ref(),
+                    &accept,
+                    &cancel,
+                    field.as_ref(),
+                    mtm,
+                )
             }) {
                 Ok(answer) => answer,
                 Err(_) => pass_through,
@@ -503,7 +602,7 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfirmKey, confirm_key};
+    use super::{ConfirmKey, FieldEdit, confirm_key, field_edit};
 
     const SHIFT: u64 = 1 << 17;
     const CONTROL: u64 = 1 << 18;
@@ -561,6 +660,32 @@ mod tests {
     /// [`super::ConfirmationUp`] counts one while it lives, nested ones included.
     /// NEGATIVE CONTROL: with `hold` counting nothing, `confirmation_up` reads false under a
     /// held guard and the first assertion fails.
+    /// THE PERSON'S EDITING KEYS EDIT A CONFIRMATION'S FIELD: ⌘X, ⌘C, ⌘V and ⌘A alone, in either
+    /// case, and nothing with another modifier or no Command.
+    #[test]
+    fn command_x_c_v_and_a_alone_edit_a_confirmation_field() {
+        for (chars, want) in [
+            ("x", FieldEdit::Cut),
+            ("c", FieldEdit::Copy),
+            ("v", FieldEdit::Paste),
+            ("a", FieldEdit::SelectAll),
+            ("V", FieldEdit::Paste),
+        ] {
+            assert_eq!(field_edit(COMMAND, Some(chars)), Some(want), "{chars}");
+            assert_eq!(
+                field_edit(COMMAND | FUNCTION, Some(chars)),
+                Some(want),
+                "{chars} with the function bit"
+            );
+        }
+        for mods in [0, SHIFT, CONTROL, OPTION, COMMAND | SHIFT, COMMAND | OPTION] {
+            assert_eq!(field_edit(mods, Some("v")), None, "{mods:#x}");
+        }
+        assert_eq!(field_edit(COMMAND | CONTROL, Some("v")), None);
+        assert_eq!(field_edit(COMMAND, Some("z")), None);
+        assert_eq!(field_edit(COMMAND, None), None);
+    }
+
     #[test]
     fn a_confirmation_on_screen_is_counted_until_it_goes() {
         assert!(!super::confirmation_up(), "none yet");

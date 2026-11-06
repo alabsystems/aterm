@@ -69,8 +69,8 @@ fn format_at(at: usize, what: impl std::fmt::Display) -> Error {
     Error::replay(Replay::Format, format!("line {at}: {what}")).with_next(RECORD_AGAIN)
 }
 
-fn escape(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
+fn escape_into(out: &mut String, bytes: &[u8], escape_space_eq: bool) {
+    out.reserve(bytes.len());
     for chunk in bytes.utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
@@ -78,6 +78,8 @@ fn escape(bytes: &[u8]) -> String {
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
+                ' ' if escape_space_eq => out.push_str("\\x20"),
+                '=' if escape_space_eq => out.push_str("\\x3d"),
                 c if aterm_codec::tty::is_active(c) => {
                     for b in c.encode_utf8(&mut [0; 4]).bytes() {
                         let _ = write!(out, "\\x{b:02x}");
@@ -90,11 +92,10 @@ fn escape(bytes: &[u8]) -> String {
             let _ = write!(out, "\\x{b:02x}");
         }
     }
-    out
 }
 
-fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(text.len());
+fn unescape_into(text: &str, out: &mut Vec<u8>) -> std::result::Result<(), &'static str> {
+    out.reserve(text.len());
     let mut bytes = text.bytes();
     while let Some(b) = bytes.next() {
         if b != b'\\' {
@@ -107,31 +108,32 @@ fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
             Some(b'r') => out.push(b'\r'),
             Some(b't') => out.push(b'\t'),
             Some(b'x') => {
-                let hex = [bytes.next(), bytes.next()];
-                let byte = match hex {
-                    [Some(h), Some(l)] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => {
-                        std::str::from_utf8(&[h, l])
-                            .ok()
-                            .and_then(|h| u8::from_str_radix(h, 16).ok())
-                    }
-                    _ => None,
-                };
-                out.push(byte.ok_or_else(|| "a broken \\x escape".to_string())?);
+                let hi = bytes.next().and_then(|h| char::from(h).to_digit(16));
+                let lo = bytes.next().and_then(|l| char::from(l).to_digit(16));
+                let byte = hi
+                    .zip(lo)
+                    .and_then(|(h, l)| u8::try_from((h << 4) | l).ok())
+                    .ok_or("a broken \\x escape")?;
+                out.push(byte);
             }
-            _ => return Err("a broken escape".to_string()),
+            _ => return Err("a broken escape"),
         }
     }
+    Ok(())
+}
+
+fn unescape(text: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    unescape_into(text, &mut out)?;
     Ok(out)
 }
 
-fn token(name: &str) -> String {
-    escape(name.as_bytes())
-        .replace(' ', "\\x20")
-        .replace('=', "\\x3d")
+fn token_into(out: &mut String, name: &str) {
+    escape_into(out, name.as_bytes(), true);
 }
 
-fn name(word: &str) -> std::result::Result<String, String> {
-    String::from_utf8(unescape(word)?).map_err(|_| "a name that is not UTF-8".to_string())
+fn name(word: &str) -> std::result::Result<String, &'static str> {
+    String::from_utf8(unescape(word)?).map_err(|_| "a name that is not UTF-8")
 }
 
 fn pieces(out: &mut String, prefix: char, body: &[u8]) {
@@ -139,7 +141,7 @@ fn pieces(out: &mut String, prefix: char, body: &[u8]) {
         out.push(prefix);
         if !piece.is_empty() {
             out.push(' ');
-            out.push_str(&escape(piece));
+            escape_into(out, piece, false);
         }
         out.push('\n');
     }
@@ -165,11 +167,6 @@ impl TapeHeader {
     /// Render the five header lines joined by `\n`.
     #[must_use]
     pub fn render(&self) -> String {
-        let mut argv = String::from("argv");
-        for arg in &self.argv {
-            argv.push(' ');
-            argv.push_str(&token(arg));
-        }
         let mode = match self.mode {
             TapeMode::Anonymous => "anonymous",
             TapeMode::Credentialed => "credentialed",
@@ -178,10 +175,13 @@ impl TapeHeader {
             TapeEndpoints::GithubCom => "github.com",
             TapeEndpoints::Loopback => "loopback",
         };
-        format!(
-            "agh {}\napi {}\n{argv}\nmode {mode}\nendpoints {endpoints}",
-            self.agh_version, self.api_version
-        )
+        let mut out = format!("agh {}\napi {}\nargv", self.agh_version, self.api_version);
+        for arg in &self.argv {
+            out.push(' ');
+            token_into(&mut out, arg);
+        }
+        let _ = write!(out, "\nmode {mode}\nendpoints {endpoints}");
+        out
     }
 
     /// Parse a header written by `render`.
@@ -278,9 +278,7 @@ fn header_lines(text: &str) -> Vec<&str> {
 pub fn render(header: &TapeHeader, records: &[EffectRecord]) -> String {
     let mut out = head_text(header);
     for record in records {
-        if let Some(text) = render_record(record) {
-            out.push_str(&text);
-        }
+        let _ = render_record_into(&mut out, record);
     }
     out
 }
@@ -291,32 +289,44 @@ fn head_text(header: &TapeHeader) -> String {
     out
 }
 
-/// Render one record's lines, or `None` for record kinds outside the `agh` subset.
-#[must_use]
-pub fn render_record(record: &EffectRecord) -> Option<String> {
-    let mut out = String::new();
+fn render_record_into(out: &mut String, record: &EffectRecord) -> bool {
     match record {
-        EffectRecord::Clock(ns) => out.push_str(&format!("clock {ns}\n")),
-        EffectRecord::Mono(ns) => out.push_str(&format!("mono {ns}\n")),
+        EffectRecord::Clock(ns) => {
+            let _ = writeln!(out, "clock {ns}");
+        }
+        EffectRecord::Mono(ns) => {
+            let _ = writeln!(out, "mono {ns}");
+        }
         EffectRecord::Exchange {
             door,
             request,
             reply,
         } => {
-            out.push_str(&format!("exchange {}\n", token(door)));
-            pieces(&mut out, '>', request);
-            pieces(&mut out, '<', reply);
+            out.push_str("exchange ");
+            token_into(out, door);
+            out.push('\n');
+            pieces(out, '>', request);
+            pieces(out, '<', reply);
         }
         EffectRecord::Emit { door, bytes } => {
-            out.push_str(&format!("emit {}\n", token(door)));
-            pieces(&mut out, '|', bytes);
+            out.push_str("emit ");
+            token_into(out, door);
+            out.push('\n');
+            pieces(out, '|', bytes);
         }
         EffectRecord::Rand(_)
         | EffectRecord::File { .. }
         | EffectRecord::FileErr { .. }
-        | EffectRecord::Raised { .. } => return None,
+        | EffectRecord::Raised { .. } => return false,
     }
-    Some(out)
+    true
+}
+
+/// Render one record's lines, or `None` for record kinds outside the `agh` subset.
+#[must_use]
+pub fn render_record(record: &EffectRecord) -> Option<String> {
+    let mut out = String::new();
+    render_record_into(&mut out, record).then_some(out)
 }
 
 struct Lines<'a> {
@@ -347,9 +357,9 @@ impl<'a> Lines<'a> {
         self.lines.peek().copied()
     }
 
-    fn piece(&mut self, prefix: char) -> Result<Option<Vec<u8>>> {
+    fn piece_into(&mut self, prefix: char, out: &mut Vec<u8>, sep: bool) -> Result<bool> {
         let Some(line) = self.peek() else {
-            return Ok(None);
+            return Ok(false);
         };
         if line.starts_with('=') {
             return Err(format_at(
@@ -358,20 +368,26 @@ impl<'a> Lines<'a> {
             ));
         }
         let Some(rest) = line.strip_prefix(prefix) else {
-            return Ok(None);
+            return Ok(false);
         };
         let _ = self.next();
+        if sep {
+            out.push(b'\n');
+        }
         if rest.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(true);
         }
         let piece = rest
             .strip_prefix(' ')
             .ok_or_else(|| format_at(self.at, format!("no space after {prefix:?}")))?;
-        unescape(piece).map(Some).map_err(|e| format_at(self.at, e))
+        unescape_into(piece, out)
+            .map(|()| true)
+            .map_err(|e| format_at(self.at, e))
     }
 
     fn bytes(&mut self, prefix: char) -> Result<Vec<u8>> {
-        let Some(mut body) = self.piece(prefix)? else {
+        let mut body = Vec::new();
+        if !self.piece_into(prefix, &mut body, false)? {
             let at = self.at + 1;
             let found = self.peek().and_then(|l| l.chars().next());
             return Err(match found {
@@ -381,11 +397,8 @@ impl<'a> Lines<'a> {
                 ),
                 _ => format_at(at, format!("a body behind {prefix:?} is missing")),
             });
-        };
-        while let Some(piece) = self.piece(prefix)? {
-            body.push(b'\n');
-            body.extend(piece);
         }
+        while self.piece_into(prefix, &mut body, true)? {}
         Ok(body)
     }
 }
@@ -417,30 +430,30 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
         }
         Ok(door)
     };
-    let words: Vec<&str> = head.splitn(4, ' ').collect();
-    let record = match words.as_slice() {
-        ["clock", ns] => EffectRecord::Clock(number(ns, at)?),
-        ["mono", ns] => EffectRecord::Mono(number(ns, at)?),
-        ["exchange", word] => EffectRecord::Exchange {
+    let mut words = head.splitn(4, ' ');
+    let first = words.next().unwrap_or_default();
+    let record = match (first, words.next(), words.next(), words.next()) {
+        ("clock", Some(ns), None, None) => EffectRecord::Clock(number(ns, at)?),
+        ("mono", Some(ns), None, None) => EffectRecord::Mono(number(ns, at)?),
+        ("exchange", Some(word), None, None) => EffectRecord::Exchange {
             door: door(word)?,
             request: lines.bytes('>')?,
             reply: lines.bytes('<')?,
         },
-        ["exchange", _, "raw"] => {
+        ("exchange", Some(_), Some("raw"), None) => {
             return Err(format_at(
                 at,
                 "a raw exchange, which agh's tapes do not hold",
             ));
         }
-        ["emit", word] => EffectRecord::Emit {
+        ("emit", Some(word), None, None) => EffectRecord::Emit {
             door: door(word)?,
             bytes: lines.bytes('|')?,
         },
         _ => {
-            let kind = words.first().copied().unwrap_or_default();
             return Err(format_at(
                 at,
-                format!("a {kind} item, which agh's tapes do not hold"),
+                format!("a {first} item, which agh's tapes do not hold"),
             ));
         }
     };
@@ -1179,6 +1192,9 @@ pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
 
 /// `bytes` with each valid UTF-8 run through `f` and each invalid byte kept as it is.
 fn per_run(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return f(text).into_bytes();
+    }
     let mut out = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
         out.extend_from_slice(f(chunk.valid()).as_bytes());
@@ -1244,7 +1260,10 @@ fn redacted_record(record: &EffectRecord, redactor: Option<&Redactor>) -> Effect
 
 /// Whether the shapes would change `bytes` on the tape (`shaped`): a canonical request a tape of which could not replay, because the replay asks the unredacted question.
 pub(crate) fn redacts(bytes: &[u8]) -> bool {
-    shaped(bytes) != bytes
+    bytes.utf8_chunks().any(|chunk| {
+        let valid = chunk.valid();
+        Redactor::shapes(valid) != valid
+    })
 }
 
 /// Whether the shapes would change the canonical reply `reply` (`canon::reply`'s bytes), or any string of the JSON text its body holds, read decoded.

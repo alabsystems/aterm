@@ -98,6 +98,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         wake: None,
         pending_input: false,
         interrupted: false,
+        fault: None,
         restartable: true,
         relaunch_off: false,
         resume: None,
@@ -4257,6 +4258,164 @@ fn a_muse_code_lost_login_is_escalated_with_its_own_remedy() {
         is_escalate(&a, "sign in to Muse Code again with muse login in a shell"),
         "the control: {a:?}"
     );
+}
+
+const MUSE_FAULT: &str = "A configuration problem stopped this turn. Fix it in /settings.";
+
+/// Muse Code's end of a turn (its fixture's `◆ echo: hello there`) with `row` for its reply, read
+/// as having worked three minutes.
+fn muse_ends_on(row: &str) -> TurnEndReading {
+    use aterm_phase::muse::fixtures as u;
+    let mut rows = screen(u::END_OF_TURN);
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with("◆ echo"))
+        .expect("the reply");
+    rows[at] = row.to_string();
+    let reading = aterm_phase::read(Some("muse"), &rows, None);
+    TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None)
+}
+
+/// A MUSE CODE FAULT IS HANDED TO A PERSON: its own stop notice (`◆ A configuration problem
+/// stopped this turn. Fix it in /settings.`) is no reply and no wall, a non-authoritative idle no
+/// rule types at, and only a person fixes what it names, so under Cruise and under Land the point
+/// escalates naming the row, and the next look at the same point types nothing. Negative
+/// controls: the same words on a row Muse Code did not mark as its own read the same idle and
+/// stay nothing, and the words quoted inside a reply are that reply, which Cruise continues.
+#[test]
+fn a_muse_code_fault_escalates_naming_its_row() {
+    let t = t0();
+    let fault = muse_ends_on(&format!("◆ {MUSE_FAULT}"));
+    assert_eq!(
+        (
+            &fault.phase,
+            fault.authoritative,
+            &fault.said_tail,
+            fault.wall
+        ),
+        (&Phase::Idle, false, &None, None)
+    );
+    assert_eq!(fault.fault.as_deref(), Some(MUSE_FAULT));
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let r = under(mode, fault.clone());
+        let mut st = TurnEndState::default();
+        let a = act(&mut st, &r, t);
+        assert!(
+            is_escalate(&a, &format!("Muse Code stopped the turn: {MUSE_FAULT}")),
+            "{mode:?}: {a:?}"
+        );
+        let again = TurnEndReading {
+            worked: None,
+            ..r.clone()
+        };
+        let next = act(&mut st, &again, t + MIN);
+        assert_eq!(
+            next.rule_id(),
+            None,
+            "{mode:?}: nothing typed at the next look: {next:?}"
+        );
+    }
+    let unmarked = muse_ends_on(MUSE_FAULT);
+    assert_eq!(
+        (&unmarked.phase, unmarked.authoritative, &unmarked.fault),
+        (&Phase::Idle, false, &None)
+    );
+    assert_eq!(
+        act(&mut TurnEndState::default(), &unmarked, t),
+        TurnEndAction::Nothing,
+        "the control: an unmarked row"
+    );
+    let quoted = muse_ends_on(&format!("◆ It said: {MUSE_FAULT}"));
+    assert!(quoted.authoritative && quoted.fault.is_none(), "{quoted:?}");
+    assert_eq!(
+        act(&mut TurnEndState::default(), &quoted, t),
+        typed(RULE_CONTINUE),
+        "the control: the words quoted in a reply"
+    );
+}
+
+/// A MUSE CODE FAULT THAT ANSWERS THE POLICY'S OWN ACT IS HANDED OVER AT ONCE: Muse Code refuses
+/// Cruise's continuation (or Land's instruction) before a busy frame is read, so the act's
+/// answer is the stop notice itself, and no take of the act is waited on at it. Negative
+/// controls: the act's answer not yet drawn (the reply it was typed at, read again) waits for the
+/// act's take, typing nothing, and an unmarked row with the same words, no answer the policy
+/// reads, stays nothing.
+#[test]
+fn a_muse_code_fault_answering_the_policys_own_act_escalates_at_once() {
+    let t = t0();
+    let answered = |mode, row: &str| TurnEndReading {
+        worked: None,
+        ..under(mode, muse_ends_on(row))
+    };
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let reply = under(mode, muse_ends_on("◆ echo: hello there"));
+        let mut st = TurnEndState::default();
+        let first = act(&mut st, &reply, t);
+        assert!(first.rule_id().is_some(), "{mode:?}: {first:?}");
+        let soon = t + Duration::from_secs(2);
+        let faulted = act(
+            &mut st.clone(),
+            &answered(mode, &format!("◆ {MUSE_FAULT}")),
+            soon,
+        );
+        assert!(
+            is_escalate(
+                &faulted,
+                &format!("Muse Code stopped the turn: {MUSE_FAULT}")
+            ),
+            "{mode:?}: {faulted:?}"
+        );
+        let unseen = act(
+            &mut st.clone(),
+            &answered(mode, "◆ echo: hello there"),
+            soon,
+        );
+        assert!(
+            matches!(unseen, TurnEndAction::WaitUntil { .. }),
+            "{mode:?}, the control: the act's answer not yet drawn: {unseen:?}"
+        );
+        assert_eq!(
+            act(&mut st.clone(), &answered(mode, MUSE_FAULT), soon),
+            TurnEndAction::Nothing,
+            "{mode:?}, the control: an unmarked row"
+        );
+    }
+}
+
+/// A MUSE CODE FAULT WAITS OUT A PERSON AT THE KEYBOARD: one typing at the tab its stop notice
+/// stands in is handling it, so the hand-over waits out their grace, as every act does, and is
+/// made once it lapses with the notice still standing. Negative control: a person whose grace
+/// has lapsed holds nothing, so the point is handed over at once.
+#[test]
+fn a_muse_code_fault_waits_out_a_person_at_the_keyboard() {
+    let t = t0();
+    let grace = Duration::from_secs(u64::from(cfg().human_grace_s));
+    let keyed = Duration::from_secs(5);
+    let fault = |mode, person| TurnEndReading {
+        person: Some(person),
+        ..under(mode, muse_ends_on(&format!("◆ {MUSE_FAULT}")))
+    };
+    let handed = format!("Muse Code stopped the turn: {MUSE_FAULT}");
+    for mode in [Autopilot::Cruise, Autopilot::Land] {
+        let mut st = TurnEndState::default();
+        let held = act(&mut st, &fault(mode, keyed), t);
+        assert!(
+            matches!(&held, TurnEndAction::WaitUntil { until, why, .. }
+                if *until == t + (grace - keyed) && why == "a person is typing"),
+            "{mode:?}: {held:?}"
+        );
+        let lapsed = TurnEndReading {
+            worked: None,
+            ..fault(mode, grace)
+        };
+        let after = act(&mut st, &lapsed, t + (grace - keyed));
+        assert!(is_escalate(&after, &handed), "{mode:?}: {after:?}");
+        let gone = act(&mut TurnEndState::default(), &fault(mode, grace + keyed), t);
+        assert!(
+            is_escalate(&gone, &handed),
+            "{mode:?}, the control: a lapsed grace: {gone:?}"
+        );
+    }
 }
 
 #[test]
@@ -16387,7 +16546,9 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
 /// relaunch; with `self.opened_fresh = false` out of `restarted`, the one after a banner read
 /// mid-relaunch. With `self.resumed = None` out of `new_point`, a fresh program's after a
 /// relaunch and a point is carried; so is one at `RESUME_DRAWN` past the relaunch with that bound
-/// out of `resuming`.
+/// out of `resuming`. With `!self.opened_fresh` out of `observe`'s `carried`, a fresh program's
+/// opening message is carried while the session's task is, and with `carried` dropped from its
+/// `theirs`, the session's own is left to the person under Off.
 #[test]
 fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     let quick = Some(Duration::from_secs(5));
@@ -16507,7 +16668,10 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
         // included, so the person's message after it interrupts the work. A taskless screen
         // after the next point, at `RESUME_DRAWN` past the relaunch, after a relaunch that
         // started the agent afresh (`done:fresh`) or after a restart the host did not make is a
-        // program started fresh.
+        // program started fresh. A fresh program carries nothing of the task before it: its
+        // opening message is theirs while the policy carries the session's task too (acts a loop
+        // before typed, no reply done), and a message to the session's own relaunch stays the
+        // carried task's, under Off too.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Since {
             Nothing,
@@ -16517,16 +16681,22 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             Afresh,
             Unmade,
         }
-        for since in [
+        for (since, carry) in [
             Since::Nothing,
             Since::BannerFirst,
             Since::Point,
             Since::Late,
             Since::Afresh,
             Since::Unmade,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|since| [(since, false), (since, true)])
+        {
             let mut st = TurnEndState::default();
             st.seed_worked();
+            if carry {
+                st.seed_acts(&[Duration::ZERO], now);
+            }
             at(&mut st, &under(mode, work.clone()), now);
             let relaunch = now + 21 * MIN;
             if since == Since::BannerFirst {
@@ -16553,11 +16723,15 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
             at(&mut st, &under(mode, fresh.clone()), relaunch + drawn);
             at(&mut st, &under(mode, asked.clone()), relaunch + drawn + MIN);
             let opens = !matches!(since, Since::Nothing | Since::BannerFirst);
-            assert_eq!(st.exchange_opens(), opens, "{mode:?}: {since:?}");
+            assert_eq!(
+                st.exchange_opens(),
+                opens,
+                "{mode:?}: {since:?}, carried {carry}"
+            );
             assert_eq!(
                 st.left_to_person(),
-                opens || mode == Autopilot::Off,
-                "{mode:?}: {since:?}"
+                opens || (mode == Autopilot::Off && !carry),
+                "{mode:?}: {since:?}, carried {carry}"
             );
         }
         // The message that opens the session stays theirs.

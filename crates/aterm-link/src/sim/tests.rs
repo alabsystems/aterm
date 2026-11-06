@@ -1000,7 +1000,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            59,
+            47,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -1042,13 +1042,13 @@ fn each_rule_switched_off_is_caught() {
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            443,
+            2795,
         ),
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            2127,
+            4431,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
@@ -1151,7 +1151,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            430,
+            239,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1217,7 +1217,7 @@ fn each_rule_switched_off_is_caught() {
             "an adoption names the attach of the hand-off it takes (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            1943,
+            2766,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
@@ -1402,9 +1402,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // The E07 review's fix (a landed post's entry stands until the post left aterm's outbox; a
     // read back ends the entry it finds standing) moved 171 and 187 off their bugs (each holds
     // every law still). Each replacement is the first seed to 60,000 that breaks its law with the
-    // rule off and holds all with it on ([`found_again`]).
+    // rule off and holds all with it on ([`found_again`]). Critic item F20's floor, written at
+    // the attach, moved 59 to 47.
     (
-        59,
+        47,
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
@@ -1414,8 +1415,9 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         "a pin judged before the reconcile a write error stopped",
     ),
     // After composing grouped landing with the power-cut repairs, 1435 no longer reaches it.
-    // Explicit discovery returned this first witness in the same world and 60,000-seed bound.
-    (443, 400, "a floor whose flush failed trusted as it read"),
+    // Explicit discovery returned this first witness in the same world and 60,000-seed bound,
+    // 443, which critic item F20's floor written at the attach moved to 2795.
+    (2795, 400, "a floor whose flush failed trusted as it read"),
     // Sim item B05: a cut dropped the dedup key of a record an in-flight entry named.
     (
         12,
@@ -1454,10 +1456,11 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
 ];
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
-    // Grouped landing moved 3273 off it, the E07 review's fix 558, and critic item F17's
-    // self-lane log 7324; the first replacement in this world to 60,000.
+    // Grouped landing moved 3273 off it, the E07 review's fix 558, critic item F17's self-lane
+    // log 7324, and F20's floor written at the attach 2127; the first replacement in this world
+    // to 60,000.
     (
-        2127,
+        4431,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1539,8 +1542,9 @@ const FOUND_QUITTING: &[FoundIn] = &[
         "an entry sent ahead of a post of its sender's with none",
     ),
     (
+        // Critic item F20's floor written at the attach moved 13679 to 3400.
         both_ways_erring_quitting,
-        13679,
+        3400,
         400,
         "a retired record's copy ended the memory of its torn file's",
     ),
@@ -2179,6 +2183,44 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
         caught,
         "an emptied escalation table is never caught losing a halt"
     );
+}
+
+/// ANOTHER LOG (critic item F10): what astream settles for a weak log a power loss left with no
+/// record, a fresh id that continues nothing, is a restart the law admits; at a cut that kept a
+/// record, or at a stop that loses nothing, it is not.
+#[test]
+fn the_law_admits_another_log_only_for_a_power_loss_that_kept_no_record() {
+    let oracle = Escalation::aterm();
+    let restart = |stop: Stop, kept: u64| {
+        let broker = bus::Broker::new(Tier::Relaxed, Escalation::aterm());
+        broker.name_producer(7, "n-sim");
+        for i in 0..3 {
+            broker.publish_as(7, i + 1, "/f/sim/pub/n-sim/s-a/ev", b"v=1");
+        }
+        let mut r = broker.stop_keeping_all(stop);
+        r.kept = kept;
+        r.generation_after = 0;
+        r.lineage_after = Vec::new();
+        r.another_log = true;
+        r
+    };
+    let admitted = bus::law_check(&restart(Stop::PowerLoss, 0), &oracle);
+    assert!(
+        admitted.is_empty(),
+        "another log at a cut to 0: {admitted:?}"
+    );
+    let kept = bus::law_check(&restart(Stop::PowerLoss, 2), &oracle);
+    assert!(
+        kept.iter().any(|v| v.starts_with("P7: another log")),
+        "another log that kept 2 records: {kept:?}"
+    );
+    for stop in [Stop::Clean, Stop::Crash] {
+        let moved = bus::law_check(&restart(stop, 3), &oracle);
+        assert!(
+            moved.iter().any(|v| v.contains("moved the identity")),
+            "another log at a {stop:?}: {moved:?}"
+        );
+    }
 }
 
 #[test]
@@ -4091,7 +4133,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 201, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 775, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",

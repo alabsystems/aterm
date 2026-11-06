@@ -407,8 +407,7 @@ impl<'a> Session<'a> {
         Ok((self.bootstrap, &self.journal))
     }
 
-    /// Current peer membership for an already channel-authenticated actor.
-    pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
+    fn peer_member(&self, actor: Actor) -> Result<&aterm_secrets::commons::roster::Member> {
         if !self.access.is_current(&self.journal) {
             return Err(Error::new("Commons membership changed during table repair"));
         }
@@ -425,8 +424,13 @@ impl<'a> Session<'a> {
                         .as_ref()
                         .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
             })
-            .map(|member| member.binding().clone())
             .ok_or_else(|| Error::new("table repair peer is not a current member"))
+    }
+
+    /// Current peer membership for an already channel-authenticated actor.
+    pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
+        self.peer_member(actor)
+            .map(|member| member.binding().clone())
     }
 
     /// A credential contributor or custodian must still be a current Writer, rather
@@ -435,16 +439,48 @@ impl<'a> Session<'a> {
         &self,
         actor: Actor,
     ) -> Result<aterm_secrets::commons::binding::Binding> {
-        let binding = self.peer(actor)?;
-        if !self
-            .access
-            .members()
-            .iter()
-            .any(|member| member.binding().actor() == actor && member.role() == Role::Writer)
-        {
+        let member = self.peer_member(actor)?;
+        if member.role() != Role::Writer {
             return Err(Error::new("credential peer is not a current Writer"));
         }
-        Ok(binding)
+        Ok(member.binding().clone())
+    }
+
+    /// Every current member's actor and every current Writer's binding under one membership
+    /// check and one roster read.
+    pub(crate) fn members_and_writers(
+        &self,
+    ) -> Result<(
+        std::collections::BTreeSet<Actor>,
+        std::collections::BTreeMap<Actor, aterm_secrets::commons::binding::Binding>,
+    )> {
+        if !self.access.is_current(&self.journal) {
+            return Err(Error::new(
+                "Commons membership changed during writer observation",
+            ));
+        }
+        let roster = aterm_secrets::client::swarm_roster_until(
+            self.bootstrap.paths(),
+            crate::admission::deadline(),
+        )
+        .map_err(failure)?;
+        let mut members = std::collections::BTreeSet::new();
+        let mut writers = std::collections::BTreeMap::new();
+        for member in self.access.members() {
+            let binding = member.binding();
+            if roster
+                .as_ref()
+                .is_some_and(|r| binding_denied_in_roster(r, binding))
+            {
+                continue;
+            }
+            let actor = binding.actor();
+            members.insert(actor);
+            if member.role() == Role::Writer {
+                writers.insert(actor, binding.clone());
+            }
+        }
+        Ok((members, writers))
     }
 
     /// Every binding [`Self::members`] names whose actor [`Self::peer_writer`] accepts, under
@@ -916,10 +952,15 @@ impl<'a> Session<'a> {
                 .with_key(&self.journal, |key| scope.key(basis, self.epoch(), key))
                 .map_err(failure);
         }
-        let history = self
-            .bootstrap
-            .historical(&self.journal, &self.access, *basis)
-            .map_err(failure)?;
+        if !self.history.borrow().contains_key(basis) {
+            let history = self
+                .bootstrap
+                .historical(&self.journal, &self.access, *basis)
+                .map_err(failure)?;
+            self.history.borrow_mut().insert(*basis, history);
+        }
+        let histories = self.history.borrow();
+        let history = &histories[basis];
         history
             .with_key(&self.journal, |key| {
                 scope.key(basis, history.generation(), key)
@@ -1250,10 +1291,19 @@ impl<'a> Session<'a> {
         } = envelope;
         let actor = header.actor;
         if !self.history.borrow().contains_key(&roster) {
+            // A roster this Mac has not seen, or holds no access to, waits for its view to
+            // grow; local contention stays busy.
             let history = self
                 .bootstrap
                 .historical(&self.journal, &self.access, roster)
-                .map_err(failure)?;
+                .map_err(|error| {
+                    let error = failure(error);
+                    if error.is_busy() {
+                        error
+                    } else {
+                        Error::awaiting_membership(&error.0)
+                    }
+                })?;
             self.history.borrow_mut().insert(roster, history);
         }
         let histories = self.history.borrow();
@@ -1267,7 +1317,9 @@ impl<'a> Session<'a> {
             if negative {
                 return Ok(None);
             }
-            return Err(Error::new("record lacks an exact historical writer grant"));
+            return Err(Error::awaiting_membership(
+                "record lacks an exact historical writer grant",
+            ));
         }
         let mut payload = Zeroizing::new(body.to_vec());
         let mut open = |key: &[u8; 32]| -> Result<Option<usize>> {

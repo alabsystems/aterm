@@ -7,7 +7,7 @@
 //! clean close) run unchanged against a simulated device through the storage seam
 //! (`storage.rs`), and the device is "crashed" after every operation it sees.
 //!
-//! # The device
+//! # The device (`sim_device.rs`)
 //!
 //! The log file is a byte array in fixed-size blocks (16, 32 or 64 bytes: every 4 KiB
 //! outcome is one of these, and smaller blocks only add hole positions). Each block is
@@ -31,9 +31,11 @@
 //!   before everything issued before it. The DEVICE allows any subset of the next
 //!   epoch; the sweep takes EVERY subset at a crash point, for each prefix of epochs,
 //!   while they fit its budget (64 images, 16 in a second crash: at most 6 blocks, 5
-//!   with a size change pending), and beyond that a SAMPLE — none, all, every prefix,
-//!   each block alone, all but each one, and seeded random subsets — so a loss that
-//!   needs two particular blocks among many is tried only if the sample lands on it.
+//!   with a size change pending), and beyond that a SAMPLE trimmed to the budget —
+//!   none and all always, the shortest prefixes, and a seeded pick of the longer
+//!   prefixes, each block alone, all but each one and seeded random subsets — so a
+//!   loss that needs two particular blocks among many is tried only if the sample
+//!   lands on it.
 //!   Each sweep prints how many crash points it enumerated and how many it sampled.
 //! - The PLAIN-FSYNC device (negative control NC1) ignores barriers: every block written
 //!   since the last full flush stays volatile, any subset of them persisting.
@@ -99,15 +101,14 @@
 //!
 //! No clock is read, nothing sleeps, nothing retries: every choice is the fixed seed's.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use astream_wire::{Offset, HEADER_SIZE};
 
 use crate::brecord::BrokerRecord;
 use crate::logid::{self, Lineage, Prior};
+use crate::sim_device::{images, Device, Rng, Sim, SimDevice};
 use crate::storage::Dir;
 #[cfg(doc)]
 use crate::store::Committed;
@@ -117,12 +118,12 @@ use crate::store::{
 };
 use crate::{BrokerLog, Escalate, Escalation, LogIdentity};
 
-// --- the device -------------------------------------------------------------------
+// --- the device's annotations ------------------------------------------------------
 
-/// Annotations the harness keeps beside each recorded device state: what the product
-/// had told clients when the device stood there.
+/// Annotations the harness keeps beside each recorded device state (`sim_device.rs`):
+/// what the product had told clients when the device stood there.
 #[derive(Clone, Debug, Default)]
-struct Meta {
+pub(crate) struct Meta {
     /// The identity the last completed open settled (`None` before any).
     told: Option<LogIdentity>,
     /// Records visible (acked, or recovered by the open) under `told`.
@@ -138,339 +139,6 @@ struct Meta {
     in_open: bool,
     /// The log was closed cleanly and nothing followed.
     closed: bool,
-}
-
-/// One barrier epoch: the blocks a barrier issued, with their contents then, and the
-/// file's size then.
-#[derive(Clone, Debug)]
-struct Epoch {
-    blocks: BTreeMap<usize, Vec<u8>>,
-    size: usize,
-}
-
-/// One state of the simulated device.
-#[derive(Clone)]
-struct Device {
-    block: usize,
-    exists: bool,
-    /// What reads see: the page cache.
-    logical: Vec<u8>,
-    /// What the media holds; its length is the durable size.
-    durable: Vec<u8>,
-    /// Blocks written since the last barrier or full flush (volatile).
-    dirty: BTreeSet<usize>,
-    /// Barrier epochs issued since the last full flush, oldest first.
-    epochs: Vec<Epoch>,
-    /// NC1: the plain-fsync device, on which a barrier orders nothing.
-    ignore_barriers: bool,
-    /// The identity sidecar (durable when replaced).
-    id: Option<Vec<u8>>,
-    /// The file's length at the last full flush the PRODUCT issued: bytes a flush
-    /// covered (for P3), unlike `durable`, which an image makes everything.
-    flushed: usize,
-    /// Where the write that produced this state started, when it was a log append:
-    /// a process killed during that write leaves any page-aligned prefix of it (a
-    /// SHORT WRITE — Linux stops a write between pages for a fatal signal).
-    appended_from: Option<usize>,
-    meta: Meta,
-}
-
-impl Device {
-    fn new(block: usize) -> Device {
-        Device {
-            block,
-            exists: false,
-            logical: Vec::new(),
-            durable: Vec::new(),
-            dirty: BTreeSet::new(),
-            epochs: Vec::new(),
-            ignore_barriers: false,
-            id: None,
-            flushed: 0,
-            appended_from: None,
-            meta: Meta::default(),
-        }
-    }
-
-    /// The contents of block `b` as reads see it now (short at the file's end).
-    fn block_now(&self, b: usize) -> Vec<u8> {
-        let from = (b * self.block).min(self.logical.len());
-        let to = ((b + 1) * self.block).min(self.logical.len());
-        self.logical[from..to].to_vec()
-    }
-
-    /// Persist `epoch` onto `bytes`: the file takes the epoch's size (new space reading
-    /// `fill`), and every block it issued its contents then.
-    fn apply(bytes: &mut Vec<u8>, block: usize, epoch: &Epoch, fill: u8) {
-        bytes.resize(epoch.size, fill);
-        for (&b, data) in &epoch.blocks {
-            let from = b * block;
-            let to = (from + data.len()).min(epoch.size);
-            if from < to {
-                bytes[from..to].copy_from_slice(&data[..to - from]);
-            }
-        }
-    }
-
-    /// The volatile blocks as the epoch a barrier would issue now.
-    fn volatile_epoch(&self) -> Epoch {
-        Epoch {
-            blocks: self.dirty.iter().map(|&b| (b, self.block_now(b))).collect(),
-            size: self.logical.len(),
-        }
-    }
-
-    fn touch(&mut self, from: usize, to: usize) {
-        if to > from {
-            for b in from / self.block..to.div_ceil(self.block) {
-                self.dirty.insert(b);
-            }
-        }
-    }
-
-    /// The epoch after the first `full` issued ones: the next issued epoch, or — past
-    /// them all — the volatile blocks, the one more epoch after the newest barrier.
-    fn epoch_after(&self, full: usize) -> Epoch {
-        self.epochs
-            .get(full)
-            .cloned()
-            .unwrap_or_else(|| self.volatile_epoch())
-    }
-
-    /// The file's size once the first `full` issued epochs are persisted.
-    fn size_after(&self, full: usize) -> usize {
-        match full {
-            0 => self.durable.len(),
-            n => self.epochs[n - 1].size,
-        }
-    }
-
-    /// A power-loss image: the durable bytes, every block of the first `full` issued
-    /// epochs, then the blocks `keep` picks from the epoch after them, at that epoch's
-    /// size or the one before it, unpersisted space reading `fill`.
-    fn image(&self, full: usize, keep: &BTreeSet<usize>, new_size: bool, fill: u8) -> Device {
-        let mut bytes = self.durable.clone();
-        for e in &self.epochs[..full] {
-            Device::apply(&mut bytes, self.block, e, fill);
-        }
-        let next = self.epoch_after(full);
-        let size = if new_size { next.size } else { bytes.len() };
-        bytes.resize(size, fill);
-        for b in keep {
-            if let Some(data) = next.blocks.get(b) {
-                let from = b * self.block;
-                let to = (from + data.len()).min(size);
-                if from < to {
-                    bytes[from..to].copy_from_slice(&data[..to - from]);
-                }
-            }
-        }
-        Device {
-            block: self.block,
-            exists: self.exists,
-            logical: bytes.clone(),
-            durable: bytes,
-            dirty: BTreeSet::new(),
-            epochs: Vec::new(),
-            ignore_barriers: self.ignore_barriers,
-            id: self.id.clone(),
-            flushed: self.flushed.min(size),
-            appended_from: None,
-            meta: self.meta.clone(),
-        }
-    }
-
-    /// The SHORT WRITES of the append that produced this state: the file as a process
-    /// killed during that write leaves it — the bytes before the write plus a prefix of
-    /// it ending on a block boundary (Linux checks for a fatal signal between pages, so
-    /// a write it stops ends on one), at every such boundary inside it. Process-crash
-    /// images: the kernel runs on, so what reads see is what it holds.
-    fn short_writes(&self) -> Vec<Device> {
-        let Some(from) = self.appended_from else {
-            return Vec::new();
-        };
-        let to = self.logical.len();
-        (from / self.block + 1..)
-            .map(|b| b * self.block)
-            .take_while(|&end| end < to)
-            .map(|end| {
-                let mut d = self.clone();
-                d.logical.truncate(end);
-                d.durable.truncate(end);
-                d.dirty.retain(|&b| b * d.block < end);
-                d.appended_from = None;
-                d
-            })
-            .collect()
-    }
-}
-
-struct State {
-    dev: Device,
-    trace: Option<Vec<Device>>,
-}
-
-impl State {
-    fn record(&mut self) {
-        if let Some(t) = &mut self.trace {
-            t.push(self.dev.clone());
-        }
-    }
-}
-
-/// The simulated device behind the storage seam: cheap to clone (one shared state).
-#[derive(Clone)]
-pub(crate) struct Sim {
-    inner: Arc<Mutex<State>>,
-    path: Arc<PathBuf>,
-}
-
-impl Sim {
-    /// A fresh, empty simulated device of 16-byte blocks: what a unit test elsewhere in
-    /// the crate opens a log on when the behaviour it checks must not depend on the
-    /// platform's real flush (the simulated barrier exists everywhere).
-    pub(crate) fn fresh() -> Sim {
-        Sim::with(Device::new(16))
-    }
-
-    fn with(dev: Device) -> Sim {
-        Sim {
-            inner: Arc::new(Mutex::new(State { dev, trace: None })),
-            path: Arc::new(PathBuf::from("sim.log")),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Open the log file, creating it if absent; whether this call created it.
-    pub(crate) fn open_file(&self) -> bool {
-        let mut s = self.lock();
-        let created = !s.dev.exists;
-        s.dev.exists = true;
-        created
-    }
-
-    pub(crate) fn read_log(&self, out: &mut Vec<u8>) -> usize {
-        let s = self.lock();
-        out.extend_from_slice(&s.dev.logical);
-        s.dev.logical.len()
-    }
-
-    pub(crate) fn append(&self, bytes: &[u8]) {
-        let mut s = self.lock();
-        let from = s.dev.logical.len();
-        s.dev.logical.extend_from_slice(bytes);
-        let to = s.dev.logical.len();
-        s.dev.touch(from, to);
-        s.dev.appended_from = Some(from);
-        s.record();
-    }
-
-    pub(crate) fn set_len(&self, len: u64) {
-        let mut s = self.lock();
-        let len = usize::try_from(len).unwrap_or(usize::MAX);
-        let old = s.dev.logical.len();
-        s.dev.logical.resize(len, 0);
-        // The block holding the new end changes (growth zero-fills it); a pure
-        // truncation changes the size, which an image takes or leaves.
-        s.dev.touch(len.min(old), len.max(old));
-        if len < old && len % s.dev.block != 0 {
-            let b = len / s.dev.block;
-            s.dev.dirty.insert(b);
-        }
-        s.dev.appended_from = None;
-        s.record();
-    }
-
-    pub(crate) fn full_flush(&self) {
-        let mut s = self.lock();
-        s.dev.durable = s.dev.logical.clone();
-        s.dev.dirty.clear();
-        s.dev.epochs.clear();
-        s.dev.flushed = s.dev.logical.len();
-        s.dev.appended_from = None;
-        s.record();
-    }
-
-    /// An ordering barrier: the volatile blocks, as they read now, and the file's size
-    /// become a new issued epoch — persisted after every earlier epoch and before any
-    /// later write, but not yet durable. On the plain-fsync device (NC1) it orders
-    /// nothing.
-    pub(crate) fn barrier(&self) {
-        let mut s = self.lock();
-        if !s.dev.ignore_barriers {
-            let epoch = s.dev.volatile_epoch();
-            s.dev.epochs.push(epoch);
-            s.dev.dirty.clear();
-        }
-        s.dev.appended_from = None;
-        s.record();
-    }
-
-    pub(crate) fn read_id(&self) -> Option<Vec<u8>> {
-        self.lock().dev.id.clone()
-    }
-
-    /// Replace the sidecar, durably: an `F_FULLFSYNC` of its own, which drains every
-    /// issued epoch of the log onto the media (the device empties its queue) but leaves
-    /// the log's volatile blocks in the page cache.
-    pub(crate) fn replace_id(&self, bytes: &[u8]) {
-        let mut s = self.lock();
-        s.dev.id = Some(bytes.to_vec());
-        let block = s.dev.block;
-        for epoch in std::mem::take(&mut s.dev.epochs) {
-            Device::apply(&mut s.dev.durable, block, &epoch, 0);
-        }
-        s.dev.appended_from = None;
-        s.record();
-    }
-
-    fn set_meta(&self, meta: Meta) {
-        self.lock().dev.meta = meta;
-    }
-
-    fn meta(&self) -> Meta {
-        self.lock().dev.meta.clone()
-    }
-
-    /// Record the current state as a crash point with no device operation: the instant
-    /// after an ack, whose device state is the operation's before it (and whose write,
-    /// acked, finished: no short write of it is left to take).
-    fn mark(&self) {
-        let mut s = self.lock();
-        s.dev.appended_from = None;
-        s.record();
-    }
-
-    fn trace_on(&self) {
-        let mut s = self.lock();
-        let start = s.dev.clone();
-        s.trace = Some(vec![start]);
-    }
-
-    fn take_trace(&self) -> Vec<Device> {
-        self.lock().trace.take().unwrap_or_default()
-    }
-
-    fn device(&self) -> Device {
-        self.lock().dev.clone()
-    }
-
-    /// Put `bytes` in place of the log, durably, keeping the sidecar: a restored copy.
-    fn restore(&self, bytes: &[u8]) {
-        let mut s = self.lock();
-        s.dev.logical = bytes.to_vec();
-        s.dev.durable = bytes.to_vec();
-        s.dev.dirty.clear();
-        s.dev.epochs.clear();
-        s.dev.flushed = bytes.len();
-    }
 }
 
 // --- workloads ----------------------------------------------------------------------
@@ -748,24 +416,6 @@ fn random_workload(rng: &mut Rng, tier: Durability) -> Workload {
     }
 }
 
-/// xorshift64*: the simulation's only source of choice, seeded.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
-}
-
 // --- running the real code ----------------------------------------------------------
 
 /// Two boots: the one a run serves in, and the one a power loss leaves.
@@ -833,11 +483,25 @@ fn opts(tier: Durability, boot: [u8; 16], c: &Controls) -> OpenOptions {
     o
 }
 
+/// THE OPEN AN EMBEDDER'S TEST TAKES ([`BrokerLog::open_sim`] on a [`SimDevice`]), the one every
+/// recovery the sweeps check goes through: the inputs it never takes are [`open_as`]'s.
 fn open(sim: &Sim, tier: Durability, boot: [u8; 16], c: &Controls) -> std::io::Result<BrokerLog> {
-    open_as(sim, tier, boot, c, false, None)
+    #[cfg_attr(
+        not(feature = "at-rest"),
+        expect(unused_mut, reason = "the key is the at-rest arm's")
+    )]
+    let mut o = opts(tier, boot, c);
+    #[cfg(feature = "at-rest")]
+    {
+        o.at_rest_key = c.key;
+    }
+    let mut log = BrokerLog::open_sim(&SimDevice::on(sim.clone()), o)?;
+    log.unsealed_writer = c.unsealed_writer;
+    Ok(log)
 }
 
-/// [`open`], as a `repair`, or with the embedder's `prepared` unclean verdict.
+/// The open the harness takes as a `repair`, or with the embedder's `prepared` unclean
+/// verdict: [`open`] with what [`BrokerLog::open_sim`] does not take.
 fn open_as(
     sim: &Sim,
     tier: Durability,
@@ -1027,87 +691,6 @@ fn run(
         lineage,
         held,
     }
-}
-
-/// Up to `budget` power-loss images of `dev` for each prefix of its issued epochs, and
-/// whether they are EVERY image: with the first `full` epochs persisted whole (`full`
-/// from none to all of them), every subset of the NEXT epoch's blocks — the volatile
-/// blocks, past the newest barrier — with and without its size change, while that fits
-/// the budget (2^n subsets of n blocks, so at most 6 blocks at a budget of 64, or 5 with
-/// a size change pending); beyond it, a SAMPLE — the structured subsets (none, all, each
-/// prefix, each block alone, all but each one) and seeded random ones, trimmed to the
-/// budget. Either way unpersisted space reads zeros in one image and `0xEE` garbage in
-/// the next, alternating. Strict and Relaxed issue no barrier, so for them this is the
-/// volatile blocks alone, as before the Ordered tier.
-fn images(dev: &Device, budget: usize, rng: &mut Rng) -> (Vec<Device>, bool) {
-    let mut out = Vec::new();
-    let mut every_prefix = true;
-    let mut image_no = 0usize;
-    for full in 0..=dev.epochs.len() {
-        let next = dev.epoch_after(full);
-        let before = dev.size_after(full);
-        // An empty epoch (a barrier with nothing new, the open's probe) persists nothing
-        // the next prefix does not: skip it, but never the volatile set at the end.
-        if full < dev.epochs.len() && next.blocks.is_empty() && next.size == before {
-            continue;
-        }
-        let blocks: Vec<usize> = next.blocks.keys().copied().collect();
-        let sizes: &[bool] = if next.size == before {
-            &[true]
-        } else {
-            &[false, true]
-        };
-        let mut subsets: Vec<BTreeSet<usize>> = Vec::new();
-        let n = blocks.len();
-        let every = n < 63 && (1usize << n) * sizes.len() <= budget;
-        every_prefix &= every;
-        if every {
-            for mask in 0u64..(1u64 << n) {
-                subsets.push(
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| mask & (1 << i) != 0)
-                        .map(|(_, &b)| b)
-                        .collect(),
-                );
-            }
-        } else {
-            subsets.push(BTreeSet::new());
-            for k in 1..=n {
-                subsets.push(blocks[..k].iter().copied().collect());
-            }
-            for &b in &blocks {
-                subsets.push([b].into_iter().collect());
-                subsets.push(blocks.iter().copied().filter(|&x| x != b).collect());
-            }
-            while subsets.len() * sizes.len() < budget {
-                subsets.push(
-                    blocks
-                        .iter()
-                        .copied()
-                        .filter(|_| rng.below(2) == 0)
-                        .collect(),
-                );
-            }
-            // Over budget: keep the first (none, all, the prefixes — the shapes a torn
-            // append leaves) and a seeded pick of the rest.
-            let room = (budget / sizes.len()).max(2);
-            while subsets.len() > room {
-                let at = room / 2 + rng.below((subsets.len() - room / 2) as u64) as usize;
-                subsets.swap_remove(at);
-            }
-        }
-        for keep in &subsets {
-            for &new_size in sizes {
-                // Zeros for unpersisted space, and every other image 0xEE garbage.
-                let fill = if image_no % 2 == 1 { 0xEE } else { 0 };
-                out.push(dev.image(full, keep, new_size, fill));
-            }
-            image_no += 1;
-        }
-    }
-    (out, every_prefix)
 }
 
 // --- the properties -----------------------------------------------------------------
@@ -2536,6 +2119,7 @@ fn the_outcome_unknown_resend_after_a_poison_lands_exactly_once() {
             "{tier:?}: owes a flush"
         );
         log.inject_faults(InjectedFaults {
+            write: false,
             sync: true,
             truncate: false,
         });

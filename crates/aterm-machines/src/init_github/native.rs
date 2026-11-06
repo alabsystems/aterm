@@ -324,7 +324,7 @@ impl InitialRepositoryInputs {
             return Err(String::from("repository setup must run as its local user").into());
         }
         if !repos::git_installed(sys) {
-            return Err(Block::of(Wait::CommandLineTools)(repos::no_git(sys).into()));
+            return Err(Block::of(Wait::GitReadiness)(repos::no_git(sys).into()));
         }
         repos::admit_home(sys, user)?;
         let configured = configuration(sys, user).map_err(Block::of(Wait::Settings))?;
@@ -380,7 +380,7 @@ impl NativeRepositories {
     /// Whether aterm's route hands back `plan`'s token ([`Git::lookups`]).
     fn lookups(&self, sys: &dyn System, plan: &Plan) -> Result<Lookups, String> {
         let helper = super::helper(sys, &self.user);
-        Git::new(sys).lookups(sys, &self.user, helper.as_ref(), &plan.token)
+        Git::for_user(sys, &self.user).lookups(sys, &self.user, helper.as_ref(), &plan.token)
     }
 
     /// The reading the probe answers from: the apply's, with what it cloned read back, or a
@@ -429,6 +429,9 @@ impl Item for NativeRepositories {
             }
             let check = (|| {
                 let (plan, standing) = self.read(sys)?;
+                if let Some(why) = repos::named(&standing.git_waits) {
+                    return Err(Block::of(Wait::GitReadiness)(why));
+                }
                 let lookups = self.lookups(sys, &plan)?;
                 self.ensure_current(sys).map_err(Block::from)?;
                 // Signed in, with no repository left that fits: the row waits for room instead of
@@ -549,6 +552,10 @@ impl Item for NativeRepositories {
             self.ensure_current(sys)
         };
         current()?;
+        if let Some(why) = repos::named(&standing.git_waits) {
+            self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
+            return Err(why);
+        }
         if standing.missing.is_empty() && standing.dependencies.is_empty() {
             self.carry(Carried::Applied(plan, standing, Vec::new()));
             return Ok(());
@@ -561,23 +568,35 @@ impl Item for NativeRepositories {
         }
         let guard = repos::CloneGuard::new(&current);
         let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        let home = Path::new(&self.user.home);
+        // Read once the clones and dependencies have taken their room.
+        let room =
+            |left: &[String]| repos::short_of_room(sys.volume(home).as_ref(), left, CHECK_AGAIN);
         for (repo, path) in &standing.dependencies {
-            current()?;
+            if let Err(why) = current() {
+                return Err(repos::stopped_after_clones(
+                    why,
+                    cloned.failed,
+                    room(&cloned.left),
+                    &cloned.hooks,
+                ));
+            }
             match super::dependencies::repair(sys, &self.user, path, repo, &current) {
                 Ok(()) => cloned.cloned.push(repo.clone()),
                 Err(why) => cloned.failed.push(format!("~/{}: {why}", repo.name)),
             }
         }
+        let room = room(&cloned.left);
         // A failed row is read back by nothing: it says what the clones that went made of their
         // hook installers, after why it failed; a done one leaves that to the read-back's row.
         if let Err(why) = current() {
-            return Err(std::iter::once(why)
-                .chain(cloned.hooks)
-                .collect::<Vec<_>>()
-                .join("; "));
+            return Err(repos::stopped_after_clones(
+                why,
+                cloned.failed,
+                room,
+                &cloned.hooks,
+            ));
         }
-        let home = Path::new(&self.user.home);
-        let room = repos::short_of_room(sys.volume(home).as_ref(), &cloned.left, CHECK_AGAIN);
         let mut failed = cloned.failed;
         // What it cloned stays missing until the read-back reads it as its own worktree.
         self.carry(Carried::Applied(plan, standing, cloned.cloned));
@@ -1025,6 +1044,130 @@ pub(super) mod tests {
             &Path::new(&who.home).join(name),
             paths,
         );
+    }
+
+    /// Capability refusal is a local tool wait, and a ready managed Git resolves it without
+    /// changing the private inventory. Dirty dependency work remains a personal conflict.
+    #[test]
+    fn required_dependencies_wait_for_managed_git_and_preserve_dirty_work() {
+        use super::super::dependencies::tests::{PIN, existing};
+        use aterm_types::macos_setup::{Setting, Standing};
+
+        let names = ["parent".to_owned()];
+        let (sys, item) = listing(&names, &names);
+        sys.logged_in(&item.user);
+        let parent = Path::new(&item.user.home).join("parent");
+        let child = parent.join("vendor/library");
+        sys.stat_of(parent.join("vendor").to_str().unwrap(), stat(true, 0o700));
+        sys.stat_of(child.to_str().unwrap(), stat(true, 0o700));
+        sys.file(child.join(".git").to_str().unwrap(), b"inert metadata")
+            .stat_of(child.join(".git").to_str().unwrap(), stat(false, 0o600));
+        required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+        existing(&sys, &item.user, &child, "library", PIN);
+        sys.simulate(|_, command| {
+            (command.program == Path::new(crate::items::github::CLT_GIT)
+                && command.args.iter().any(|arg| arg == "--no-lazy-fetch"))
+            .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
+        });
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let pending = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert_eq!(stage(&pending).outcome, crate::model::Outcome::Blocked);
+        assert_eq!(
+            Reading::of(stage(&pending)),
+            Some(Reading::Waits(Wait::GitReadiness))
+        );
+        assert_eq!(Wait::GitReadiness.kind(), FailureKind::Transient);
+        assert_eq!(
+            crate::init_observe::observation(Setting::Repositories, &[stage(&pending)]).standing,
+            Standing::Waiting
+        );
+        let untouched = |calls: &[String]| {
+            calls.iter().all(|call| {
+                !call.contains(" clone ")
+                    && !call.contains(" fetch ")
+                    && !call.contains(" checkout ")
+                    && !call.contains(" submodule ")
+            })
+        };
+        assert!(untouched(&sys.calls()), "{:?}", sys.calls());
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.contains("--no-lazy-fetch") && call.ends_with(" --version"))
+                .count(),
+            1
+        );
+
+        let prefix = Path::new(&item.user.home).join("Library/Application Support/aterm/pkg");
+        let git_store = prefix.join("store/git");
+        sys.link(git_store.join("current").to_str().unwrap(), "12");
+        sys.stat_of(
+            git_store.join("12.ready").to_str().unwrap(),
+            stat(false, 0o600),
+        );
+        sys.stat_of(
+            git_store.join("12/bin/git").to_str().unwrap(),
+            stat(false, 0o755),
+        );
+        sys.stat_of(prefix.join("bin/git").to_str().unwrap(), stat(false, 0o755));
+        // Re-register read answers for the newly selected executable; policy stays identical.
+        repos::tests::script_existing(&sys, &item.user, &parent, "parent");
+        required_repository(&sys, &item.user, "parent", &["vendor/library"]);
+        existing(&sys, &item.user, &child, "library", PIN);
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &item.user);
+        let ready = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert_eq!(
+            stage(&ready).outcome,
+            crate::model::Outcome::Ok,
+            "{ready:?}"
+        );
+        assert_eq!(
+            Reading::of(stage(&ready)),
+            Some(Reading::Repositories {
+                present: 1,
+                count: 1,
+                signed_in: true
+            })
+        );
+        assert!(untouched(&sys.calls()), "{:?}", sys.calls());
+
+        sys.file(
+            child.join("fixture.rs").to_str().unwrap(),
+            b"the person's changes",
+        );
+        let dirty_child = child.clone();
+        sys.simulate(move |_, command| {
+            if command.args.iter().any(|arg| arg == "--porcelain=v1") {
+                Some(Ran::ok(" M fixture.rs\0"))
+            } else if command
+                .args
+                .iter()
+                .any(|arg| arg == dirty_child.as_os_str())
+                && command.args.windows(3).any(|args| {
+                    args[0] == "rev-parse" && args[1] == "--verify" && args[2] == "HEAD^{commit}"
+                })
+            {
+                Some(Ran::ok("2222222222222222222222222222222222222222"))
+            } else {
+                None
+            }
+        });
+        let personal = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert_eq!(
+            stage(&personal).outcome,
+            crate::model::Outcome::Person,
+            "{personal:?}"
+        );
+        assert_eq!(
+            crate::init_observe::observation(Setting::Repositories, &[stage(&personal)]).standing,
+            Standing::NeedsYou
+        );
+        assert_eq!(
+            sys.read_file(&child.join("fixture.rs")).unwrap(),
+            b"the person's changes"
+        );
+        assert!(untouched(&sys.calls()), "{:?}", sys.calls());
     }
 
     #[test]
@@ -1908,7 +2051,7 @@ pub(super) mod tests {
             (sys, item)
         };
         let cases: Vec<(&str, (Fake, NativeRepositories), Option<Wait>)> = vec![
-            ("no git", bare(), Some(Wait::CommandLineTools)),
+            ("no git", bare(), Some(Wait::GitReadiness)),
             (
                 "no token yet",
                 {
@@ -2958,8 +3101,8 @@ pub(super) mod tests {
     }
 
     /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody
-    /// anything: its row is not applicable, and neither git nor GitHub is asked. A `[github]`
-    /// table that scopes the stage makes the same Mac the person's step (the control).
+    /// anything: its row is not applicable, and neither git nor GitHub is asked. An explicit
+    /// request for the stage waits for Git's automatic installation on that Mac (the control).
     #[test]
     fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
@@ -2981,7 +3124,7 @@ pub(super) mod tests {
         );
         assert!(matches!(
             item(&bare.user, None, false).probe(&sys, &context),
-            Probe::Person { .. }
+            Probe::Blocked { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();

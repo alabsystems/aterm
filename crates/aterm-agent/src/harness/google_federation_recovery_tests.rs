@@ -162,6 +162,139 @@ fn deadline() -> Instant {
 }
 
 #[test]
+fn recovered_kimi_results_keep_the_admitted_work_with_or_without_cookie_state() {
+    for cookies in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let f = Fixture::at(root.path());
+        let first = f.stage("first");
+        {
+            let request = f.request(&first, 4);
+            let mut journal = Journal::open(&request, &f.home).unwrap().unwrap();
+            drop(kimi_pending_proof_fixture(
+                &first,
+                Region::Global,
+                "person@example.com",
+                true,
+            ));
+            let pending = cookies.then(|| f.pending(&journal));
+            journal
+                .capture(&request, pending.as_ref(), &f.home)
+                .unwrap();
+        }
+        // This encrypted checkpoint is local synthetic data. No browser, endpoint or
+        // Google cookie publication runs: cancellation must precede the verify callback.
+        let record = std::fs::read(f.record()).unwrap();
+        std::fs::remove_dir_all(&first).unwrap();
+        let stage = f.stage("resumed");
+        let request = f.request(&stage, 4);
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let mut journal = Journal::open_scoped(&request, &f.home, lifetime.enter())
+            .unwrap()
+            .unwrap();
+        assert!(journal.candidate.is_some());
+        let mut pending = journal
+            .resume_using(&request, &f.home, deadline(), |scope, _| {
+                Ok(Some(kimi_pending_proof_fixture(
+                    &stage,
+                    scope.region,
+                    &scope.expected,
+                    false,
+                )))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.session.is_some(), cookies);
+        assert!(
+            pending.scope.current().is_ok(),
+            "unchanged admitted recovery is current"
+        );
+        // A later caller cannot rebind a retained result to a different live operation.
+        let other = crate::harness::account_work::Lifetime::default();
+        journal.retain_work(other.enter());
+        pending.retain_work(other.enter());
+        assert!(
+            other
+                .pause()
+                .unwrap()
+                .try_wait()
+                .expect("no replacement scope retained")
+                .resume()
+                .is_ok()
+        );
+        drop(journal);
+        let pause = lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .expect_err("the recovered result retains its original operation");
+        let result = pending.complete_using(&request, &outcome(), deadline(), |_| {
+            panic!("cancelled recovery cannot verify or publish")
+        });
+        assert!(result.is_err());
+        let drained = pause.try_wait().expect("all recovered claims retired");
+        assert_eq!(std::fs::read(f.record()).unwrap(), record);
+        assert!(crate::harness::browser_window::ProfileLock::claim(&stage).is_ok());
+        assert!(drained.resume().is_ok());
+    }
+}
+
+#[test]
+fn closed_kimi_work_preserves_completed_native_receipt_without_admitting_publication() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let f = Fixture::at(root.path());
+    let stage = f.stage("completed");
+    let request = f.request(&stage, 4);
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let mut journal = Journal::open_scoped(&request, &f.home, lifetime.enter())
+        .unwrap()
+        .unwrap();
+    drop(kimi_pending_proof_fixture(
+        &stage,
+        Region::Global,
+        "person@example.com",
+        true,
+    ));
+    let pause = lifetime
+        .pause()
+        .unwrap()
+        .try_wait()
+        .expect_err("completed effect still owned");
+    journal
+        .capture(&request, None, &f.home)
+        .expect("exact completed native receipt retained");
+    assert!(
+        journal.check(&request).is_err(),
+        "receipt is not permission to publish"
+    );
+    assert!(
+        journal.pending(&f.home).is_err(),
+        "closed work cannot produce a publishable result"
+    );
+    let record = std::fs::read(f.record()).unwrap();
+    drop(journal);
+    let drained = pause.try_wait().expect("receipt resources retired");
+    assert!(drained.resume().is_ok());
+    let recovered = Journal::open_scoped(&request, &f.home, lifetime.enter())
+        .unwrap()
+        .unwrap();
+    assert!(
+        recovered.candidate.is_some(),
+        "next admitted operation can see completed evidence"
+    );
+    assert_eq!(std::fs::read(f.record()).unwrap(), record);
+    drop(recovered);
+    assert!(
+        lifetime
+            .pause()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .resume()
+            .is_ok()
+    );
+}
+
+#[test]
 fn admitted_pool_resume_renews_retained_completion_and_keeps_proof_custody_until_publication() {
     let root = aterm_tempfile::tempdir().unwrap();
     let f = Fixture::at(root.path());

@@ -433,6 +433,17 @@ pub trait SecretsOps: Send + Sync {
         false
     }
 
+    /// What this Mac's row says where its vault let it go (`Membership::Revoked` at `seq`) with
+    /// no act against it that it can read (`aterm_secrets::client::dropped_words`): a rotation
+    /// left its recipient out, every desk that read that rotation refuses its key, and a join
+    /// keeps that key, so it comes back only as a new Mac, its vault folder set aside (one-mesh
+    /// E2). `None` for a Mac an act took out, whose join an admin's approve or a person's Allow
+    /// again lets in, and for a port with no vault folder.
+    fn dropped(&self, seq: u64) -> Option<String> {
+        let _ = seq;
+        None
+    }
+
     /// Whether macOS has answered aterm's Local Network question, so a look for the ALab vault
     /// raises nothing on the screen ([`Here::Session`]). The live port reads what the binary
     /// registered ([`on_lan_answered`]); a port with none reads no answer.
@@ -1073,6 +1084,10 @@ impl SecretsOps for LiveSecrets {
         aterm_secrets::client::holds_allowed(&self.paths())
     }
 
+    fn dropped(&self, seq: u64) -> Option<String> {
+        aterm_secrets::client::dropped_words(&self.paths(), seq)
+    }
+
     fn lan_answered(&self) -> bool {
         LAN_ANSWERED.get().is_some_and(|answered| answered())
     }
@@ -1630,6 +1645,10 @@ fn kept_dir(dir: &Path, at: u64) -> PathBuf {
 enum Step {
     /// This Mac is not in the selected vault: a join, from this state.
     Join(String),
+    /// A rotation dropped this Mac from the selected vault with no `Remove`
+    /// ([`SecretsOps::dropped`]): a join keeps its key, which every desk that read the rotation
+    /// refuses, so none is planned; the row's words.
+    Dropped(String),
     /// The selected vault is this Mac's: read as a configured one is.
     Read,
 }
@@ -1785,6 +1804,21 @@ impl Vault {
             .clone()
     }
 
+    /// The row's words for a Mac a rotation dropped from its vault with no `Remove`
+    /// ([`SecretsOps::dropped`], asked only of a `Membership::Revoked` Mac); `None` otherwise.
+    fn dropped(&self, status: &Status) -> Option<String> {
+        let Membership::Revoked { seq } = &status.membership else {
+            return None;
+        };
+        let name = status
+            .config
+            .as_ref()
+            .map_or("(unnamed)", |config| config.name.as_str());
+        self.ops
+            .dropped(*seq)
+            .map(|words| format!("vault {name}: {words}"))
+    }
+
     /// Whether this selected vault is to be joined, and from what.
     /// # Errors
     /// The plan's source is not a vault source.
@@ -1809,9 +1843,13 @@ impl Vault {
             _ if config.signer.is_some() && status.machine.is_none() => {
                 Step::Join(format!("vault {name}, but this Mac's key is missing"))
             }
-            Membership::Revoked { seq } => Step::Join(format!(
-                "this Mac was removed from vault {name} at seq {seq}"
-            )),
+            Membership::Revoked { seq } => match self.dropped(status) {
+                Some(words) => Step::Dropped(words),
+                None => Step::Join(format!(
+                    "this Mac was removed from vault {name}{}",
+                    aterm_secrets::client::out_since(*seq)
+                )),
+            },
             Membership::Pending if self.has_password() => Step::Join(format!(
                 "waiting to be let into vault {name}, with a join password not yet sent"
             )),
@@ -2243,12 +2281,14 @@ fn judge(
         Membership::Pending => unwatched(format!("waiting to be let into vault {name}")),
         Membership::Revoked { seq } if alab => Probe::Blocked {
             why: format!(
-                "this Mac was removed from vault {name} at seq {seq}; to rejoin, run aterm members join and press Allow on any Mac in ALab"
+                "this Mac was removed from vault {name}{}; to rejoin, run aterm members join and press Allow again on any Mac in ALab",
+                aterm_secrets::client::out_since(*seq)
             ),
         },
         Membership::Revoked { seq } => Probe::Blocked {
             why: format!(
-                "this Mac was removed from vault {name} at seq {seq}; to rejoin, an admin Mac approves it again: {}",
+                "this Mac was removed from vault {name}{}; to rejoin, an admin Mac approves it again: {}",
+                aterm_secrets::client::out_since(*seq),
                 approve.as_deref().unwrap_or("aterm secrets approve <its code>")
             ),
         },
@@ -2291,7 +2331,7 @@ impl Item for Vault {
         };
         if self.origin == Origin::Selected {
             match self.step(&status) {
-                Err(why) => return Probe::Blocked { why },
+                Err(why) | Ok(Step::Dropped(why)) => return Probe::Blocked { why },
                 Ok(Step::Join(from)) => {
                     // A later configuration, including a new machine name or signer at
                     // this address, is the next try's to read, not this one's to replace.
@@ -2329,6 +2369,12 @@ impl Item for Vault {
                 }
                 Ok(Step::Read) => {}
             }
+        }
+        // A Mac a rotation dropped with no `Remove` comes back only as a new Mac: the row says
+        // how and nothing is planned (`aterm init` on its configured vault; a selected one said
+        // so in `step`).
+        if let Some(why) = self.dropped(&status) {
+            return Probe::Blocked { why };
         }
         let unsynced = match status.membership {
             Membership::In { .. } | Membership::Plain | Membership::Pending => {
@@ -2443,6 +2489,9 @@ impl Item for Vault {
                         "this Mac's vault state changed after it was read ({now}), so nothing was changed; the next try plans the join"
                     )),
                     Step::Join(now) => Err(format!(
+                        "this Mac's vault state changed after it was read ({now}), so nothing was changed; the next try reads it"
+                    )),
+                    Step::Dropped(now) => Err(format!(
                         "this Mac's vault state changed after it was read ({now}), so nothing was changed; the next try reads it"
                     )),
                     Step::Read => self.settle(),
@@ -2656,7 +2705,15 @@ pub(crate) mod tests {
         lan_unanswered: Mutex<bool>,
         /// Where this Mac is for its join's words (`None`: on the ALab LAN).
         place: Mutex<Option<JoinPlace>>,
+        /// What `dropped` answers (`None`: an act took this Mac out), and each seq it was asked
+        /// with.
+        drop_words: Mutex<Option<String>>,
+        dropped_asks: Mutex<Vec<u64>>,
     }
+
+    /// The scripted port's words for a Mac a rotation dropped: a stand-in, so a test holds the
+    /// routing, not the prose (`aterm_secrets::client::dropped_words`'s own test holds that).
+    pub(crate) const DROPPED: &str = "dropped: the scripted port's words";
 
     impl Scripted {
         pub(crate) fn new(statuses: Vec<aterm_secrets::Result<Status>>) -> Arc<Self> {
@@ -2678,6 +2735,16 @@ pub(crate) mod tests {
         /// Puts this Mac where `place` says for its join's words.
         pub(crate) fn placed(&self, place: JoinPlace) {
             *self.place.lock().unwrap() = Some(place);
+        }
+
+        /// Has `dropped` answer `words`: a rotation dropped this Mac with no `Remove`.
+        pub(crate) fn drops(&self, words: &str) {
+            *self.drop_words.lock().unwrap() = Some(words.to_owned());
+        }
+
+        /// Each seq `dropped` was asked with.
+        pub(crate) fn dropped_asks(&self) -> Vec<u64> {
+            self.dropped_asks.lock().unwrap().clone()
         }
 
         pub(crate) fn alab_answers(&self) {
@@ -2853,6 +2920,11 @@ pub(crate) mod tests {
 
         fn allowed(&self) -> bool {
             *self.let_in.lock().unwrap()
+        }
+
+        fn dropped(&self, seq: u64) -> Option<String> {
+            self.dropped_asks.lock().unwrap().push(seq);
+            self.drop_words.lock().unwrap().clone()
         }
 
         fn lan_answered(&self) -> bool {
@@ -5397,6 +5469,74 @@ pub(crate) mod tests {
                 "typed: {typed}: {row:?}"
             );
         }
+    }
+
+    /// A Mac a rotation dropped from its vault with no `Remove` (one-mesh E2) is never joined
+    /// again, which would ask with the key every desk that read the rotation refuses: System
+    /// State's Secrets stage and `aterm init` read it blocked with its words (the way back as a new
+    /// Mac) and change nothing, and the port is asked only of a Mac its vault let go.
+    ///
+    /// CONTROL: the same Mac with no dropped words (an act took it out) is planned a join, as
+    /// before. NEGATIVE CONTROL: a step that plans a join for every `Membership::Revoked` fails
+    /// the selected read; a probe without `Vault::dropped`'s return gives `judge`'s removal words
+    /// and fails the configured reads.
+    #[test]
+    fn a_dropped_mac_is_never_joined_again_and_says_how_it_comes_back() {
+        let context = ctx(&[user("alice", 501)]);
+        let alab = aterm_secrets::ALAB_DEFAULT_URL;
+        let revoked = |name: &str| {
+            let mut status = configured(Membership::Revoked { seq: 9 });
+            if name != "alab" {
+                let config = status.config.as_mut().unwrap();
+                config.source = Source::Url(format!("https://vault.example/v1/{name}"));
+                config.name = name.to_owned();
+            }
+            let ops = Scripted::new(vec![Ok(status)]);
+            ops.subscribed(Ok(installed_state()));
+            ops
+        };
+
+        // System State's Secrets stage: the selected vault.
+        let ops = revoked("alab");
+        ops.drops(DROPPED);
+        let vault = selected(&context, ops.clone(), alab, SETUP_WAIT, Replaces::Any).unwrap();
+        let probe = vault.probe(&fake(), &context);
+        assert_eq!(
+            probe,
+            Probe::Blocked {
+                why: format!("vault alab: {DROPPED}")
+            }
+        );
+        assert_eq!(vault.planned(), Planned::default(), "nothing is planned");
+        assert_eq!(ops.dropped_asks(), [9]);
+
+        // `aterm init` on its configured vault, the ALab vault or another.
+        for name in ["alab", "lab"] {
+            let ops = revoked(name);
+            ops.drops(DROPPED);
+            let rows = run(&fake(), &ops, Mode::Apply);
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+            let why = rows[0].why.as_deref().unwrap();
+            assert_eq!(why, format!("vault {name}: {DROPPED}"));
+            assert!(ops.changes().is_empty(), "{:?}", ops.changes());
+            assert!(ops.joins().is_empty());
+        }
+
+        // Asked only of a Mac its vault let go.
+        let ops = converged();
+        ops.drops(DROPPED);
+        let rows = run(&fake(), &ops, Mode::Plan);
+        assert_ne!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+        assert!(ops.dropped_asks().is_empty());
+
+        // CONTROL: an act took it out, and the stage plans its join as before.
+        let ops = revoked("alab");
+        let vault = selected(&context, ops.clone(), alab, SETUP_WAIT, Replaces::Any).unwrap();
+        assert!(
+            matches!(vault.probe(&fake(), &context), Probe::Change { .. }) && vault.planned().join,
+            "a removed Mac is planned a join"
+        );
+        assert_eq!(ops.dropped_asks(), [9]);
     }
 
     #[test]

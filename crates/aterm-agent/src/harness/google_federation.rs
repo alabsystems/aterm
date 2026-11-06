@@ -80,10 +80,17 @@ struct FederationScope {
     expected: String,
     revision: [u8; 32],
     region: Region,
+    work: Option<super::account_work::Scope>,
 }
 
 impl FederationScope {
     fn current(&self) -> Result<(), String> {
+        self.work_current()?;
+        self.binding_current()?;
+        self.work_current()
+    }
+
+    fn binding_current(&self) -> Result<(), String> {
         if let Some(admission) = &self.attempt.admission {
             if self.attempt.recovery != Some(admission.key()) {
                 return Err("Google recovery admission differs from its key".into());
@@ -105,6 +112,18 @@ impl FederationScope {
             return Err("Google federation binding changed".into());
         }
         Ok(())
+    }
+
+    fn work_current(&self) -> Result<(), String> {
+        if self
+            .work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            Err("automatic account work is cancelled".into())
+        } else {
+            Ok(())
+        }
     }
 
     fn check_attempt(&self) -> Result<(), String> {
@@ -141,25 +160,31 @@ impl FederationScope {
     }
 
     fn check_request(&self, request: &login_drive::Request<'_>) -> Result<(), String> {
+        self.work_current()?;
+        self.check_receipt_request(request)?;
+        self.work_current()
+    }
+
+    fn check_receipt_request(&self, request: &login_drive::Request<'_>) -> Result<(), String> {
         if NativeAttempt::capture(request) != self.attempt {
             return Err("Google federation native attempt changed".into());
         }
         self.check_attempt()?;
-        self.current()
+        self.binding_current()
     }
 }
 
 pub(super) struct PendingFederation {
-    scope: FederationScope,
     session: Option<PendingSession>,
     native: Option<KimiProof>,
+    scope: FederationScope,
 }
 
 /// Native Kimi's canonical account proof and the Google binding that authorized its flow.
 pub(super) struct VerifiedKimiGoogle<'a> {
-    scope: FederationScope,
     native: KimiProof,
     journal: Option<&'a recovery::Journal>,
+    scope: FederationScope,
 }
 
 impl VerifiedKimiGoogle<'_> {
@@ -188,6 +213,14 @@ impl VerifiedKimiGoogle<'_> {
 }
 
 impl PendingFederation {
+    pub(super) fn retain_work(&mut self, work: Option<super::account_work::Scope>) {
+        if self.scope.work.is_none() {
+            self.scope.work = work;
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.retain_work(self.scope.work.clone());
+        }
+    }
     pub(super) fn verified_email(&self) -> Option<&str> {
         self.native.as_ref().map(LoginProof::identity)
     }
@@ -382,6 +415,7 @@ pub(super) fn configured(approver: &mut VendorApprover, handoff: &Handoff<'_>) -
         } else {
             Region::MainlandCn
         },
+        work: approver.work.clone(),
     };
     if let Err(why) = scope.check_attempt().and_then(|()| scope.current()) {
         return Some(quiet(why));
@@ -570,11 +604,12 @@ fn run(
     if !login_drive::pinned(handoff.url, handoff.hosts) {
         return Approval::Refused("Native sign-in URL is outside its provider realm".into());
     }
-    let mut browser = match MemoryBrowser::start(
+    let mut browser = match MemoryBrowser::start_scoped(
         identity,
         &approver.google_state,
         Some(home),
         handoff.deadline,
+        approver.work.clone(),
     ) {
         Ok(browser) => browser,
         Err(error) => return quiet(error),
@@ -1315,6 +1350,7 @@ mod tests {
                 expected: EMAIL.into(),
                 revision: registry.binding_revision("kimi-global", "one").unwrap(),
                 region: Region::Global,
+                work: None,
             };
             let claim = identity.claim(&state).unwrap();
             let snapshot = claim.profile().join("session.age");

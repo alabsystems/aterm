@@ -92,6 +92,25 @@ type ExtrasOut<'a> = (
     &'a mut Vec<(usize, Box<[char]>)>,
 );
 
+/// Replace one resolved extra only when its payload changed, then advance the live prefix.
+fn reuse_frame_extra<T: ?Sized>(
+    out: &mut Vec<(usize, Box<T>)>,
+    written: &mut usize,
+    col: usize,
+    same: impl FnOnce(&T) -> bool,
+    make: impl FnOnce() -> Box<T>,
+) {
+    if let Some((old_col, payload)) = out.get_mut(*written) {
+        if !same(payload.as_ref()) {
+            *payload = make();
+        }
+        *old_col = col;
+    } else {
+        out.push((col, make()));
+    }
+    *written += 1;
+}
+
 /// The line-decoration style under a cell (SGR 4 / 4:n / 21).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UnderlineStyle {
@@ -366,11 +385,11 @@ impl Terminal {
         screen: bool,
     ) {
         out.clear();
-        if let Some((clusters, combining)) = extras_out.as_mut() {
-            clusters.clear();
-            combining.clear();
-        }
         let Ok(visible_row) = u16::try_from(row) else {
+            if let Some((clusters, combining)) = extras_out.as_mut() {
+                clusters.clear();
+                combining.clear();
+            }
             return;
         };
         let grid = self.grid();
@@ -413,6 +432,7 @@ impl Terminal {
         };
 
         let cells = view.cells_slice();
+        let (mut clusters_written, mut combining_written) = (0, 0);
         out.reserve(cells.len());
         let mut prev_wide = false;
         let mut plain_style_memo: Option<(PlainStyleKey, PlainStyle)> = None;
@@ -572,18 +592,38 @@ impl Terminal {
                     // Emoji sequence: surface the whole grapheme for shaping. Skip a NUL base.
                     if raw != '\0' {
                         let bytes = raw.len_utf8() + marks_utf8_bytes;
-                        let mut s = String::with_capacity(bytes);
-                        s.push(raw);
-                        s.extend(marks);
-                        clusters.push((col as usize, s.into_boxed_str()));
+                        let compare_marks = marks.clone();
+                        reuse_frame_extra(
+                            clusters,
+                            &mut clusters_written,
+                            col as usize,
+                            |old| old.chars().eq(std::iter::once(raw).chain(compare_marks)),
+                            || {
+                                let mut s = String::with_capacity(bytes);
+                                s.push(raw);
+                                s.extend(marks);
+                                s.into_boxed_str()
+                            },
+                        );
                     }
                 } else if has_any_mark {
-                    let overlay: Box<[char]> = marks.filter(|&c| !draws_no_glyph(c)).collect();
-                    if !overlay.is_empty() {
-                        combining_out.push((col as usize, overlay));
+                    let mut overlay = marks.filter(|&c| !draws_no_glyph(c)).peekable();
+                    if overlay.peek().is_some() {
+                        let compare_marks = overlay.clone();
+                        reuse_frame_extra(
+                            combining_out,
+                            &mut combining_written,
+                            col as usize,
+                            |old| old.iter().copied().eq(compare_marks),
+                            || overlay.collect(),
+                        );
                     }
                 }
             }
+        }
+        if let Some((clusters, combining)) = extras_out {
+            clusters.truncate(clusters_written);
+            combining.truncate(combining_written);
         }
     }
 
@@ -1308,6 +1348,39 @@ mod image_probe_meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_frame_extras_match_fresh_frames_through_glyph_changes_and_removal() {
+        let mut term = Terminal::new(2, 32);
+        let mut cached = crate::render::RenderInput::empty();
+        for text in [
+            "👩‍💻 e\u{301}",
+            "  👩‍💻 e\u{301}",
+            "👍🏽 a\u{323}",
+            "plain",
+            "",
+            "a\u{FE0E}",
+            "👨‍👩‍👧\r\na\u{301}\u{323}",
+        ] {
+            term.process(b"\x1b[H\x1b[2J");
+            term.process(text.as_bytes());
+            term.cell_frame_into(&mut cached, 2, 32);
+            let mut fresh = crate::render::RenderInput::empty();
+            term.cell_frame_into(&mut fresh, 2, 32);
+            assert_eq!(cached.cells, fresh.cells, "{text:?}");
+            assert_eq!(cached.clusters, fresh.clusters, "{text:?}");
+            assert_eq!(cached.combining, fresh.combining, "{text:?}");
+        }
+        term.logical_row_into(
+            usize::MAX,
+            &mut cached.cells[0],
+            &mut cached.clusters[0],
+            &mut cached.combining[0],
+        );
+        assert!(cached.cells[0].is_empty());
+        assert!(cached.clusters[0].is_empty());
+        assert!(cached.combining[0].is_empty());
+    }
 
     #[test]
     fn small_emoji_rows_are_centred_and_bounded_even_at_the_largest_height() {

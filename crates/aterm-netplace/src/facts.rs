@@ -374,11 +374,17 @@ pub struct Script {
 
 /// A hardware address `aa:bb:cc:dd:ee:ff`.
 fn parse_hw(text: &str) -> Option<Vec<u8>> {
-    let bytes: Option<Vec<u8>> = text
-        .split(':')
-        .map(|part| u8::from_str_radix(part, 16).ok())
-        .collect();
-    bytes.filter(|bytes| !bytes.is_empty() && bytes.len() <= 20)
+    if text.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(6);
+    for part in text.split(':') {
+        if bytes.len() >= 20 {
+            return None;
+        }
+        bytes.push(u8::from_str_radix(part, 16).ok()?);
+    }
+    Some(bytes)
 }
 
 /// The script a [`SEAM`] file holds, one fact a line (blank lines and `#` comments skipped, a

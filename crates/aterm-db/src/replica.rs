@@ -8,10 +8,14 @@
 //! crosses network I/O. Dynamic subscriptions default on within an enrolled lab.
 
 use crate::admission::deadline as admission_deadline;
+pub use crate::control::Side;
 use crate::{
-    Error, Result,
-    control::{self, Side},
-    table::{Scope, Session, conflict::ProofKey, store::Store},
+    Error, Result, control,
+    table::{
+        Scope, Session,
+        conflict::ProofKey,
+        store::{Receipt, Store, Via},
+    },
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_digest::Sha256;
@@ -27,10 +31,14 @@ use std::{
     time::Instant,
 };
 
-const MAX_TABLES: usize = 64;
-pub(crate) const MAX_RECORDS: usize = 8192;
-const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints::MAX_BINDINGS;
-const BATCH: usize = 16;
+/// The bound of a table-ID list: the tables one Mac selects, and a round's clock mark.
+pub const MAX_TABLES: usize = 64;
+/// The bound of one table's operation inventory.
+pub const MAX_RECORDS: usize = 8192;
+/// The bound of one table's conflict-proof inventory.
+pub const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints::MAX_BINDINGS;
+/// The records of one batch, each way; also the bound of a round's history-key needs.
+pub const BATCH: usize = 16;
 /// A full batch may continue before the ordinary table scan resumes.
 const TABLE_BURST: usize = 4;
 /// How many times a round reads its local state before state that keeps moving is its answer
@@ -487,13 +495,19 @@ impl Backfill {
         if self.hinted >= TABLE_BURST {
             return None;
         }
-        let candidates = self
-            .wanted
-            .keys()
-            .filter(|table| common.contains(*table))
-            .copied()
-            .collect();
-        let selected = cycle(&candidates, self.after).next().copied();
+        use std::ops::Bound::{Excluded, Unbounded};
+        let tail = match self.after {
+            Some(after) => self.wanted.range((Excluded(after), Unbounded)),
+            None => self.wanted.range::<Digest, _>(..),
+        };
+        let head = self
+            .after
+            .into_iter()
+            .flat_map(|after| self.wanted.range(..=after));
+        let selected = tail
+            .chain(head)
+            .map(|(table, _)| *table)
+            .find(|table| common.contains(table));
         if selected.is_some() {
             self.after = selected;
             self.hinted += 1;
@@ -703,10 +717,13 @@ impl Replica {
             .ok_or_else(|| Error::new("system clock cannot place the ring tables"))
     }
 
+    /// One admitted local batch. `peer`, where given, is the channel's authenticated actor and
+    /// must be a current member; a record the mesh delivered has no channel peer, and its own
+    /// writer grant, which every ingest checks, stands alone.
     fn observe<T>(
         &self,
         bootstrap: &Bootstrap,
-        peer: Actor,
+        peer: impl Into<Option<Actor>>,
         expected: Option<[u8; 64]>,
         write: bool,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
@@ -734,14 +751,16 @@ impl Replica {
         if session.actor() != self.actor {
             return Err(Error::new("table repair local identity changed"));
         }
-        session.peer(peer)?;
+        if let Some(peer) = peer.into() {
+            session.peer(peer)?;
+        }
         if expected.is_some_and(|expected| session.observation().ok() != Some(expected)) {
             return Err(Error::new("control history changed during table repair"));
         }
         run(&session)
     }
 
-    fn round(&self, peer: Actor) -> Result<Round<'_>> {
+    fn round(&self, peer: impl Into<Option<Actor>>) -> Result<Round<'_>> {
         let policy = self
             .commons
             .as_ref()
@@ -890,6 +909,220 @@ impl Replica {
 enum BatchKind {
     Operation,
     Conflict,
+}
+
+/// Which store path a record the mesh delivered takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A table operation ([`Store::ingest`]).
+    Operation,
+    /// A conflict certificate ([`Store::ingest_conflict`]).
+    Conflict,
+}
+
+/// What became of one record [`Replica::mesh_ingest`] was handed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Entered (or was already held): its receipt.
+    Applied(Receipt),
+    /// Its writer or roster is not in this Mac's view yet: try again after a membership change.
+    Waiting(String),
+    /// Refused for good (bad signature, policy, conflicted writer, a table this Mac does not
+    /// hold or subscribe).
+    Refused(String),
+    /// Local contention (busy, snapshot moved): nothing changed, try again.
+    Busy(String),
+}
+impl Verdict {
+    fn of(error: &Error) -> Self {
+        if error.is_busy() {
+            Self::Busy(error.to_string())
+        } else if error.is_awaiting_membership() {
+            Self::Waiting(error.to_string())
+        } else {
+            Self::Refused(error.to_string())
+        }
+    }
+}
+
+/// The mesh's entry to this Mac's tables: the same admission and store checks a repair batch
+/// runs, with no channel peer. The relay's broker already refused a record from an origin that
+/// is not a seat; each record's own writer grant is what admits it here.
+impl Replica {
+    /// Ingest up to `BATCH` wires of one table that the mesh delivered, each with `Via::Mesh`.
+    /// One admission per call. A storage failure answers every wire `Busy` or `Refused` as the
+    /// error classifies.
+    ///
+    /// Each admission of the call (the table selection's, then the batch's) rechecks custody,
+    /// this Mac's actor and the Commons policy captured when the call began; a control change
+    /// between them is not refused, as a round's pinned probe observation would be, because no
+    /// peer shares this view.
+    ///
+    /// # Errors
+    /// More than [`BATCH`] wires.
+    pub fn mesh_ingest(
+        &self,
+        table: Digest,
+        kind: Kind,
+        wires: &[Vec<u8>],
+    ) -> Result<Vec<Verdict>> {
+        if wires.len() > BATCH {
+            return Err(Error::repair(
+                "mesh table batch exceeds its bound",
+                aterm_types::network_state::RepairCause::Quota,
+            ));
+        }
+        if wires.is_empty() {
+            return Ok(Vec::new());
+        }
+        let every = |verdict: Verdict| vec![verdict; wires.len()];
+        let round = match self.mesh_round(table) {
+            Ok(Some(round)) => round,
+            Ok(None) => {
+                return Ok(every(Verdict::Refused(
+                    "table is not held or subscribed on this Mac".into(),
+                )));
+            }
+            Err(error) => return Ok(every(Verdict::of(&error))),
+        };
+        let max = match kind {
+            Kind::Operation => crate::crypto::MAX_OPERATION,
+            Kind::Conflict => crate::table::conflict::MAX_CONFLICT,
+        };
+        let admitted = round.local_write(None, |session| {
+            let mut store = match round.store(session, table) {
+                Ok(store) => store,
+                Err(error) => return Ok(every(Verdict::of(&error))),
+            };
+            Ok(wires
+                .iter()
+                .map(|wire| {
+                    if wire.len() > max {
+                        return Verdict::Refused("table record exceeds its bound".into());
+                    }
+                    let receipt = match kind {
+                        Kind::Operation => store.ingest_via(session, wire, Via::Mesh),
+                        Kind::Conflict => store.ingest_conflict_via(session, wire, Via::Mesh),
+                    };
+                    match receipt {
+                        Ok(receipt) if receipt.id == Sha256::digest(wire) => {
+                            Verdict::Applied(receipt)
+                        }
+                        Ok(_) => Verdict::Refused(
+                            "table receipt did not name the delivered record".into(),
+                        ),
+                        Err(error) => Verdict::of(&error),
+                    }
+                })
+                .collect())
+        });
+        let verdicts = admitted.unwrap_or_else(|error| every(Verdict::of(&error)));
+        if kind == Kind::Operation {
+            let mut backfill = self.backfill.lock().unwrap_or_else(|p| p.into_inner());
+            for verdict in &verdicts {
+                if let Verdict::Applied(receipt) = verdict {
+                    backfill.retained(table, receipt.id);
+                }
+            }
+        }
+        Ok(verdicts)
+    }
+
+    /// The digests of `table`'s operations this Mac holds (`store.inventory`), `None` for a table
+    /// it does not hold.
+    ///
+    /// # Errors
+    /// Custody, admission or the store's read fails, other than the table being absent.
+    pub fn mesh_inventory(&self, table: Digest) -> Result<Option<BTreeSet<Digest>>> {
+        let Some(round) = self.mesh_round(table)? else {
+            return Ok(None);
+        };
+        round.local(None, |session| match round.store(session, table) {
+            Ok(store) => Ok(Some(store.inventory(session)?.copied().collect())),
+            Err(error) if error.is_busy() => Err(error),
+            Err(_) => Ok(None),
+        })
+    }
+
+    /// The wire of operation `id` of `table`, where held, for each of `ids` in order; an id this
+    /// Mac does not hold is left out.
+    ///
+    /// # Errors
+    /// Custody, admission or the store's read fails.
+    pub fn mesh_wires(&self, table: Digest, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
+        let Some(round) = self.mesh_round(table)? else {
+            return Ok(Vec::new());
+        };
+        round.local(None, |session| {
+            let store = round.store(session, table)?;
+            let mut wires = Vec::new();
+            for id in ids {
+                if let Some(wire) = store.wire(session, id)? {
+                    wires.push(wire.to_vec());
+                }
+            }
+            Ok(wires)
+        })
+    }
+
+    /// The conflict proofs `table`'s store holds, by key; `None` where this Mac does not select
+    /// the table or its store is not open to it.
+    ///
+    /// # Errors
+    /// Custody, admission or a busy store.
+    pub fn mesh_proofs(&self, table: Digest) -> Result<Option<BTreeSet<ProofKey>>> {
+        let Some(round) = self.mesh_round(table)? else {
+            return Ok(None);
+        };
+        round.local(None, |session| match round.store(session, table) {
+            Ok(store) => store.proof_inventory(session).map(Some),
+            Err(error) if error.is_busy() => Err(error),
+            Err(_) => Ok(None),
+        })
+    }
+
+    /// The wire of conflict proof `key` of `table`, where held, for each of `keys` in order; a
+    /// key this Mac does not hold is left out.
+    ///
+    /// # Errors
+    /// Custody, admission or the store's read fails.
+    pub fn mesh_proof_wires(&self, table: Digest, keys: &[ProofKey]) -> Result<Vec<Vec<u8>>> {
+        let Some(round) = self.mesh_round(table)? else {
+            return Ok(Vec::new());
+        };
+        round.local(None, |session| {
+            let store = round.store(session, table)?;
+            let mut wires = Vec::new();
+            for key in keys {
+                if let Some(wire) = store.proof_wire(session, key)? {
+                    wires.push(wire);
+                }
+            }
+            Ok(wires)
+        })
+    }
+
+    /// The tables this replica selects (its subscriptions), by digest.
+    ///
+    /// # Errors
+    /// Custody, admission or the subscription read fails.
+    pub fn mesh_tables(&self) -> Result<BTreeSet<Digest>> {
+        let mut round = self.round(None)?;
+        round.select_tables(None, &mut Report::default())?;
+        Ok(round.tables.keys().copied().collect())
+    }
+
+    /// A round with no channel peer that has selected this Mac's tables, with `table` its active
+    /// one; `None` where this Mac does not select `table`.
+    fn mesh_round(&self, table: Digest) -> Result<Option<Round<'_>>> {
+        let mut round = self.round(None)?;
+        round.select_tables(None, &mut Report::default())?;
+        if !round.tables.contains_key(&table) {
+            return Ok(None);
+        }
+        round.active_table.set(Some(table));
+        Ok(Some(round))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1074,7 +1307,12 @@ impl Round<'_> {
     /// ([`Self::check_table_policy`]). A fresh admission and read is the answer, where giving up
     /// would cost both peers this round. [`LOCAL_READS`] bounds the reads: no sleep separates
     /// them, though each still waits for its own admission.
-    fn local<T>(&self, peer: Actor, mut run: impl FnMut(&Session<'_>) -> Result<T>) -> Result<T> {
+    fn local<T>(
+        &self,
+        peer: impl Into<Option<Actor>>,
+        mut run: impl FnMut(&Session<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let peer = peer.into();
         for _ in 1..LOCAL_READS {
             match self.admit(peer, false, &mut run) {
                 Err(error) if error.is_snapshot_changed() => {}
@@ -1108,7 +1346,7 @@ impl Round<'_> {
 
     fn local_write<T>(
         &self,
-        peer: Actor,
+        peer: impl Into<Option<Actor>>,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
         self.admit(peer, true, run)
@@ -1140,14 +1378,18 @@ impl Round<'_> {
     )]
     fn admit<T>(
         &self,
-        peer: Actor,
+        peer: impl Into<Option<Actor>>,
         write: bool,
         run: impl FnOnce(&Session<'_>) -> Result<T>,
     ) -> Result<T> {
+        // A peer shares the view this round probed, so each admission holds it to that view.
+        // With no peer (the mesh's calls) nobody shares it: a control change since the round
+        // began is no refusal, and each record's own writer grant is checked at its ingest.
+        let peer = peer.into();
         self.replica.observe(
             &self.bootstrap,
             peer,
-            Some(self.observation),
+            peer.map(|_| self.observation),
             write,
             |session| {
                 // Custody and journal replay can take time. Read local policy
@@ -1243,15 +1485,10 @@ impl Round<'_> {
         result.map(|()| report)
     }
 
-    fn exchange_tables(
-        mut self,
-        stream: &mut (impl Read + Write),
-        peer: Actor,
-        side: Side,
-        repair: &mut Repair,
-        report: &mut Report,
-    ) -> Result<()> {
-        self.keys(stream, peer, side, repair, report)?;
+    /// Select this Mac's tables for the round: the Commons storage region (recovery when the
+    /// primary catalog cannot be read), then its subscriptions, enrolling them under a write
+    /// admission when none is established yet.
+    fn select_tables(&mut self, peer: Option<Actor>, report: &mut Report) -> Result<()> {
         if let Some((directory, config)) = self.commons.as_ref() {
             let recovery = self.local(peer, |session| {
                 match directory.observe_primary_with_config(session, config) {
@@ -1300,6 +1537,19 @@ impl Round<'_> {
                 })?,
             };
         }
+        Ok(())
+    }
+
+    fn exchange_tables(
+        mut self,
+        stream: &mut (impl Read + Write),
+        peer: Actor,
+        side: Side,
+        repair: &mut Repair,
+        report: &mut Report,
+    ) -> Result<()> {
+        self.keys(stream, peer, side, repair, report)?;
+        self.select_tables(Some(peer), report)?;
         repair.records.retain(|id, _| self.tables.contains_key(id));
         repair
             .conflicts
@@ -1808,7 +2058,7 @@ impl Round<'_> {
         {
             report.retained_after = local.known.len();
         }
-        report.local_known = Some(InventorySummary::of(&local.known));
+        report.local_known = Some(local.observation.inventory);
         report.local_offered = Some(InventorySummary::of(&local.offered));
         report.peer_known = Some(InventorySummary::of(&remote));
         self.backfill
@@ -2055,7 +2305,12 @@ fn with_mark(local: &BTreeSet<Digest>, wall: Option<u64>) -> BTreeSet<Digest> {
     listed
 }
 
-fn exchange_ids<const N: usize>(
+/// Exchange two sorted, unique ID lists of at most `max` each: the initiator sends first, and
+/// `authorize` runs before this side sends its own.
+///
+/// # Errors
+/// A list exceeds `max` or is not sorted and unique, `authorize` refuses, or the stream fails.
+pub fn exchange_ids<const N: usize>(
     stream: &mut (impl Read + Write),
     side: Side,
     ids: &BTreeSet<[u8; N]>,
@@ -2111,7 +2366,12 @@ fn receive_ids<const N: usize>(stream: &mut impl Read, max: usize) -> Result<BTr
     }
     Ok(ids)
 }
-fn exchange_inventory<const N: usize>(
+/// [`exchange_ids`] where either side may say its inventory is unavailable (`None`), as a store
+/// it cannot read now.
+///
+/// # Errors
+/// As [`exchange_ids`], or an invalid ready byte.
+pub fn exchange_inventory<const N: usize>(
     stream: &mut (impl Read + Write),
     side: Side,
     local: Option<&BTreeSet<[u8; N]>>,
@@ -2189,5 +2449,7 @@ fn receive_inventory<const N: usize>(
 #[doc(hidden)]
 pub fn db_repair_policy_environment() {}
 
+#[cfg(test)]
+mod mesh_tests;
 #[cfg(test)]
 pub(crate) mod tests;

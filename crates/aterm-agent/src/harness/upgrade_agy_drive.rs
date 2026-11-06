@@ -310,6 +310,17 @@ fn witness(config: &Path, files: &[PathBuf], pid: u32) -> Held {
     }
 }
 
+/// The conversation `pid` holds now, as its snapshot reads it ([`witness`]): `None` when its
+/// files cannot be read, `Some(None)` when it holds no single one.
+pub(super) fn conversation_held(
+    config: &Path,
+    pid: u32,
+    k: &dyn AgyKernel,
+) -> Option<Option<String>> {
+    let files = k.open_files(pid)?;
+    Some(witness(config, &files, pid).conversation.map(|(c, _)| c))
+}
+
 /// Whether the dead process's crash file is left: `crash`, else a crash file of `pid` under
 /// `config` written no earlier than `started_ms` (a second's slack), and none when
 /// `started_ms` is `0` (unread).
@@ -1109,7 +1120,7 @@ fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
 
 /// The relaunched agy started a fresh conversation and does not hold the conversation's presence lock.
 fn started_fresh(opts: &Opts, r: Report, st: &mut St, new: u32) -> Report {
-    st.fail("started-fresh", now_s());
+    st.fail(super::STARTED_FRESH, now_s());
     let mut r = said(r, "refused:started-fresh");
     r.pid = new;
     ledger(

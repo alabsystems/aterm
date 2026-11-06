@@ -17,6 +17,7 @@ use aterm_secrets::{
         journal::Journal,
     },
 };
+use aterm_types::MutexExt;
 use aterm_types::network_state::{MachineIdentity, Visibility};
 use std::{
     path::{Path, PathBuf},
@@ -132,6 +133,13 @@ struct Network {
     lan: LanGate,
     /// Authenticated contacts go to the machine's shared place; fixtures are inert.
     place: place::Publisher,
+    /// The one-mesh transport is on (`aterm_types::mesh_switch::MESH`, read once, in
+    /// [`Self::gated`]): a background owner no longer yields to a window, whose tables and
+    /// pushes the mesh carries ([`Runtime::start_background`]). Off by default (tests flip it).
+    mesh: bool,
+    /// Which peers speak `Bus` ([`Runtime::speaks_bus`]): every transport this network opens
+    /// holds their seats out of its dials and pushes. Shared with the runtime's handle.
+    bus: transport::Bus,
     #[cfg(test)]
     isolated: Option<auto_sync_tests::Attachment>,
     /// Counts each transport this network opened (tests).
@@ -167,6 +175,8 @@ impl Network {
             repairs: crate::control::PeerCache::default(),
             lan,
             place: place::Publisher::live(),
+            mesh: aterm_types::mesh_switch::MESH,
+            bus: transport::Bus::default(),
             #[cfg(test)]
             isolated: None,
             #[cfg(test)]
@@ -253,7 +263,9 @@ impl Network {
         endpoint: Option<Endpoint>,
         candidates: &[std::net::SocketAddr],
     ) -> Result<transport::Transport> {
-        let opened = self.opening(endpoint, candidates);
+        let opened = self
+            .opening(endpoint, candidates)
+            .map(|transport| transport.hearing_bus(self.bus.clone()));
         self.note_use(
             candidates,
             opened.as_ref().is_ok_and(transport::Transport::bound),
@@ -471,15 +483,17 @@ impl Stop {
 /// What a push came to ([`Pusher::push_until`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pushed {
-    /// A repair round that began after the ask caught a peer up on the table: the peer now holds
-    /// every operation of it this runtime offered then (`crate::replica::Report::caught_up`), and
-    /// its own rounds carry them on. Data transfers and the first quiet confirmation are
-    /// followed at once; further quiet rounds keep ordinary spacing.
+    /// A neighbour acknowledged the table on the mesh's relay ([`Pusher::relay`]), or a repair
+    /// round that began after the ask caught a peer up on the table: the peer now holds every
+    /// operation of it this runtime offered then (`crate::replica::Report::caught_up`), and its
+    /// own rounds carry them on. Data transfers and the first quiet confirmation are followed at
+    /// once; further quiet rounds keep ordinary spacing.
     Reached,
     /// This runtime had no serving owner, or that service ended before the push completed.
     /// The table remains available for the serving owner's next rounds.
     NotServing,
-    /// This runtime knows no verified peer to dial.
+    /// This runtime knows no verified peer to dial: none, or only ones that speak `Bus`
+    /// ([`Runtime::speaks_bus`]), whose relay did not acknowledge the table.
     NoPeers,
     /// The deadline came first.
     TimedOut,
@@ -492,7 +506,7 @@ impl Pushed {
         match self {
             Self::Reached => "a peer took it",
             Self::NotServing => "Commons repair was unavailable or restarted",
-            Self::NoPeers => "no verified peer is known",
+            Self::NoPeers => "no verified peer off the mesh is known",
             Self::TimedOut => "no peer took it before the deadline",
         }
     }
@@ -503,16 +517,55 @@ impl Pushed {
 #[derive(Clone, Default)]
 pub struct Pusher(Arc<Board>);
 
+/// What answers a push on the mesh's relay ([`Pusher::relay`]).
+type RelayAck = Arc<dyn Fn(astream_wire::sync::Digest, Instant) -> Option<Pushed> + Send + Sync>;
+
 impl Pusher {
-    /// Hand the table `table` (a scope digest) to this runtime's peers now: every verified peer is
+    /// Install `ack`, the mesh relay's answer to a push, on this pusher and every clone of it (the
+    /// runtime's own included); a later call replaces it. `ack(table, deadline)` answers
+    /// `Some(Pushed::Reached)` once a neighbour acknowledged the relay past `table`'s latest local
+    /// operation, by `deadline` (half of what is left of the push's); any other answer, `None`
+    /// included, hands the push to the repair rounds ([`Self::push_until`]) with the rest. It runs on the caller's
+    /// thread with no lock of this runtime held.
+    pub fn relay(
+        &self,
+        ack: Arc<dyn Fn(astream_wire::sync::Digest, Instant) -> Option<Pushed> + Send + Sync>,
+    ) {
+        *self.0.relay.lock().unwrap_or_else(|p| p.into_inner()) = Some(ack);
+    }
+
+    /// Hand the table `table` (a scope digest) to this runtime's peers now. The mesh's relay is
+    /// asked first ([`Self::relay`]): its acknowledgement is [`Pushed::Reached`] at once, with no
+    /// round. Otherwise every verified peer that does not speak `Bus` ([`Runtime::speaks_bus`]) is
     /// dialled at once and each round this runtime begins repairs `table` first where the peer
     /// holds it too. Waits until a round that began after this ask caught a peer up on it
     /// ([`Pushed::Reached`]), the runtime stops serving, or `deadline`, whichever is first; past
-    /// the deadline the runtime ends the push. Concurrent callers wait for the current caller
-    /// within their own deadline; one table's completion never acknowledges another table.
-    /// An unfinished call ends if its serving generation changes, even across a fast restart.
+    /// the deadline the runtime ends the push. Concurrent callers of the rounds wait for the
+    /// current caller within their own deadline; one table's completion never acknowledges
+    /// another table. An unfinished call ends if its serving generation changes, even across a
+    /// fast restart.
     #[must_use]
     pub fn push_until(&self, table: astream_wire::sync::Digest, deadline: Instant) -> Pushed {
+        let relay = self
+            .0
+            .relay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        // The relay has half of what is left: a neighbour that follows but does not ack leaves
+        // the rounds the rest for the peers that do not speak `Bus`.
+        let now = Instant::now();
+        let relay_until = now + deadline.saturating_duration_since(now) / 2;
+        if let Some(ack) = relay
+            && ack(table, relay_until) == Some(Pushed::Reached)
+        {
+            return Pushed::Reached;
+        }
+        self.push_by_rounds(table, deadline)
+    }
+
+    /// [`Self::push_until`] on the repair rounds alone.
+    fn push_by_rounds(&self, table: astream_wire::sync::Digest, deadline: Instant) -> Pushed {
         let board = &*self.0;
         let mut desk = board.desk.lock().unwrap_or_else(|p| p.into_inner());
         let generation = desk.generation;
@@ -586,6 +639,8 @@ struct Board {
     changed: Condvar,
     /// The table the endpoint's rounds repair first while a push runs.
     first: crate::replica::First,
+    /// The mesh relay's answer to a push, asked before any round ([`Pusher::relay`]).
+    relay: Mutex<Option<RelayAck>>,
 }
 
 #[derive(Default)]
@@ -625,20 +680,12 @@ impl Desk {
 }
 
 impl Board {
-    fn desk(&self) -> std::sync::MutexGuard<'_, Desk> {
-        self.desk.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    fn first(&self) -> std::sync::MutexGuard<'_, Option<astream_wire::sync::Digest>> {
-        self.first.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
     /// The owner serves repair until the guard drops; then every waiting push hears it.
     fn serving(&self) -> Serving<'_> {
         let generation = {
-            let mut desk = self.desk();
+            let mut desk = self.desk.lock_or_recover();
             let generation = desk.start();
-            *self.first() = None;
+            *self.first.lock_or_recover() = None;
             generation
         };
         self.changed.notify_all();
@@ -650,22 +697,22 @@ impl Board {
 
     /// The latest ask not taken yet, its table now the one the rounds repair first.
     fn take(&self) -> Option<Ask> {
-        let mut desk = self.desk();
+        let mut desk = self.desk.lock_or_recover();
         let ask = desk.ask.take()?;
         desk.active = Some(ask.id);
-        *self.first() = Some(ask.table);
+        *self.first.lock_or_recover() = Some(ask.table);
         Some(ask)
     }
 
     /// Release this active round's priority and answer its caller if still current. A round
     /// superseded by a new one cannot change that new round's priority or result.
     fn settle(&self, id: u64, pushed: Pushed) {
-        let mut desk = self.desk();
+        let mut desk = self.desk.lock_or_recover();
         if desk.active != Some(id) {
             return;
         }
         desk.active = None;
-        *self.first() = None;
+        *self.first.lock_or_recover() = None;
         if id == desk.asked {
             desk.settled = Some((id, pushed));
         }
@@ -682,16 +729,19 @@ struct Serving<'a> {
 
 impl Drop for Serving<'_> {
     fn drop(&mut self) {
-        let mut desk = self.board.desk();
+        let mut desk = self.board.desk.lock_or_recover();
         if desk.generation != self.generation {
             return;
         }
         desk.stop();
-        *self.board.first() = None;
+        *self.board.first.lock_or_recover() = None;
         drop(desk);
         self.board.changed.notify_all();
     }
 }
+
+/// Whether a peer's fleet node key speaks `Bus` ([`Runtime::speaks_bus`]).
+pub type SpeaksBus = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 
 /// Owning process lifetime. Dropping it stops and joins all network workers.
 pub struct Runtime {
@@ -699,6 +749,8 @@ pub struct Runtime {
     task: Option<JoinHandle<()>>,
     observation: ObservationHandle,
     pusher: Pusher,
+    /// Its network's `Bus` predicate ([`Self::speaks_bus`]).
+    bus: transport::Bus,
 }
 
 /// Development observations keep their publication separate from live policy.
@@ -765,9 +817,12 @@ impl Runtime {
     }
 
     /// Start background Commons repair and steward enrollment for `aterm node serve` (C22).
-    /// Owns local observation and transport while no interactive `aterm` window runs, yields
-    /// both within one tick when a window claims [`owner::WindowClaim`], and resumes once the
-    /// last window exits. `lan` gates its first LAN use as [`Self::start`]'s does.
+    /// Before the one-mesh transport (`aterm_types::mesh_switch::MESH` off), it owns local
+    /// observation and transport while no interactive `aterm` window runs, yields both within
+    /// one tick when a window claims [`owner::WindowClaim`], and resumes once the last window
+    /// exits. With the mesh on it yields to no window: the node service is the one owner, and a
+    /// window's runtime waits for its lease. `lan` gates its first LAN use as
+    /// [`Self::start`]'s does.
     pub fn start_background(
         paths: Paths,
         config: PathBuf,
@@ -851,6 +906,9 @@ impl Runtime {
         let published = observation.clone();
         let pusher = Pusher::default();
         let board = pusher.0.clone();
+        let bus = network.bus.clone();
+        // A background owner yields to a window only before the one-mesh transport.
+        let yields = background && !network.mesh;
         let task = thread::Builder::new()
             .name("commons-owner".into())
             .spawn(move || {
@@ -869,7 +927,7 @@ impl Runtime {
                 // One streak of refusals, whether the gate or a try refused ([`Refusals`]).
                 let mut refusals = Refusals::new(background);
                 while !worker.requested() {
-                    if background && owner::window_claimed(&observer_dir) {
+                    if yields && owner::window_claimed(&observer_dir) {
                         wait_relay.stop();
                         let publication = waiting_publication(
                             &paths,
@@ -929,7 +987,7 @@ impl Runtime {
                         let mut serving = None;
                         let mut served = serve_mode_with_recovery(
                             (&paths, &config, recover_writer),
-                            background.then_some(observer_dir.as_path()),
+                            yields.then_some(observer_dir.as_path()),
                             &worker,
                             &mut |status| {
                                 if matches!(status, Status::Active { .. } | Status::Pending) {
@@ -948,7 +1006,7 @@ impl Runtime {
                         );
                         if let Err(status) = served {
                             history.unconfirm_local();
-                            if background
+                            if yields
                                 && status == Status::Waiting
                                 && owner::window_claimed(&observer_dir)
                             {
@@ -1003,6 +1061,7 @@ impl Runtime {
             task: Some(task),
             observation,
             pusher,
+            bus,
         })
     }
     pub fn stop(mut self) {
@@ -1015,6 +1074,17 @@ impl Runtime {
     /// What hands a table to this runtime's peers now ([`Pusher::push_until`]).
     pub fn pusher(&self) -> Pusher {
         self.pusher.clone()
+    }
+    /// Install `pred`, which says whether a peer's fleet node key speaks `Bus` (the mesh carries
+    /// its tables); a later call replaces it. Within one discovery refresh (2 s), each current
+    /// seat whose node key `pred` names is held out of this runtime's dials and pushes: a push
+    /// counts and hurries only the other peers. Such a peer stays known (its beacons, presence and
+    /// contacts as before), its incoming rounds are still served, and it is dialled again once
+    /// `pred` no longer names it. A peer this side cannot yet bind to a seat (no signed fleet
+    /// advertisement and no authenticated round) may take one round first. With no predicate
+    /// every peer is dialled, as before the mesh.
+    pub fn speaks_bus(&self, pred: SpeaksBus) {
+        *self.bus.lock().unwrap_or_else(|p| p.into_inner()) = Some(pred);
     }
     fn join(&mut self) {
         self.stop.request();
@@ -1478,22 +1548,7 @@ impl Hearing {
         let Some(now_ms) = aterm_time::unix_millis() else {
             return;
         };
-        for contact in contacts {
-            // What the peer said, at the time of the round that said it; then its latest
-            // contact, which can be a later round that ended before versions were traded.
-            self.changed |= self.ledger.record(
-                contact.actor,
-                contact_time(now_ms, now, contact.said_at),
-                contact.said,
-            );
-            if contact.at != contact.said_at {
-                self.changed |= self.ledger.record(
-                    contact.actor,
-                    contact_time(now_ms, now, contact.at),
-                    Said::Unknown,
-                );
-            }
-        }
+        self.changed |= record_contacts(&mut self.ledger, contacts, now_ms, now);
         let due = self
             .kept
             .is_none_or(|kept| now.saturating_duration_since(kept) >= KEEP);
@@ -1509,6 +1564,34 @@ impl Hearing {
         self.changed = false;
         let _ = self.ledger.write(bootstrap);
     }
+}
+
+/// Record `contacts` in `ledger`, each instant placed on the wall clock that read `now_ms` at
+/// `now`. Whether this changed a version or added a member.
+fn record_contacts(
+    ledger: &mut Ledger,
+    contacts: &[transport::Contact],
+    now_ms: u64,
+    now: Instant,
+) -> bool {
+    let mut changed = false;
+    for contact in contacts {
+        // What the peer said, at the time of the round that said it; then its latest
+        // contact, which can be a later round that ended before versions were traded.
+        changed |= ledger.record(
+            contact.actor,
+            contact_time(now_ms, now, contact.said_at),
+            contact.said,
+        );
+        if contact.at != contact.said_at {
+            changed |= ledger.record(
+                contact.actor,
+                contact_time(now_ms, now, contact.at),
+                Said::Unknown,
+            );
+        }
+    }
+    changed
 }
 
 /// This device's readings of its clock against each peer's (`crate::clock`, F22): the latest per

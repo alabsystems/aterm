@@ -11508,6 +11508,9 @@ pub struct TurnEndReading {
     pub wake: Option<RideFact>,
     pub pending_input: bool,
     pub interrupted: bool,
+    /// The program's own notice that it stopped the turn, where only a person clears what it
+    /// names ([`aterm_phase::reader::ScreenReader::stopped_turn`]): the point is handed over.
+    pub fault: Option<String>,
     pub restartable: bool,
     pub relaunch_off: bool,
     pub resume: Option<String>,
@@ -11978,6 +11981,7 @@ impl TurnEndReading {
             pending_input: claude
                 && last_said_row(rows).is_some_and(|r| r.trim_start().starts_with('❯')),
             interrupted: reading.interrupted,
+            fault: reading.program.reader().stopped_turn(rows),
             restartable: false,
             relaunch_off: false,
             resume: None,
@@ -12048,6 +12052,14 @@ impl TurnEndReading {
             && matches!(self.phase, Phase::Idle)
             && self.authoritative
             && self.login_screen.is_none()
+    }
+
+    /// THE PROGRAM'S OWN STOP NOTICE an idle point with a task ends on ([`Self::fault`]): the
+    /// answer to whatever turn was asked, an act of this policy's included, and no point.
+    fn stopped_turn(&self) -> Option<&str> {
+        self.fault
+            .as_deref()
+            .filter(|_| self.phase == Phase::Idle && !self.taskless)
     }
 
     /// Whether `rows`, read as `program` draws them (`None`: as the screen names its program),
@@ -13274,6 +13286,8 @@ pub struct TurnEndState {
     /// this loop's own point ([`Self::landed_by_check`]).
     by_check: bool,
     wake_restated: bool,
+    /// Cruise unlanded the books at the point folded last ([`Self::unlanded`]).
+    unlanded: bool,
     seed_noted_ms: Option<i64>,
     restating: Option<(TaskFace, i64)>,
     face_told: Option<TaskFace>,
@@ -13474,6 +13488,7 @@ impl TurnEndState {
             by_wake: false,
             by_check: false,
             wake_restated: false,
+            unlanded: false,
             seed_noted_ms: None,
             restating: None,
             face_told: None,
@@ -15792,6 +15807,13 @@ impl TurnEndState {
         std::mem::take(&mut self.wake_restated)
     }
 
+    /// CRUISE UNLANDED THE BOOKS AT THE POINT FOLDED LAST: it never parks, so the task is open
+    /// again whatever act that point followed. The next point folded unlands nothing of its own.
+    #[must_use]
+    pub const fn unlanded(&self) -> bool {
+        self.unlanded
+    }
+
     /// THE LOOP STARTS UNDER `mode`, the session's word as the loop read it before it tells its start face ([`Self::face_start`]).
     pub fn start_under(&mut self, mode: Autopilot) {
         if mode == Autopilot::Cruise {
@@ -17611,6 +17633,7 @@ impl TurnEndState {
         self.limit_ended_elsewhere = false;
         self.point_moved = false;
         self.left_judged = false;
+        self.unlanded = false;
         // A program started fresh in a tab that ran another: the tab's books, and this loop's
         // points, are the other's ([`Self::opened_fresh`]). One this loop relaunched on the
         // session's conversation is that session, its banner drawn before the transcript
@@ -17999,7 +18022,9 @@ impl TurnEndState {
         let wall_cut = reading.wall.is_some();
         let pass = wall_cut && !self.cut_pass_spent;
         let mut cut_counted = false;
-        let carried = self.carrying && self.done == 0;
+        // A program started fresh since the last point carries nothing of the task before it
+        // ([`Self::opened_fresh`]): its opening message is the person's, carried task or none.
+        let carried = self.carrying && self.done == 0 && !self.opened_fresh;
         let redelivers = reading.worked.is_some()
             && self
                 .wall
@@ -18518,6 +18543,7 @@ impl TurnEndState {
         if reading.autopilot == Autopilot::Cruise && self.landed && !self.exchange {
             self.landed = false;
             self.done = 1;
+            self.unlanded = true;
         }
         if awaited.is_some() || reading.worked.is_some() || first_point {
             let tail = reading.said_tail.as_deref();
@@ -21461,7 +21487,13 @@ fn decide_unridden(
     if reading.wall == Some(WallKind::Memory) && !reading.interrupted {
         return ended_at(trace, "memory", memory_restart(cfg, reading));
     }
-    if let Some(a) = &state.awaiting {
+    // An act the program answered with its own stop notice was taken: that notice is the act's
+    // answer, read below (`stopped-turn`).
+    if let Some(a) = state
+        .awaiting
+        .as_ref()
+        .filter(|_| reading.stopped_turn().is_none())
+    {
         if !reading.authoritative
             || reading.survey
             || matches!(reading.phase, Phase::Busy | Phase::Prompt)
@@ -21539,6 +21571,25 @@ fn decide_unridden(
                 ),
             });
         return ended_at(trace, "sign-in-menu", act);
+    }
+    // A PROGRAM'S OWN STOP NOTICE (Muse Code's fault rows) is no reply and no wall, so no rule
+    // types at it; only a person clears what it names, so the point is handed over, once a
+    // person at the keyboard, there to clear it, has had their grace.
+    if let Some(row) = reading.stopped_turn() {
+        let act = match person_hold(state, reading, cfg, now) {
+            Some((until, why)) => TurnEndAction::WaitUntil {
+                until,
+                why: why.to_string(),
+                wait: WaitKind::Other,
+            },
+            None => TurnEndAction::Escalate {
+                reason: format!(
+                    "{} stopped the turn: {row}; only a person fixes it",
+                    reading.program.product()
+                ),
+            },
+        };
+        return ended_at(trace, "stopped-turn", act);
     }
     if !reading.at_point(state.stale_input) || reading.taskless || rests {
         return ended_at(trace, "no-task", TurnEndAction::Nothing);

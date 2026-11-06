@@ -25,6 +25,10 @@ use crate::{
 };
 
 fn cpu_pool(fixture: &CohortFixture) -> RetainedPool {
+    cpu_pool_width(fixture, 1)
+}
+
+fn cpu_pool_width(fixture: &CohortFixture, width: u32) -> RetainedPool {
     RetainedPool::create_private(
         &fixture
             .namespace
@@ -32,9 +36,110 @@ fn cpu_pool(fixture: &CohortFixture) -> RetainedPool {
             .parent()
             .unwrap()
             .join("retained-cpu.noindex"),
-        NonZeroU32::new(1).unwrap(),
+        NonZeroU32::new(width).unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn cpu_bundle_releases_only_after_the_original_group_drains() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 3);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let leases = (0..3)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+    assert_eq!(retained.cpu_units(), 3);
+    let mut leader = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    let mut member = Running::new(
+        retained
+            .launch_member(&fence, &mut leader.owned, &mut cat())
+            .unwrap(),
+    );
+    leader.end();
+    assert!(retained.try_finish(&fence).is_err());
+    assert_cpu_denied(&pool);
+    member.end();
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert_eq!(retained.cpu_units(), 3);
+    assert!(
+        pool.snapshot()
+            .unwrap()
+            .iter()
+            .all(|slot| matches!(slot, RetainedSlotState::Available { .. }))
+    );
+}
+
+#[test]
+fn dropping_cpu_bundle_retains_every_unit_after_root_exit() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 3);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let leases = (0..3)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+    let mut leader = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    drop(retained);
+    leader.end();
+    wait_for_kernel_release(&pool);
+    assert_cpu_denied(&pool);
+    assert!(
+        pool.snapshot()
+            .unwrap()
+            .iter()
+            .all(|slot| matches!(slot, RetainedSlotState::Retained { .. }))
+    );
+}
+
+#[test]
+fn refused_cpu_bundle_returns_all_original_capabilities() {
+    let fixture = CohortFixture::new();
+    let other = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 2);
+    let fence = Fence::acquire(&other.namespace, Instant::now()).unwrap();
+    let leases = (0..2)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let error = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap_err();
+    let (_, claim, leases) = error.into_parts();
+    assert_eq!(leases.len(), 2);
+    assert_cpu_denied(&pool);
+    let proper = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new_bundle(&proper, claim, leases).unwrap();
+    retained.try_finish(&proper).unwrap();
+    drop(retained);
+    let error = RetainedCohort::new_bundle(&proper, fixture.claim(), Vec::new()).unwrap_err();
+    assert!(error.into_parts().2.is_empty());
+}
+
+#[test]
+fn cpu_bundle_partial_settlement_is_not_reported_or_retried_as_complete() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 3);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let leases = (0..3)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+    let slots = pool.path().join(RETAINED_DIRECTORY_NAME);
+    std::fs::write(slots.join("slot-00000001"), b"interrupted retained record").unwrap();
+    assert!(retained.try_finish(&fence).is_err());
+    assert!(!retained.is_settled());
+    assert!(
+        std::fs::read_to_string(slots.join("slot-00000002"))
+            .unwrap()
+            .contains("free=1")
+    );
+    assert!(
+        std::fs::read_to_string(slots.join("slot-00000000"))
+            .unwrap()
+            .contains("retained=1")
+    );
+    assert!(retained.try_finish(&fence).is_err());
+    assert!(!retained.is_settled());
 }
 
 fn owner() -> Owner {

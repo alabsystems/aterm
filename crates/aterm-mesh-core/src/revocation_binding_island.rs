@@ -23,8 +23,8 @@ clean {
     theorem row_revokes_is_exact (a b : Bool) : trust_import_aterm_mesh_core__revocation__row_revokes a b = spec_row_revokes a b := by
       cases a <;> cases b <;> rfl
 
-    theorem gate_row_is_exact (a b : Bool) : trust_import_aterm_mesh_core__revocation__gate_row a b = spec_gate_row a b := by
-      cases a <;> cases b <;> rfl
+    theorem gate_row_is_exact (a b c d : Bool) : trust_import_aterm_mesh_core__revocation__gate_row a b c d = spec_gate_row a b c d := by
+      cases a <;> cases b <;> cases c <;> cases d <;> rfl
 
     theorem current_is_exact (a b : Bool) : trust_import_aterm_mesh_core__revocation__current a b = spec_current a b := by
       cases a <;> cases b <;> rfl
@@ -60,9 +60,7 @@ clean {
 
     -- The writer's rule of the compiled decision, in every state of every run.
     theorem compiled_writer_rule (t0 : Table) :
-        Satisfies (SpecW compiled t0) (Always (Lift (fun t => ∀ e w i j,
-          headDueW compiled t e w = false → i < t.rows → revokesW compiled t i = true →
-            j < t.rms → takesW compiled t j i = true → t.before (t.mid j) e = true))) :=
+        Satisfies (SpecW compiled t0) (Always (Lift (WriterRule compiled))) :=
       writer_rule_of_exact compiled compiled_exact t0
 
     end AtermMeshRevocation

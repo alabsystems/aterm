@@ -132,14 +132,12 @@ impl Channel {
         Ok(())
     }
 
-    /// The next whole message's kind and payload, reading as needed, or `None` at EOF
-    /// between messages.
-    fn next(&mut self, allow_reply_fds: bool) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
+    /// The next whole message's kind and byte span in `self.buf`, reading as needed, or `None`
+    /// at EOF between messages.
+    fn next(&mut self, allow_reply_fds: bool) -> Result<Option<(u8, usize)>, ProtoError> {
         loop {
-            if let Some((kind, payload, used)) = split(&self.buf)? {
-                let payload = payload.to_vec();
-                self.buf.drain(..used);
-                return Ok(Some((kind, payload)));
+            if let Some((kind, _, used)) = split(&self.buf)? {
+                return Ok(Some((kind, used)));
             }
             if allow_reply_fds {
                 let allowed = usize::from(
@@ -196,11 +194,18 @@ impl Channel {
     pub fn recv_request(&mut self) -> Result<Option<Request>, ProtoError> {
         let next = self.next(false)?;
         if !self.fds.is_empty() {
+            if let Some((_, used)) = next {
+                self.buf.drain(..used);
+            }
             self.fds.clear();
             return Err(ProtoError::Malformed("unexpected descriptor on request"));
         }
         match next {
-            Some((kind, payload)) => Request::decode(kind, &payload).map(Some),
+            Some((kind, used)) => {
+                let decoded = Request::decode(kind, &self.buf[crate::proto::HEADER..used]);
+                self.buf.drain(..used);
+                decoded.map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -211,10 +216,12 @@ impl Channel {
     /// The socket failed (a read past the span among them), the message is not a reply, a
     /// `Connected` came with no descriptor, or an unexpected descriptor arrived.
     pub fn recv_reply(&mut self) -> Result<Option<(Reply, Option<OwnedFd>)>, ProtoError> {
-        let Some((kind, payload)) = self.next(true)? else {
+        let Some((kind, used)) = self.next(true)? else {
             return Ok(None);
         };
-        let reply = Reply::decode(kind, &payload)?;
+        let decoded = Reply::decode(kind, &self.buf[crate::proto::HEADER..used]);
+        self.buf.drain(..used);
+        let reply = decoded?;
         let fd = if Reply::carries_descriptor(kind) {
             Some(self.fds.pop_front().ok_or(ProtoError::NoDescriptor)?)
         } else {

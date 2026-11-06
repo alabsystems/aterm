@@ -152,16 +152,24 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// The exact client asset set a release must carry, sorted.
 #[must_use]
 pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<String> {
+    let dmg = dmg_asset_name(version);
+    let zip = zip_asset_name(version);
+    let stable_dmg = stable_dmg_asset_name();
+    let stable_zip = stable_zip_asset_name();
+    let dmg_sha256 = sha256_sidecar_name(&dmg);
+    let zip_sha256 = sha256_sidecar_name(&zip);
+    let stable_dmg_sha256 = sha256_sidecar_name(&stable_dmg);
+    let stable_zip_sha256 = sha256_sidecar_name(&stable_zip);
     let mut names = vec![
         manifest_out::MANIFEST_ASSET.to_string(),
-        dmg_asset_name(version),
-        zip_asset_name(version),
-        stable_dmg_asset_name(),
-        stable_zip_asset_name(),
-        sha256_sidecar_name(&dmg_asset_name(version)),
-        sha256_sidecar_name(&zip_asset_name(version)),
-        sha256_sidecar_name(&stable_dmg_asset_name()),
-        sha256_sidecar_name(&stable_zip_asset_name()),
+        dmg,
+        zip,
+        stable_dmg,
+        stable_zip,
+        dmg_sha256,
+        zip_sha256,
+        stable_dmg_sha256,
+        stable_zip_sha256,
     ];
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());

@@ -113,7 +113,7 @@ fn an_external_capture_watch_reaps_and_joins_with_open_or_closed_stdout() {
         for closed in [false, true] {
             for panics in [false, true] {
                 let observed = Arc::new(CaptureLifecycleObservation::default());
-                let mut watch = || {
+                let mut watch = |_: &mut aterm_uds::spawnfd::Child| {
                     if panics {
                         std::panic::panic_any(PanicOnDrop);
                     }
@@ -145,8 +145,10 @@ fn an_external_capture_watch_reaps_and_joins_with_open_or_closed_stdout() {
         }
     }
     let ran =
-        capture_bounded_owned_watching(shell("printf kept; exit 7"), HANG_DETECTOR, 1024, || false)
-            .unwrap();
+        capture_bounded_owned_watching(shell("printf kept; exit 7"), HANG_DETECTOR, 1024, |_| {
+            false
+        })
+        .unwrap();
     assert_eq!(
         ran,
         Ended::Exited(Captured {
@@ -171,7 +173,7 @@ fn completed_output_and_observed_exit_win_over_a_terminal_capture_watch() {
                     exit.wait(remaining);
                 }
             }));
-            let mut failed = || true;
+            let mut failed = |_: &mut aterm_uds::spawnfd::Child| true;
             let ran = capture_with(
                 shell(&format!("printf kept; exit {code}")),
                 HANG_DETECTOR,

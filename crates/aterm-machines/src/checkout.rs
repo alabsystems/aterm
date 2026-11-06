@@ -25,12 +25,12 @@ pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
     "maintenance.auto=false",
 ];
 
-/// The installed git ([`crate::items::github::git_program`]: the Command Line Tools', or a
-/// selected Xcode's) as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
+/// The installed git for `user` ([`crate::items::github::git_program_for_user`]: their managed
+/// build, else native Git), in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
 /// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running) and no
 /// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git).
 pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
-    let mut command = Cmd::new(crate::items::github::git_program(sys))
+    let mut command = Cmd::new(crate::items::github::git_program_for_user(sys, user))
         .as_user(user)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
@@ -120,14 +120,32 @@ pub fn github_writer_origin(url: &str, owner: &str, name: &str, writer: &str) ->
         && github_origin(&format!("https://{host_path}"), owner, name)
 }
 
-/// The `<owner>/<name>` a github.com URL names, without `.git`.
+/// The `<owner>/<name>` a github.com URL names, without `.git`: the host read without regard
+/// to case, as DNS reads it, and a trailing `/` or a `.git` in any case dropped, as GitHub
+/// serves the same repository at each.
 fn github_path(url: &str) -> Option<&str> {
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("git@github.com:"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com:22/"))?;
-    Some(path.strip_suffix(".git").unwrap_or(path))
+    let url = url.trim().trim_end_matches('/');
+    let path = [
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "ssh://git@github.com:22/",
+    ]
+    .iter()
+    .find_map(|prefix| {
+        url.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &url[prefix.len()..])
+    })?;
+    Some(
+        path.len()
+            .checked_sub(".git".len())
+            .filter(|&at| {
+                path.get(at..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(".git"))
+            })
+            .map_or(path, |at| &path[..at]),
+    )
 }
 
 /// A remote a checkout's origin may name.
@@ -140,8 +158,8 @@ pub(crate) enum Remote {
         /// The repository.
         name: String,
     },
-    /// Exactly this URL or path (a tree whose `repository` is not on GitHub, a test's scratch
-    /// remote).
+    /// Exactly this URL or path, read without a trailing `/` (a tree whose `repository` is not
+    /// on GitHub, a test's scratch remote).
     Exact(String),
 }
 
@@ -163,7 +181,7 @@ impl Remote {
     fn admits(&self, url: &str) -> bool {
         match self {
             Self::Github { owner, name } => github_origin(url, owner, name),
-            Self::Exact(exact) => url == exact,
+            Self::Exact(exact) => url.trim().trim_end_matches('/') == exact,
         }
     }
 

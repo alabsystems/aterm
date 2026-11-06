@@ -136,6 +136,8 @@ fn a_step_is_there_exactly_when_one_is_due() {
         },
         Standing::Asking(JoinPlace::Home),
         Standing::Asking(JoinPlace::Away),
+        Standing::Seatless,
+        Standing::Dropped("dropped: no seat; …".into()),
         Standing::NotIn,
         Standing::Unknown("unreadable".into()),
     ];
@@ -145,6 +147,7 @@ fn a_step_is_there_exactly_when_one_is_due() {
         Vault::Pending,
         Vault::Plain,
         Vault::Revoked(None),
+        Vault::Dropped("dropped: no seat; …".into()),
         Vault::In {
             name: "alab".into(),
             entries: 3,
@@ -272,6 +275,83 @@ fn membership_names_a_person_only_where_only_a_person_lets_the_mac_in() {
         membership_area(&Standing::Member("m1".into()), &done).level,
         Level::Ok
     );
+}
+
+/// A Mac a rotation dropped (one-mesh E2) is due in both areas, which say `aterm secrets
+/// status`'s words, with one step: set the vault folder aside and join as a new Mac, never an
+/// admin's approve or a join with the same key, and never the setup's, whose Secrets step reads
+/// a dropped Mac blocked and plans no join.
+///
+/// CONTROL: a revoked vault keeps its approve step, and a Mac not in ALab its join.
+#[test]
+fn a_dropped_mac_is_told_to_come_back_as_a_new_mac() {
+    let words = "dropped: no seat; a rotation left this Mac out with no Remove (out as of seq 6)";
+    let joining = setup_with(vec![stage(SECRETS, "running", "")], false);
+    let done = setup_with(vec![stage(SECRETS, "applied", "")], true);
+    for setup in [&joining, &done] {
+        for area in [
+            vault_area(&Vault::Dropped(words.into()), setup),
+            membership_area(&Standing::Dropped(words.into()), setup),
+        ] {
+            assert_eq!(area.level, Level::Due, "{area:?}");
+            assert_eq!(area.says, words);
+            let next = area.next.expect("a step");
+            assert_eq!(next.who, Who::Agent);
+            assert!(
+                next.act.contains("aside") && next.act.contains("new Mac"),
+                "{}",
+                next.act
+            );
+            assert!(!next.act.contains("approve"), "{}", next.act);
+        }
+    }
+    let revoked = vault_area(&Vault::Revoked(None), &done);
+    assert!(revoked.next.expect("a step").act.contains("approve"));
+    assert_eq!(
+        who(&membership_area(&Standing::NotIn, &joining)),
+        Some(Who::Aterm)
+    );
+}
+
+/// `aterm status` reads a Mac its vault dropped (one-mesh E2) as `Vault::Dropped` in `aterm
+/// secrets status`'s words, one read through `client::dropped_words`.
+/// `client::test_read_dropped` stands in for the judgment, which aterm-secrets'
+/// `a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped` holds to a real
+/// rotation.
+///
+/// CONTROL: the same revoked Mac, not dropped, reads `Vault::Revoked`.
+#[test]
+fn read_vault_reads_a_dropped_mac_dropped_where_a_revoked_one_reads_revoked() {
+    use aterm_secrets::client::{self, Membership, Paths};
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = Paths::for_home(&scratch.path().join("home"));
+    let source = scratch.path().join("scratch.vault");
+    client::create(&paths, source.to_str().expect("utf-8"), None, Some("m1")).expect("vault");
+    let at = paths.dir.join("state.toml");
+    let mut state: aterm_toml::Table =
+        aterm_toml::from_str(&std::fs::read_to_string(&at).expect("state")).expect("toml");
+    state.insert(
+        "membership".into(),
+        aterm_toml::Value::String("revoked".into()),
+    );
+    aterm_secrets::fsx::write_atomic(
+        &at,
+        aterm_toml::to_string(&state).expect("toml").as_bytes(),
+        0o600,
+    )
+    .expect("state written");
+    let Ok(Membership::Revoked { seq }) = client::status(&paths).map(|status| status.membership)
+    else {
+        panic!("the Mac reads itself out");
+    };
+    assert!(
+        matches!(read_vault(&paths), Vault::Revoked(_)),
+        "the control"
+    );
+    let (vault, words) =
+        client::test_read_dropped(|| (read_vault(&paths), client::out_words(&paths, seq)));
+    assert!(words.starts_with("dropped"), "{words}");
+    assert_eq!(vault, Vault::Dropped(words));
 }
 
 /// The vault: a missing subscriber is an agent's `secrets agent on`, a person's Sync off is off,

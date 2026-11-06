@@ -112,13 +112,12 @@ pub(super) fn origin(
 }
 
 pub(super) fn destination(session: &Session<'_>, thread: &Thread) -> Result<Binding> {
-    let requester = session.peer(thread.requester)?;
     match thread.origin {
         Some(origin) => {
             session.peer_writer(thread.requester)?;
             session.peer_writer(origin)
         }
-        None => Ok(requester),
+        None => session.peer(thread.requester),
     }
 }
 

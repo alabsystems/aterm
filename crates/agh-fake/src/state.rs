@@ -100,22 +100,22 @@ impl Repo {
     }
 
     /// Resolves a branch or tag name (or the default branch) to its commit SHA.
-    pub(crate) fn resolve(&self, reference: &str) -> String {
+    pub(crate) fn resolve<'a>(&'a self, reference: &'a str) -> &'a str {
         if let Some(sha) = self.other_refs.get(reference) {
-            return sha.clone();
+            return sha;
         }
         if let Some(sha) = self.branches.get(reference) {
-            return sha.clone();
+            return sha;
         }
         if let Some((_, sha)) = self.tags.iter().find(|(n, _)| n == reference) {
-            return sha.clone();
+            return sha;
         }
         if reference == self.spec.default_branch
             && let Some(newest) = self.commits.last()
         {
-            return newest.sha.clone();
+            return &newest.sha;
         }
-        reference.to_string()
+        reference
     }
 
     /// Whether `reference` names something the repository holds.
@@ -184,17 +184,17 @@ impl Repo {
     }
 
     /// The OID a fully qualified `reference` points at.
-    pub(crate) fn ref_sha(&self, reference: &str) -> Option<String> {
+    pub(crate) fn ref_sha(&self, reference: &str) -> Option<&str> {
         if let Some(name) = reference.strip_prefix("refs/heads/") {
-            return self.branches.get(name).cloned();
+            return self.branches.get(name).map(String::as_str);
         }
         let Some(name) = reference.strip_prefix("refs/tags/") else {
-            return self.other_refs.get(reference).cloned();
+            return self.other_refs.get(reference).map(String::as_str);
         };
         self.tags
             .iter()
             .find(|(n, _)| n == name)
-            .map(|(_, s)| s.clone())
+            .map(|(_, s)| s.as_str())
     }
 
     /// Point a fully qualified `reference` at `sha`; callers validate its name.
@@ -259,10 +259,12 @@ pub(crate) fn is_sha(text: &str) -> bool {
 
 /// A public key as GitHub keeps it: its type and its base64, without the comment.
 pub(crate) fn key_kept(key: &str) -> String {
-    key.split_ascii_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut parts = key.split_ascii_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a} {b}"),
+        (Some(a), None) => a.to_owned(),
+        _ => String::new(),
+    }
 }
 
 /// An asset.

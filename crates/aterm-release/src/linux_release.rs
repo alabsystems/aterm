@@ -1325,7 +1325,7 @@ pub fn run_worker(
         build_number: build,
         short_version: version.into(),
         expected_update_pin_sha256: None,
-        one_slice_at_a_time: true,
+        sequencing: super::Sequencing::OneAtATime,
         index_hint: super::index_hint_now(),
     };
     super::build_one(&plan, &take, "aterm", None, None)?;

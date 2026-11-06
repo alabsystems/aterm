@@ -925,7 +925,7 @@ fn draft_removal(
         |audience, newest, gone| {
             let mints = match audience {
                 EpochAudience::Hosts(_) => {
-                    log_entries::rotates_host_list(&opened, audience, newest, gone)
+                    log_entries::rotates_host_list(&log, &opened, audience, newest, gone)
                 }
                 EpochAudience::Everyone | EpochAudience::Commons => {
                     log_entries::opens_newest(&opened, audience)
@@ -1084,16 +1084,11 @@ const fn fill_mutants() -> (bool, bool) {
     (false, false)
 }
 
-/// Whether a log that holds `held` of `limit` (records or bytes) takes `cost` more and still keeps
-/// `need` free: `held + cost + need <= limit`, without overflow at any size. The room check of a
-/// removal's fill ([`RemovalFill::passes`]), a heal (`log_entries`' `heal_room`) and the tender's
-/// re-keys no removal made due ([`within_automatic_stop`], and its 8,500 stop with no `need`);
-/// one-mesh proofs P6's `keeps_room`. `Log::insert`'s hard bound and a proof admission's line keep
-/// their own checks.
-#[must_use]
-pub(super) const fn keeps_room(held: u64, cost: u64, need: u64, limit: u64) -> bool {
-    held <= limit && cost <= limit - held && need <= limit - held - cost
-}
+/// The room check of a removal's fill ([`RemovalFill::passes`]), a heal (`log_entries`'
+/// `heal_room`) and the tender's re-keys no removal made due ([`within_automatic_stop`], and its
+/// 8,500 stop with no `need`): one-mesh proofs P6's kernel, whose island proves the rule that asks
+/// it never wedges. `Log::insert`'s hard bound and a proof admission's line keep their own checks.
+pub(super) use aterm_mesh_core::capacity::keeps_room;
 
 /// `count` as a [`keeps_room`] operand.
 #[must_use]
@@ -2231,10 +2226,14 @@ fn within_automatic_stop(
     active: &BTreeSet<Recipient>,
     ready: Vec<EpochAudience>,
 ) -> Vec<EpochAudience> {
+    // The stop judges a re-key only where no held `Remove` made it due (one-mesh proofs P6's
+    // kernel), and every one under the `STOP_HOLDS_REMOVALS` mutant.
+    let judged =
+        |rotation: bool| stop_holds_removals() || aterm_mesh_core::capacity::stop_judges(rotation);
     let made_by_removal: BTreeSet<EpochAudience> = log
         .rekey_dues()
         .into_iter()
-        .filter(|due| due.rotation && !stop_holds_removals())
+        .filter(|due| !judged(due.rotation))
         .map(|due| due.audience)
         .collect();
     let removed = log.removed_recipients();

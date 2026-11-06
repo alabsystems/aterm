@@ -12731,7 +12731,12 @@ mod encode_worker_tests {
         assert!(raster.presented);
         assert!(app.retained_native_leaf_artifact(wid, view, true).is_some());
         #[cfg(a11y_tree)]
-        assert!(app.windows[&wid].native_a11y_staged.is_some());
+        {
+            // The present published its tree; a later preparation stages the next one.
+            assert!(app.windows[&wid].native_a11y_published.is_some());
+            assert!(app.prepare_native_input_scratch(wid));
+            assert!(app.windows[&wid].native_a11y_staged.is_some());
+        }
 
         // A successful present may invalidate its next compile after a load
         // policy transition, before capture reads that present's metadata.
@@ -12756,7 +12761,7 @@ mod encode_worker_tests {
             assert!(app.windows[&wid].native_a11y_staged.is_none());
             assert!(matches!(
                 app.take_native_accessibility_update_from_plan(wid, &plan),
-                Some(Err(_))
+                Some(Ok(_))
             ));
         }
         let after = app

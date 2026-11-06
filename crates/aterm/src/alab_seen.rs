@@ -90,6 +90,23 @@ fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
 /// What the journal says, as the harness reads it: each account `seen` knows, its Macs named
 /// through `view`.
 pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen {
+    let mut history_by_pk: std::collections::BTreeMap<&str, Vec<&seen::Logged>> =
+        std::collections::BTreeMap::new();
+    for logged in seen.events.iter().rev() {
+        let a1 = logged.event.account.as_ref().map(|a| a.as_str());
+        let a2 = logged
+            .event
+            .to
+            .as_ref()
+            .map(|a| a.as_str())
+            .filter(|&to| Some(to) != a1);
+        for acct in a1.into_iter().chain(a2) {
+            let bucket = history_by_pk.entry(acct).or_default();
+            if bucket.len() < HISTORY_MAX {
+                bucket.push(logged);
+            }
+        }
+    }
     let mut accounts = std::collections::BTreeMap::new();
     for pk in seen.accounts() {
         let last_use = seen.last_use.get(&pk).map(|(uuid, t)| LastUse {
@@ -143,13 +160,11 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                 }
             })
             .collect();
-        let mut history: Vec<Line> = seen
-            .events
-            .iter()
-            .filter(|logged| {
-                logged.event.account.is_some_and(|a| a.as_str() == pk)
-                    || logged.event.to.is_some_and(|a| a.as_str() == pk)
-            })
+        let history: Vec<Line> = history_by_pk
+            .remove(pk.as_str())
+            .into_iter()
+            .flatten()
+            .rev()
             .map(|logged| Line {
                 t: secs(logged.event.t),
                 by: mac(view, &logged.uuid),
@@ -159,8 +174,6 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                 heard: logged.heard,
             })
             .collect();
-        let extra = history.len().saturating_sub(HISTORY_MAX);
-        history.drain(..extra);
         accounts.insert(
             pk,
             AccountSeen {

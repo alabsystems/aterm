@@ -1,0 +1,1343 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The candidate line on real git: a bare origin whose main moved past the line's base, a rival
+//! clone that pushes, and the release's work clone (`crate::line`).
+
+use crate::ledger::{self, GitRunner, RunOut};
+use crate::line::{self, Admitted, Fix, Hop, Line, Merged, Reason, Recorded, Stop};
+
+use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::fmt::Debug;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::push_hook::HookRunner;
+use ledger::testing::Git;
+
+const VERSION: &str = "0.26.0";
+
+/// The commits the template's history holds, oldest first.
+#[derive(Clone)]
+struct Shas {
+    /// `seed`, the root: it declares v0.26.0.
+    seed: String,
+    /// The line's base, `feat: the base`.
+    g: String,
+    /// `fix: a1`, on a branch from G, landed by `merge`.
+    fix_a: String,
+    /// `feat: main moves c3`, on main while the branch was out.
+    n1: String,
+    /// `Merge remote-tracking branch 'origin/main' into fix-a` (parents `fix_a`, `n1`), pushed
+    /// fast-forward: how landings look on aterm's main.
+    merge: String,
+    /// `fix: c1`, which edits a line that main changed after G: it conflicts with G.
+    fix_c: String,
+    /// `fix: b2`, a clean fix that descends from `fix_a`.
+    fix_b: String,
+    /// `fix: d`, which `d_revert` takes back.
+    d_fix: String,
+    /// `revert: fix: d`: its tree lacks `d_fix`'s change, and its history holds `d_fix`.
+    d_revert: String,
+    /// `refactor: src/c.rs is src/c2.rs`, a pure rename of a file main changed after G.
+    rename: String,
+    /// `fix: b5 and the toolchain pin`, moving `rust-toolchain.toml`.
+    frozen: String,
+    /// `release: a claim`, appending to `RELEASES.ledger`.
+    ledger: String,
+    /// `bump: v0.27.0`.
+    bump: String,
+    /// main's tip.
+    tip: String,
+    /// `fix: a3`, on origin's `side` branch only.
+    off: String,
+}
+
+struct Fixture {
+    _root: aterm_tempfile::TempDir,
+    origin: PathBuf,
+    rival: PathBuf,
+    work: PathBuf,
+    shas: Shas,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Fixture {
+        static BUILT: crate::template::Template<Shas> = crate::template::Template::new();
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-release-line-{name}-"))
+            .tempdir()
+            .unwrap();
+        let root = dir.path().to_path_buf();
+        let shas = BUILT.lay(&root, build);
+        Fixture {
+            origin: root.join("origin.git"),
+            rival: root.join("rival"),
+            work: root.join("work"),
+            _root: dir,
+            shas,
+        }
+    }
+
+    fn git(&self) -> Git {
+        Git::new(&self.work)
+    }
+
+    fn origin_main(&self) -> String {
+        rev(&self.origin, "main")
+    }
+
+    /// The rival lands one commit on main: `src/a.rs` gains `line`.
+    fn rival_moves_main(&self, line: &str) -> String {
+        run(&self.rival, &["fetch", "-q", "origin", "main"]);
+        run(&self.rival, &["reset", "-q", "--hard", "origin/main"]);
+        let path = self.rival.join("src/a.rs");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(line);
+        text.push('\n');
+        fs::write(&path, text).unwrap();
+        run(
+            &self.rival,
+            &["commit", "-q", "-am", &format!("rival: {line}")],
+        );
+        run(&self.rival, &["push", "-q", "origin", "main"]);
+        rev(&self.rival, "HEAD")
+    }
+}
+
+const A: &str = "fn a1() {}\nfn a2() {}\nfn a3() {}\nfn a4() {}\nfn a5() {}\n";
+const B: &str = "fn b1() {}\nfn b2() {}\nfn b3() {}\nfn b4() {}\nfn b5() {}\n";
+const C: &str = "fn c1() {}\nfn c2() {}\nfn c3() {}\n";
+
+fn build(root: &Path) -> Shas {
+    let origin = root.join("origin.git");
+    run(root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+    ledger::testing::config(&origin, &[]);
+    run(root, &["clone", "-q", origin.to_str().unwrap(), "rival"]);
+    let rival = root.join("rival");
+    identity(&rival);
+    run(&rival, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let seed = commit(
+        &rival,
+        "seed",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.26.0\"\n",
+            ),
+            ("RELEASES.ledger", "1783354739 0.25.0\n"),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"trust\"\n"),
+            ("src/a.rs", A),
+            ("src/b.rs", B),
+            ("src/c.rs", C),
+        ],
+    );
+    let g = commit(&rival, "feat: the base", &[("src/d.rs", "fn d() {}\n")]);
+    run(&rival, &["push", "-q", "-u", "origin", "main"]);
+
+    run(&rival, &["checkout", "-q", "-b", "fix-a", &g]);
+    let fix_a = commit(
+        &rival,
+        "fix: a1",
+        &[("src/a.rs", &A.replace("a1() {}", "a1() { fixed }"))],
+    );
+    run(&rival, &["checkout", "-q", "main"]);
+    let n1 = commit(
+        &rival,
+        "feat: main moves c3",
+        &[("src/c.rs", &C.replace("c3() {}", "c3() { main }"))],
+    );
+    run(&rival, &["push", "-q", "origin", "main"]);
+    run(&rival, &["checkout", "-q", "fix-a"]);
+    run(
+        &rival,
+        &["merge", "-q", "--no-ff", "--no-edit", "origin/main"],
+    );
+    let merge = rev(&rival, "HEAD");
+    run(&rival, &["push", "-q", "origin", "fix-a:main"]);
+    run(&rival, &["checkout", "-q", "-B", "main", &merge]);
+
+    let c_main = fs::read_to_string(rival.join("src/c.rs"))
+        .unwrap()
+        .replace("c1() {}", "c1() { main }");
+    commit(&rival, "feat: main moves c1", &[("src/c.rs", &c_main)]);
+    let fix_c = commit(
+        &rival,
+        "fix: c1",
+        &[(
+            "src/c.rs",
+            &c_main.replace("c1() { main }", "c1() { fixed }"),
+        )],
+    );
+    let fix_b = commit(
+        &rival,
+        "fix: b2",
+        &[("src/b.rs", &B.replace("b2() {}", "b2() { fixed }"))],
+    );
+    let d_fix = commit(&rival, "fix: d", &[("src/d.rs", "fn d() { fixed }\n")]);
+    let d_revert = commit(&rival, "revert: fix: d", &[("src/d.rs", "fn d() {}\n")]);
+    run(&rival, &["mv", "src/c.rs", "src/c2.rs"]);
+    let rename = commit(&rival, "refactor: src/c.rs is src/c2.rs", &[]);
+    let b_fixed = fs::read_to_string(rival.join("src/b.rs")).unwrap();
+    let frozen = commit(
+        &rival,
+        "fix: b5 and the toolchain pin",
+        &[
+            ("src/b.rs", &b_fixed.replace("b5() {}", "b5() { fixed }")),
+            (
+                "rust-toolchain.toml",
+                "[toolchain]\nchannel = \"trust-next\"\n",
+            ),
+        ],
+    );
+    let ledger = commit(
+        &rival,
+        "release: a claim",
+        &[("RELEASES.ledger", "1783354739 0.25.0\n1790000000 0.26.0\n")],
+    );
+    let bump = commit(
+        &rival,
+        "bump: v0.27.0",
+        &[(
+            "Cargo.toml",
+            "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"0.27.0\"\n",
+        )],
+    );
+    run(&rival, &["push", "-q", "origin", "main"]);
+    let tip = bump.clone();
+
+    run(&rival, &["checkout", "-q", "-b", "side", &fix_b]);
+    let a_side = fs::read_to_string(rival.join("src/a.rs"))
+        .unwrap()
+        .replace("a3() {}", "a3() { off main }");
+    let off = commit(&rival, "fix: a3", &[("src/a.rs", &a_side)]);
+    run(&rival, &["push", "-q", "origin", "side"]);
+    run(&rival, &["checkout", "-q", "main"]);
+
+    run(root, &["clone", "-q", origin.to_str().unwrap(), "work"]);
+    identity(&root.join("work"));
+    Shas {
+        seed,
+        g,
+        fix_a,
+        n1,
+        merge,
+        fix_c,
+        fix_b,
+        d_fix,
+        d_revert,
+        rename,
+        frozen,
+        ledger,
+        bump,
+        tip,
+        off,
+    }
+}
+
+fn identity(repo: &Path) {
+    ledger::testing::config(
+        repo,
+        &[
+            ("user.email", "ship-test@aterm.invalid"),
+            ("user.name", "aterm ship test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+        ],
+    );
+}
+
+/// Write each file, then commit them all: the new commit's sha.
+fn commit(repo: &Path, message: &str, files: &[(&str, &str)]) -> String {
+    for (path, text) in files {
+        let path = repo.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    run(repo, &["add", "-A"]);
+    run(repo, &["commit", "-q", "-m", message]);
+    rev(repo, "HEAD")
+}
+
+fn run(cwd: &Path, args: &[&str]) -> String {
+    run_env::<&str>(cwd, args, &[])
+}
+
+fn run_env<V: AsRef<OsStr>>(cwd: &Path, args: &[&str], env: &[(&str, V)]) -> String {
+    let mut git = ledger::testing::git();
+    for (key, value) in env {
+        git.env(key, value);
+    }
+    let out = git
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed:\n{}",
+        cwd.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn rev(repo: &Path, name: &str) -> String {
+    run(repo, &["rev-parse", name]).trim().to_string()
+}
+
+fn parents(repo: &Path, commit: &str) -> Vec<String> {
+    run(repo, &["rev-list", "--parents", "-n", "1", commit])
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+    ledger::testing::git()
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..12]
+}
+
+/// `fix`'s patch, as `git diff` writes it, applied by `git apply` to `base`'s tree in an index of
+/// its own: the tree a hop of `fix` onto `base` must have, computed without `merge-tree`.
+fn applied(fix: &Fixture, base: &str, commit: &str) -> String {
+    let index = fix.work.join(".git/oracle-index");
+    let patch = fix.work.join(".git/oracle.patch");
+    let diff = run(
+        &fix.work,
+        &[
+            "diff",
+            "--binary",
+            "--no-renames",
+            &format!("{commit}^"),
+            commit,
+        ],
+    );
+    fs::write(&patch, diff).unwrap();
+    let env = [("GIT_INDEX_FILE", index.as_path())];
+    run_env(&fix.work, &["read-tree", base], &env);
+    run_env(
+        &fix.work,
+        &["apply", "--cached", patch.to_str().unwrap()],
+        &env,
+    );
+    let tree = run_env(&fix.work, &["write-tree"], &env).trim().to_string();
+    fs::remove_file(&index).unwrap();
+    tree
+}
+
+/// `base`'s tree plus `path`, committed with `parent`: a hop nobody carried.
+fn tampered(fix: &Fixture, base: &str, parent: &str, path: &str) -> String {
+    let index = fix.work.join(".git/tamper-index");
+    let env = [("GIT_INDEX_FILE", index.as_path())];
+    run_env(&fix.work, &["read-tree", base], &env);
+    let blob_file = fix.work.join(".git/tamper-blob");
+    fs::write(&blob_file, "planted\n").unwrap();
+    let blob = run(
+        &fix.work,
+        &["hash-object", "-w", blob_file.to_str().unwrap()],
+    );
+    let info = format!("100644,{},{path}", blob.trim());
+    run_env(
+        &fix.work,
+        &["update-index", "--add", "--cacheinfo", &info],
+        &env,
+    );
+    let tree = run_env(&fix.work, &["write-tree"], &env).trim().to_string();
+    fs::remove_file(&index).unwrap();
+    run(
+        &fix.work,
+        &["commit-tree", &tree, "-p", parent, "-m", "tampered"],
+    )
+    .trim()
+    .to_string()
+}
+
+/// A hop of `carries` onto `parent` with the tree [`line::hop_tree`] gives it, made by hand.
+fn hand_hop(fix: &Fixture, parent: &str, carries: &str) -> Hop {
+    let Merged::Tree(tree) = line::hop_tree(&fix.git(), parent, carries).unwrap() else {
+        panic!("{carries} conflicts onto {parent}");
+    };
+    let commit = run(
+        &fix.work,
+        &["commit-tree", &tree, "-p", parent, "-m", "by hand"],
+    )
+    .trim()
+    .to_string();
+    let paths = run(
+        &fix.work,
+        &[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "--no-renames",
+            parent,
+            &commit,
+        ],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect();
+    Hop {
+        commit,
+        carries: carries.to_string(),
+        why: "by hand".to_string(),
+        paths,
+    }
+}
+
+fn fix_of(git: &dyn GitRunner, l: &Line, rev: &str) -> Fix {
+    match line::admit(git, l, rev) {
+        Ok(Admitted::Fix(fix)) => fix,
+        other => panic!("{rev} is not admitted as a fix: {other:?}"),
+    }
+}
+
+/// The stop `result` ended in, which must have `reason`.
+fn stopped<T: Debug>(result: Result<T, Stop>, reason: Reason) -> Stop {
+    match result {
+        Err(stop) => {
+            assert_eq!(stop.reason, reason, "{stop:?}");
+            assert_eq!(stop.could_not_run(), reason.could_not_run(), "{stop:?}");
+            stop
+        }
+        Ok(done) => panic!("wanted {reason:?}, and it did: {done:?}"),
+    }
+}
+
+/// A commit of G's tree on G under a pinned author and committer at `time`: a sibling of every
+/// other one, whose sha the message and the time alone decide.
+fn sibling(fix: &Fixture, message: &str, time: u64) -> Fix {
+    let date = format!("{time} +0000");
+    let env = [
+        ("GIT_AUTHOR_NAME", "aterm ship test"),
+        ("GIT_AUTHOR_EMAIL", "ship-test@aterm.invalid"),
+        ("GIT_AUTHOR_DATE", date.as_str()),
+        ("GIT_COMMITTER_NAME", "aterm ship test"),
+        ("GIT_COMMITTER_EMAIL", "ship-test@aterm.invalid"),
+        ("GIT_COMMITTER_DATE", date.as_str()),
+    ];
+    let g = &fix.shas.g;
+    let commit = run_env(
+        &fix.work,
+        &[
+            "commit-tree",
+            &format!("{g}^{{tree}}"),
+            "-p",
+            g,
+            "-m",
+            message,
+        ],
+        &env,
+    )
+    .trim()
+    .to_string();
+    Fix {
+        commit,
+        subject: message.to_string(),
+        paths: Vec::new(),
+    }
+}
+
+/// The record push says it landed, and pushes nothing.
+struct NoPush(Git);
+
+impl GitRunner for NoPush {
+    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+        if args.first() == Some(&"push") {
+            return Ok(RunOut {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+        self.0.git(args)
+    }
+
+    fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+        self.0.git_input(args, input)
+    }
+
+    fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> ledger::Result<RunOut> {
+        self.0.git_env(args, env)
+    }
+}
+
+#[test]
+fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
+    let fix = Fixture::new("clean");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 1_790_000_000);
+    let admitted = fix_of(&git, &start, &s.fix_b);
+    assert_eq!(
+        admitted,
+        Fix {
+            commit: s.fix_b.clone(),
+            subject: "fix: b2".to_string(),
+            paths: vec!["src/b.rs".to_string()],
+        }
+    );
+    let hops = line::carry(&git, &start, &[admitted]).unwrap();
+    let [hop] = hops.as_slice() else {
+        panic!("one fix makes one hop: {hops:?}");
+    };
+    assert_eq!(parents(&fix.work, &hop.commit), [s.g.as_str()]);
+    assert_eq!(
+        rev(&fix.work, &format!("{}^{{tree}}", hop.commit)),
+        applied(&fix, &s.g, &s.fix_b),
+        "the hop is G with fix: b2's patch, and none of main's movement since G"
+    );
+    assert_eq!(
+        (hop.carries.as_str(), hop.why.as_str(), hop.paths.as_slice()),
+        (
+            s.fix_b.as_str(),
+            "fix: b2",
+            ["src/b.rs".to_string()].as_slice()
+        )
+    );
+    assert_eq!(
+        run(&fix.work, &["log", "-1", "--format=%s", &hop.commit]).trim(),
+        format!("release line v0.26.0 hop 1: carries {} (fix: b2)", s.fix_b)
+    );
+    let who = "--format=%an <%ae> %ad %cn <%ce> %cd";
+    assert_eq!(
+        run(&fix.work, &["log", "-1", who, &hop.commit]),
+        run(&fix.work, &["log", "-1", who, &s.fix_b]),
+        "the hop keeps the fix's author and committer"
+    );
+
+    let mut carried = start.clone();
+    carried.hops = hops.clone();
+    assert_eq!(carried.head(), hop.commit);
+    let unrecorded = stopped(line::verify(&git, &carried), Reason::Unrecorded);
+    assert!(
+        unrecorded.remedy.contains("--forget"),
+        "a journaled head origin/main lacks lost its record, and no re-run records it: \
+         {unrecorded:?}"
+    );
+    let recorded = line::record(&git, VERSION, carried.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let Recorded::Pushed { merge, attempt: 1 } = recorded else {
+        panic!("a quiet main takes the record merge on the first push: {recorded:?}");
+    };
+    assert_eq!(fix.origin_main(), merge);
+    assert_eq!(
+        parents(&fix.origin, &merge),
+        [s.tip.clone(), hop.commit.clone()]
+    );
+    assert_eq!(
+        rev(&fix.origin, &format!("{merge}^{{tree}}")),
+        rev(&fix.origin, &format!("{}^{{tree}}", s.tip)),
+        "the record merge leaves main's tree as it was"
+    );
+    let summary = line::verify(&git, &carried).unwrap();
+    assert!(summary.contains("1 hop(s)"), "{summary}");
+    assert!(summary.contains(short(&s.fix_b)), "{summary}");
+}
+
+#[test]
+fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
+    let fix = Fixture::new("conflict");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let fix_c = fix_of(&git, &start, &s.fix_c);
+    let stop = stopped(
+        line::carry(&git, &start, std::slice::from_ref(&fix_c)),
+        Reason::Conflict,
+    );
+    assert!(stop.why.contains("src/c.rs"), "{stop:?}");
+    assert_eq!(
+        stop.remedy,
+        format!(
+            "author it on {} and land it, then `{} --fix <that commit>`",
+            short(&s.g),
+            ledger::RELEASE_COMMAND
+        )
+    );
+    let after_b = stopped(
+        line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b), fix_c]),
+        Reason::Conflict,
+    );
+    assert!(
+        after_b
+            .remedy
+            .contains(&format!("--fix {}`", short(&s.fix_b))),
+        "a fix authored on the line's head lacks fix: b2, carried first in this run: {after_b:?}"
+    );
+    assert_eq!(fix.origin_main(), s.tip, "a refused carry pushes nothing");
+}
+
+#[test]
+fn a_fix_whose_change_the_head_has_carries_nothing_and_is_refused() {
+    let fix = Fixture::new("empty");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let fix_a = fix_of(&git, &start, &s.fix_a);
+    let hops = line::carry(&git, &start, std::slice::from_ref(&fix_a)).unwrap();
+    let has_it = Line::start(VERSION, &hops[0].commit, 0);
+    stopped(line::carry(&git, &has_it, &[fix_a]), Reason::Empty);
+}
+
+#[test]
+fn carry_refuses_a_hand_built_fix_that_moves_a_frozen_path_or_the_version() {
+    let fix = Fixture::new("carry-guard");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let by_hand = |commit: &str| Fix {
+        commit: commit.to_string(),
+        subject: "by hand".to_string(),
+        paths: Vec::new(),
+    };
+    for (commit, reason) in [
+        (s.frozen.as_str(), Reason::Frozen),
+        (s.bump.as_str(), Reason::Version),
+        (short(&s.fix_b), Reason::Spelling),
+    ] {
+        stopped(line::carry(&git, &start, &[by_hand(commit)]), reason);
+    }
+}
+
+#[test]
+fn a_merge_is_refused_listing_each_sides_commits() {
+    let fix = Fixture::new("merge");
+    let (git, s) = (fix.git(), &fix.shas);
+    let stop = stopped(
+        line::admit(&git, &Line::start(VERSION, &s.g, 0), &s.merge),
+        Reason::Merge,
+    );
+    let at = |line: &str| {
+        stop.detail
+            .iter()
+            .position(|d| d.contains(line))
+            .unwrap_or_else(|| panic!("no {line:?} in {:#?}", stop.detail))
+    };
+    let side_1 = at(&format!("its parent 1 ({})", short(&s.fix_a)));
+    let main_moved = at(&format!("  {} feat: main moves c3", s.n1));
+    let side_2 = at(&format!("its parent 2 ({})", short(&s.n1)));
+    let own = at(&format!("  {} fix: a1", s.fix_a));
+    assert!(
+        side_1 < main_moved && main_moved < side_2 && side_2 < own,
+        "each side lists the commits that parent lacks: {:#?}",
+        stop.detail
+    );
+}
+
+#[test]
+fn a_commit_off_main_a_root_or_no_commit_is_refused() {
+    let fix = Fixture::new("off-main");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    stopped(line::admit(&git, &start, &s.off), Reason::OffMain);
+    stopped(line::admit(&git, &start, &s.seed), Reason::Root);
+    for rev in ["no-such-branch", "-p", ""] {
+        stopped(line::admit(&git, &start, rev), Reason::NoCommit);
+    }
+}
+
+#[test]
+fn a_frozen_path_or_a_version_bump_is_refused() {
+    let fix = Fixture::new("frozen");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    for (commit, reason) in [
+        (&s.frozen, Reason::Frozen),
+        (&s.ledger, Reason::Frozen),
+        (&s.bump, Reason::Version),
+    ] {
+        stopped(line::admit(&git, &start, commit), reason);
+    }
+}
+
+#[test]
+fn a_carried_fix_resumes_and_one_the_line_holds_is_refused() {
+    let fix = Fixture::new("carried");
+    let (git, s) = (fix.git(), &fix.shas);
+    let mut l = Line::start(VERSION, &s.g, 0);
+    assert!(!l.carried(&s.fix_b));
+    l.hops = line::carry(&git, &l, &[fix_of(&git, &l, &s.fix_b)]).unwrap();
+    assert!(l.carried(&s.fix_b));
+    assert_eq!(line::admit(&git, &l, &s.fix_b).unwrap(), Admitted::Carried);
+    stopped(line::admit(&git, &l, &s.g), Reason::Held);
+    line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    stopped(line::admit(&git, &l, l.head()), Reason::Held);
+    stopped(
+        line::admit(&git, &Line::start(VERSION, &s.d_revert, 0), &s.d_fix),
+        Reason::Held,
+    );
+}
+
+#[test]
+fn fixes_carry_in_ancestry_order_whatever_order_they_are_named_in() {
+    let fix = Fixture::new("order");
+    let (git, s) = (fix.git(), &fix.shas);
+    let mut l = Line::start(VERSION, &s.g, 0);
+    let (a, b) = (fix_of(&git, &l, &s.fix_a), fix_of(&git, &l, &s.fix_b));
+    let commits = |fixes: Vec<Fix>| -> Vec<String> {
+        line::order(&git, fixes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.commit)
+            .collect()
+    };
+    let ancestry = vec![s.fix_a.clone(), s.fix_b.clone()];
+    assert_eq!(commits(vec![b.clone(), a.clone()]), ancestry);
+    assert_eq!(commits(vec![a.clone(), b.clone()]), ancestry);
+    assert_eq!(commits(vec![b.clone(), a.clone(), b.clone()]), ancestry);
+
+    let hops = line::carry(&git, &l, &line::order(&git, vec![b, a]).unwrap()).unwrap();
+    assert_eq!(
+        hops.iter().map(|h| h.carries.as_str()).collect::<Vec<_>>(),
+        [s.fix_a.as_str(), s.fix_b.as_str()]
+    );
+    assert_eq!(parents(&fix.work, &hops[0].commit), [s.g.as_str()]);
+    assert_eq!(
+        parents(&fix.work, &hops[1].commit),
+        [hops[0].commit.as_str()]
+    );
+    assert_eq!(
+        run(&fix.work, &["log", "-1", "--format=%s", &hops[1].commit]).trim(),
+        format!("release line v0.26.0 hop 2: carries {} (fix: b2)", s.fix_b)
+    );
+    l.hops = hops;
+    line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let summary = line::verify(&git, &l).unwrap();
+    assert!(summary.contains("2 hop(s)"), "{summary}");
+}
+
+#[test]
+fn unrelated_fixes_go_by_committer_time_then_sha_whatever_order_they_are_named_in() {
+    let fix = Fixture::new("order-ties");
+    let git = fix.git();
+    let t = 1_790_000_000;
+    let (older, newer) = (0..)
+        .map(|i| {
+            (
+                sibling(&fix, &format!("older {i}"), t),
+                sibling(&fix, &format!("newer {i}"), t + 1),
+            )
+        })
+        .find(|(older, newer)| older.commit > newer.commit)
+        .unwrap();
+    let (a, b) = (
+        sibling(&fix, "same a", t + 2),
+        sibling(&fix, "same b", t + 2),
+    );
+    let (low, high) = if a.commit < b.commit { (a, b) } else { (b, a) };
+    let commits = |fixes: Vec<Fix>| -> Vec<String> {
+        line::order(&git, fixes)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.commit)
+            .collect()
+    };
+    for named in [
+        vec![newer.clone(), older.clone()],
+        vec![older.clone(), newer.clone()],
+    ] {
+        assert_eq!(
+            commits(named),
+            [older.commit.clone(), newer.commit.clone()],
+            "the older commit first, though its sha is the higher"
+        );
+    }
+    for named in [
+        vec![high.clone(), low.clone()],
+        vec![low.clone(), high.clone()],
+    ] {
+        assert_eq!(
+            commits(named),
+            [low.commit.clone(), high.commit.clone()],
+            "at one time, the lower sha first"
+        );
+    }
+}
+
+#[test]
+fn a_hops_tree_is_the_commits_alone_whatever_this_clone_holds() {
+    let fix = Fixture::new("steered");
+    let (git, s) = (fix.git(), &fix.shas);
+    let conflict = Merged::Conflict(vec!["src/c.rs".to_string()]);
+    assert_eq!(line::hop_tree(&git, &s.g, &s.fix_c).unwrap(), conflict);
+
+    // The checkout's .gitattributes and an attributes file of this clone's config each make
+    // src/c.rs a union merge, which would take both sides of the conflict.
+    let union = "src/c.rs merge=union\n";
+    fs::write(fix.work.join(".gitattributes"), union).unwrap();
+    let attributes = fix.work.join(".git/aterm-attributes");
+    fs::write(&attributes, union).unwrap();
+    run(
+        &fix.work,
+        &[
+            "config",
+            "core.attributesFile",
+            attributes.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        line::hop_tree(&git, &s.g, &s.fix_c).unwrap(),
+        conflict,
+        "neither the checkout nor a global attributes file steers the merge"
+    );
+
+    // The clone's info/attributes and merge.default, which no flag reaches, stop it.
+    let info = fix.work.join(".git/info/attributes");
+    fs::create_dir_all(info.parent().unwrap()).unwrap();
+    fs::write(&info, "src/a.rs merge=union\n").unwrap();
+    assert_eq!(
+        line::hop_tree(&git, &s.g, &s.fix_c).unwrap(),
+        conflict,
+        "an attribute on a path the fix does not move picks no driver it meets"
+    );
+    fs::write(&info, union).unwrap();
+    stopped(line::hop_tree(&git, &s.g, &s.fix_c), Reason::Steered);
+    stopped(
+        line::carry(
+            &git,
+            &Line::start(VERSION, &s.g, 0),
+            &[fix_of(&git, &Line::start(VERSION, &s.g, 0), &s.fix_c)],
+        ),
+        Reason::Steered,
+    );
+    fs::remove_file(&info).unwrap();
+    run(&fix.work, &["config", "merge.default", "union"]);
+    stopped(line::hop_tree(&git, &s.g, &s.fix_c), Reason::Steered);
+    run(&fix.work, &["config", "--unset", "merge.default"]);
+    assert_eq!(line::hop_tree(&git, &s.g, &s.fix_c).unwrap(), conflict);
+}
+
+#[test]
+fn a_rename_carries_as_a_deletion_and_an_addition() {
+    let fix = Fixture::new("rename");
+    let (git, s) = (fix.git(), &fix.shas);
+    assert_eq!(
+        line::hop_tree(&git, &s.g, &s.rename).unwrap(),
+        Merged::Conflict(vec!["src/c.rs".to_string()]),
+        "G changed src/c.rs's lines after it was renamed on main: a modify/delete conflict, \
+         never a merge into src/c2.rs that rename detection would make"
+    );
+}
+
+#[test]
+fn the_record_merge_rebuilds_on_a_rival_push_and_keeps_mains_tree() {
+    let fix = Fixture::new("record-race");
+    let s = fix.shas.clone();
+    let mut l = Line::start(VERSION, &s.g, 0);
+    l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
+    let rival_tip = RefCell::new(String::new());
+    let git = HookRunner::new(&fix.work, |n: u32| {
+        if n == 1 {
+            *rival_tip.borrow_mut() = fix.rival_moves_main("fn a6() {}");
+        }
+    });
+    let recorded = line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let Recorded::Pushed { merge, attempt: 2 } = recorded else {
+        panic!("the first push lost to the rival, the rebuild landed: {recorded:?}");
+    };
+    let rival_tip = rival_tip.borrow().clone();
+    assert_eq!(fix.origin_main(), merge);
+    assert_eq!(
+        parents(&fix.origin, &merge),
+        [rival_tip.clone(), l.head().to_string()]
+    );
+    assert_eq!(
+        rev(&fix.origin, &format!("{merge}^{{tree}}")),
+        rev(&fix.origin, &format!("{rival_tip}^{{tree}}")),
+        "the rebuilt record merge keeps the rival's main, byte for byte"
+    );
+    assert!(is_ancestor(&fix.origin, l.head(), "main"));
+    assert_eq!(
+        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap(),
+        Recorded::Already { tip: merge },
+        "a re-run finds the head on main and pushes nothing"
+    );
+    assert_eq!(git.pushes.get(), 2);
+}
+
+#[test]
+fn the_record_stops_could_not_run_when_every_push_loses() {
+    let fix = Fixture::new("record-cap");
+    let s = fix.shas.clone();
+    let mut l = Line::start(VERSION, &s.g, 0);
+    l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
+    let git = HookRunner::new(&fix.work, |n: u32| {
+        fix.rival_moves_main(&format!("fn rival{n}() {{}}"));
+    });
+    stopped(line::record(&git, VERSION, l.head(), 3), Reason::Raced);
+    assert_eq!(git.pushes.get(), 3);
+    assert!(!is_ancestor(&fix.origin, l.head(), "main"));
+}
+
+#[test]
+fn an_unreachable_origin_or_a_push_that_lands_nothing_could_not_run() {
+    let fix = Fixture::new("offline");
+    let s = &fix.shas;
+    let mut l = Line::start(VERSION, &s.g, 0);
+    l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
+    stopped(
+        line::record(
+            &NoPush(fix.git()),
+            VERSION,
+            l.head(),
+            line::MAX_RECORD_ATTEMPTS,
+        ),
+        Reason::Unlanded,
+    );
+    let gone = fix.work.join("no-such-origin.git");
+    run(
+        &fix.work,
+        &["remote", "set-url", "origin", gone.to_str().unwrap()],
+    );
+    stopped(
+        line::record(&fix.git(), VERSION, l.head(), line::MAX_RECORD_ATTEMPTS),
+        Reason::Unreachable,
+    );
+}
+
+#[test]
+fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
+    let fix = Fixture::new("verify");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let honest = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
+    let real = honest[0].clone();
+    let hop_a = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_a)]).unwrap()[0].clone();
+    line::record(&git, VERSION, &hop_a.commit, line::MAX_RECORD_ATTEMPTS).unwrap();
+    let on = |base: &str, hops: Vec<Hop>| Line {
+        hops,
+        ..Line::start(VERSION, base, 0)
+    };
+
+    let planted = tampered(&fix, &real.commit, &s.g, "src/extra.rs");
+    let reparented = run(
+        &fix.work,
+        &[
+            "commit-tree",
+            &format!("{}^{{tree}}", real.commit),
+            "-p",
+            &s.n1,
+            "-m",
+            "reparented",
+        ],
+    )
+    .trim()
+    .to_string();
+    let duplicate = hand_hop(&fix, &real.commit, &s.fix_b);
+    let cases = [
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    commit: planted,
+                    paths: vec!["src/b.rs".to_string(), "src/extra.rs".to_string()],
+                    ..real.clone()
+                }],
+            ),
+            Reason::Tree,
+        ),
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    commit: reparented,
+                    ..real.clone()
+                }],
+            ),
+            Reason::Parent,
+        ),
+        (
+            on(&s.g, vec![hand_hop(&fix, &s.g, &s.merge)]),
+            Reason::Merge,
+        ),
+        (
+            on(&s.g, vec![hand_hop(&fix, &s.g, &s.off)]),
+            Reason::OffMain,
+        ),
+        (
+            on(&s.d_revert, vec![hand_hop(&fix, &s.d_revert, &s.d_fix)]),
+            Reason::Held,
+        ),
+        (
+            on(&hop_a.commit, vec![hand_hop(&fix, &hop_a.commit, &s.fix_a)]),
+            Reason::Empty,
+        ),
+        (
+            on(&s.g, vec![hand_hop(&fix, &s.g, &s.frozen)]),
+            Reason::Frozen,
+        ),
+        (
+            on(&s.g, vec![hand_hop(&fix, &s.g, &s.bump)]),
+            Reason::Version,
+        ),
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    paths: Vec::new(),
+                    ..real.clone()
+                }],
+            ),
+            Reason::Paths,
+        ),
+        (on(&s.g, vec![real.clone(), duplicate]), Reason::Duplicate),
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    carries: short(&s.fix_b).to_string(),
+                    ..real.clone()
+                }],
+            ),
+            Reason::Spelling,
+        ),
+    ];
+    for (l, reason) in cases {
+        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+        stopped(line::verify(&git, &l), reason);
+    }
+    let honest = on(&s.g, vec![real.clone()]);
+    line::record(&git, VERSION, honest.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::verify(&git, &honest).unwrap();
+
+    let lacked = "0123456789abcdef0123456789abcdef01234567";
+    for (l, reason) in [
+        (on(&s.off, Vec::new()), Reason::BaseOffMain),
+        (
+            Line {
+                version: "0.27.0".to_string(),
+                ..start.clone()
+            },
+            Reason::BaseVersion,
+        ),
+        (on(short(&s.g), Vec::new()), Reason::Spelling),
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    commit: rev(&fix.work, &format!("{}^{{tree}}", real.commit)),
+                    ..real.clone()
+                }],
+            ),
+            Reason::Spelling,
+        ),
+        (on(lacked, Vec::new()), Reason::Unread),
+        (
+            on(
+                &s.g,
+                vec![Hop {
+                    carries: lacked.to_string(),
+                    ..real.clone()
+                }],
+            ),
+            Reason::Unread,
+        ),
+    ] {
+        stopped(line::verify(&git, &l), reason);
+    }
+}
+
+/// A commit origin/main holds only through a content-neutral merge never landed: another line's
+/// hop (its record merge's second parent) and a commit pushed under a merge that keeps main's
+/// tree are refused by `admit` and fail `verify` as off main, while the fix the rival's hop
+/// carries is admitted and the rival's line verifies. NEGATIVE CONTROL: take any ancestor of
+/// origin/main as landed, and both are admitted and verify.
+#[test]
+fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
+    let fix = Fixture::new("record-only");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let mut rival = start.clone();
+    rival.hops = line::carry(&git, &rival, &[fix_of(&git, &rival, &s.fix_b)]).unwrap();
+    line::record(&git, VERSION, rival.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let rival_hop = rival.head().to_string();
+    assert!(
+        is_ancestor(&fix.work, &rival_hop, "origin/main"),
+        "the record puts the rival's hop in main's history"
+    );
+
+    let planted = tampered(&fix, &s.g, &s.g, "src/planted.rs");
+    let tip = fix.origin_main();
+    let keeps = run(
+        &fix.work,
+        &[
+            "commit-tree",
+            &format!("{tip}^{{tree}}"),
+            "-p",
+            &tip,
+            "-p",
+            &planted,
+            "-m",
+            "keeps main's tree",
+        ],
+    )
+    .trim()
+    .to_string();
+    run(
+        &fix.work,
+        &["push", "-q", "origin", &format!("{keeps}:refs/heads/main")],
+    );
+    run(&fix.work, &["fetch", "-q", "origin", "main"]);
+    assert!(is_ancestor(&fix.work, &planted, "origin/main"));
+
+    let landed = line::landed_since(&git, &s.g).unwrap();
+    for main in [&s.fix_a, &s.n1, &s.merge, &s.fix_b, &s.tip] {
+        assert!(landed.contains(main), "{main} landed: {landed:?}");
+    }
+    for unlanded in [&rival_hop, &planted] {
+        assert!(!landed.contains(unlanded), "{unlanded}: {landed:?}");
+        let stop = stopped(line::admit(&git, &start, unlanded), Reason::OffMain);
+        assert!(stop.why.contains("never landed in main's tree"), "{stop:?}");
+        let l = Line {
+            hops: vec![hand_hop(&fix, &s.g, unlanded)],
+            ..start.clone()
+        };
+        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+        let stop = stopped(line::verify(&git, &l), Reason::OffMain);
+        assert!(
+            stop.why.starts_with("hop 1: ") && stop.remedy.contains("--forget"),
+            "{stop:?}"
+        );
+    }
+    assert_eq!(fix_of(&git, &start, &s.fix_b).commit, s.fix_b);
+    line::verify(&git, &rival).unwrap();
+}
+
+/// `tree_has` reads a file of a commit's tree (never a directory or another path's prefix), and
+/// could not run for a commit the clone lacks.
+#[test]
+fn tree_has_reads_a_file_its_absence_or_could_not_run() {
+    let fix = Fixture::new("tree-has");
+    let (git, s) = (fix.git(), &fix.shas);
+    assert!(line::tree_has(&git, &s.g, "src/d.rs").unwrap());
+    assert!(
+        !line::tree_has(&git, &s.seed, "src/d.rs").unwrap(),
+        "G adds it"
+    );
+    for not_a_file in ["src", "src/d", "d.rs"] {
+        assert!(
+            !line::tree_has(&git, &s.g, not_a_file).unwrap(),
+            "{not_a_file}"
+        );
+    }
+    stopped(
+        line::tree_has(&git, "0123456789abcdef0123456789abcdef01234567", "src/d.rs"),
+        Reason::Unread,
+    );
+}
+
+#[test]
+fn a_rebuilt_hop_is_the_same_commit() {
+    let fix = Fixture::new("rebuild");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 0);
+    let first = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
+    run(&fix.work, &["config", "user.name", "another releaser"]);
+    run(
+        &fix.work,
+        &["config", "user.email", "another@aterm.invalid"],
+    );
+    let again = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
+    assert_eq!(
+        first, again,
+        "a re-run under another identity, later, makes the same hop commit"
+    );
+}
+
+#[test]
+fn this_git_runs_a_line_and_an_older_one_could_not_run() {
+    let fix = Fixture::new("git-version");
+    let words = line::git_ready(&fix.git()).unwrap();
+    assert!(
+        line::parse_git_version(&words).is_some_and(|v| v >= line::MIN_GIT),
+        "{words}"
+    );
+    assert_eq!(
+        line::parse_git_version("git version 2.39.5 (Apple Git-154)"),
+        Some((2, 39))
+    );
+    assert_eq!(
+        line::parse_git_version("git version 2.45.1.windows.1\n"),
+        Some((2, 45))
+    );
+
+    struct Old;
+    impl GitRunner for Old {
+        fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            let (status, stdout) = match args.first() {
+                Some(&"version") => (0, "git version 2.39.5 (Apple Git-154)\n"),
+                _ => (129, ""),
+            };
+            Ok(RunOut {
+                status,
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: b"error: unknown option `attr-source=4b825dc642cb'".to_vec(),
+            })
+        }
+    }
+    stopped(line::git_ready(&Old), Reason::OldGit);
+    let stop = stopped(line::hop_tree(&Old, "head", "fix"), Reason::OldGit);
+    assert!(
+        stop.why.contains("2.39.5"),
+        "it names the git found: {stop:?}"
+    );
+}
+
+#[test]
+fn a_stop_becomes_a_refusal_that_could_not_run_exactly_when_its_reason_judged_nothing() {
+    for (reason, could_not_run) in [
+        (Reason::Conflict, false),
+        (Reason::Held, false),
+        (Reason::Unrecorded, false),
+        (Reason::Unread, true),
+        (Reason::Steered, true),
+        (Reason::Unreachable, true),
+    ] {
+        let stop = Stop {
+            reason,
+            why: "why".to_string(),
+            remedy: "remedy".to_string(),
+            detail: vec!["detail".to_string()],
+        };
+        assert_eq!(stop.could_not_run(), could_not_run, "{reason:?}");
+        let refusal = crate::release::Refusal::from(stop);
+        assert_eq!(
+            (
+                refusal.why.as_str(),
+                refusal.remedy.as_str(),
+                refusal.detail.as_slice(),
+                refusal.could_not_run
+            ),
+            (
+                "why",
+                "remedy",
+                ["detail".to_string()].as_slice(),
+                could_not_run
+            ),
+            "{reason:?}"
+        );
+    }
+}
+
+/// The release journal keeps its line through its own save and load; a journal written before
+/// lines has none, and reads as a line at its commit with no hops.
+#[test]
+fn a_line_round_trips_through_the_journals_toml() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join(crate::release::JOURNAL_FILE);
+    let journal = crate::release::Journal {
+        version: VERSION.to_string(),
+        commit: "5".repeat(40),
+        started: 1_790_000_100,
+        line: Some(Line {
+            hops: vec![
+                Hop {
+                    commit: "3".repeat(40),
+                    carries: "4".repeat(40),
+                    why: "fix: b2".to_string(),
+                    paths: vec!["src/b.rs".to_string()],
+                },
+                Hop {
+                    commit: "5".repeat(40),
+                    carries: "6".repeat(40),
+                    why: "fix: \"quoted\" = x".to_string(),
+                    paths: Vec::new(),
+                },
+            ],
+            ..Line::start(VERSION, &"2".repeat(40), 1_790_000_000)
+        }),
+        ..Default::default()
+    };
+    journal.save(&path).unwrap();
+    let read = crate::release::Journal::load(&path).unwrap().unwrap();
+    assert_eq!(read, journal, "{}", fs::read_to_string(&path).unwrap());
+    assert_eq!(read.line().head(), read.commit);
+
+    let before_lines = format!(
+        "version = \"0.26.0\"\ncommit = \"{c}\"\nprover = \"/p\"\ntrustc = \"t\"\nstarted = 7\n",
+        c = "2".repeat(40)
+    );
+    fs::write(&path, before_lines).unwrap();
+    let old = crate::release::Journal::load(&path).unwrap().unwrap();
+    assert_eq!(old.line, None);
+    assert_eq!(old.line(), Line::start(VERSION, &"2".repeat(40), 7));
+
+    let bare = format!(
+        "version = \"0.26.0\"\ncommit = \"{c}\"\nprover = \"/p\"\ntrustc = \"t\"\n\n[line]\n\
+         version = \"0.26.0\"\nbase = \"{c}\"\n",
+        c = "2".repeat(40)
+    );
+    fs::write(&path, bare).unwrap();
+    let read = crate::release::Journal::load(&path).unwrap().unwrap();
+    assert_eq!(read.line, Some(Line::start(VERSION, &"2".repeat(40), 0)));
+}
+
+/// The cut signs only the head of a line that verifies: the journal's line must end at the
+/// published commit and, with hops, hold `line::verify`, before the verified bundle's other
+/// gates are read (a sound line, and a journal from before lines, go on to the next gate, which
+/// refuses here because nothing was judged). NEGATIVE CONTROLS: drop the head test, and a line
+/// that ends elsewhere reaches the next gate; drop the verify, and a hop whose carried commit
+/// was swapped does too.
+#[test]
+fn the_cut_signs_only_the_head_of_a_line_that_verifies() {
+    let fix = Fixture::new("cut");
+    let (git, s) = (fix.git(), &fix.shas);
+    let start = Line::start(VERSION, &s.g, 1_790_000_000);
+    let admitted = fix_of(&git, &start, &s.fix_b);
+    let mut carried = start.clone();
+    carried.hops = line::carry(&git, &start, &[admitted]).unwrap();
+    line::record(&git, VERSION, carried.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let head = carried.head().to_string();
+    let journal = fix
+        .work
+        .join(".git")
+        .join(crate::release::RELEASE_DIR)
+        .join(crate::release::JOURNAL_FILE);
+    let cut = |line: Option<Line>| {
+        crate::release::Journal {
+            version: VERSION.to_string(),
+            commit: head.clone(),
+            line,
+            ..Default::default()
+        }
+        .save(&journal)
+        .unwrap();
+        crate::publish::verified_release_bundle_with_inputs(
+            &git,
+            &fix.work,
+            &head,
+            VERSION,
+            "/stage2/bin trustc 0",
+            || Ok("inputs".into()),
+        )
+        .err()
+        .expect("nothing was judged or built here")
+        .to_string()
+    };
+    let next = "has not judged R's commit-only gates";
+    let sound = cut(Some(carried.clone()));
+    assert!(sound.contains(next), "{sound}");
+    let before_lines = cut(None);
+    assert!(before_lines.contains(next), "{before_lines}");
+
+    let elsewhere = cut(Some(start));
+    assert!(
+        elsewhere.contains(&format!("its line's head {}", short(&s.g))),
+        "{elsewhere}"
+    );
+    let mut swapped = carried;
+    swapped.hops[0].carries.clone_from(&s.d_fix);
+    let lied = cut(Some(swapped));
+    assert!(
+        lied.contains("line::verify") && lied.contains("hop 1's tree"),
+        "{lied}"
+    );
+}

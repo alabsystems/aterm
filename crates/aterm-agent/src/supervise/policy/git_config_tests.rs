@@ -1171,3 +1171,140 @@ fn a_tests_worker_path_is_its_git_and_the_system_not_the_runners_toolchain() {
     assert_eq!(bare, "/usr/bin:/bin:/usr/sbin:/sbin");
     assert_eq!(worker_path_from(None), bare);
 }
+
+/// A stand-in for git, in `dir`, that runs `body` as `/bin/sh` for every command (its `$2` is
+/// the git command after `--no-pager`).
+#[cfg(unix)]
+fn stand_in_git(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let git = dir.join("git");
+    std::fs::write(&git, format!("#!/bin/sh\n{body}\n")).expect("stand-in git");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    git
+}
+
+/// More than [`aterm_uds::deadline::OUTPUT_KEEP`]: what a git read keeps of it is its tail.
+#[cfg(unix)]
+const FLOOD: &str = "/usr/bin/head -c 2097152 /dev/zero";
+
+/// A `check-attr` that never answers is killed at its wait and the read refused (`None`, which
+/// counts every configured filter driver as selected); the same read by the worker's real git
+/// is the control.
+#[cfg(unix)]
+#[test]
+fn a_check_attr_that_never_answers_is_killed_at_its_wait() {
+    let r = repo("check-attr-hang");
+    std::fs::write(r.0.path().join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+    std::fs::write(r.0.path().join("a.bin"), "x\n").unwrap();
+    git(r.0.path(), &["add", "."]);
+    let env = isolated();
+    let real = Probe {
+        env: &env,
+        program: env.git_program(&|_| false).expect("the worker's git"),
+    };
+    assert_eq!(
+        real.drivers_selected(
+            r.0.path(),
+            b"a.bin\0".to_vec(),
+            aterm_spec::wait::MUST_HAPPEN
+        ),
+        Some(vec!["lfs".to_string()])
+    );
+
+    let bin = Scratch::new("check-attr-hang-bin");
+    let ran = bin.0.path().join("check-attr.pid");
+    let program = stand_in_git(
+        bin.0.path(),
+        &format!("echo $$ > '{}'\nexec /bin/sleep 120", ran.display()),
+    );
+    let top = r.0.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let env = isolated();
+        let hung = Probe { env: &env, program };
+        let _ = tx.send(hung.drivers_selected(
+            &top,
+            b"a.bin\0".to_vec(),
+            std::time::Duration::from_secs(1),
+        ));
+    });
+    let read = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("a check-attr that never answers ends the read within the hang detector");
+    assert_eq!(read, None);
+    // A stand-in killed before its first line wrote no pid, and leaves nothing to look for.
+    if let Some(pid) = std::fs::read_to_string(&ran)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+    {
+        assert!(
+            !aterm_uds::process::pid_alive(pid),
+            "the git that never answered is killed"
+        );
+    }
+}
+
+/// What a stand-in git running `body` for every command reads `top` as, through `read`.
+#[cfg(unix)]
+fn read_by_stand_in<T>(tag: &str, body: &str, read: impl FnOnce(&Probe<'_>, &Path) -> T) -> T {
+    let env = isolated();
+    let r = repo(tag);
+    let bin = Scratch::new(&format!("{tag}-bin"));
+    let probe = Probe {
+        env: &env,
+        program: stand_in_git(bin.0.path(), body),
+    };
+    read(&probe, r.0.path())
+}
+
+// A git read whose output outgrew what a read keeps (its tail) is refused, never judged on
+// that tail. The same reads of a real repository are the controls
+// (a_filter_driver_counts_only_where_the_attributes_select_it,
+// a_check_attr_that_never_answers_is_killed_at_its_wait and the rest of this file).
+
+#[cfg(unix)]
+#[test]
+fn a_config_list_larger_than_a_read_keeps_is_refused() {
+    let why = read_by_stand_in("keep-config", FLOOD, |probe, top| {
+        probe.view_at(top, 0, &mut 0)
+    })
+    .expect_err("a config list over what a read keeps");
+    assert!(why.contains("whole git config"), "{why}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_index_larger_than_a_read_keeps_is_refused() {
+    let body = format!(
+        "case \"$2 $3\" in\n'config --list') exit 0 ;;\n'rev-parse --show-toplevel') pwd ;;\n\
+         'ls-files -z') {FLOOD} ;;\n*) exit 1 ;;\nesac"
+    );
+    let why = read_by_stand_in("keep-index", &body, |probe, top| {
+        probe.view_at(top, 0, &mut 0)
+    })
+    .expect_err("an index listing over what a read keeps");
+    assert!(why.contains("whole index"), "{why}");
+}
+
+/// `None`: every configured filter driver counts as selected.
+#[cfg(unix)]
+#[test]
+fn a_path_list_larger_than_a_read_keeps_leaves_every_driver_selected() {
+    let body =
+        format!("case \"$2\" in\nls-files) {FLOOD} ;;\ncheck-attr) /bin/cat > /dev/null ;;\nesac");
+    let read = read_by_stand_in("keep-paths", &body, |probe, top| {
+        probe.filters_selected(top)
+    });
+    assert_eq!(read, None);
+}
+
+/// `None`: every configured filter driver counts as selected.
+#[cfg(unix)]
+#[test]
+fn attributes_larger_than_a_read_keeps_leave_every_driver_selected() {
+    let body = format!("/bin/cat > /dev/null\n{FLOOD}");
+    let read = read_by_stand_in("keep-attributes", &body, |probe, top| {
+        probe.drivers_selected(top, b"a.bin\0".to_vec(), aterm_spec::wait::MUST_HAPPEN)
+    });
+    assert_eq!(read, None);
+}

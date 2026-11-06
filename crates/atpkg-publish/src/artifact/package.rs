@@ -340,7 +340,7 @@ pub fn staged_upstream(
         .join("store")
         .join(program)
         .join(pkg.build_number.to_string());
-    atpkg::verify_and_stage(
+    atpkg::verify_for_publication(
         artifact,
         &dir.join(&artifact.asset),
         &build_dir,
@@ -641,7 +641,7 @@ pub fn check_pack(
             aliases: &[],
             npm_package: None,
         };
-        atpkg::verify_and_stage(artifact, &archive, &build_dir, &hooks).map_err(|e| {
+        atpkg::verify_for_publication(artifact, &archive, &build_dir, &hooks).map_err(|e| {
             Error::refused(format!(
                 "the client's stage refuses {p}@{build} for {triple}: {e}"
             ))

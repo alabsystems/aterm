@@ -2445,7 +2445,7 @@ fn hold_ends(inst: &Instance, sid: &str) {
 }
 
 fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
-    driven_pair_beating(tags, None)
+    driven_pair_with(tags, &[])
 }
 
 #[test]
@@ -2493,11 +2493,11 @@ fn account_renewal_runs_over_native_fleet_with_no_ssh_or_interactive_terminal() 
     );
 }
 
-/// [`driven_pair`], the member's heartbeat every `beat_ms` (`ATERM_DEBUG_FLEET_HEARTBEAT_MS`)
-/// where one is named.
-fn driven_pair_beating(
+/// [`driven_pair`], the member's aterm run with `member_env` besides (a heartbeat's seam, a lag
+/// for its typed keys).
+fn driven_pair_with(
     tags: (&str, &str),
-    beat_ms: Option<&str>,
+    member_env: &[(&str, &str)],
 ) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
@@ -2548,9 +2548,7 @@ fn driven_pair_beating(
             cmd.env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .args(["--lines", "24", "--columns", "80"]);
-            if let Some(ms) = beat_ms {
-                cmd.env("ATERM_DEBUG_FLEET_HEARTBEAT_MS", ms);
-            }
+            cmd.envs(member_env.iter().copied());
         },
         |_| true,
     );
@@ -3580,7 +3578,10 @@ fn a_grant_written_while_a_drive_is_open_cuts_it_only_once_it_takes_its_grant_aw
 
 #[test]
 fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
-    let (issuer, member, worker, target) = driven_pair_beating(("afai", "afam"), Some(BEAT_MS));
+    let (issuer, member, worker, target) = driven_pair_with(
+        ("afai", "afam"),
+        &[("ATERM_DEBUG_FLEET_HEARTBEAT_MS", BEAT_MS)],
+    );
     let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).expect("a code");
     let third = World(headless_boot::scratch_root("afat"));
     let (holder, third_port) = hold_a_port();
@@ -3746,6 +3747,110 @@ fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
         rows.get(slow + 1)
             .is_some_and(|row| row.ends_with("echo after-$((6*7))")),
         "one Enter went in, so no empty prompt follows the command's own: {after}"
+    );
+}
+
+/// A drive's typed turn whose keys go slower than its 20 s allows (the driven node holds each key
+/// 400 ms before it goes, `ATERM_DEBUG_TURN_KEY_LAG_MS`: m108 behind m14's drive, 2026-11-04)
+/// lands whole: the keys that fit, then the rest as one paste and an Enter; and one whose first
+/// key does not fit writes nothing. Either way the shell's line is as the turn found it, so the
+/// next command runs alone. What it judges is that property, never how soon the shell answers:
+/// an Enter no look verified still says `pressed=`, and the line's run is the hang detector's.
+/// NEGATIVE CONTROL: cutting the typing at the deadline, as the turn did before its pace, answers
+/// `skipped reason=deadline typed=<n>` and leaves those keys in the shell's line.
+#[test]
+fn a_drives_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
+    let (issuer, member, worker, target) =
+        driven_pair_with(("afki", "afkm"), &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
+    let at = format!("@{worker}");
+    ctl_ok(
+        &member,
+        &[&at, "turn", "timeout=60000", "echo ready-$((6*7))"],
+    );
+    ctl_ok(
+        &member,
+        &[&at, "await", "match", "^ready-42", "timeout=60000"],
+    );
+    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let line = format!("echo whole-$((6*7))-{alphabet}");
+    let keys = line.chars().count();
+    // 72 keys 70 ms apart fit the drive's 20 s; 400 ms apart (the lag, which the cadence runs
+    // within) they do not. The submit's share is the most a 20 s turn keeps for it, half.
+    let sent = drive_in(
+        &issuer.tmp,
+        &target,
+        &[
+            &at,
+            "turn",
+            "typed=1",
+            "timeout=20000",
+            "settle=submitted",
+            "submit_window=10000",
+            &line,
+        ],
+    );
+    let verdict = String::from_utf8_lossy(&sent.stderr).into_owned();
+    // A turn whose Enter no look verified in its window ends `status=timeout`, which exits 124.
+    assert!(
+        sent.status.success() || sent.status.code() == Some(124),
+        "{sent:?}"
+    );
+    let count = |name: &str| {
+        field(verdict.trim_end(), name)
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("{name}= in {verdict}"))
+    };
+    let (typed, pasted) = (count("typed"), count("pasted"));
+    assert!(
+        !verdict.contains(" turn skipped ")
+            && (verdict.contains("submitted=1") || verdict.contains(" pressed="))
+            && typed > 0
+            && pasted > 0
+            && typed + pasted == keys,
+        "the keys that fit, then the rest as one paste and an Enter: {verdict}"
+    );
+    ctl_ok(
+        &member,
+        &[&at, "await", "match", "^whole-42-", "timeout=60000"],
+    );
+    // A first key that does not fit: nothing is written.
+    let (_, skipped) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[
+            &at,
+            "turn",
+            "typed=1",
+            "cadence=2000",
+            "timeout=1000",
+            "submit_window=200",
+            "echo none-$((6*7))",
+        ],
+    );
+    assert!(
+        skipped.contains(" turn skipped reason=deadline typed=0 pasted=0 submitted=0 "),
+        "{skipped}"
+    );
+    ctl_ok(
+        &member,
+        &[&at, "turn", "timeout=60000", "echo after-$((6*7))"],
+    );
+    ctl_ok(
+        &member,
+        &[&at, "await", "match", "^after-42", "timeout=60000"],
+    );
+    let screen = ctl_ok(&member, &[&at, "text"]);
+    let rows: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| **row == format!("whole-42-{alphabet}"))
+            .count(),
+        1,
+        "the whole line ran once: {screen}"
+    );
+    assert!(
+        rows.contains(&"after-42") && !rows.iter().any(|row| row.contains("none-42")),
+        "the next command ran alone: {screen}"
     );
 }
 

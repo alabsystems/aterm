@@ -3,11 +3,12 @@
 #
 # THE TOOLCHAIN, ONE SOURCE: where the pinned Trust toolchain is, where rustup's home
 # is, where plain targo puts its build intermediates, when a checkout is gone, the
-# lease a run holds on the toolchain it resolved, and the named lock and the
-# interrupt every wait for a lock or for capacity ends on. Std only but for
-# aterm-libc's signal declarations and aterm-sysprobe's process sweep (a wait's
-# stuck holder), so the check runner (aterm-verify), the libc oracle's gate and
-# the package manager (atpkg, which re-exports every module under its old path)
+# lease a run holds on the toolchain it resolved, the named lock and the interrupt
+# every wait for a lock or for capacity ends on, and the status digest a sealed
+# toolchain is rechecked by. Std only but for aterm-libc's signal declarations,
+# aterm-sysprobe's process sweep (a wait's stuck holder) and aterm-digest's SHA-256
+# (the status digest), so the check runner (aterm-verify), the libc oracle's gate
+# and the package manager (atpkg, which re-exports every module under its old path)
 # depend on it instead of compiling a file of another crate by `#[path]`.
 
 [package]
@@ -17,7 +18,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule, the toolchain lease and the named lock whose wait names a stuck holder"
+description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule, the toolchain lease, the named lock whose wait names a stuck holder, and the status digest a sealed toolchain is rechecked by"
 
 [dependencies]
 # The process sweep (`aterm_sysprobe::processes`): a wait for a named lock reads
@@ -29,6 +30,10 @@ description = "The pinned Trust toolchain's discovery, rustup's home, the shared
 # `aterm_sysprobe::paths`). Workspace crate; every crate that depends on this
 # one already reaches it.
 aterm-sysprobe = { workspace = true }
+
+# The status digest (`stat_digest`): SHA-256 from aterm-digest, astream-digest's
+# re-export, which has no dependencies. Workspace crate; no cycle.
+aterm-digest = { workspace = true }
 
 # A wait's interrupt (`interrupt::Watch`) sets the process's own SIGINT, SIGTERM and
 # SIGHUP handling aside and puts it back exactly: `sigaction`, `sigemptyset`, `kill`

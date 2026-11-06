@@ -210,11 +210,33 @@ impl LaneCommand {
     }
 }
 
+#[derive(Debug, Default)]
+struct WaitCustody {
+    lost: bool,
+}
+
+impl WaitCustody {
+    fn require(&self) -> io::Result<()> {
+        if self.lost {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn observe_error(&mut self, error: &io::Error, reaped: bool) {
+        if !reaped && error.raw_os_error() == Some(libc::ECHILD) {
+            self.lost = true;
+        }
+    }
+}
+
 /// A child [`spawn_with_two_fds`] started: `std::process::Child`'s process half, by pid.
 #[derive(Debug)]
 pub struct LaneChild {
     pid: i32,
     status: Option<ExitStatus>,
+    custody: WaitCustody,
 }
 
 impl LaneChild {
@@ -240,6 +262,7 @@ impl LaneChild {
 
     /// `SIGKILL` the child.
     pub fn kill(&mut self) -> io::Result<()> {
+        self.require_custody()?;
         if self.status.is_some() {
             return Ok(());
         }
@@ -253,6 +276,7 @@ impl LaneChild {
 
     /// `SIGTERM` the child, so it can pass the signal on; once it is reaped, signal nothing.
     pub fn terminate(&mut self) -> io::Result<()> {
+        self.require_custody()?;
         if self.status.is_some() {
             return Ok(());
         }
@@ -266,6 +290,7 @@ impl LaneChild {
 
     /// `SIGCONT` the child: a child started stopped ([`Command::start_suspended`]) runs.
     pub fn resume(&mut self) -> io::Result<()> {
+        self.require_custody()?;
         if self.status.is_some() {
             return Ok(());
         }
@@ -278,6 +303,7 @@ impl LaneChild {
     }
 
     fn reap(&mut self, options: i32) -> io::Result<Option<ExitStatus>> {
+        self.require_custody()?;
         if let Some(status) = self.status {
             return Ok(Some(status));
         }
@@ -294,10 +320,19 @@ impl LaneChild {
                 return Ok(None);
             }
             let err = io::Error::last_os_error();
+            self.observe_wait_error(&err);
             if err.kind() != io::ErrorKind::Interrupted {
                 return Err(err);
             }
         }
+    }
+
+    fn require_custody(&self) -> io::Result<()> {
+        self.custody.require()
+    }
+
+    fn observe_wait_error(&mut self, error: &io::Error) {
+        self.custody.observe_error(error, self.status.is_some());
     }
 }
 
@@ -369,7 +404,11 @@ fn launch_placed(cmd: LaneCommand, lanes: &[OwnedFd], setsid: bool) -> io::Resul
             ..Placement::default()
         },
     )?;
-    Ok(LaneChild { pid, status: None })
+    Ok(LaneChild {
+        pid,
+        status: None,
+        custody: WaitCustody::default(),
+    })
 }
 
 fn stage(slot: ChildStdio) -> io::Result<ChildStdio> {

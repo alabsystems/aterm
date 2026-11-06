@@ -24,6 +24,10 @@ pub(in crate::init_github) fn directory(who: &User) -> Stat {
 /// Tracked metadata, independently scripted from the selected worktrees. The fixture
 /// includes an optional entry so acquiring everything in .gitmodules is observable.
 pub(in crate::init_github) fn declarations(sys: &Fake, who: &User, parent: &Path, paths: &[&str]) {
+    sys.on(
+        &local(sys, who, None).arg("--version").display(),
+        Ran::ok("git version fixture with no-lazy-fetch\n"),
+    );
     let git = || local(sys, who, Some(parent));
     sys.on(
         &git()
@@ -110,7 +114,7 @@ pub(in crate::init_github) fn declarations(sys: &Fake, who: &User, parent: &Path
     );
 }
 
-fn existing(sys: &Fake, who: &User, path: &Path, name: &str, pin: &str) {
+pub(in crate::init_github) fn existing(sys: &Fake, who: &User, path: &Path, name: &str, pin: &str) {
     existing_as(sys, who, path, "alice", name, pin);
 }
 
@@ -317,6 +321,45 @@ fn policy_accepts_only_canonical_nonoverlapping_relative_paths() {
 }
 
 #[test]
+fn unsupported_git_refuses_dependency_work_without_an_ordinary_fallback() {
+    let (sys, who, repo, parent) = fixture(&["vendor/library"]);
+    sys.simulate(|_, command| {
+        command
+            .args
+            .iter()
+            .any(|arg| arg == "--no-lazy-fetch")
+            .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
+    });
+    assert!(matches!(
+        ready(&sys, &who, &parent, &repo),
+        Err(Unready::Git(_))
+    ));
+    let why = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
+    assert!(why.contains("must support --no-lazy-fetch"), "{why}");
+    let calls = sys.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one capability probe at each entry: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.contains("--no-lazy-fetch") && call.ends_with(" --version")),
+        "{calls:?}"
+    );
+    assert!(sys.stat(&parent.join("vendor/library")).is_err());
+    // A repository selecting no dependencies requires no new Git capability.
+    let unselected = Repo {
+        required_submodules: Vec::new(),
+        ..repo
+    };
+    assert!(ready(&sys, &who, &parent, &unselected).unwrap());
+    repair(&sys, &who, &parent, &unselected, &|| Ok(())).unwrap();
+    assert_eq!(sys.calls(), calls);
+}
+
+#[test]
 fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_work() {
     use crate::port::Live;
     crate::items::github::need_clt_git();
@@ -412,13 +455,305 @@ fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_w
         ],
     );
     run(&parent, &["commit", "-m", "fixture later pin"]);
-    assert!(
-        ready(&sys, &who, &parent, &repo)
-            .unwrap_err()
-            .contains("branch")
-    );
+    assert!(matches!(
+        ready(&sys, &who, &parent, &repo),
+        Err(Unready::Preserved(why)) if why.contains("branch")
+    ));
     assert!(repair(&sys, &who, &parent, &repo, &|| Ok(())).is_err());
     assert_eq!(run(&child, &["rev-parse", "HEAD"]).trim(), pin);
+}
+
+#[test]
+fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_transport() {
+    use crate::port::Live;
+    crate::items::github::need_clt_git();
+    let sys = Live::new();
+    let scratch = Scratch::new(&sys, "required-offline-pin").unwrap();
+    let mut who = user("fixture", sys.euid());
+    who.home = scratch.path().to_string_lossy().into_owned();
+    let parent = scratch.path().join("parent");
+    let child = parent.join("vendor/library");
+    sys.create_dir_all(&child, 0o700).unwrap();
+    let run = |path: &Path, args: &[&str]| {
+        text(
+            &sys,
+            local(&sys, &who, Some(path))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(checkout::NO_SIDE_RUNS)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args.iter().copied()),
+            "synthetic local git fixture failed",
+        )
+        .unwrap()
+    };
+    run(&child, &["init", "--template=", "--initial-branch=main"]);
+    sys.write_file(
+        &child.join("library.rs"),
+        b"previous recorded source\n",
+        0o600,
+    )
+    .unwrap();
+    run(&child, &["add", "--", "library.rs"]);
+    run(&child, &["commit", "-m", "fixture previous dependency"]);
+    let old = run(&child, &["rev-parse", "HEAD"]).trim().to_owned();
+    sys.write_file(
+        &child.join("library.rs"),
+        b"required preloaded source\n",
+        0o600,
+    )
+    .unwrap();
+    run(&child, &["commit", "-am", "fixture required dependency"]);
+    let pin = run(&child, &["rev-parse", "HEAD"]).trim().to_owned();
+    run(
+        &child,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/library.git",
+        ],
+    );
+    // The legitimate SSH rewrite is admitted, but its transport cannot run. Any attempted
+    // fetch fails before opening a connection; the exact pin already exists locally.
+    run(
+        &child,
+        &[
+            "config",
+            "url.git@github.com:.insteadOf",
+            "https://github.com/",
+        ],
+    );
+    run(&child, &["config", "core.sshCommand", "/usr/bin/false"]);
+    run(&child, &["checkout", "--detach", &old]);
+    run(&parent, &["init", "--template=", "--initial-branch=main"]);
+    run(
+        &parent,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/parent.git",
+        ],
+    );
+    sys.write_file(
+        &parent.join(".gitmodules"),
+        b"[submodule \"vendor/library\"]\npath = vendor/library\nurl = ../library.git\n",
+        0o600,
+    )
+    .unwrap();
+    run(&parent, &["add", "--", ".gitmodules"]);
+    run(
+        &parent,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{old},vendor/library"),
+        ],
+    );
+    run(&parent, &["commit", "-m", "fixture previous parent pin"]);
+    run(
+        &parent,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{pin},vendor/library"),
+        ],
+    );
+    run(&parent, &["commit", "-m", "fixture required parent pin"]);
+    let repo = Repo {
+        owner: "alice".into(),
+        name: "parent".into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: vec!["vendor/library".into()],
+    };
+    assert!(!ready(&sys, &who, &parent, &repo).unwrap());
+    repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert_eq!(run(&child, &["rev-parse", "HEAD"]).trim(), pin);
+    assert_eq!(
+        sys.read_file(&child.join("library.rs")).unwrap(),
+        b"required preloaded source\n"
+    );
+    assert!(
+        sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args([
+            "symbolic-ref",
+            "--quiet",
+            "HEAD"
+        ]))
+        .unwrap()
+        .status
+            == Some(1)
+    );
+}
+
+#[test]
+fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still_works() {
+    use crate::port::Live;
+    crate::items::github::need_clt_git();
+    let sys = Live::new();
+    let scratch = Scratch::new(&sys, "required-partial-parent").unwrap();
+    let mut who = user("fixture", sys.euid());
+    who.home = scratch.path().to_string_lossy().into_owned();
+    let parent = scratch.path().join("parent");
+    let backup = scratch.path().join("complete-backup.git");
+    sys.create_dir_all(&parent, 0o700).unwrap();
+    let base = || {
+        checkout::git(&sys, &who, Some(&parent))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(checkout::NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+    };
+    let run = |args: &[&str]| {
+        text(
+            &sys,
+            base().args(args.iter().copied()),
+            "synthetic partial parent fixture failed",
+        )
+        .unwrap()
+    };
+    run(&["init", "--template=", "--initial-branch=main"]);
+    run(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/alice/parent.git",
+    ]);
+    sys.write_file(
+        &parent.join(".gitmodules"),
+        b"[submodule \"vendor/library\"]\npath = vendor/library\nurl = ../library.git\n",
+        0o600,
+    )
+    .unwrap();
+    run(&["add", "--", ".gitmodules"]);
+    run(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{PIN},vendor/library"),
+    ]);
+    run(&["commit", "-m", "fixture parent"]);
+    let revision = run(&["rev-parse", "HEAD"]).trim().to_owned();
+    let blob = run(&["rev-parse", "HEAD:.gitmodules"]).trim().to_owned();
+    read(
+        &sys,
+        base()
+            .args(["clone", "--bare", "--no-local", "--"])
+            .arg(&parent)
+            .arg(&backup),
+        "cannot retain complete fixture objects",
+    )
+    .unwrap();
+    run(&["config", "core.repositoryformatversion", "1"]);
+    run(&["config", "extensions.partialclone", "origin"]);
+    run(&["config", "remote.origin.promisor", "true"]);
+    run(&["config", "remote.origin.partialclonefilter", "blob:none"]);
+    run(&[
+        "config",
+        "url.git@github.com:.insteadOf",
+        "https://github.com/",
+    ]);
+    run(&["config", "core.sshCommand", "/usr/bin/false"]);
+    sys.remove(
+        &parent
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    let query = [
+        "config",
+        "--blob",
+        &format!("{revision}:.gitmodules"),
+        "--no-includes",
+        "--get-all",
+        "submodule.vendor/library.url",
+    ];
+    let transport_started = |path: &Path| {
+        String::from_utf8(sys.read_file(path).unwrap())
+            .unwrap()
+            .lines()
+            .any(|line| {
+                let event: Value = aterm_json::from_str(line).unwrap();
+                event.get("event").and_then(Value::as_str) == Some("child_start")
+                    && event
+                        .get("argv")
+                        .and_then(Value::as_array)
+                        .is_some_and(|argv| argv.iter().any(|arg| arg.as_str() == Some("fetch")))
+            })
+    };
+    // An ordinary Git read starts a promisor fetch through the existing parent's own
+    // transport. Its harmless failing SSH command proves this without any connection.
+    let control_trace = scratch.path().join("unprotected.trace.jsonl");
+    let control = sys
+        .run_complete_stdout(
+            &base()
+                .env("GIT_NO_LAZY_FETCH", "0")
+                .env("GIT_TRACE2_EVENT", control_trace.to_string_lossy())
+                .args(query),
+        )
+        .unwrap();
+    assert!(!control.success());
+    assert!(
+        transport_started(&control_trace),
+        "the negative control must attempt a lazy fetch"
+    );
+    let guarded_trace = scratch.path().join("guarded.trace.jsonl");
+    let guarded = sys
+        .run_complete_stdout(
+            &local(&sys, &who, Some(&parent))
+                .env("GIT_TRACE2_EVENT", guarded_trace.to_string_lossy())
+                .args(query),
+        )
+        .unwrap();
+    assert!(!guarded.success());
+    assert!(
+        !transport_started(&guarded_trace),
+        "a local metadata read must never start transport"
+    );
+    let repo = Repo {
+        owner: "alice".into(),
+        name: "parent".into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: vec!["vendor/library".into()],
+    };
+    assert!(ready(&sys, &who, &parent, &repo).is_err());
+    assert!(sys.stat(&parent.join("vendor/library")).is_err());
+    // Suppressing on-demand fetch leaves an explicitly requested fetch available. This
+    // controlled local transport restores the blob and makes metadata readable again.
+    read(
+        &sys,
+        local(&sys, &who, Some(&parent))
+            .args(["fetch", "--refetch", "--no-recurse-submodules", "--"])
+            .arg(&backup)
+            .arg("HEAD"),
+        "explicit fixture fetch was suppressed",
+    )
+    .unwrap();
+    assert!(
+        sys.run_complete_stdout(&local(&sys, &who, Some(&parent)).args(["cat-file", "-e", &blob]))
+            .unwrap()
+            .success()
+    );
+    assert!(!ready(&sys, &who, &parent, &repo).unwrap());
 }
 
 #[test]
@@ -630,6 +965,7 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
         assert!(
             sys.calls().iter().all(|call| !call.contains(" clone ")
                 && !call.contains(" fetch ")
+                && !call.contains("cat-file -e")
                 && !call.contains(" checkout ")
                 && !call.starts_with("rename-noreplace ")),
             "{mode}"
@@ -651,6 +987,12 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
     );
     existing(&sys, &who, &path, "library", OLD);
     let git = || local(&sys, &who, Some(&path));
+    sys.on(
+        &git()
+            .args(["cat-file", "-e", &format!("{PIN}^{{commit}}")])
+            .display(),
+        Ran::exit(1, "synthetic pin not stored locally"),
+    );
     sys.on(
         &git()
             .args([

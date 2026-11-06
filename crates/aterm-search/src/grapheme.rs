@@ -130,6 +130,8 @@ pub(crate) struct ColumnMap {
     /// What the columns were measured from, so a policy switch re-measures
     /// only what the policy decides.
     source: MapSource,
+    /// Whether the source text is ASCII, cached while its columns are built.
+    ascii: bool,
 }
 
 const _: () = assert!(std::mem::size_of::<ColumnMap>() <= 32);
@@ -246,7 +248,7 @@ impl RunBuilder {
         });
     }
 
-    fn finish(self, text_len: usize, total: usize, source: MapSource) -> ColumnMap {
+    fn finish(self, text_len: usize, total: usize, source: MapSource, ascii: bool) -> ColumnMap {
         let (text_len, total) = (narrow(text_len), narrow(total));
         let identity = text_len > 0
             && total == text_len
@@ -265,6 +267,7 @@ impl RunBuilder {
             text_len,
             total,
             source,
+            ascii,
         }
     }
 }
@@ -274,7 +277,7 @@ impl ColumnMap {
     pub fn new(text: &str, ambiguous: AmbiguousWidth) -> Self {
         // Controls (tab, newline, CR) can be zero-width, so they take the full map.
         if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
-            return Self::identity(text.len(), MapSource::Walk(ambiguous));
+            return Self::identity(text.len(), MapSource::Walk(ambiguous), true);
         }
 
         let mut runs = RunBuilder::new();
@@ -287,16 +290,31 @@ impl ColumnMap {
             });
             before = g.end_col;
         }
-        runs.finish(text.len(), before, MapSource::Walk(ambiguous))
+        runs.finish(
+            text.len(),
+            before,
+            MapSource::Walk(ambiguous),
+            text.is_ascii(),
+        )
     }
 
     /// Build a column map from `text` and the grid `cells` it was read from.
     pub fn with_cells(text: &str, cells: &LineCells) -> Self {
+        Self::build_cells(text, cells, RunBuilder::new())
+    }
+
+    /// Re-measure grid coordinates while reusing this map's run allocation.
+    pub(crate) fn refresh_cells(&mut self, text: &str, cells: &LineCells) {
+        let mut runs = std::mem::take(&mut self.runs).into_vec();
+        runs.clear();
+        *self = Self::build_cells(text, cells, RunBuilder { runs });
+    }
+
+    fn build_cells(text: &str, cells: &LineCells, mut runs: RunBuilder) -> Self {
         // A row of printable ASCII read one cell per character is the identity.
         if cells.is_identity(text.len()) {
-            return Self::identity(text.len(), MapSource::Cells);
+            return Self::identity(text.len(), MapSource::Cells, text.is_ascii());
         }
-        let mut runs = RunBuilder::new();
         let mut spans = cells
             .iter()
             .take_while(|cell| cell.byte < text.len())
@@ -330,18 +348,19 @@ impl ColumnMap {
         }
         let last = spans.last().or(current);
         let total = last.map_or(0, |cell| cell.end_col);
-        runs.finish(text.len(), total, MapSource::Cells)
+        runs.finish(text.len(), total, MapSource::Cells, text.is_ascii())
     }
 
     /// The identity map over `len` bytes: every byte one grapheme one column
     /// wide, which needs no runs.
     #[inline]
-    fn identity(len: usize, source: MapSource) -> Self {
+    fn identity(len: usize, source: MapSource, ascii: bool) -> Self {
         Self {
             runs: Box::default(),
             text_len: narrow(len),
             total: narrow(len),
             source,
+            ascii,
         }
     }
 
@@ -350,6 +369,47 @@ impl ColumnMap {
     #[must_use]
     pub(crate) const fn source(&self) -> MapSource {
         self.source
+    }
+
+    /// Whether the text these columns describe is ASCII.
+    #[inline]
+    pub(crate) const fn is_ascii(&self) -> bool {
+        self.ascii
+    }
+
+    /// Exclusive byte limit for qualifying start columns in an identity map of `len` bytes.
+    /// Saturated or non-identity maps leave column filtering to the visitor.
+    #[inline]
+    pub(crate) fn identity_start_limit(
+        &self,
+        len: usize,
+        col: usize,
+        inclusive: bool,
+    ) -> Option<usize> {
+        (self.runs.is_empty() && self.text_len as usize == len)
+            .then(|| col.saturating_add(usize::from(inclusive)).min(len))
+    }
+
+    /// Byte window containing exactly the eligible needle starts of an identity map.
+    #[inline]
+    pub(crate) fn identity_match_window<const REV: bool>(
+        &self,
+        len: usize,
+        col: usize,
+        inclusive: bool,
+        needle_len: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let limit =
+            self.identity_start_limit(len, col, if REV { inclusive } else { !inclusive })?;
+        Some(if REV {
+            0..if limit == 0 {
+                0
+            } else {
+                (limit - 1).saturating_add(needle_len).min(len)
+            }
+        } else {
+            limit..len
+        })
     }
 
     /// Display column span `(start_col, end_col)` (`end_col` exclusive) for byte range `start..end`.
@@ -478,6 +538,28 @@ impl LowerByteMap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refreshed_cell_maps_equal_fresh_maps_across_shape_changes() {
+        let mut map = ColumnMap::new("initial", AmbiguousWidth::Single);
+        for text in ["", "abc", "日a\u{301}👩🏽‍💻", "plain ASCII", "日日日", ""] {
+            for shape in 0..4 {
+                let mut cells = crate::LineCells::new();
+                let mut col = 0;
+                for (i, (byte, ch)) in text.char_indices().enumerate() {
+                    let width = if shape == 0 { 1 } else { (i + shape) % 3 };
+                    cells.push(byte..byte + ch.len_utf8(), col, width);
+                    col += width + usize::from(shape == 3);
+                }
+                map.refresh_cells(text, &cells);
+                assert_eq!(
+                    map,
+                    super::ColumnMap::with_cells(text, &cells),
+                    "text={text:?} shape={shape}"
+                );
+            }
+        }
+    }
+
     use aterm_types::text_shaping::AmbiguousWidth;
 
     use aterm_grapheme::{GridColumns, GridStep, grid_graphemes_with};
@@ -622,6 +704,8 @@ mod tests {
                         let text = format!("{a}{b}{c}");
                         let walked = ColumnMap::new(&text, ambiguous);
                         let celled = ColumnMap::with_cells(&text, &written_cells(&text, ambiguous));
+                        assert_eq!(walked.is_ascii(), text.is_ascii());
+                        assert_eq!(celled.is_ascii(), text.is_ascii());
                         for start in 0..=text.len() + 1 {
                             for end in start..=text.len() + 1 {
                                 assert_eq!(

@@ -16,6 +16,7 @@ fn view(name: &str, nick: &str, fleet: bool) -> MachineView {
     MachineView {
         name: name.to_owned(),
         nick: nick.to_owned(),
+        word: nick.to_owned(),
         fleet,
     }
 }
@@ -210,4 +211,161 @@ fn a_title_read_before_an_update_commits_is_kept() {
         !app.drops_wake_before_commit(&Wake::MachineName(view("m8", "Heron", true))),
         "the reader posts a view once, so a candidate that dropped it would show no title"
     );
+}
+
+#[test]
+fn the_nickname_alert_reads_change_cancel_and_the_random_noun_from_its_response() {
+    use crate::appkit::consts::{
+        NS_ALERT_FIRST_BUTTON_RETURN, NS_ALERT_SECOND_BUTTON_RETURN, NS_ALERT_THIRD_BUTTON_RETURN,
+    };
+    assert_eq!(NICK_BUTTONS, ["Change", "Cancel", "New Random Noun"]);
+    assert_eq!(
+        nick_answer(NS_ALERT_FIRST_BUTTON_RETURN, || "Kestrel".to_owned()),
+        NickAnswer::Typed("Kestrel".to_owned())
+    );
+    let unread = || -> String { panic!("only Change reads the field") };
+    assert_eq!(
+        nick_answer(NS_ALERT_SECOND_BUTTON_RETURN, unread),
+        NickAnswer::Cancel
+    );
+    assert_eq!(
+        nick_answer(NS_ALERT_THIRD_BUTTON_RETURN, unread),
+        NickAnswer::Random
+    );
+    // `NSModalResponseAbort`: a modal session ended by something other than a button.
+    assert_eq!(nick_answer(-1001, unread), NickAnswer::Cancel);
+}
+
+#[test]
+fn a_typed_nickname_is_trimmed_and_a_word_that_is_none_is_refused_by_name() {
+    let typed = |text: &str| NickAnswer::Typed(text.to_owned());
+    assert!(matches!(
+        nick_to(&typed("  Kestrel \n"), "heron"),
+        Ok(Some(NickTo::Word(nick))) if nick.as_str() == "Kestrel"
+    ));
+    assert!(matches!(
+        nick_to(&NickAnswer::Random, "heron"),
+        Ok(Some(NickTo::Random))
+    ));
+    assert!(matches!(nick_to(&NickAnswer::Cancel, "heron"), Ok(None)));
+    assert_eq!(
+        nick_to(&typed("   "), "heron").err().as_deref(),
+        Some("Type a nickname first.")
+    );
+    let refused = nick_to(&typed("m12"), "heron").expect_err("a number shape is no nickname");
+    assert!(
+        refused.starts_with("\u{201c}m12\u{201d} is no nickname: ") && refused.ends_with('.'),
+        "{refused}"
+    );
+}
+
+#[test]
+fn an_untouched_field_changes_nothing_but_another_case_is_a_change() {
+    let typed = |text: &str| NickAnswer::Typed(text.to_owned());
+    assert!(
+        matches!(nick_to(&typed("heron"), "heron"), Ok(None)),
+        "the held word typed back is no change, so a drawn noun stays drawn"
+    );
+    assert!(matches!(nick_to(&typed(" heron "), "heron"), Ok(None)));
+    assert!(matches!(
+        nick_to(&typed("Heron"), "heron"),
+        Ok(Some(NickTo::Word(nick))) if nick.as_str() == "Heron"
+    ));
+}
+
+#[test]
+fn the_view_starts_the_field_at_the_stored_word_not_the_title_s_form() {
+    let root = state();
+    let dir = root.path();
+    read(dir, || Ok(None)).expect("a first read makes the name");
+    file::replace(dir, |name| {
+        name.nick = Nickname::parse("kestrel").map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
+    })
+    .expect("renames");
+    let shown = read(dir, || Ok(None)).expect("a read");
+    assert_eq!(
+        (shown.nick.as_str(), shown.word.as_str()),
+        ("Kestrel", "kestrel")
+    );
+}
+
+#[test]
+fn the_alert_names_the_number_and_puts_the_last_refusal_first() {
+    let body = nickname_alert_body(&view("m8", "Heron", true), None);
+    assert!(body.contains("beside its number, m8."), "{body}");
+    assert!(body.contains("random noun"), "{body}");
+    let again = nickname_alert_body(&view("m8", "Heron", true), Some("Type a nickname first."));
+    assert_eq!(again, format!("Type a nickname first.\n\n{body}"));
+}
+
+#[test]
+fn a_nickname_change_is_refused_to_a_gesture_the_person_did_not_make_and_before_a_read() {
+    let mut app = crate::App::headless_for_test();
+    app.machine_view = Some(view("m8", "Heron", true));
+    for mark in 0..3 {
+        app.agents.controller_gesture = mark == 0;
+        app.agents.assistive_gesture = mark == 1;
+        app.agents.relayed_gesture = mark == 2;
+        app.change_nickname();
+        assert_eq!(
+            app.pending_action_refusal.take().as_deref(),
+            Some(NICK_PERSON_ONLY),
+            "mark {mark}"
+        );
+    }
+    app.agents.relayed_gesture = false;
+    app.machine_view = None;
+    app.change_nickname();
+    assert_eq!(
+        app.pending_action_refusal.take().as_deref(),
+        Some(NICK_UNREAD)
+    );
+}
+
+#[test]
+fn a_failed_set_is_kept_for_the_next_press_unless_a_later_press_superseded_it() {
+    let mut app = crate::App::headless_for_test();
+    let unset = |generation| NickUnset {
+        generation,
+        word: Some("Kestrel".to_owned()),
+        why: "The nickname was not changed: the lock is busy.".to_owned(),
+    };
+    app.nickname_sets = 2;
+    app.nickname_not_set(unset(1));
+    assert_eq!(
+        app.nickname_unset, None,
+        "press 2 started after press 1's set"
+    );
+    app.nickname_not_set(unset(2));
+    assert_eq!(app.nickname_unset, Some(unset(2)));
+}
+
+/// A read name reaches the status item: the glance the item is built from carries the title, and
+/// the read owes the item a rebuild though no session row moved (machine names §5.5).
+#[test]
+fn a_read_name_leads_the_status_items_tooltip_and_this_mac_row() {
+    let mut app = crate::App::headless_for_test();
+    let _ = app.take_status_rebuild();
+    let before = app.status_glance();
+    assert_eq!(before.machine, None, "CONTROL: nothing read yet");
+    assert_eq!(before.tooltip(), "aterm");
+    app.machine_name_read(view("m8", "Heron", true));
+    assert!(
+        app.take_status_rebuild(),
+        "the read owes the item a rebuild"
+    );
+    let after = app.status_glance();
+    assert_eq!(after.machine.as_deref(), Some("m8 Heron"));
+    assert_eq!(after.tooltip(), "aterm \u{b7} m8 Heron");
+    assert!(
+        crate::status_item::compose_status_menu(&after, 0)
+            .iter()
+            .any(|row| matches!(
+                row,
+                crate::status_item::StatusRow::Info(line) if line.starts_with("m8 Heron \u{2014} ")
+            )),
+        "This Mac's row is led by the title"
+    );
+    assert_ne!(before.fingerprint(), after.fingerprint());
 }

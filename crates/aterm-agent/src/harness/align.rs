@@ -414,7 +414,7 @@ pub(super) fn capture_with_owning_wait(
         None,
         Some(observed),
         false,
-        Some(&mut || true),
+        Some(&mut |_| true),
     )
 }
 
@@ -621,11 +621,11 @@ pub fn capture_bounded_owned(
 }
 
 /// [`capture_bounded_owned`] that also watches an external terminal condition, `stopped`, while
-/// the child runs unreaped, as a renewal watches for its browser opener's recorded failure. Once
-/// it says so the child is ended as every other stop ends it, the output reader is cancelled and
-/// joined, and the answer is [`Ended::Stopped`]; an exit the capture observes first is answered
-/// as that exit. A panic in `stopped` becomes an error after the same end; its payload is not
-/// returned.
+/// the child runs unreaped with piped stdin, as a renewal watches for its browser opener's
+/// recorded failure or a hosted OAuth code to inject. Once it says so the child is ended as every
+/// other stop ends it, the output reader is cancelled and joined, and the answer is
+/// [`Ended::Stopped`]; an exit the capture observes first is answered as that exit. A panic in
+/// `stopped` becomes an error after the same end; its payload is not returned.
 ///
 /// # Errors
 ///
@@ -636,7 +636,7 @@ pub(super) fn capture_bounded_owned_watching(
     mut cmd: Command,
     budget: Duration,
     max_stdout: usize,
-    mut stopped: impl FnMut() -> bool,
+    mut stopped: impl FnMut(&mut aterm_uds::spawnfd::Child) -> bool,
 ) -> Result<Ended, String> {
     tie(&mut cmd)?;
     capture_with(
@@ -831,7 +831,7 @@ fn capture_with(
     stop: Option<&'static [u8]>,
     observer: CaptureObserver,
     owned: bool,
-    mut watch: Option<&mut dyn FnMut() -> bool>,
+    mut watch: Option<&mut dyn FnMut(&mut aterm_uds::spawnfd::Child) -> bool>,
 ) -> Result<Ended, String> {
     let mut keep: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (name, value) in cmd.get_envs() {
@@ -839,7 +839,13 @@ fn capture_with(
             keep.push((name.to_os_string(), value.to_os_string()));
         }
     }
-    cmd.env_clear().stdin(Stdio::null()).stdout(Stdio::piped());
+    cmd.env_clear()
+        .stdin(if watch.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped());
     #[cfg(unix)]
     let mut stderr_watch = match stop {
         Some(stop) => {
@@ -1007,7 +1013,7 @@ fn capture_with(
                         };
                     }
                 }
-                let checked = check_capture_watch(&mut watch);
+                let checked = check_capture_watch(&mut watch, &mut child.child);
                 if !matches!(checked, Ok(false)) {
                     let cleanup = kill_capture_child_checked(&mut child, &observer);
                     let joined = join_capture_reader(&mut child, &mut reader);
@@ -1081,7 +1087,7 @@ fn capture_with(
         }
         // Natural exit observed after output completion retains its actual exit status.
         // Until then the original unreaped child still pins its private process group.
-        let checked = check_capture_watch(&mut watch);
+        let checked = check_capture_watch(&mut watch, &mut child.child);
         if !matches!(checked, Ok(false)) {
             kill_capture_child_checked(&mut child, &observer)?;
             checked?;
@@ -1142,11 +1148,14 @@ fn discard_capture_value<T>(value: T) {
     }
 }
 
-fn check_capture_watch(watch: &mut Option<&mut dyn FnMut() -> bool>) -> Result<bool, String> {
+fn check_capture_watch(
+    watch: &mut Option<&mut dyn FnMut(&mut aterm_uds::spawnfd::Child) -> bool>,
+    child: &mut aterm_uds::spawnfd::Child,
+) -> Result<bool, String> {
     let Some(watch) = watch else {
         return Ok(false);
     };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(watch)) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch(child))) {
         Ok(stopped) => Ok(stopped),
         Err(payload) => {
             // A callback's arbitrary panic payload may itself panic on drop.

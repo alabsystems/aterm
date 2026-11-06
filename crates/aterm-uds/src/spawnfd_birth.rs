@@ -150,7 +150,8 @@ pub struct ObservedSpawned {
 
 impl ObservedSpawned {
     /// Whether mutable borrowing still holds this receipt's exact original
-    /// Child handle. Moving it preserves identity; replacing it does not, even
+    /// Child handle without a kernel-reported loss of wait custody. Moving it preserves
+    /// identity; replacing it does not, even
     /// if the replacement later obtains the same numeric pid.
     #[must_use]
     pub fn is_original_child(&self) -> bool {
@@ -184,7 +185,8 @@ pub struct Spawned {
 }
 
 impl Spawned {
-    /// Whether this receipt still holds the original native child handle.
+    /// Whether this receipt still holds the original native child handle without
+    /// a kernel-reported loss of wait custody.
     #[must_use]
     pub fn is_original_child(&self) -> bool {
         self.observed.is_original_child()

@@ -998,6 +998,62 @@ fn unit_clocks_refuse_truncation_symlinks_and_nonfile_invocation_stamps() {
     }
 }
 
+#[test]
+fn reclaimable_profile_totals_preserve_exact_maximum_overflow_and_partial_counts() {
+    let tmp = Tmp::new("profile-total");
+    let t = synthetic_target(&tmp, "target");
+    let now = now_after_write(STALE + 1);
+    let mut td = assessed(&t, now);
+    assert_eq!(td.profiles.len(), 1);
+    td.profiles[0].bytes = u64::MAX;
+    td.profiles[0].bytes_partial = false;
+    assert_eq!(td.reclaimable(now, STALE), (u64::MAX, false));
+
+    let mut extra = td.profiles[0].clone();
+    extra.path = t.join("another-profile");
+    extra.bytes = 1;
+    td.profiles.push(extra);
+    assert_eq!(td.reclaimable(now, STALE), (u64::MAX, true));
+
+    td.profiles[1].bytes = 0;
+    assert_eq!(td.reclaimable(now, STALE), (u64::MAX, false));
+    td.profiles[1].bytes_partial = true;
+    assert_eq!(td.reclaimable(now, STALE), (u64::MAX, true));
+    td.profiles.clear();
+    assert_eq!(td.reclaimable(now, STALE), (0, false));
+}
+
+#[test]
+fn reclaimable_totals_use_only_the_same_eligible_profiles_as_the_candidate_list() {
+    let tmp = Tmp::new("profile-selection-total");
+    let t = synthetic_target(&tmp, "target");
+    let now = now_after_write(STALE + 1);
+    let mut td = assessed(&t, now);
+    assert_eq!(td.profiles.len(), 1);
+    td.profiles[0].bytes = 7;
+    td.profiles[0].bytes_partial = false;
+    let base = td.profiles[0].clone();
+    for (name, last_used, incremental, in_use) in [
+        ("held", base.last_used, true, Some("locked".to_owned())),
+        ("recent", Some(now), true, None),
+        ("unknown-age", None, true, None),
+        ("empty", base.last_used, false, None),
+    ] {
+        td.profiles.push(Profile {
+            path: t.join(name),
+            last_used,
+            incremental,
+            in_use,
+            bytes: u64::MAX,
+            bytes_partial: true,
+        });
+    }
+    assert_eq!(td.candidates(now, STALE), vec![&base]);
+    assert_eq!(td.reclaimable(now, STALE), (7, false));
+    td.profiles[0].bytes_partial = true;
+    assert_eq!(td.reclaimable(now, STALE), (7, true));
+}
+
 /// An idle profile loses only its `incremental/` cache and releases its locks.
 #[test]
 fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_identical() {

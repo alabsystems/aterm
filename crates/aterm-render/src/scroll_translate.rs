@@ -23,21 +23,26 @@ pub const fn grid_band_px(
     (y0, y1)
 }
 
-/// Shifts the rows of the grid band `[y0, y1)` of `buf` (`w`-wide, row-major) by `frac_px` device pixels in place.
+/// Shifts the rows of the grid band `[y0, y1)` of `buf` (`w`-wide, row-major) by `frac_px` device pixels in place; a band that runs past `buf`, or a shift wider than `usize`, moves nothing.
 #[inline]
 pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: usize, frac_px: i64) {
     if w == 0 || y0 >= y1 || frac_px == 0 {
         return;
     }
+    let Some(end) = y1.checked_mul(w).filter(|&end| end <= buf.len()) else {
+        return;
+    };
     let band_h = y1 - y0;
-    let mag = frac_px.unsigned_abs() as usize;
+    let Ok(mag) = usize::try_from(frac_px.unsigned_abs()) else {
+        return;
+    };
     let moved = band_h.saturating_sub(mag);
     if moved == 0 {
         return;
     }
     if frac_px > 0 {
         // Shift up: rows `[y0, y0 + moved)` take `[y0 + mag, y1)`.
-        buf.copy_within((y0 + mag) * w..y1 * w, y0 * w);
+        buf.copy_within((y0 + mag) * w..end, y0 * w);
     } else {
         // Shift down: rows `[y0 + mag, y1)` take `[y0, y0 + moved)`.
         buf.copy_within(y0 * w..(y0 + moved) * w, (y0 + mag) * w);
@@ -126,7 +131,9 @@ mod tests {
         if w == 0 || y0 >= y1 || frac == 0 {
             return out;
         }
-        let mag = frac.unsigned_abs() as usize;
+        let Ok(mag) = usize::try_from(frac.unsigned_abs()) else {
+            return out;
+        };
         let moved = (y1 - y0).saturating_sub(mag);
         for i in 0..moved {
             let (dst, s) = if frac > 0 {
@@ -158,6 +165,29 @@ mod tests {
                     );
                 }
             }
+        }
+        for frac in [
+            i64::from(u32::MAX) + 1,
+            i64::from(u32::MAX) + 2,
+            -(i64::from(u32::MAX) + 2),
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let mut buf = base.clone();
+            translate_grid_band_in_place(&mut buf, w, 2, 18, frac);
+            assert_eq!(
+                buf, base,
+                "oversized residual {frac} must not wrap on 32-bit targets"
+            );
+        }
+        for frac in [1, -1] {
+            let mut short = base[..(h - 1) * w].to_vec();
+            translate_grid_band_in_place(&mut short, w, 0, h, frac);
+            assert_eq!(
+                short,
+                base[..(h - 1) * w],
+                "a band past the buffer's end moves nothing (frac={frac})"
+            );
         }
     }
 

@@ -6,61 +6,88 @@
 
 use crate::{Error, Result};
 use aterm_digest::Sha256;
-use aterm_secrets::{client::Paths, fsx};
+use aterm_secrets::client::Paths;
 use std::path::{Path, PathBuf};
 
 pub(super) struct Custody {
-    immutable: Vec<(PathBuf, [u8; 32])>,
+    root: PathBuf,
+    identity: [u8; 32],
+    commons: PathBuf,
+    commons_files: [(&'static str, [u8; 32]); 3],
     journal: PathBuf,
+    anchor: [u8; 32],
 }
-fn digest(path: &Path) -> Result<[u8; 32]> {
-    let bytes = fsx::read_private(path, 4096)
-        .map_err(|_| Error::new("Commons custody file is not private"))?
-        .ok_or_else(|| Error::new("Commons custody file is missing"))?;
+fn digest_in(dir: &aterm_uds::private_file::JudgedDir, name: &str) -> Result<[u8; 32]> {
+    let bytes = dir.read(name, 4096).map_err(|error| match error {
+        aterm_uds::private_file::PrivateFileError::Missing => {
+            Error::new("Commons custody file is missing")
+        }
+        _ => Error::new("Commons custody file is not private"),
+    })?;
+    let bytes = zeroize::Zeroizing::new(bytes);
     Ok(Sha256::digest(bytes.as_slice()))
+}
+fn judge_custody_dir(dir: &Path) -> Result<aterm_uds::private_file::JudgedDir<'_>> {
+    aterm_uds::private_file::JudgedDir::judge(dir)
+        .map_err(|_| Error::new("Commons custody file is not private"))
 }
 impl Custody {
     pub(super) fn capture(paths: &Paths, journal: &Path) -> Result<Self> {
+        let root_dir = judge_custody_dir(&paths.dir)?;
+        let identity = digest_in(&root_dir, "identity")?;
         let commons = paths.dir.join("commons");
-        let immutable = [
-            paths.dir.join("identity"),
-            commons.join("device.age"),
-            commons.join("device.claim"),
-            commons.join("default.pin"),
-            journal.join("control.anchor"),
-        ]
-        .into_iter()
-        .map(|path| digest(&path).map(|hash| (path, hash)))
-        .collect::<Result<_>>()?;
-        let custody = Self {
-            immutable,
-            journal: journal.into(),
-        };
-        custody.check_journal()?;
-        Ok(custody)
-    }
-    fn check_journal(&self) -> Result<()> {
-        let dir = aterm_uds::private_file::JudgedDir::judge(&self.journal)
-            .map_err(|_| Error::new("Commons established history is missing or not private"))?;
+        let commons_dir = judge_custody_dir(&commons)?;
+        let commons_files = [
+            ("device.age", digest_in(&commons_dir, "device.age")?),
+            ("device.claim", digest_in(&commons_dir, "device.claim")?),
+            ("default.pin", digest_in(&commons_dir, "default.pin")?),
+        ];
+        let journal_dir = aterm_uds::private_file::JudgedDir::judge(journal)
+            .map_err(|_| Error::new("Commons custody file is not private"))?;
+        let anchor = digest_in(&journal_dir, "control.anchor")?;
         for name in ["control.astream", "control.checkpoint"] {
-            dir.open(name)
+            journal_dir
+                .open(name)
                 .map_err(|_| Error::new("Commons established history is missing or not private"))?;
         }
-        Ok(())
+        Ok(Self {
+            root: paths.dir.clone(),
+            identity,
+            commons,
+            commons_files,
+            journal: journal.into(),
+            anchor,
+        })
     }
     pub(super) fn recheck(&self) -> Result<()> {
-        for (path, expected) in &self.immutable {
-            if &digest(path)? != expected {
+        let root_dir = judge_custody_dir(&self.root)?;
+        if digest_in(&root_dir, "identity")? != self.identity {
+            return Err(Error::new("Commons immutable custody changed"));
+        }
+        let commons_dir = judge_custody_dir(&self.commons)?;
+        for (name, expected) in &self.commons_files {
+            if &digest_in(&commons_dir, name)? != expected {
                 return Err(Error::new("Commons immutable custody changed"));
             }
         }
-        self.check_journal()
+        let journal_dir = aterm_uds::private_file::JudgedDir::judge(&self.journal)
+            .map_err(|_| Error::new("Commons established history is missing or not private"))?;
+        if digest_in(&journal_dir, "control.anchor")? != self.anchor {
+            return Err(Error::new("Commons immutable custody changed"));
+        }
+        for name in ["control.astream", "control.checkpoint"] {
+            journal_dir
+                .open(name)
+                .map_err(|_| Error::new("Commons established history is missing or not private"))?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_secrets::fsx;
     #[test]
     fn immutable_change_or_lost_history_withdraws_without_repairing_storage() {
         let home = aterm_tempfile::tempdir().unwrap();

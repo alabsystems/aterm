@@ -1965,9 +1965,9 @@ impl ResourceView {
 }
 
 fn heat_of(v: Option<f64>, cap: Option<f64>) -> Option<f32> {
-    let (v, cap) = (v?, cap?);
+    let (v, cap) = (v.filter(|x| x.is_finite())?, cap.filter(|x| x.is_finite())?);
     Some(if cap > 0.0 {
-        (v / cap).max(0.0) as f32
+        (v / cap).clamp(0.0, f64::from(f32::MAX)) as f32
     } else if v > 0.0 {
         1.0
     } else {
@@ -4910,6 +4910,8 @@ mod tests {
             snapshot.delegated.iter().map(|job| job.cores).sum::<f32>(),
             0.75
         );
+        assert_eq!(heat_of(Some(f64::NAN), Some(10.0)), None);
+        assert_eq!(heat_of(Some(f64::INFINITY), Some(f64::INFINITY)), None);
     }
 
     #[test]

@@ -1031,6 +1031,26 @@ pub fn tidy_profile(
     session: Option<(&str, &str)>,
     within: Duration,
 ) -> Result<Tidied, String> {
+    tidy_profile_scoped(browser, profile, session, within, None)
+}
+
+/// Tidies a profile while its client and detached pipe workers retain the same operation.
+/// # Errors
+/// As [`tidy_profile`], or its operation has been cancelled.
+#[cfg(unix)]
+pub fn tidy_profile_scoped(
+    browser: &super::headless_oauth::HeadlessBrowser,
+    profile: &Path,
+    session: Option<(&str, &str)>,
+    within: Duration,
+    scope: Option<super::account_work::Scope>,
+) -> Result<Tidied, String> {
+    if scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Err("browser profile account work is paused".into());
+    }
     use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
     use std::os::fd::OwnedFd;
     let (cmd_read, cmd_write) =
@@ -1047,12 +1067,19 @@ pub fn tidy_profile(
     let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
         .map_err(|e| format!("{} did not start ({e})", browser_name(&browser.path)))?;
     let _guard = super::headless_oauth::BrowserChild::new(child);
-    let mut cdp = super::headless_oauth::CdpClient::new(cmd_write, out_read);
+    let mut cdp = super::headless_oauth::CdpClient::new_scoped(cmd_write, out_read, scope.clone())?;
     let now = Instant::now();
     let deadline = now
         .checked_add(within)
         .unwrap_or_else(|| now + Duration::from_secs(86_400));
-    tidy_over_cdp(&mut cdp, session, deadline)
+    let result = tidy_over_cdp(&mut cdp, session, deadline);
+    if scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+    {
+        return Err("browser profile account work is paused".into());
+    }
+    result
 }
 
 /// Non-Unix: nothing is tidied.
@@ -1066,6 +1093,20 @@ pub fn tidy_profile(
     _within: Duration,
 ) -> Result<Tidied, String> {
     Err("a profile is tidied on macOS and Linux only".to_owned())
+}
+
+/// Non-Unix: nothing is tidied.
+/// # Errors
+/// Always, as [`tidy_profile`].
+#[cfg(not(unix))]
+pub fn tidy_profile_scoped(
+    browser: &super::headless_oauth::HeadlessBrowser,
+    profile: &Path,
+    session: Option<(&str, &str)>,
+    within: Duration,
+    _scope: Option<super::account_work::Scope>,
+) -> Result<Tidied, String> {
+    tidy_profile(browser, profile, session, within)
 }
 
 /// The origin (`https://host`) of `url`.

@@ -1888,3 +1888,48 @@ fn shared_application_observation_keeps_deadline_custody_and_catalog_refusals_re
         );
     }
 }
+
+/// A home or config path that is not UTF-8 (a Unix path is bytes) reads back from the selection
+/// record as the same path, where its null text alone would read as no record at all. A UTF-8
+/// path's record is its text alone, unchanged. A hex spelling of a UTF-8 path, or of one holding
+/// a NUL, is refused, so each path has one spelling.
+#[cfg(unix)]
+#[test]
+fn a_selection_whose_paths_are_not_utf8_reads_back_as_the_same_paths() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let text = Selection {
+        original: Paths::for_home(Path::new("/tmp/aterm-home")),
+        config: PathBuf::from("/tmp/aterm-config.toml"),
+        actor: "a1".to_owned(),
+        trust: "t1".to_owned(),
+        complete: None,
+    };
+    let encoded = text.bytes();
+    assert!(
+        !String::from_utf8_lossy(&encoded).contains("_hex"),
+        "{}",
+        String::from_utf8_lossy(&encoded)
+    );
+    assert_eq!(Selection::parse(&encoded).unwrap().bytes(), encoded);
+    let mut raw = text.clone();
+    raw.original = Paths::for_home(Path::new(std::ffi::OsStr::from_bytes(
+        b"/tmp/aterm-home-\xff",
+    )));
+    raw.config = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/aterm-config-\xfe.toml"));
+    let encoded = raw.bytes();
+    let back = Selection::parse(&encoded).expect("a non-UTF-8 path reads back");
+    assert_eq!(back.original, raw.original);
+    assert_eq!(back.config, raw.config);
+    assert_eq!(back.bytes(), encoded);
+    let mut record: Value = aterm_json::from_slice(&encoded).unwrap();
+    for forged in [&b"/tmp/aterm-home"[..], b"/tmp/aterm-\0\xff", b""] {
+        record.as_object_mut().unwrap().insert(
+            "home_hex".to_owned(),
+            Value::String(aterm_codec::hex::encode_lower(forged)),
+        );
+        assert!(
+            Selection::parse(record.to_string().as_bytes()).is_err(),
+            "{forged:?}"
+        );
+    }
+}

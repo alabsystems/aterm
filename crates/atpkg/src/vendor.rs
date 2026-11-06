@@ -184,6 +184,14 @@ pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowErro
 }
 
 fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
+    if artifact.kind == "elf-binary"
+        && !matches!(
+            artifact.target.as_str(),
+            "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+        )
+    {
+        return Err(refuse("elf-binary requires a supported GNU Linux target"));
+    }
     if !artifact.asset.is_empty() && !bare_file_name(&artifact.asset) {
         return Err(refuse2(
             "asset must be a bare local file name (no separators, not `.`/`..`): ",
@@ -652,6 +660,21 @@ mod tests {
         );
         a.payload = "tar-zst".into();
         check_row(&a, &[]).expect("only the bundle lane must sign a root");
+    }
+
+    #[test]
+    fn elf_binary_rows_are_confined_to_the_published_gnu_targets() {
+        let mut artifact = row();
+        artifact.protocol = "github-release".into();
+        artifact.kind = "elf-binary".into();
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            artifact.target = target.into();
+            assert!(check_row(&artifact, &[]).is_ok());
+        }
+        for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", ""] {
+            artifact.target = target.into();
+            assert!(refused(&artifact, &[]).contains("GNU Linux target"));
+        }
     }
 
     #[test]

@@ -30,6 +30,13 @@ aterm-metrics = { path = "../aterm-metrics" }
 aterm-mesh-core = { path = "../aterm-mesh-core" }
 # The neighbour links the relay rides (`fleet::link`), their `Bus` streams and the node key's file.
 aterm-net = { workspace = true }
+# The Commons table stores the tables the mesh moves live in: their append hook (`table::store`),
+# the batch checks a delivered record goes through and the digest exchange `Inventory` runs
+# (`replica`).
+aterm-db = { workspace = true }
+# SHA-256: a record's id, the `Inventory` summary and the two digests a presence row carries
+# (`presence::Held`).
+aterm-digest = { workspace = true }
 # The membership log, whose current seats are the origins and whose removed and retired keys are
 # revoked (`membership_log`, `client::load_acknowledged_and_ahead`).
 aterm-secrets = { workspace = true }
@@ -43,8 +50,6 @@ aterm-types = { workspace = true }
 aterm-log = { workspace = true }
 # The flush a test may skip (`plain_durable_flushes_in_tests!`).
 aterm-durable = { workspace = true }
-# SHA-256 for the two digests a presence row carries (`presence::Held`).
-aterm-digest = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Scratch folders for each test Mac.

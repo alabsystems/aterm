@@ -5,8 +5,15 @@
 //! §3.3.7, F21 rule 5), read from the log's counting records alone, so every Mac that holds the
 //! same records names the same due, the same Macs and the same order:
 //!
-//! - [`Log::rekey_dues`]: each audience whose causally newest epochs still wrap a recipient the
-//!   log removed (rotation), that has two or more newest epochs that are not [`secure_twins`]
+//! - [`Log::head_due`]: P1's one rule for a newest epoch (`aterm_mesh_core::revocation`): it is
+//!   due a rotation, and no writer seals under it, when its gate is shut (for a revoked seat row,
+//!   [`Membership::revoking_rows`], no `Remove` that took it is in the epoch's causal past, or
+//!   one is missing while a live row binds its recipient) or it wraps a revoked recipient. The
+//!   gate does not read which `Wrap`s of the epoch this Mac holds: another Mac may have handed
+//!   the epoch to the removed Mac beside the `Remove` (a heal), and its `Wrap` need not have
+//!   arrived here.
+//! - [`Log::rekey_dues`]: each audience one of whose causally newest epochs is due by
+//!   [`Log::head_due`] (rotation), that has two or more newest epochs that are not [`secure_twins`]
 //!   (coverage), or that has an uncovered keyed epoch a current member holds and can reseal
 //!   (F21 rule 5); with the current members that can carry it, the removers among them and the
 //!   resealers.
@@ -37,6 +44,7 @@
 use super::{Body, EpochAudience, Log, MemberId, Membership, RecordId};
 use crate::age::Recipient;
 use aterm_digest::Sha256;
+use aterm_mesh_core::revocation::{gate_row, head_due, wraps_removed};
 use std::collections::{BTreeMap, BTreeSet};
 
 const RANK_DOMAIN: &[u8] = b"aterm/members/rekey-rank/3\0";
@@ -261,13 +269,29 @@ impl Log {
                 .iter()
                 .filter_map(|id| Some((*id, cache.wraps().get(id)?.keys().copied().collect())))
                 .collect();
-            let wraps_removed = |r: &Recipient| {
-                removed.contains(r)
-                    && newest
+            // Whether a newest epoch still wraps `r`, a recipient the log removed: one-mesh proofs
+            // P1's `wraps_removed` kernel, the decision `client/log_entries`' `wraps_removed` (a
+            // removal's reserve for its own targets) asks too (P6).
+            let wraps_revoked = |r: &Recipient| {
+                wraps_removed(
+                    removed.contains(r),
+                    newest
                         .iter()
-                        .any(|id| wrapped.get(id).is_some_and(|set| set.contains(r)))
+                        .any(|id| wrapped.get(id).is_some_and(|set| set.contains(r))),
+                )
             };
-            let rotation = removed.iter().any(&wraps_removed);
+            let rotation = newest
+                .iter()
+                .any(|id| self.head_due(id, wrapped.get(id), &removed));
+            // The Macs whose `Remove` a newest epoch's shut gate lacks ([`Log::gate_misses`]).
+            let ungated: BTreeSet<MemberId> = newest
+                .iter()
+                .flat_map(|id| self.gate_misses(id))
+                .filter_map(|at| match self.order[at].body() {
+                    Body::Remove { member, .. } => Some(*member),
+                    _ => None,
+                })
+                .collect();
             let coverage = newest.len() > 1 && !secure_twins(&newest, &wrapped, &removed);
             let carriers: BTreeSet<MemberId> = membership
                 .members()
@@ -288,9 +312,10 @@ impl Log {
             let mut removals: BTreeSet<MemberId> = BTreeSet::new();
             let mut removed_seats: BTreeSet<MemberId> = BTreeSet::new();
             for (target, removal) in membership.removed() {
-                if !seats
-                    .get(target)
-                    .is_some_and(|set| set.iter().any(&wraps_removed))
+                if !ungated.contains(target)
+                    && !seats
+                        .get(target)
+                        .is_some_and(|set| set.iter().any(&wraps_revoked))
                 {
                     continue;
                 }
@@ -341,6 +366,60 @@ impl Log {
             });
         }
         dues
+    }
+
+    /// Whether the newest epoch `epoch`, whose counting `Wrap`s here name `wrapped`, is due a
+    /// rotation, so that no writer seals under it: P1's one rule
+    /// (`aterm_mesh_core::revocation::head_due`). Its gate is shut when [`Log::gate_misses`]
+    /// names a `Remove`, and it wraps a revoked recipient when one of `removed` (the caller's
+    /// [`Log::removed_recipients`]) is in `wrapped`. `rekey_dues`' rotation and a writer's wait
+    /// ask this one rule.
+    #[must_use]
+    pub fn head_due(
+        &self,
+        epoch: &RecordId,
+        wrapped: Option<&BTreeSet<Recipient>>,
+        removed: &BTreeSet<Recipient>,
+    ) -> bool {
+        let wraps_revoked = removed
+            .iter()
+            .any(|r| wraps_removed(true, wrapped.is_some_and(|set| set.contains(r))));
+        head_due(self.gate_misses(epoch).is_empty(), wraps_revoked)
+    }
+
+    /// The `Remove`s that keep `epoch`'s gate shut, as indices into this log's order: for each
+    /// revoked seat row ([`Membership::revoking_rows`]) whose gate row is shut
+    /// (`aterm_mesh_core::revocation::gate_row`: no `Remove` that took it lies in the epoch's
+    /// causal past, or one is missing while a live row binds its recipient), the ones the
+    /// epoch's past lacks; every one of them when this log does not hold `epoch`. Empty exactly
+    /// when the gate is open.
+    fn gate_misses(&self, epoch: &RecordId) -> BTreeSet<usize> {
+        let epoch_at = self.held.get(epoch).copied();
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("held-wrap-gate") {
+            return BTreeSet::new();
+        }
+        let effective = self.effective();
+        let mut misses = BTreeSet::new();
+        for row in self.membership_ref().revoking_rows() {
+            let takers: Vec<(usize, bool)> = row
+                .removes
+                .iter()
+                .filter_map(|id| self.held.get(id).copied())
+                .map(|at| (at, epoch_at.is_some_and(|e| effective.before(at, e))))
+                .collect();
+            let every = takers.iter().fold(true, |all, &(_, before)| all && before);
+            let some = takers.iter().fold(false, |any, &(_, before)| any || before);
+            if !gate_row(true, every, row.recipient_live, some) {
+                misses.extend(
+                    takers
+                        .iter()
+                        .filter(|&&(_, before)| !before)
+                        .map(|&(at, _)| at),
+                );
+            }
+        }
+        misses
     }
 
     /// The epochs of `epochs` whose minter's batch this log may hold only a prefix of: it holds

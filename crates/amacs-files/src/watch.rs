@@ -16,13 +16,15 @@
 //! as the file, so a save that replaces the file by rename (a new inode, as
 //! most editors, formatters and `git checkout` save) is heard too, as is a
 //! deleted file made again, and after each burst it arms again on whatever
-//! file the path names now.
+//! file the path names now. A file whose folder went with it has nothing to
+//! arm on, so the watch arms it again every `REARM_EVERY` until its folder
+//! is back, and only while some file is unarmed.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
 //! reload or keep over unsaved edits).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +41,11 @@ pub const SETTLE_CAP: Duration = Duration::from_millis(600);
 /// How often the stat-poll arm looks where no file events exist.
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 const POLL_EVERY: Duration = Duration::from_millis(500);
+
+/// How often the watch arms again a file it could not arm (neither the file nor its directory
+/// is there: a folder deleted with the file, or not made yet), while one is left: no event
+/// tells it the folder came back.
+const REARM_EVERY: Duration = Duration::from_millis(500);
 
 /// Wakes a parked [`FileEvents::wait`] from another thread.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -251,6 +258,7 @@ fn watch_loop(
     // Each watched file and the stamp the watch last told, `Seen::Never`
     // until its first look.
     let mut watched: BTreeMap<u64, (PathBuf, Seen)> = BTreeMap::new();
+    let mut unarmed = Unarmed::default();
     let mut debounce = Debounce::default();
     let mut touched = Vec::new();
     loop {
@@ -263,28 +271,44 @@ fn watch_loop(
                     // Armed, then looked at once, and that first look tells:
                     // the host read the file before this, so a change since
                     // its read may already be in any stamp taken here.
-                    let _ = events.arm(key, &path);
+                    let now = Instant::now();
+                    unarmed.arm(events.as_mut(), key, &path, now);
                     watched.insert(key, (path, Seen::Never));
-                    debounce.note(key, Instant::now());
+                    debounce.note(key, now);
                 }
                 Ok(Command::Unwatch(key)) => {
                     events.disarm(key);
                     watched.remove(&key);
+                    unarmed.forget(key);
                     debounce.forget(key);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
         }
-        let timeout = debounce
+        let before = Instant::now();
+        let due = debounce
             .deadline()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            .map(|deadline| deadline.saturating_duration_since(before));
+        let timeout = match (due, unarmed.wait(before)) {
+            (Some(due), Some(rearm)) => Some(due.min(rearm)),
+            (due, rearm) => due.or(rearm),
+        };
         touched.clear();
         if events.wait(timeout, &mut touched).is_err() {
             // A failed wait is not a reason to spin: look again shortly.
             std::thread::park_timeout(QUIET);
         }
         let now = Instant::now();
+        for key in unarmed.due(now) {
+            // An arm that takes now is looked at, as a first look is: the
+            // file may have come back with its folder before the arm.
+            if let Some((path, _)) = watched.get(&key)
+                && unarmed.arm(events.as_mut(), key, path, now)
+            {
+                debounce.note(key, now);
+            }
+        }
         for key in &touched {
             if watched.contains_key(key) {
                 debounce.note(*key, now);
@@ -294,13 +318,68 @@ fn watch_loop(
             let Some((path, seen)) = watched.get_mut(&key) else {
                 continue;
             };
-            let _ = events.arm(key, path);
+            unarmed.arm(events.as_mut(), key, path, now);
             let stamp = Seen::Stamp(FileStamp::of(path));
             if stamp != *seen {
                 *seen = stamp;
                 notify(key);
             }
         }
+    }
+}
+
+/// The watched files no arm took (neither the file nor its directory is
+/// there), which the watch arms again every [`REARM_EVERY`] after the last
+/// arm that failed, while one is left; with none left the watch waits on
+/// events alone.
+#[derive(Debug)]
+struct Unarmed {
+    keys: BTreeSet<u64>,
+    last_failed: Instant,
+}
+
+impl Default for Unarmed {
+    fn default() -> Self {
+        Self {
+            keys: BTreeSet::new(),
+            last_failed: Instant::now(),
+        }
+    }
+}
+
+impl Unarmed {
+    /// Arm `key` on `path` at `now`: whether it took. One that did not is
+    /// armed again later ([`Self::due`]).
+    fn arm(&mut self, events: &mut dyn FileEvents, key: u64, path: &Path, now: Instant) -> bool {
+        let armed = events.arm(key, path).is_ok();
+        if armed {
+            self.keys.remove(&key);
+        } else {
+            self.keys.insert(key);
+            self.last_failed = now;
+        }
+        armed
+    }
+
+    /// `key` is no longer watched.
+    fn forget(&mut self, key: u64) {
+        self.keys.remove(&key);
+    }
+
+    /// How long from `now` until the next arm again, if a file is unarmed.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        (!self.keys.is_empty())
+            .then(|| REARM_EVERY.saturating_sub(now.saturating_duration_since(self.last_failed)))
+    }
+
+    /// The unarmed files to arm again at `now`: every one once
+    /// [`REARM_EVERY`] passed since the last failed arm, else none.
+    fn due(&mut self, now: Instant) -> Vec<u64> {
+        if self.wait(now) != Some(Duration::ZERO) {
+            return Vec::new();
+        }
+        self.last_failed = now;
+        self.keys.iter().copied().collect()
     }
 }
 
@@ -427,6 +506,19 @@ impl FileEvents for PollEvents {
 
     fn waker(&self) -> Waker {
         self.inert.waker()
+    }
+}
+
+/// `poll(2)`'s timeout for a [`FileEvents::wait`] of at most `timeout`: `-1`
+/// (until an event or a wake) for none, `0` for a wait already due, which only
+/// takes what is ready, and otherwise its whole milliseconds, a rest under one
+/// rounded up to one so it never spins, and at most `i32::MAX`.
+#[cfg(any(test, target_os = "linux"))]
+fn poll_millis(timeout: Option<Duration>) -> i32 {
+    match timeout {
+        None => -1,
+        Some(timeout) if timeout.is_zero() => 0,
+        Some(timeout) => i32::try_from(timeout.as_millis().max(1)).unwrap_or(i32::MAX),
     }
 }
 
@@ -819,11 +911,8 @@ mod inotify {
                     revents: 0,
                 },
             ];
-            let millis = timeout.map_or(-1, |timeout| {
-                libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX)
-            });
             // SAFETY: two live pollfd slots.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, millis) };
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, super::poll_millis(timeout)) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
                 return if error.kind() == io::ErrorKind::Interrupted {

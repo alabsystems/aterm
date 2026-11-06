@@ -222,6 +222,12 @@ fn global_monitor_summaries_show_used_available_and_total_capacity() {
     );
     assert_eq!(json.get("mem_available_bytes"), Some(&Jv::u(17 << 30)));
     assert_eq!(json.get("mem_total_bytes"), Some(&Jv::u(32 << 30)));
+    assert_eq!(c2(f32::INFINITY), "0.00c");
+    assert_eq!(gpu_pm(f32::INFINITY), 0);
+    assert_eq!(gpu_ppm(f32::INFINITY), 0);
+    assert_eq!(gpu_share(f32::INFINITY), "0.0%");
+    assert_eq!(bps_word(f64::INFINITY), "0 B/s");
+    assert_eq!(covered_whole_s(f64::INFINITY), 0);
 }
 
 #[test]
@@ -1769,6 +1775,60 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
             .and_then(|t| t.get("jobs"))
             .and_then(|j| j.get("running")),
         Some(&Jv::Int(1))
+    );
+}
+
+#[test]
+fn jobs_capacity_keeps_machine_and_slot_ages_and_unknowns_separate() {
+    use crate::model::{SlotsUnread, SlotsView};
+    let mut s = snapshot_with_jobs();
+    s.jobs_age_ms = 10_000;
+    s.avail = Some(77 << 30);
+    s.slots_age_ms = Some(60_000);
+    s.slots = Some(SlotsView::Read {
+        n: 5,
+        held: 1,
+        free: 3,
+        pending: 1,
+        unknown: 0,
+        discounted: 2,
+    });
+    let w = world();
+    let c = ctx(&w, Some(&s), false, true);
+    let j = render_json(&query(View::Jobs, true), &c);
+    let machine = j.get("machine").unwrap();
+    assert_eq!(machine.get("age_ms"), Some(&Jv::Int(120)));
+    assert_eq!(machine.get("available_bytes"), Some(&Jv::u(77 << 30)));
+    let slots = machine.get("slots").unwrap();
+    assert_eq!(slots.get("free"), Some(&Jv::Int(1)));
+    assert_eq!(slots.get("pending"), Some(&Jv::Int(1)));
+    assert_eq!(slots.get("age_ms"), Some(&Jv::Int(60_120)));
+    let text = all_text(&render_text(&query(View::Jobs, false), &c));
+    assert!(
+        text.contains("1/5 free, 1 pending, 0 unknown, age_ms=60120"),
+        "{text}"
+    );
+
+    // Even when the job engine has not sampled, missing machine counters are not zero.
+    s.jobs = None;
+    s.cpu = None;
+    s.avail = None;
+    s.slots = Some(SlotsView::Unread(SlotsUnread::Refused));
+    let c = ctx(&w, Some(&s), false, true);
+    let j = render_json(&query(View::Jobs, true), &c);
+    let machine = j.get("machine").unwrap();
+    assert_eq!(
+        machine.get("cpu_busy_mc"),
+        Some(&Jv::why("no_counter_delta"))
+    );
+    assert_eq!(
+        machine.get("available_bytes"),
+        Some(&Jv::why("not_sampled"))
+    );
+    assert_eq!(machine.get("slots"), Some(&Jv::why("refused")));
+    assert!(
+        all_text(&render_text(&query(View::Jobs, false), &c))
+            .contains("build_slots=unavailable(refused)")
     );
 }
 

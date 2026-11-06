@@ -231,6 +231,7 @@ impl Recovery {
         let directory = Directory::new(&paths, bootstrap.trust());
         let state = directory.ring_view(&session, &RECOVERIES);
         let mut latest: BTreeMap<DecisionKey, ((u64, u64), Request)> = BTreeMap::new();
+        let mut writers: BTreeMap<Actor, Option<Binding>> = BTreeMap::new();
         for period in state.window(&RECOVERIES, now) {
             require_time(deadline)?;
             let scope = RECOVERIES.scope(directory.trust(), period)?;
@@ -242,7 +243,7 @@ impl Recovery {
             require_time(deadline)?;
             for (operation, command) in log.eligible() {
                 let actor = operation.header.actor;
-                let Ok((key, account, decision, attempt, record_period)) = body(&command) else {
+                let Ok((key, account, decision, attempt, record_period)) = body(command) else {
                     continue;
                 };
                 if key != Sha256::digest(actor) || record_period != period {
@@ -257,7 +258,11 @@ impl Recovery {
                 if latest.get(&key).is_some_and(|(old, _)| *old >= rank) {
                     continue;
                 }
-                let Ok(requester) = session.peer_writer(actor) else {
+                let Some(requester) = writers
+                    .entry(actor)
+                    .or_insert_with(|| session.peer_writer(actor).ok())
+                    .clone()
+                else {
                     continue;
                 };
                 latest.insert(

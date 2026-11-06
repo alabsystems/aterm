@@ -142,19 +142,12 @@ pub(super) const AOS_STEP_CLOCK: Rule = Rule {
 };
 
 fn aos_step_clock(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let test_only: std::collections::BTreeSet<String> = AOS_STEP
-        .iter()
-        .flat_map(|root| tree.corpus.test_only(root))
-        .collect();
     let mut needles: Vec<&str> = AOS_READS.iter().map(|r| r.0).collect();
     needles.extend(AOS_READS.iter().flat_map(|r| r.0.split("::")));
     needles.extend(RANDOM_MODULES);
     needles.extend(["type ", WALL_READER_MODULE]);
     for file in tree.corpus.under(AOS_STEP) {
-        if tree.corpus.test_code().holds(&file.rel)
-            || test_only.contains(&file.rel)
-            || !file.mentions(&needles)
-        {
+        if tree.corpus.test_code().holds(&file.rel) || !file.mentions(&needles) {
             continue;
         }
         let uses = use_statements(file);

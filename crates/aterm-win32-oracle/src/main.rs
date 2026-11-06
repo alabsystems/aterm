@@ -86,11 +86,14 @@ fn read(path: &Path) -> Result<String> {
 pub(crate) fn write_fresh(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(path);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?
-        .write_all(bytes.as_ref())
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    opts.open(path)?.write_all(bytes.as_ref())
 }
 fn which(name: &str) -> Result<PathBuf> {
     if Path::new(name).is_absolute() {
@@ -302,8 +305,15 @@ fn formatted(
         std::fs::create_dir_all(p.parent().ok_or("output has no parent")?)
             .map_err(|e| e.to_string())?;
         if p.extension().is_some_and(|e| e == "rs") {
-            write_fresh(&p, with_seal_line(rel, text)?).map_err(|e| e.to_string())?;
-            paths.push(p)
+            let unsealed = with_seal_line(rel, text)?;
+            if format {
+                write_fresh(&p, unsealed).map_err(|e| e.to_string())?;
+                paths.push(p);
+            } else {
+                let sealed = aterm_census::seal::stamp(&unsealed)
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                write_fresh(&p, sealed).map_err(|e| e.to_string())?;
+            }
         } else {
             write_fresh(&p, text).map_err(|e| e.to_string())?;
         }

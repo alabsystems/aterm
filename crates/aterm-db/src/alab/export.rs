@@ -111,10 +111,9 @@ pub fn materialized(home: &std::path::Path, names: &[String]) -> Result<BTreeMap
     let mut out = BTreeMap::new();
     for name in names {
         let path = dir.join(name);
-        if !path.is_file() {
+        let Some(bytes) = crate::import::read_bounded_if_file(&path)? else {
             continue;
-        }
-        let bytes = crate::import::read_bounded(&path)?;
+        };
         if let Ok(text) = String::from_utf8(bytes) {
             out.insert(name.clone(), text);
         }
@@ -140,22 +139,27 @@ pub fn in_doc(doc: &Document, names: &[String]) -> BTreeMap<String, String> {
 /// another machine. Several hints for one node are a clone or a reinstall for the owner to judge,
 /// and a member no facts row binds keeps what it has. Returns the labels whose hint changed.
 pub fn hints(roster: &mut SwarmRoster, facts: &OwnedRead) -> Vec<String> {
+    let mut by_node: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for row in facts.rows.values() {
+        let value = &row.value;
+        if value.get("merged_into").is_none_or(Value::is_null)
+            && let Some(node) = value.get("node").and_then(Value::as_str)
+            && let Some(hint) = value
+                .get("hw_hint")
+                .and_then(Value::as_str)
+                .filter(|hint| aterm_codec::hex::is_lower(hint, 16))
+        {
+            by_node.entry(node).or_default().push(hint);
+        }
+    }
     let mut changed = Vec::new();
     for member in &mut roster.members {
         let Some(mine) = member.node_id.as_deref() else {
             continue;
         };
-        let mut found: Vec<&str> = facts
-            .rows
-            .values()
-            .filter(|row| {
-                let value = &row.value;
-                value.get("node").and_then(Value::as_str) == Some(mine)
-                    && value.get("merged_into").is_none_or(Value::is_null)
-            })
-            .filter_map(|row| row.value.get("hw_hint").and_then(Value::as_str))
-            .filter(|hint| aterm_codec::hex::is_lower(hint, 16))
-            .collect();
+        let Some(found) = by_node.get_mut(mine) else {
+            continue;
+        };
         found.sort_unstable();
         found.dedup();
         if let [hint] = found[..]
@@ -166,15 +170,6 @@ pub fn hints(roster: &mut SwarmRoster, facts: &OwnedRead) -> Vec<String> {
         }
     }
     changed
-}
-
-/// The section entry `name` is written in: the one that holds it ([`plan`] writes only files the
-/// vault holds), else `[everyone]`, where every Mac's subscriber reads these files today.
-fn section(doc: &Document, name: &str) -> Audience {
-    doc.entries()
-        .into_iter()
-        .find(|entry| entry.name == name)
-        .map_or(Audience::Everyone, |entry| entry.audience)
 }
 
 /// What one `export` would write: the files whose bytes differ, and the roster with its hints.
@@ -232,10 +227,20 @@ pub fn plan(
 /// The vault text refuses an entry.
 pub fn apply_to(doc: &mut Document, planned: &Planned) -> Result<()> {
     let refused = |why: aterm_secrets::text::TextError| Error::new(&format!("vault: {why}"));
-    for (name, text) in &planned.files {
-        let audience = section(doc, name);
-        doc.set_entry(&audience, name, text.as_bytes())
-            .map_err(refused)?;
+    if !planned.files.is_empty() {
+        let sections: BTreeMap<String, Audience> = doc
+            .entries()
+            .into_iter()
+            .map(|entry| (entry.name, entry.audience))
+            .collect();
+        for (name, text) in &planned.files {
+            // The section entry `name` is written in: the one that holds it (`plan` writes only
+            // files the vault holds), else `[everyone]`, where every Mac's subscriber reads these
+            // files today.
+            let audience = sections.get(name).unwrap_or(&Audience::Everyone);
+            doc.set_entry(audience, name, text.as_bytes())
+                .map_err(refused)?;
+        }
     }
     if let Some((roster, _)) = &planned.roster {
         doc.set_entry(

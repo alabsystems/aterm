@@ -66,38 +66,95 @@ pub fn serialize_lines_bounded(lines: &[Line], max_bytes: usize) -> Option<Vec<u
 /// [`serialize_lines`] for a store that must decode what it writes.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn serialize_pages(lines: &[Line], max_page_bytes: usize) -> Vec<(usize, Vec<u8>)> {
-    let estimate = lines
-        .iter()
-        .map(Line::serialized_size_estimate)
-        .fold(4usize, usize::saturating_add)
-        .min(max_page_bytes);
     let mut pages = Vec::with_capacity(1);
-    let mut page = Vec::with_capacity(estimate);
-    page.extend_from_slice(&[0; 4]);
-    let mut count = 0usize;
-    for line in lines {
-        let mark = page.len();
-        line.append_serialized(&mut page);
-        if page.len() > max_page_bytes && count > 0 {
-            page.truncate(mark);
-            pages.push(seal_page(page, count));
-            page = Vec::from([0; 4]);
-            line.append_serialized(&mut page);
-            count = 0;
+    let mut first = 0;
+    let mut size = 4usize;
+    for (i, line) in lines.iter().enumerate() {
+        let line_size = line.serialized_size_estimate();
+        if size.saturating_add(line_size) > max_page_bytes && i > first {
+            pages.push(write_page(&lines[first..i], size, max_page_bytes));
+            first = i;
+            size = 4;
         }
-        count = count.saturating_add(1);
+        size = size.saturating_add(line_size);
     }
-    if count > 0 {
-        pages.push(seal_page(page, count));
+    if first < lines.len() {
+        pages.push(write_page(&lines[first..], size, max_page_bytes));
     }
     pages
 }
 
-fn seal_page(mut page: Vec<u8>, count: usize) -> (usize, Vec<u8>) {
-    if let Some(header) = page.get_mut(..4) {
-        header.copy_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
+fn write_page(lines: &[Line], size: usize, max_page_bytes: usize) -> (usize, Vec<u8>) {
+    let mut page = Vec::with_capacity(size.min(max_page_bytes));
+    page.extend_from_slice(&u32::try_from(lines.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for line in lines {
+        line.append_serialized(&mut page);
     }
-    (count, page)
+    (lines.len(), page)
+}
+
+#[cfg(test)]
+mod packing_tests {
+    use super::super::line_codec::take_records_written;
+    use super::{Line, serialize_lines, serialize_pages};
+
+    #[test]
+    fn page_packing_writes_each_record_once_and_preserves_greedy_boundaries() {
+        use crate::{CellAttrs, HyperlinkSpan, Rle, UnderlineColorSpan};
+        use std::sync::Arc;
+        let lines: Vec<_> = (0..32)
+            .map(|i| {
+                let text = "x".repeat(i % 7 * 13);
+                let mut attrs = Rle::new();
+                for _ in 0..text.len() {
+                    attrs.push(CellAttrs::new(0x01_112233, 0, 0));
+                }
+                let mut line = Line::with_hyperlinks(
+                    &text,
+                    attrs,
+                    vec![HyperlinkSpan::with_id(
+                        0,
+                        1,
+                        Arc::from("https://example.test"),
+                        Some(Arc::from("id")),
+                    )],
+                );
+                if i % 2 == 1 {
+                    line.set_underline_colors(vec![UnderlineColorSpan::new(0, 1, 0x01_112233)]);
+                }
+                line
+            })
+            .collect();
+        let exact_pair =
+            4 + lines[0].serialized_size_estimate() + lines[1].serialized_size_estimate();
+        for limit in [0, 4, 13, 18, 27, 64, 127, exact_pair - 1, exact_pair, 4096] {
+            take_records_written();
+            let pages = serialize_pages(&lines, limit);
+            let written = take_records_written();
+            eprintln!(
+                "page_packing limit={limit} records={} writes={written}",
+                lines.len()
+            );
+            assert_eq!(
+                written,
+                lines.len(),
+                "each record has exactly one destination page"
+            );
+            let mut first = 0;
+            for (count, bytes) in pages {
+                let end = first + count;
+                assert!(count > 0);
+                assert!(bytes.len() <= limit || count == 1);
+                assert_eq!(bytes, serialize_lines(&lines[first..end]));
+                if let Some(next) = lines.get(end) {
+                    assert!(bytes.len().saturating_add(next.serialized_size_estimate()) > limit);
+                }
+                first = end;
+            }
+            assert_eq!(first, lines.len());
+        }
+        assert!(serialize_pages(&[], 0).is_empty());
+    }
 }
 
 const _: () = assert!(

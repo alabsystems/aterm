@@ -552,7 +552,12 @@ pub fn diskwalk_size_full(
 ) -> Result<SizeFull, Refusal> {
     let mut walk = match Walk::begin(root, policy) {
         Ok(w) => w,
-        Err(Refusal::NotDirectory) => return file_root(root, policy),
+        // A root that became a directory after the walk found a file there is walked once more
+        // as the directory it is now.
+        Err(Refusal::NotDirectory) => match file_root(root, policy)? {
+            Some(file) => return Ok(file),
+            None => Walk::begin(root, policy)?,
+        },
         Err(e) => return Err(e),
     };
     let start = now();
@@ -574,7 +579,9 @@ pub fn diskwalk_size_full(
     })
 }
 
-fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
+/// A file root's full size, read through one open of its directory; `None` when the name is a
+/// directory by then, which its caller walks as one.
+pub(crate) fn file_root(root: &RootSpec, policy: &Policy) -> Result<Option<SizeFull>, Refusal> {
     let canon = walk_path(&root.path)?;
     let parent = canon.parent().ok_or(Refusal::TooBroad)?;
     let name = canon.file_name().ok_or(Refusal::Relative)?;
@@ -591,7 +598,7 @@ fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
             return Err(Refusal::Link);
         }
         if e.kind == crate::list::Kind::Dir {
-            return Err(Refusal::NotDirectory);
+            return Ok(None);
         }
         let nlink = u64::from(e.nlink.max(1));
         let mut sums = Sums {
@@ -634,12 +641,12 @@ fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
                 }
             }
         });
-        Ok(SizeFull {
+        Ok(Some(SizeFull {
             sums,
             complete: true,
             walked: 1,
             links,
-        })
+        }))
     }
     #[cfg(not(unix))]
     {
@@ -778,26 +785,45 @@ pub(crate) mod imp {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Open `path` one component at a time from `/`, each with `O_NOFOLLOW` relative to its parent.
-    pub(super) fn open_chain(path: &Path) -> Result<OwnedFd, Refusal> {
+    /// Open `path` one component at a time from `/`, each with `O_NOFOLLOW` relative to its parent,
+    /// and never look a name up in a cloud placeholder on the way: the lookup would download it.
+    fn open_chain(path: &Path) -> Result<OwnedFd, Refusal> {
         let mut fd = open_slash()?;
         for c in path.components() {
             match c {
                 Component::RootDir => {}
-                Component::Normal(name) => fd = open_child(&fd, name)?,
+                Component::Normal(name) => {
+                    let (.., is_dataless) = fstat_of(&fd)?;
+                    if is_dataless {
+                        return Err(Refusal::Dataless);
+                    }
+                    fd = open_child(&fd, name)?;
+                }
                 _ => return Err(Refusal::Relative),
             }
         }
         Ok(fd)
     }
 
-    /// [`open_chain`], then the volume test on the open descriptor: what a marker look opens.
+    /// [`open_checked_stat`]'s descriptor alone: what a marker or link look, a file root's
+    /// directory and an entry count open.
     pub(crate) fn open_checked(path: &Path) -> Result<OwnedFd, Refusal> {
+        open_checked_stat(path).map(|(fd, _)| fd)
+    }
+
+    /// [`open_chain`], then the volume and cloud-placeholder tests on the open descriptor, which
+    /// every look into a directory and every listing of one passes first; with the directory's
+    /// device, inode and allocated bytes.
+    fn open_checked_stat(path: &Path) -> Result<(OwnedFd, (u64, u64, u64)), Refusal> {
         let fd = open_chain(path)?;
         if let Some(why) = volume_refusal_of(&fd) {
             return Err(why);
         }
-        Ok(fd)
+        let (dev, ino, alloc, is_dataless) = fstat_of(&fd)?;
+        if is_dataless {
+            return Err(Refusal::Dataless);
+        }
+        Ok((fd, (dev, ino, alloc)))
     }
 
     fn open_child(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Refusal> {
@@ -900,7 +926,21 @@ pub(crate) mod imp {
         None
     }
 
-    fn fstat_of(fd: &OwnedFd) -> Result<(u64, u64, u64, u32), Refusal> {
+    #[cfg(test)]
+    std::thread_local! {
+        /// The inode this thread's [`fstat_of`] reads as a cloud placeholder, which a scratch
+        /// tree cannot make.
+        static FORCED_DATALESS_INO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Read the directory with inode `ino` as a cloud placeholder on this thread (`None`: none).
+    #[cfg(test)]
+    pub(crate) fn force_dataless_ino_for_test(ino: Option<u64>) {
+        FORCED_DATALESS_INO.set(ino);
+    }
+
+    /// `fd`'s device, inode, allocated bytes and whether it is a cloud placeholder.
+    fn fstat_of(fd: &OwnedFd) -> Result<(u64, u64, u64, bool), Refusal> {
         // SAFETY: `stat` is integers: all-zero is a value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a live descriptor and a writable `stat`.
@@ -913,22 +953,23 @@ pub(crate) mod imp {
         let flags = st.st_flags;
         #[cfg(not(target_vendor = "apple"))]
         let flags = 0u32;
+        let ino = st.st_ino as u64;
+        #[cfg(test)]
+        let forced = FORCED_DATALESS_INO.get() == Some(ino);
+        #[cfg(not(test))]
+        let forced = false;
         Ok((
             crate::list::dev_of(st.st_dev),
-            st.st_ino as u64,
+            ino,
             u64::try_from(st.st_blocks as i64)
                 .unwrap_or(0)
                 .saturating_mul(512),
-            flags,
+            dataless(flags) || forced,
         ))
     }
 
     pub(crate) fn directory_identity(path: &Path) -> Result<(u64, u64), Refusal> {
-        let fd = open_checked(path)?;
-        let (dev, ino, _, flags) = fstat_of(&fd)?;
-        if dataless(flags) {
-            return Err(Refusal::Dataless);
-        }
+        let (_, (dev, ino, _)) = open_checked_stat(path)?;
         Ok((dev, ino))
     }
 
@@ -944,14 +985,7 @@ pub(crate) mod imp {
     }
 
     pub(super) fn begin(canon: PathBuf, policy: &Policy) -> Result<Walk, Refusal> {
-        let fd = open_chain(&canon)?;
-        if let Some(why) = volume_refusal_of(&fd) {
-            return Err(why);
-        }
-        let (dev, ino, alloc, flags) = fstat_of(&fd)?;
-        if dataless(flags) {
-            return Err(Refusal::Dataless);
-        }
+        let (fd, (dev, ino, alloc)) = open_checked_stat(&canon)?;
         let mut tree = Tree::new(canon.clone(), ino);
         {
             let root = tree.rec_mut(DirId::ROOT);
@@ -1180,8 +1214,8 @@ pub(crate) mod imp {
                     if let Some(why) = volume_refusal_of(&cfd) {
                         return Err(why);
                     }
-                    let (dev, _, _, flags) = fstat_of(&cfd)?;
-                    if dataless(flags) {
+                    let (dev, _, _, is_dataless) = fstat_of(&cfd)?;
+                    if is_dataless {
                         return Err(Refusal::Dataless);
                     }
                     Ok((cfd, dev))
@@ -1246,14 +1280,7 @@ pub(crate) mod imp {
     }
 
     pub(super) fn one_level(canon: &Path, policy: &Policy) -> Result<Vec<LevelRow>, Refusal> {
-        let fd = open_chain(canon)?;
-        if let Some(why) = volume_refusal_of(&fd) {
-            return Err(why);
-        }
-        let (root_dev, _, _, flags) = fstat_of(&fd)?;
-        if dataless(flags) {
-            return Err(Refusal::Dataless);
-        }
+        let (fd, (root_dev, ..)) = open_checked_stat(canon)?;
         let skip = unsafe_mounts_in(canon, &policy.mounts, policy.deny.fold_case());
         let dir = aterm_dirfd::Dir::read_from(&fd).map_err(|e| errno_refusal(e.raw_os_error()))?;
         let mut rows = Vec::new();
@@ -1331,14 +1358,7 @@ pub(crate) mod imp {
     }
 
     pub(super) fn entry_count(canon: &Path) -> Result<u32, Refusal> {
-        let fd = open_chain(canon)?;
-        if let Some(why) = volume_refusal_of(&fd) {
-            return Err(why);
-        }
-        let (_, _, _, flags) = fstat_of(&fd)?;
-        if dataless(flags) {
-            return Err(Refusal::Dataless);
-        }
+        let fd = open_checked(canon)?;
         #[cfg(target_vendor = "apple")]
         {
             crate::list::bulk::entry_count(fd.as_fd()).map_err(errno_refusal)

@@ -805,6 +805,7 @@ struct Carrier {
     #[serde(default)]
     map: BTreeMap<String, Option<i64>>,
     flat: Option<FlatHolder>,
+    inline: Option<(i64, Holder)>,
 }
 
 const NONE_SITES: u32 = 11;
@@ -866,6 +867,7 @@ impl Carrier {
                     },
                 },
             }),
+            inline: (rng.below(2) == 0).then(|| (i64::from(rng.next()), Holder { x: maybe(rng) })),
         };
         let site = (rng.below(2) == 0).then(|| rng.below(NONE_SITES));
         match site {
@@ -1042,4 +1044,29 @@ fn a_none_field_is_left_out_and_a_none_map_value_refused() {
     };
     let refused = aterm_toml::to_string(&vanished).expect_err("a flattened None payload");
     assert!(refused.to_string().contains("no null"), "{refused}");
+
+    // A table inside a tuple is written inline, and its None field is left out there too.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Inline {
+        keep: i64,
+        inline: (i64, Holder),
+    }
+    let absent = Inline {
+        keep: 1,
+        inline: (4, Holder { x: None }),
+    };
+    assert_eq!(
+        aterm_toml::to_string(&absent).expect("write"),
+        "keep = 1\ninline = [4, {}]\n"
+    );
+    assert_eq!(reads_back(&absent), Ok(()));
+    let present = Inline {
+        keep: 1,
+        inline: (4, Holder { x: Some(10) }),
+    };
+    assert_eq!(
+        aterm_toml::to_string(&present).expect("write"),
+        "keep = 1\ninline = [4, { x = 10 }]\n"
+    );
+    assert_eq!(reads_back(&present), Ok(()));
 }

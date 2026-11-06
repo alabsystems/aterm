@@ -119,6 +119,7 @@ fn render_extras_avoid_temporary_allocations() {
     ];
     let mut terminal = Terminal::new(2, 32);
     terminal.process(CLUSTERS.join(" ").as_bytes());
+    terminal.process("\x1b[2;1He\u{0301}\u{0323}".as_bytes());
     let mut frame = RenderInput::empty();
     terminal.cell_frame_into(&mut frame, 2, 32);
     assert_eq!(frame.clusters[0].len(), CLUSTERS.len());
@@ -133,10 +134,10 @@ fn render_extras_avoid_temporary_allocations() {
             terminal.cell_frame_into(black_box(&mut frame), 2, 32);
         }
     });
-    assert!(
-        cluster_allocations <= 16 * CLUSTERS.len() as u64 + 2,
-        "warm extraction made {cluster_allocations} allocations for {} required cluster strings",
-        16 * CLUSTERS.len()
+    eprintln!("warm_frame_extras repeats=16 allocations={cluster_allocations}");
+    assert_eq!(
+        cluster_allocations, 0,
+        "unchanged emoji and combining payloads should reuse their owned frame storage"
     );
     let historical_clusters = count_allocations(|| {
         for _ in 0..16 {
@@ -158,8 +159,45 @@ fn render_extras_avoid_temporary_allocations() {
 
 const CEILING: u64 = 64;
 
+fn hot_scrollback_walks_allocate_only_owned_line_payloads() {
+    use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
+    const ROWS: usize = 4_096;
+    let long = "x".repeat(256);
+    for text in ["inline hot row", long.as_str()] {
+        let mut scrollback = Scrollback::new(ROWS * 2, 1 << 20, 64 << 20);
+        for i in 0..ROWS {
+            let mut line = Line::from(text);
+            line.set_wrapped(i % 2 == 1);
+            scrollback.push_line(line);
+        }
+        let direct = count_allocations(|| {
+            for (i, line) in scrollback.iter().enumerate() {
+                assert_eq!(line.as_bytes(), text.as_bytes());
+                assert_eq!(line.is_wrapped(), i % 2 == 1);
+                std::hint::black_box(line);
+            }
+        });
+        let storage: ScrollbackStorage = scrollback.into();
+        let owning = count_allocations(|| {
+            assert_eq!(storage.iter().count(), ROWS);
+        });
+        let borrowing = count_allocations(|| {
+            assert_eq!(storage.dense_from(0).count(), ROWS);
+        });
+        let payloads = if text.len() > 32 { ROWS as u64 } else { 0 };
+        eprintln!(
+            "hot_walk bytes_per_row={} direct_allocations={direct} storage_allocations={owning} dense_allocations={borrowing}",
+            text.len()
+        );
+        assert_eq!(direct, payloads);
+        assert_eq!(owning, payloads);
+        assert_eq!(borrowing, 0);
+    }
+}
+
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
+    hot_scrollback_walks_allocate_only_owned_line_payloads();
     let measure = 2_000;
 
     let ascii = steady_state_alloc_calls(&workload(measure));

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use aterm_capacity::CpuObservation;
-use aterm_json::{Map, Value};
+use aterm_json::Value;
 
 /// The command's presentation of the same facts native views consume.
 pub(super) struct Report(CpuObservation);
@@ -63,41 +63,7 @@ impl Report {
     }
 
     pub(super) fn json(&self) -> Value {
-        let mut out = Map::new();
-        let state = match &self.0 {
-            CpuObservation::Unsupported => "unsupported",
-            CpuObservation::Absent => "absent",
-            CpuObservation::Initializing => "initializing",
-            CpuObservation::Unreadable(error) => {
-                out.insert("error".to_owned(), Value::from(error.as_str()));
-                "unreadable"
-            }
-            CpuObservation::Ready { total, holders } => {
-                out.insert("total".to_owned(), Value::from(*total as u64));
-                out.insert("held".to_owned(), Value::from(holders.len() as u64));
-                out.insert(
-                    "available".to_owned(),
-                    Value::from((total - holders.len()) as u64),
-                );
-                let holders = holders
-                    .iter()
-                    .map(|holder| {
-                        let mut row = Map::new();
-                        row.insert("slot".to_owned(), Value::from(holder.slot));
-                        row.insert("reported_pid".to_owned(), Value::from(holder.reported_pid));
-                        row.insert(
-                            "reported_birth".to_owned(),
-                            Value::from(holder.reported_birth),
-                        );
-                        Value::Object(row)
-                    })
-                    .collect();
-                out.insert("holders".to_owned(), Value::Array(holders));
-                "ready"
-            }
-        };
-        out.insert("state".to_owned(), Value::from(state));
-        Value::Object(out)
+        self.0.json()
     }
 }
 

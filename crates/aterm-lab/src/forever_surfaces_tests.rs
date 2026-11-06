@@ -75,6 +75,49 @@ fn the_menu_is_read_row_by_row_under_its_sections() {
     assert!(row_names("● fmt (worker of mgr) — working 2m", "fmt"));
 }
 
+/// This Mac's row is led by `This Mac` until the title's reader has read the name, then by the
+/// machine's title (`m8 Heron`), and its counts are what follows ` — ` either way; a row a word
+/// such as `macOS` leads, or one with no counts, is not it.
+#[test]
+fn this_mac_s_row_is_read_under_either_lead() {
+    for (label, counts) in [
+        (
+            "This Mac — 1 need you · 2 shells",
+            Some("1 need you · 2 shells"),
+        ),
+        ("m8 Heron — 3 landed", Some("3 landed")),
+        ("m0 Blue Heron — 1 shell", Some("1 shell")),
+        ("m14 — 2 shells", Some("2 shells")),
+        ("This Mac", None),
+        ("m8 Heron", None),
+        ("macOS 27 — update ready", None),
+        ("m — 1 shell", None),
+        ("m8x — 1 shell", None),
+        ("This Macintosh — 1 shell", None),
+    ] {
+        assert_eq!(here_counts(label), counts, "{label}");
+        assert_eq!(
+            section_of(label).is_some_and(|s| s == "here"),
+            counts.is_some(),
+            "{label}"
+        );
+    }
+    let titled = CHROME.replace("This Mac — 1 need you", "m8 Heron — 1 need you");
+    let rows = menu_rows(&titled);
+    let here = rows
+        .iter()
+        .find(|r| r.label.starts_with("m8 Heron"))
+        .unwrap();
+    assert_eq!(here.section, "here");
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.label.starts_with("✓ land-ab"))
+            .unwrap()
+            .section,
+        "done"
+    );
+}
+
 /// A tab's menu entry carries the header of each section its rows are in,
 /// with the rows the menu lists under it (every tab's), and never This
 /// Mac's (whose counts move with every tab).

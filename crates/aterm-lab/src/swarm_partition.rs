@@ -1828,14 +1828,25 @@ impl Lane {
             Paths::for_home(&self.home(member)),
             Paths::for_home(&self.home(mac)),
         );
-        let local = desk::Local::of(&by)
-            .map_err(|e| format!("{member}'s membership: {e}"))?
-            .ok_or_else(|| format!("{member} is no member"))?;
-        if !local.can_allow() {
-            return Err(format!(
-                "neither the membership log seats {member} nor a Commons roster binds it"
-            ));
-        }
+        // The member's desk as its window follows it: a read during a vault pass or an apply
+        // still pending finds none for a moment (a founder's first pass, right after `secrets
+        // create`, under `--one-url`, where no policy publish comes first), and a member's desk
+        // must come, so this waits for it under the hang detector.
+        let start = Instant::now();
+        let local = loop {
+            let why = match desk::Local::of(&by) {
+                Ok(Some(local)) if local.can_allow() => break local,
+                Ok(Some(_)) => format!(
+                    "neither the membership log seats {member} nor a Commons roster binds it"
+                ),
+                Ok(None) => format!("{member} is no member"),
+                Err(e) => format!("{member}'s membership: {e}"),
+            };
+            if start.elapsed() >= HANG {
+                return Err(format!("{why} (no desk that can allow came in {HANG:?})"));
+            }
+            stop::sleep(Duration::from_millis(250)).map_err(|_| "interrupted".to_owned())?;
+        };
         let desk = std::sync::Mutex::new(desk::Desk::new(local));
         let device = Device::open(&paths)
             .map_err(|e| format!("{mac}'s device: {e}"))?

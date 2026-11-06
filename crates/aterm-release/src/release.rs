@@ -49,6 +49,10 @@ pub const RELEASE_DIR: &str = "aterm-release";
 /// The release journal, in [`RELEASE_DIR`].
 pub const JOURNAL_FILE: &str = "release.toml";
 
+/// The release line's source: a head whose tree lacks it has a cutter that keeps no line, so
+/// `--fix` refuses to carry onto it.
+pub const LINE_SOURCE: &str = "crates/aterm-release/src/line.rs";
+
 /// The live run's claim, beside the journal.
 pub const RUNNING_FILE: &str = "running";
 
@@ -69,7 +73,7 @@ pub fn child_notes(dir: &Path) -> Vec<PathBuf> {
     };
     let mut notes: Vec<PathBuf> = entries
         .flatten()
-        .filter(|entry| is_child_note(&entry.file_name().to_string_lossy()))
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_child_note))
         .map(|entry| entry.path())
         .collect();
     notes.sort();
@@ -250,10 +254,13 @@ impl LinuxDecl {
 /// Every `release` flag (cli.rs parses them).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReleaseOptions {
-    /// `--bump`: commit the next MINOR on origin/main's tip and release it.
+    /// `--bump`: commit the next MINOR on origin/main's tip and start a line at it.
     pub bump: bool,
-    /// `--commit <rev>`: release this commit of origin/main.
+    /// `--commit <rev>`: start a line at this commit of origin/main.
     pub commit: Option<String>,
+    /// `--fix <commit>…`: carry these landed, non-merge main commits onto this clone's
+    /// unpublished line as hops ([`crate::line`]).
+    pub fix: Vec<String>,
     pub linux: LinuxDecl,
     /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
@@ -295,17 +302,23 @@ impl ReleaseOptions {
         opts
     }
 
-    /// `args` (a process's own, after the program) with each path flag's value replaced by these options'.
+    /// `args` (a process's own, after the program) as the re-run as R's own cutter is handed
+    /// them: each path flag's value replaced by these options', and `--fix` with its commits
+    /// left out, since the re-run resumes the head the journal names (the hops are made).
     #[must_use]
-    pub fn anchored_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    pub fn rerun_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
             "--engine" => self.engine.as_ref(),
             "--release-credentials" => self.release_credentials.as_ref(),
             _ => self.linux.artifacts.as_ref(),
         };
         let mut out = Vec::with_capacity(args.len());
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
         while let Some(arg) = args.next() {
+            if arg.to_str() == Some("--fix") {
+                while args.next_if(|a| a.to_str().is_some_and(is_value)).is_some() {}
+                continue;
+            }
             let flag = arg
                 .to_str()
                 .filter(|a| PATH_FLAGS.contains(a))
@@ -321,12 +334,18 @@ impl ReleaseOptions {
     }
 }
 
+/// A flag's value as `release` parses it: a word that is not empty and is no flag.
+#[must_use]
+pub fn is_value(word: &str) -> bool {
+    !word.is_empty() && !word.starts_with('-')
+}
+
 /// This clone's release: what a re-run resumes with.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Journal {
     /// The release version, `X.Y.0`.
     pub version: String,
-    /// R, full.
+    /// R, full: the head of [`Journal::line`].
     pub commit: String,
     /// The prover's bin dir, physical.
     pub prover: String,
@@ -343,7 +362,7 @@ pub struct Journal {
     /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`], `after-cut`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
-    /// The owner asks delivered and not yet resolved, by key: carried over when the candidate is replaced, withdrawn by `--forget`.
+    /// The owner asks delivered and not yet resolved, by key: carried over to each new head, withdrawn by `--forget`.
     #[serde(default)]
     pub asks: Vec<String>,
     /// R's reserved identity (`ledger::reserve`, at `build`): what the bundle is built as and the cut claims.
@@ -355,6 +374,10 @@ pub struct Journal {
     /// Written only at `--prepare`'s stop (everything heavy done for R, nothing claimed).
     #[serde(default)]
     pub prepared: Option<Prepared>,
+    /// The line R heads: its base on origin/main and the hops `--fix` carried onto it. A journal
+    /// written before lines has none; [`Journal::line`] reads it as a line at R with no hops.
+    #[serde(default)]
+    pub line: Option<crate::line::Line>,
 }
 
 /// A PREPARED release, as `--prepare` left it.
@@ -434,6 +457,15 @@ impl Journal {
         }
         crate::durable::write_atomic_durable(path, text.as_bytes(), 0o600)
             .map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// The line R heads: the one journaled, else (a journal written before lines) a line at R
+    /// with no hops.
+    #[must_use]
+    pub fn line(&self) -> crate::line::Line {
+        self.line
+            .clone()
+            .unwrap_or_else(|| crate::line::Line::start(&self.version, &self.commit, self.started))
     }
 
     /// The release reached its check: everything is done for R.
@@ -673,14 +705,19 @@ impl RunClaim {
 pub fn estimates(tsv: &str) -> BTreeMap<String, u64> {
     let mut runs: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for line in tsv.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if let [_, _, step, secs] = cols.as_slice()
-            && let s = secs.trim()
+        let mut cols = line.split('\t');
+        if let (Some(_), Some(_), Some(step), Some(secs), None) = (
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+            cols.next(),
+        ) && let s = secs.trim()
             && !s.is_empty()
             && s.bytes().all(|b| b.is_ascii_digit())
             && let Ok(secs) = s.parse::<u64>()
         {
-            runs.entry((*step).to_string()).or_default().push(secs);
+            runs.entry(step.to_string()).or_default().push(secs);
         }
     }
     runs.into_iter()
@@ -826,6 +863,8 @@ pub struct Candidate {
     pub why: String,
     /// `--bump` from this version, before the bump is made.
     pub bump_from: Option<String>,
+    /// `--fix`'s admitted fixes, before step 3 carries them onto the line's head (`commit`).
+    pub carry: Vec<crate::line::Fix>,
 }
 
 /// What a step's child said when it ended.
@@ -871,6 +910,9 @@ pub trait Backend {
 
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String>;
     fn lease(&mut self, prover: &Prover) -> Result<(), String>;
+    /// Take or adopt the release's one build-inputs seal, under the toolchain lease, and keep it
+    /// for every later step and child ([`crate::build_inputs::arm`]); never in a dry run.
+    fn seal_inputs(&mut self) -> Result<(), String>;
     fn cleared_env(&mut self) -> Vec<String>;
     fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>);
     fn fetch(&mut self) -> Result<String, Refusal>;
@@ -888,6 +930,26 @@ pub trait Backend {
     fn candidate_missing(&mut self) -> Result<Option<String>, String>;
     fn cut_journal(&mut self) -> Option<CutState>;
     fn is_dir(&mut self, path: &Path) -> bool;
+    /// `rev`'s tree holds the file `path` ([`crate::line::tree_has`]); COULD NOT RUN when git
+    /// cannot say.
+    fn tree_has(&mut self, rev: &str, path: &str) -> Result<bool, Refusal>;
+    /// What `--fix <rev>` names for `line` ([`crate::line::admit`] on this clone, after
+    /// [`crate::line::git_ready`]); it reads and changes nothing.
+    fn fix_of(
+        &mut self,
+        line: &crate::line::Line,
+        rev: &str,
+    ) -> Result<crate::line::Admitted, Refusal>;
+    /// Carry `fixes` onto `line`'s head in ancestry order ([`crate::line::order`],
+    /// [`crate::line::carry`]) and put the new head into origin/main's history
+    /// ([`crate::line::record`]'s content-neutral merge): the hops, and how the head reached main.
+    fn carry(
+        &mut self,
+        line: &crate::line::Line,
+        fixes: &[crate::line::Fix],
+    ) -> Result<(Vec<crate::line::Hop>, String), Refusal>;
+    /// The line's meaning check ([`crate::line::verify`]), which writes no ref: its summary.
+    fn verify_line(&mut self, line: &crate::line::Line) -> Result<String, Refusal>;
 
     fn sync(&mut self) -> Result<String, Refusal>;
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal>;
@@ -900,13 +962,26 @@ pub trait Backend {
     fn reexec(&mut self, prover: &Prover) -> Result<i32, Refusal>;
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts;
     fn disk(&mut self) -> (Option<u64>, bool);
+    /// What this machine's last releases wrote, by their own records
+    /// ([`crate::release_disk::RECORD`]).
+    fn disk_record(&mut self) -> aterm_capacity::Footprints;
+    /// Claim `bytes` of the clone's volume for the release `why` in the shared ledger, waiting
+    /// for room: held until [`Backend::let_disk_go`], and naming itself to every child the
+    /// release starts, which then claims and walks nothing ([`aterm_capacity::DISK_COVER_ENV`]).
+    fn claim_disk(&mut self, bytes: u64, why: &str) -> Result<(), Refusal>;
+    /// End the release's disk claim, if it holds one; where `passed`, this run's verify passed,
+    /// and what the run wrote is kept for the next claim's size.
+    fn let_disk_go(&mut self, passed: bool);
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal>;
+    /// The cut's read-only pre-claim gates of this machine, its credentials and the channel.
     fn cut_gates(
         &mut self,
         c: &Candidate,
         creds: &Path,
         kind: crate::publish::CutKind,
     ) -> Vec<Refusal>;
+    /// The cut's pre-claim gates of R's own tree: its handoff fixtures and handoff policy.
+    fn head_gates(&mut self, c: &Candidate) -> Vec<Refusal>;
     fn stage_fixtures(
         &mut self,
         c: &Candidate,
@@ -1191,11 +1266,15 @@ impl Run<'_> {
         }
 
         self.begin(Step::Verify)?;
-        if let Some(why) = self.skip_verify() {
+        let verified = if let Some(why) = self.skip_verify() {
             self.skip(&why);
+            Ok(false)
         } else {
-            self.verify()?;
-        }
+            self.verify().map(|()| true)
+        };
+        // The build and `verify release` are all the release writes under its disk claim.
+        self.b.let_disk_go(matches!(verified, Ok(true)));
+        verified?;
 
         self.begin(Step::Ready)?;
         if let Some(why) = self.claimed_words() {
@@ -1344,6 +1423,8 @@ impl Run<'_> {
         );
         self.withdraw_early_asks();
         let last = self.last.clone();
+        // The transcript's record of the step closes too, so no reader takes it as running.
+        self.stage_event("INTERRUPTED", &last);
         self.say(&last);
         Err(Halt::Said(130))
     }
@@ -1558,11 +1639,17 @@ impl Run<'_> {
             .unwrap_or_else(|| step.default_secs())
     }
 
+    /// The journal, when it is R's: its facts (the done list, the reservation, the artifact, a
+    /// PREPARED stop) are R's own. While `--fix` has fixes still to carry (step 3's, or a dry
+    /// run's throughout), R is the line's old head: the head the release goes on with is not
+    /// made yet, and its journal starts with none of them.
+    fn r_journal(&self) -> Option<&Journal> {
+        let c = self.cand.as_ref().filter(|c| c.carry.is_empty())?;
+        self.journal.as_ref().filter(|j| j.commit == c.commit)
+    }
+
     fn journal_has(&self, fact: &str) -> bool {
-        let r = self.commit_r();
-        self.journal
-            .as_ref()
-            .is_some_and(|j| j.commit == r && j.has(fact))
+        self.r_journal().is_some_and(|j| j.has(fact))
     }
 
     fn journal_add(&mut self, fact: &str) -> Flow {
@@ -1627,10 +1714,8 @@ impl Run<'_> {
     }
 
     fn prepared(&self) -> Option<Prepared> {
-        let r = self.commit_r();
-        self.journal
-            .as_ref()
-            .filter(|j| j.commit == r && !j.finished())
+        self.r_journal()
+            .filter(|j| !j.finished())
             .and_then(|j| j.prepared.clone())
     }
 
@@ -2053,10 +2138,20 @@ impl Run<'_> {
             .map(|j| j.prover.clone());
         match self.b.prover(journaled.as_deref()) {
             Ok(p) => {
-                if !self.dry
-                    && let Err(error) = self.b.lease(&p)
-                {
-                    self.refuse_hard(Refusal::new(error, "restore the toolchain lease and retry"))?;
+                if !self.dry {
+                    if let Err(error) = self.b.lease(&p) {
+                        self.refuse_hard(Refusal::new(
+                            error,
+                            "restore the toolchain lease and retry",
+                        ))?;
+                    }
+                    // Under the lease, so the seal is of the toolchain the lease holds.
+                    if let Err(error) = self.b.seal_inputs() {
+                        self.refuse_hard(Refusal::new(
+                            format!("the release build inputs cannot be sealed: {error}"),
+                            "restore the release build inputs and retry",
+                        ))?;
+                    }
                 }
                 self.prover = Some(p);
             }
@@ -2091,11 +2186,22 @@ impl Run<'_> {
         }
         let head = self.b.head();
         if self.b.branch_is_main() && !self.b.is_ancestor(&head, &self.tip.clone()) {
-            self.refuse(Refusal::new(
-                "this clone's main has commits origin/main does not — a release is staged from \
-                 origin's history",
-                "push them (git push origin main), or release from a fresh clone",
-            ))?;
+            self.refuse(if self.heads_a_hop(&head) {
+                Refusal::new(
+                    format!(
+                        "this clone's main is its line's head {}, and origin/main no longer \
+                         holds it",
+                        short(&head)
+                    ),
+                    lost_record(),
+                )
+            } else {
+                Refusal::new(
+                    "this clone's main has commits origin/main does not — a release is staged \
+                     from origin's history",
+                    "push them (git push origin main), or release from a fresh clone",
+                )
+            })?;
         }
 
         self.choose_candidate()?;
@@ -2205,8 +2311,8 @@ impl Run<'_> {
                     cut.version, cut.build
                 ),
                 format!(
-                    "finish it: {RELEASE_COMMAND} --commit <its published commit>; or withdraw \
-                     it: {RELEASE_COMMAND} --abandon v{}",
+                    "finish it: {}; or withdraw it: {RELEASE_COMMAND} --abandon v{}",
+                    self.start_remedy("--commit <its published commit>"),
                     cut.version
                 ),
             ))?;
@@ -2262,7 +2368,10 @@ impl Run<'_> {
                 version: j.version.clone(),
                 why: "the candidate this run chose before it re-ran as its own cutter".into(),
                 bump_from: None,
+                carry: Vec::new(),
             }
+        } else if !self.opts.fix.is_empty() {
+            self.fix_candidate(unfinished)?
         } else if let Some(rev) = self.opts.commit.clone() {
             let Some(r) = self.b.rev(&format!("{rev}^{{commit}}")) else {
                 return self.refuse_hard(Refusal::new(
@@ -2270,54 +2379,33 @@ impl Run<'_> {
                     "git fetch origin, and name a commit on origin/main",
                 ));
             };
-            let mut why = "--commit".to_string();
             if let Some(j) = unfinished
                 && j.commit != r
             {
-                let published = self.b.engine_rows(Some(&j.commit)).has;
-                let claimed = self.b.cut_journal().is_some_and(|c| c.version == j.version);
-                if published || claimed {
-                    self.cand = Some(Candidate {
-                        commit: j.commit.clone(),
-                        version: j.version.clone(),
-                        why: String::new(),
-                        bump_from: None,
-                    });
-                    self.public_state();
-                    return self.refuse_hard(Refusal::new(
-                        format!(
-                            "the release in progress here (v{} from {}) is already published — \
-                             the cut releases that commit",
-                            j.version,
-                            short(&j.commit)
-                        ),
-                        format!(
-                            "finish it: {RELEASE_COMMAND} without --commit; or drop it and \
-                             release the next MINOR: {RELEASE_COMMAND} --forget, then --bump"
-                        ),
-                    ));
-                }
-                let verify = self.est_or_default(Step::Verify);
-                self.say(&format!(
-                    "DECISION: --commit {} replaces the unpublished candidate v{} from {} — \
-                     {} costs a `verify release` run (about {}) unless its record already \
-                     stands",
-                    short(&r),
-                    j.version,
-                    short(&j.commit),
-                    short(&r),
-                    fmt_dur(verify)
+                self.refuse_published(j, "--commit")?;
+                let line = j.line();
+                return self.refuse_hard(Refusal::new(
+                    format!(
+                        "this clone's release is line v{} at {} (base {}, {} hop(s)), not \
+                         published, and --commit only starts a line",
+                        line.version,
+                        short(line.head()),
+                        short(&line.base),
+                        line.hops.len()
+                    ),
+                    format!(
+                        "carry the landed fix onto it: {RELEASE_COMMAND} --fix <its commit>; or \
+                         drop the line: {RELEASE_COMMAND} --forget, then {RELEASE_COMMAND} \
+                         --commit {rev}"
+                    ),
                 ));
-                why = format!(
-                    "--commit, replacing the unpublished candidate {}",
-                    short(&j.commit)
-                );
             }
             Candidate {
                 commit: r,
                 version: String::new(),
-                why,
+                why: "--commit".to_string(),
                 bump_from: None,
+                carry: Vec::new(),
             }
         } else if let Some(j) = unfinished {
             let mut why =
@@ -2330,6 +2418,7 @@ impl Run<'_> {
                 version: j.version.clone(),
                 why,
                 bump_from: None,
+                carry: Vec::new(),
             }
         } else if let Some(j) = j.as_ref().filter(|j| {
             !self.opts.bump && self.b.version_at(&tip).as_deref() == Some(j.version.as_str())
@@ -2339,6 +2428,7 @@ impl Run<'_> {
                 version: j.version.clone(),
                 why: "this clone's finished release; --bump starts the next".to_string(),
                 bump_from: None,
+                carry: Vec::new(),
             }
         } else if self.opts.bump {
             let v0 = self.b.version_at(&tip).unwrap_or_default();
@@ -2363,6 +2453,7 @@ impl Run<'_> {
                 why: format!("--bump {v0} -> {v} on origin/main's tip {}", short(&tip)),
                 version: v,
                 bump_from: Some(v0),
+                carry: Vec::new(),
             }
         } else {
             Candidate {
@@ -2370,17 +2461,23 @@ impl Run<'_> {
                 version: String::new(),
                 why: "origin/main's tip".to_string(),
                 bump_from: None,
+                carry: Vec::new(),
             }
         };
 
         if !self.b.is_ancestor(&cand.commit, &tip) {
             self.cand = Some(cand.clone());
+            let hop = self.heads_a_hop(&cand.commit);
             return self.refuse_hard(Refusal::new(
                 format!(
                     "{} is not on origin/main — the engine stages only mainline commits",
                     short(&cand.commit)
                 ),
-                format!("land it on main first, then re-run {RELEASE_COMMAND}"),
+                if hop {
+                    lost_record()
+                } else {
+                    format!("land it on main first, then re-run {RELEASE_COMMAND}")
+                },
             ));
         }
         if cand.version.is_empty() {
@@ -2389,24 +2486,30 @@ impl Run<'_> {
         self.cand = Some(cand.clone());
         let (r, v) = (cand.commit.clone(), cand.version.clone());
         if public_version(&v).is_none() {
+            let remedy = format!("release the next MINOR: {}", self.start_remedy("--bump"));
             return self.refuse_hard(Refusal::new(
                 format!(
                     "{} declares version '{v}', not a public MAJOR.MINOR.0",
                     short(&r)
                 ),
-                "--bump commits the next MINOR",
+                remedy,
             ));
         }
 
         if let Some(prev) = self.prev_release(&r, &v) {
             if !newer(&v, &prev) {
+                let remedy = format!("release the next MINOR: {}", self.start_remedy("--bump"));
                 return self.refuse_hard(Refusal::new(
                     format!("v{v} is not newer than v{prev}, the release it would succeed"),
-                    "--bump commits the next MINOR",
+                    remedy,
                 ));
             }
             let claim = self.b.origin_tag(&format!("v{prev}")).unwrap_or_default();
             if claim.is_empty() || !self.b.is_ancestor(&claim, &r) {
+                let remedy = format!(
+                    "release a commit of origin/main after that claim: {}",
+                    self.start_remedy("--commit origin/main")
+                );
                 return self.refuse_hard(Refusal::new(
                     format!(
                         "{} does not contain v{prev}'s claim commit {}, so the release it \
@@ -2414,10 +2517,7 @@ impl Run<'_> {
                         short(&r),
                         short(&claim)
                     ),
-                    format!(
-                        "release a commit of origin/main after that claim: {RELEASE_COMMAND} \
-                         --commit origin/main"
-                    ),
+                    remedy,
                 ));
             }
         }
@@ -2428,7 +2528,7 @@ impl Run<'_> {
                     "origin/main still declares {v0}: find what cut v{v} (git ls-remote --tags \
                      origin v{v}) and bring main's version past it, then {RELEASE_COMMAND} --bump"
                 ),
-                None => format!("release the next MINOR: {RELEASE_COMMAND} --bump"),
+                None => format!("release the next MINOR: {}", self.start_remedy("--bump")),
             };
             return self.refuse_hard(Refusal::new(
                 format!("v{v} is already cut (its tag is on origin), and this clone journals no cut of it"),
@@ -2449,28 +2549,147 @@ impl Run<'_> {
         }
 
         let rows = self.b.engine_rows(Some(&r));
-        if let Some(newest) = rows.newest.as_deref()
+        if let Some(newest) = rows.newest.clone()
             && !rows.has
-            && self.b.version_at(newest).as_deref() == Some(v.as_str())
+            && self.b.version_at(&newest).as_deref() == Some(v.as_str())
             && self.b.origin_tag(&format!("v{v}")).is_none()
         {
+            let remedy = format!(
+                "finish that release: {}; or release the next MINOR: {}",
+                self.start_remedy(&format!("--commit {newest}")),
+                self.start_remedy("--bump")
+            );
             return self.refuse_hard(Refusal::new(
                 format!(
                     "v{v}'s source was published from {}, not {} — the cut releases the \
                      published commit",
-                    short(newest),
+                    short(&newest),
                     short(&r)
                 ),
-                format!(
-                    "finish that release: {RELEASE_COMMAND} --commit {newest}; or release the \
-                     next MINOR: {RELEASE_COMMAND} --bump"
-                ),
+                remedy,
             ));
         }
         if let Some(r) = self.newest_row_refusal() {
             return self.refuse_hard(r);
         }
         Ok(())
+    }
+
+    /// `{RELEASE_COMMAND} {args}`, which starts a line: after `--forget` while this clone holds
+    /// an unfinished line, which neither `--commit` (it refuses) nor `--bump` (it resumes the
+    /// line) replaces.
+    fn start_remedy(&self, args: &str) -> String {
+        if self.journal.as_ref().is_some_and(|j| !j.finished()) {
+            format!("{RELEASE_COMMAND} --forget, then {RELEASE_COMMAND} {args}")
+        } else {
+            format!("{RELEASE_COMMAND} {args}")
+        }
+    }
+
+    /// `commit` heads this clone's unfinished line past its base: a hop, which origin/main
+    /// holds only through the line's record merge.
+    fn heads_a_hop(&self, commit: &str) -> bool {
+        self.journal
+            .as_ref()
+            .is_some_and(|j| !j.finished() && j.commit == commit && !j.line().hops.is_empty())
+    }
+
+    /// [`Run::refuse_hard`]'s halt, for a caller that returns a value when it goes on.
+    fn halted(&mut self, r: Refusal) -> Halt {
+        self.refuse_hard(r).err().unwrap_or(Halt::Said(1))
+    }
+
+    /// Refuses when the release `j` journals is published or claimed: `flag` cannot change a
+    /// line the cut releases (the candidate is set to it, for the final line's public state).
+    fn refuse_published(&mut self, j: &Journal, flag: &str) -> Flow {
+        let published = self.b.engine_rows(Some(&j.commit)).has;
+        let claimed = self.b.cut_journal().is_some_and(|c| c.version == j.version);
+        if !published && !claimed {
+            return Ok(());
+        }
+        self.cand = Some(Candidate {
+            commit: j.commit.clone(),
+            version: j.version.clone(),
+            why: String::new(),
+            bump_from: None,
+            carry: Vec::new(),
+        });
+        self.public_state();
+        self.refuse_hard(Refusal::new(
+            format!(
+                "the release in progress here (v{} from {}) is already published — the cut \
+                 releases that commit",
+                j.version,
+                short(&j.commit)
+            ),
+            format!(
+                "finish it: {RELEASE_COMMAND} without {flag}; or drop it and release the next \
+                 MINOR: {RELEASE_COMMAND} --forget, then --bump"
+            ),
+        ))
+    }
+
+    /// `--fix`'s candidate: the head of this clone's unfinished line, neither published nor
+    /// claimed, whose tree knows lines ([`LINE_SOURCE`]), with each commit `--fix` names
+    /// admitted ([`Backend::fix_of`]) for step 3 to carry. One a hop carries already is dropped;
+    /// when every one is, the run resumes the line as it is.
+    fn fix_candidate(&mut self, unfinished: Option<&Journal>) -> Result<Candidate, Halt> {
+        let Some(j) = unfinished else {
+            return Err(self.halted(Refusal::new(
+                "--fix carries landed fixes onto this clone's unpublished line, and this clone \
+                 has none (no release journal, or a finished one)",
+                format!(
+                    "start a line: {RELEASE_COMMAND} (origin/main's tip), {RELEASE_COMMAND} \
+                     --commit <rev> or {RELEASE_COMMAND} --bump; --fix carries a fix onto it \
+                     after a red"
+                ),
+            )));
+        };
+        self.refuse_published(j, "--fix")?;
+        let line = j.line();
+        let head = line.head().to_string();
+        let knows_lines = match self.b.tree_has(&head, LINE_SOURCE) {
+            Ok(has) => has,
+            Err(refusal) => return Err(self.halted(refusal)),
+        };
+        if !knows_lines {
+            return Err(self.halted(Refusal::new(
+                format!(
+                    "the line's head {} predates release lines (its tree has no {LINE_SOURCE}): \
+                     its own cutter, which a hop's run re-runs as, keeps no line",
+                    short(&head)
+                ),
+                format!("drop the line: {RELEASE_COMMAND} --forget, then start one on origin/main"),
+            )));
+        }
+        let mut carry = Vec::new();
+        for rev in self.opts.fix.clone() {
+            match self.b.fix_of(&line, &rev) {
+                Ok(crate::line::Admitted::Fix(fix)) => carry.push(fix),
+                Ok(crate::line::Admitted::Carried) => {}
+                Err(refusal) => return Err(self.halted(refusal)),
+            }
+        }
+        let at = format!(
+            "line v{} at {} (base {}, {} hop(s))",
+            line.version,
+            short(&head),
+            short(&line.base),
+            line.hops.len()
+        );
+        let why = if carry.is_empty() {
+            format!("{at}: every commit --fix names is carried already, so it resumes as it is")
+        } else {
+            let named: Vec<&str> = carry.iter().map(|fix| short(&fix.commit)).collect();
+            format!("{at}; step 3 carries {} onto it", named.join(", "))
+        };
+        Ok(Candidate {
+            commit: head,
+            version: j.version.clone(),
+            why,
+            bump_from: None,
+            carry,
+        })
     }
 
     fn est_or_default(&mut self, step: Step) -> u64 {
@@ -2541,6 +2760,17 @@ impl Run<'_> {
                     cand.version,
                     short(&self.tip)
                 ),
+                None if !cand.carry.is_empty() => {
+                    let named: Vec<&str> = cand.carry.iter().map(|f| short(&f.commit)).collect();
+                    format!(
+                        "would carry {} onto the line's head {} in ancestry order, one hop each \
+                         (git merge-tree, then git commit-tree), push a merge that keeps main's \
+                         tree onto main's tip to record the new head, and put this clone's main \
+                         at it",
+                        named.join(", "),
+                        short(&cand.commit)
+                    )
+                }
                 None => format!(
                     "would put this clone's main at {} (v{})",
                     short(&cand.commit),
@@ -2567,6 +2797,36 @@ impl Run<'_> {
                 }
             }
         }
+        let mut carried = None;
+        if !cand.carry.is_empty() {
+            let mut line = self.journal.as_ref().map_or_else(
+                || crate::line::Line::start(&cand.version, &cand.commit, self.t_start),
+                Journal::line,
+            );
+            match self.b.carry(&line, &cand.carry) {
+                Ok((hops, recorded)) => {
+                    let first = line.hops.len() + 1;
+                    let named: Vec<String> = hops
+                        .iter()
+                        .enumerate()
+                        .map(|(i, hop)| format!("{} as hop {}", short(&hop.carries), first + i))
+                        .collect();
+                    line.hops.extend(hops);
+                    cand.why = format!(
+                        "line v{} from {}: carried {}; {recorded}",
+                        line.version,
+                        short(&line.base),
+                        named.join(", ")
+                    );
+                    line.head().clone_into(&mut cand.commit);
+                    bumped = false;
+                    cand.carry.clear();
+                    self.cand = Some(cand.clone());
+                    carried = Some(line);
+                }
+                Err(r) => self.refuse(r)?,
+            }
+        }
         if let Err(r) = self.b.move_to(&cand.commit) {
             self.refuse(r)?;
         }
@@ -2576,6 +2836,8 @@ impl Run<'_> {
             .is_some_and(|j| j.commit == cand.commit);
         if !same {
             let now = self.b.now();
+            let line = carried
+                .unwrap_or_else(|| crate::line::Line::start(&cand.version, &cand.commit, now));
             let asks = self
                 .journal
                 .as_ref()
@@ -2594,6 +2856,7 @@ impl Run<'_> {
                 reserved: None,
                 artifact: None,
                 prepared: None,
+                line: Some(line),
             });
         } else if !self.claimed()
             && let Some(j) = self.journal.as_mut()
@@ -2690,8 +2953,12 @@ impl Run<'_> {
         let Some(c) = self.cand.clone() else {
             return;
         };
-        if self.dry && c.bump_from.is_some() {
-            let pending = Answer::no("the bump commit is not made yet");
+        if self.dry && (c.bump_from.is_some() || !c.carry.is_empty()) {
+            let pending = Answer::no(if c.bump_from.is_some() {
+                "the bump commit is not made yet"
+            } else {
+                "the line's new head is not made yet"
+            });
             self.facts = Facts {
                 built: pending.clone(),
                 verified: pending,
@@ -2755,11 +3022,7 @@ impl Run<'_> {
     }
 
     fn reservation(&self) -> Option<Reservation> {
-        let r = self.commit_r();
-        self.journal
-            .as_ref()
-            .filter(|j| j.commit == r)
-            .and_then(|j| j.reserved.clone())
+        self.r_journal().and_then(|j| j.reserved.clone())
     }
 
     fn spent(&mut self) -> Option<Spent> {
@@ -2777,11 +3040,7 @@ impl Run<'_> {
     }
 
     fn artifact(&self) -> Option<Artifact> {
-        let r = self.commit_r();
-        self.journal
-            .as_ref()
-            .filter(|j| j.commit == r)
-            .and_then(|j| j.artifact.clone())
+        self.r_journal().and_then(|j| j.artifact.clone())
     }
 
     fn skip_stage(&self) -> Option<String> {
@@ -2941,29 +3200,45 @@ impl Run<'_> {
         ));
     }
 
+    /// The release's one disk claim for its build and `verify release`, taken before either
+    /// writes: as much as the most any of this machine's recorded releases wrote, and never less
+    /// than [`crate::release_disk::WARM`] where the clone's build is warm, or
+    /// [`crate::release_disk::COLD`]. Nothing is walked to size it.
     fn disk_still_needed(&mut self) -> Flow {
         if self.facts.verified.yes {
             return Ok(());
         }
-        let (free, warm) = self.b.disk();
-        let Some(free) = free else {
-            return Ok(());
-        };
-        let (need, what) = if warm {
-            (30, "30 (its target directory is warm)")
+        let (_, warm) = self.b.disk();
+        let record = self.b.disk_record();
+        let bytes = crate::release_disk::need(&record, warm).bytes;
+        let floor = if warm {
+            crate::release_disk::WARM
         } else {
-            (39, "39 (cold)")
+            crate::release_disk::COLD
         };
-        if free < need {
-            return self.refuse(Refusal::new(
-                format!(
-                    "only {free} GiB free — the build and `verify release` still to come need \
-                     {what}, then the cut {CUT_GIB}"
-                ),
-                "free space, then re-run",
+        let gib = bytes.div_ceil(1 << 30);
+        let basis = if bytes > floor {
+            "the most a recorded release on this Mac wrote"
+        } else if warm {
+            "the floor where the clone's build is warm"
+        } else {
+            "the floor where the clone's build is cold"
+        };
+        if self.dry {
+            self.say(&format!(
+                "        disk: would claim {gib} GiB ({basis}) for the build and `verify \
+                 release`, walking nothing"
             ));
+            return Ok(());
         }
-        Ok(())
+        let why = format!("release v{} (build and verify)", self.version());
+        match self.b.claim_disk(bytes, &why) {
+            Ok(()) => {
+                self.say(&format!("        disk: claimed {gib} GiB ({basis})"));
+                Ok(())
+            }
+            Err(refusal) => self.refuse(refusal),
+        }
     }
 
     fn stage(&mut self) -> Flow {
@@ -2977,6 +3252,7 @@ impl Run<'_> {
         }
         let mut words = vec![self.commit_gates(&c)?];
         if self.opts.qualify {
+            words.extend(self.line_holds(&c)?);
             if self.dry {
                 words.push("would check the compat slice and full export with pub stage --dry-run, without a staging push".into());
             } else {
@@ -3003,16 +3279,22 @@ impl Run<'_> {
         }
         match self.skip_stage() {
             Some(why) => words.push(why),
-            None if self.dry => words.push(format!(
-                "would check its x86_64 compat slice with stable (cargo check), then run pub \
-                 stage aterm --commit {} --repo-path <this clone>",
-                if c.bump_from.is_some() {
-                    "<the bump commit>"
-                } else {
-                    c.commit.as_str()
-                }
-            )),
+            None if self.dry => {
+                words.extend(self.line_holds(&c)?);
+                words.push(format!(
+                    "would check its x86_64 compat slice with stable (cargo check), then run pub \
+                     stage aterm --commit {} --repo-path <this clone>",
+                    if c.bump_from.is_some() {
+                        "<the bump commit>"
+                    } else if !c.carry.is_empty() {
+                        "<the line's new head>"
+                    } else {
+                        c.commit.as_str()
+                    }
+                ));
+            }
             None => {
+                words.extend(self.line_holds(&c)?);
                 let log = self.b.log_path(Step::Stage);
                 self.say(&format!("        log: {}", log.display()));
                 let ran = self.b.stage(&c, &p, StageTarget::Remote);
@@ -3027,6 +3309,28 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The meaning check before the export: [`Backend::verify_line`] on the journaled line when
+    /// it has hops, its summary or its refusal. A dry run with fixes still to carry checks the
+    /// line it has and says the new head is checked before its export too.
+    fn line_holds(&mut self, c: &Candidate) -> Result<Option<String>, Halt> {
+        let line = self
+            .journal
+            .as_ref()
+            .map(Journal::line)
+            .filter(|line| !line.hops.is_empty());
+        let mut said = Vec::new();
+        if let Some(line) = line {
+            match self.b.verify_line(&line) {
+                Ok(summary) => said.push(summary),
+                Err(refusal) => self.refuse(refusal)?,
+            }
+        }
+        if self.dry && !c.carry.is_empty() {
+            said.push("would check the line's new head with line::verify before its export".into());
+        }
+        Ok((!said.is_empty()).then(|| said.join("; ")))
+    }
+
     fn commit_gates(&mut self, c: &Candidate) -> Result<String, Halt> {
         if self.journal_has(COMMIT_GATES) {
             return Ok(format!(
@@ -3037,16 +3341,25 @@ impl Run<'_> {
         let found = self.b.commit_gates(c, self.dry);
         if found.is_empty() {
             self.journal_add(COMMIT_GATES)?;
-            return Ok(String::from(
+            let mut words = String::from(
                 "the preflight passes: R's commit-only gates (the changelog, the predecessor's \
                  handoff fixtures, the handoff policy, the locked metadata) and the engine's \
                  readiness",
-            ));
+            );
+            if !c.carry.is_empty() {
+                words.push_str(&format!(
+                    ", asked of the line's head {} before the carry (a real run asks them of the \
+                     new head step 3 makes)",
+                    short(&c.commit)
+                ));
+            }
+            return Ok(words);
         }
         let n = found.len();
         self.refuse(blocked(
             format!("the preflight BLOCKED ({n} finding(s))"),
             &found,
+            &c.commit,
         ))?;
         Ok(format!("the preflight BLOCKED ({n} finding(s), above)"))
     }
@@ -3100,10 +3413,7 @@ impl Run<'_> {
         }
         Err(Refusal::new(
             format!("pub stage did not stage {r} (exit {})", ran.code),
-            format!(
-                "read its log; fix the source on main, then {RELEASE_COMMAND} --commit \
-                 origin/main"
-            ),
+            format!("read its log; {}", fix_remedy(&c.commit)),
         )
         .detail(ran.detail))
     }
@@ -3114,7 +3424,8 @@ impl Run<'_> {
             1 => self.refuse(found.remove(0)),
             n => {
                 let could_not_run = found.iter().all(|r| r.could_not_run);
-                let mut r = blocked(format!("{what} refused ({n} finding(s))"), &found);
+                let head = self.commit_r();
+                let mut r = blocked(format!("{what} refused ({n} finding(s))"), &found, &head);
                 r.could_not_run = could_not_run;
                 self.refuse(r)
             }
@@ -3167,6 +3478,12 @@ impl Run<'_> {
                 crate::publish::CutKind::Real
             };
             out.extend(self.b.cut_gates(c, &creds, kind));
+            // With fixes still to carry, R is the line's old head, which the cut never releases:
+            // the head step 3 makes meets these in step 4's preflight and before the publish, and
+            // judging the old one would refuse the very fix that repairs it.
+            if c.carry.is_empty() {
+                out.extend(self.b.head_gates(c));
+            }
         }
         out
     }
@@ -3182,6 +3499,7 @@ impl Run<'_> {
             self.refuse(blocked(
                 format!("{asked}the cut would refuse ({} finding(s))", decided.len()),
                 &decided,
+                &c.commit,
             ))?;
         }
         if !unasked.is_empty() {
@@ -3191,6 +3509,7 @@ impl Run<'_> {
                     unasked.len()
                 ),
                 &unasked,
+                &c.commit,
             );
             r.remedy = format!("run {RELEASE_COMMAND} again once it answers (nothing changed)");
             self.refuse(r.could_not_run())?;
@@ -3708,8 +4027,8 @@ impl Run<'_> {
             1 => Refusal::new(
                 format!("`verify release` failed for {r} (exit 1)"),
                 format!(
-                    "fix what it names on main (`{rerun}` in the clone runs it again), then \
-                     {RELEASE_COMMAND} --commit origin/main"
+                    "`{rerun}` in the clone runs it again; {}",
+                    fix_remedy(&c.commit)
                 ),
             ),
             code => Refusal::new(
@@ -4052,7 +4371,26 @@ enum CutMode {
     Done(String),
 }
 
-fn blocked(why: String, found: &[Refusal]) -> Refusal {
+/// The way out of a line whose hop origin/main lost (main rewritten without its record merge):
+/// the line cannot ship, so it is dropped.
+fn lost_record() -> String {
+    format!(
+        "origin/main no longer holds the line's record merge: drop the line ({RELEASE_COMMAND} \
+         --forget) and start a new one"
+    )
+}
+
+/// The way out of a red on the line whose head is `head`: the fix lands on main as its own
+/// commit, and `--fix` carries it onto the line as a hop, so the release never re-selects main.
+pub(crate) fn fix_remedy(head: &str) -> String {
+    format!(
+        "land the fix on main (based on {} when it must apply to the line's head), then \
+         {RELEASE_COMMAND} --fix <the fix's own non-merge commit>",
+        short(head)
+    )
+}
+
+fn blocked(why: String, found: &[Refusal], head: &str) -> Refusal {
     let detail: Vec<String> = found
         .iter()
         .flat_map(|r| {
@@ -4064,9 +4402,9 @@ fn blocked(why: String, found: &[Refusal]) -> Refusal {
     Refusal::new(
         why,
         format!(
-            "fix each (each block's fix line above) — on main for the source's, then \
-             {RELEASE_COMMAND} --commit origin/main; on this machine for its own, then \
-             {RELEASE_COMMAND}"
+            "fix each (each block's fix line above) — the source's: {}; this machine's: fix \
+             it, then {RELEASE_COMMAND}",
+            fix_remedy(head)
         ),
     )
     .detail(detail)

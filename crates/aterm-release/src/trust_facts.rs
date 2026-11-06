@@ -170,18 +170,14 @@ impl Pace {
     /// Reads [`Pace::text`].
     #[must_use]
     pub fn parse(s: &str) -> Option<Pace> {
-        let (cpu, wall, load, cores, threads) = match s.split(' ').collect::<Vec<_>>()[..] {
-            [cpu, wall, load, cores] => (cpu, wall, load, cores, None),
-            [cpu, wall, load, cores, ran, runnable] => (
-                cpu,
-                wall,
-                load,
-                cores,
-                Some(Threads {
-                    ran_ms: parse_uint(ran)?,
-                    runnable_ms: parse_uint(runnable)?,
-                }),
-            ),
+        let mut parts = s.split(' ');
+        let (cpu, wall, load, cores) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        let threads = match (parts.next(), parts.next(), parts.next()) {
+            (None, None, None) => None,
+            (Some(ran), Some(runnable), None) => Some(Threads {
+                ran_ms: parse_uint(ran)?,
+                runnable_ms: parse_uint(runnable)?,
+            }),
             _ => return None,
         };
         Some(Pace {
@@ -280,9 +276,8 @@ impl Backstop {
     }
 
     fn from_fields(v: &str) -> Option<Backstop> {
-        let [key, stop, said] = v.splitn(3, '\t').collect::<Vec<_>>()[..] else {
-            return None;
-        };
+        let mut parts = v.splitn(3, '\t');
+        let (key, stop, said) = (parts.next()?, parts.next()?, parts.next()?);
         (!key.is_empty() && crate::trust_oblig::is_backstop(stop)).then(|| Backstop {
             key: key.into(),
             stop: stop.into(),
@@ -1787,15 +1782,11 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
             }
         }
     }
-    let key = |(n, r, l): &(String, Option<MemRow>, String)| {
-        let ram = r.as_ref().and_then(|r| gib(&r.ram)).unwrap_or(-1.0);
-        (n.clone(), ram, l.clone())
-    };
+    let ram_of = |r: &Option<MemRow>| r.as_ref().and_then(|r| gib(&r.ram)).unwrap_or(-1.0);
     data.sort_by(|a, b| {
-        let (ka, kb) = (key(a), key(b));
-        ka.0.cmp(&kb.0)
-            .then(ka.1.total_cmp(&kb.1))
-            .then(ka.2.cmp(&kb.2))
+        a.0.cmp(&b.0)
+            .then_with(|| ram_of(&a.1).total_cmp(&ram_of(&b.1)))
+            .then_with(|| a.2.cmp(&b.2))
     });
     out.extend(data.into_iter().map(|(_, _, l)| l));
     let mut s = out.join("\n");
@@ -2095,7 +2086,10 @@ impl Facts {
                 "measured-at" => f.measured_at = v.to_string(),
                 "vanished" => f.vanished.push(v.to_string()),
                 "ambiguous" => {
-                    let [n, a, b] = v.split('\t').collect::<Vec<_>>()[..] else {
+                    let mut parts = v.split('\t');
+                    let (Some(n), Some(a), Some(b), None) =
+                        (parts.next(), parts.next(), parts.next(), parts.next())
+                    else {
                         return None;
                     };
                     f.ambiguous.push((n.into(), a.into(), b.into()));
@@ -2143,17 +2137,18 @@ fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
     let row = ratchet?
         .lines()
         .find(|l| l.split('\t').next() == Some(name))?;
-    let f: Vec<&str> = row.split('\t').collect();
-    let col = |i: usize| {
-        f.get(i)
+    let mut f = row.split('\t');
+    let _ = f.next();
+    let mut col = || {
+        f.next()
             .map_or("", |s| s.trim_end_matches('\t'))
             .to_string()
     };
     Some(Floor {
-        proved: col(1),
-        total: col(2),
-        driver: col(3),
-        why: col(4),
+        proved: col(),
+        total: col(),
+        driver: col(),
+        why: col(),
     })
 }
 
@@ -3788,13 +3783,19 @@ impl Plan {
                 }
                 "vanished" => p.facts.vanished.push(v.into()),
                 "ambiguous" => {
-                    let [n, a, b] = v.split('\t').collect::<Vec<_>>()[..] else {
+                    let mut parts = v.split('\t');
+                    let (Some(n), Some(a), Some(b), None) =
+                        (parts.next(), parts.next(), parts.next(), parts.next())
+                    else {
                         return Err(bad());
                     };
                     p.facts.ambiguous.push((n.into(), a.into(), b.into()));
                 }
                 "crate" => {
-                    let [name, spec, word] = v.split('\t').collect::<Vec<_>>()[..] else {
+                    let mut parts = v.split('\t');
+                    let (Some(name), Some(spec), Some(word), None) =
+                        (parts.next(), parts.next(), parts.next(), parts.next())
+                    else {
                         return Err(bad());
                     };
                     let decision = Decision::from_word(word).ok_or_else(bad)?;
@@ -4031,8 +4032,9 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
         .flatten()
         .filter(|e| {
             let n = e.file_name();
-            let n = n.to_string_lossy();
-            n.starts_with('j') && n[1..].bytes().all(|b| b.is_ascii_digit()) && n.len() > 1
+            n.to_str()
+                .and_then(|s| s.strip_prefix('j'))
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
         })
         .map(|e| e.path())
         .collect();
@@ -4679,10 +4681,10 @@ fn records_about(receipts: &Path, tsr: &str) -> Vec<(String, Facts)> {
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            name.starts_with(FACTS_PREFIX).then_some(())?;
+            let file_name = e.file_name();
+            let name = file_name.to_str().filter(|n| n.starts_with(FACTS_PREFIX))?;
             let facts = Facts::parse(&crate::durable::read_text(&e.path()).ok()?)?;
-            (facts.provenance.as_ref()?.tree_sans_floors == tsr).then_some((name, facts))
+            (facts.provenance.as_ref()?.tree_sans_floors == tsr).then(|| (name.to_string(), facts))
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));

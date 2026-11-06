@@ -17,6 +17,7 @@
 use std::fmt;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -38,6 +39,18 @@ pub const SCOPES: usize = 16;
 /// as fresh as it says them.
 pub const EVERY: Duration = Duration::from_secs(60);
 
+/// The walks of a run's directories this process began ([`allocated_until`] over any): what
+/// verify's run reports it made (`verify-event: … "event":"disk"`), since one walk of a release
+/// clone's build directory reads every file of it.
+static WALKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many walks of directories ([`allocated_until`] over a non-empty set) this process has
+/// begun, whether each finished or was ended early.
+#[must_use]
+pub fn walks() -> u64 {
+    WALKS.load(Ordering::Relaxed)
+}
+
 /// The bytes `paths` hold on disk: each file's allocated blocks once, however many names it has
 /// among them, never following a link.
 #[must_use]
@@ -45,10 +58,15 @@ pub fn allocated(paths: &[PathBuf]) -> u64 {
     allocated_until(paths, &|| false)
 }
 
-/// [`allocated`], walked by a wait ([`crate::Relief`]) that an interrupt can end: once `stopped`
-/// says so, the walk ends with what it has counted.
+/// [`allocated`], walked by a wait ([`crate::Relief`]) that an interrupt can end, or by a
+/// [`Meter`] its run's end halts: once `stopped` says so, the walk ends with what it has counted,
+/// which is less than the paths hold, so a caller that stopped it does not take it for a measure.
+/// Each call over a non-empty set counts as one walk ([`walks`]).
 #[must_use]
 pub fn allocated_until(paths: &[PathBuf], stopped: &dyn Fn() -> bool) -> u64 {
+    if !paths.is_empty() {
+        WALKS.fetch_add(1, Ordering::Relaxed);
+    }
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut total = 0u64;
     let mut account = |meta: &std::fs::Metadata| {
@@ -468,10 +486,18 @@ struct Shared {
     claim: Option<Claim>,
 }
 
+/// A [`Meter`]'s measure of its run's directories: the bytes they hold, walked until the `stopped`
+/// it is given says the run ended ([`allocated_until`]). A measure that `stopped` cut short is
+/// discarded, never taken for a smaller sample.
+pub type Measure = Box<dyn FnMut(&dyn Fn() -> bool) -> u64 + Send>;
+
 /// THE RUN'S OWN MEASURE OF ITS WRITES: a thread that measures the run's directories every
 /// [`EVERY`], tells its claim what they grew by ([`Claim::wrote`]), so a waiter counts only the
 /// rest of the run's need as reserved, and keeps the most they held, which [`Self::finish`]
-/// returns as the run's [`Footprint`].
+/// returns as the run's [`Footprint`]. The run's end walks nothing more where a sample completed:
+/// it halts a walk under way, whose partial count is discarded, and keeps the most the completed
+/// samples read. A run that ended before any sample completed (under [`EVERY`], or halted in its
+/// first walk) is measured once at its end, so its growth is what it wrote, not 0.
 pub struct Meter {
     start: u64,
     /// The tag of the directories it measures ([`Footprint::dirs`]).
@@ -479,6 +505,8 @@ pub struct Meter {
     /// The tag of what its run builds ([`Footprint::scope`]).
     scope: Option<u64>,
     shared: Arc<Mutex<Shared>>,
+    /// Set as the run ends: a walk under way ends at its next entry, and is discarded.
+    halted: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<u64>>,
 }
@@ -494,8 +522,8 @@ impl fmt::Debug for Meter {
 }
 
 impl Meter {
-    /// Measure `dirs` ([`allocated`]) every [`EVERY`] from `start`, the bytes they held when the
-    /// run began, holding `claim` for the run; `tag` names them in the run's [`Footprint`]
+    /// Measure `dirs` ([`allocated_until`]) every [`EVERY`] from `start`, the bytes they held when
+    /// the run began, holding `claim` for the run; `tag` names them in the run's [`Footprint`]
     /// ([`Footprint::dirs`]), and `scope` what it builds there ([`Footprint::scope`]).
     #[must_use]
     pub fn start(
@@ -505,7 +533,12 @@ impl Meter {
         start: u64,
         claim: Option<Claim>,
     ) -> Meter {
-        let mut meter = Meter::start_with(start, Box::new(move || allocated(&dirs)), claim, EVERY);
+        let mut meter = Meter::start_with(
+            start,
+            Box::new(move |stopped| allocated_until(&dirs, stopped)),
+            claim,
+            EVERY,
+        );
         meter.dirs = Some(tag);
         meter.scope = scope;
         meter
@@ -516,32 +549,41 @@ impl Meter {
     #[must_use]
     pub fn start_with(
         start: u64,
-        mut measure: Box<dyn FnMut() -> u64 + Send>,
+        mut measure: Measure,
         claim: Option<Claim>,
         every: Duration,
     ) -> Meter {
         let shared = Arc::new(Mutex::new(Shared { peak: start, claim }));
+        let halted = Arc::new(AtomicBool::new(false));
         let (stop, stopped) = mpsc::channel::<()>();
         let theirs = Arc::clone(&shared);
-        let mut look = move || {
-            let now = measure();
+        let flag = Arc::clone(&halted);
+        let keep = move |now: Option<u64>| {
             let mut s = theirs.lock().unwrap_or_else(PoisonError::into_inner);
-            s.peak = s.peak.max(now);
-            if let Some(claim) = s.claim.as_mut() {
-                let _ = claim.wrote(now.saturating_sub(start));
+            if let Some(now) = now {
+                s.peak = s.peak.max(now);
+                if let Some(claim) = s.claim.as_mut() {
+                    let _ = claim.wrote(now.saturating_sub(start));
+                }
             }
             s.peak
         };
         let thread = std::thread::Builder::new()
             .name("capacity-meter".to_owned())
             .spawn(move || {
-                loop {
-                    match stopped.recv_timeout(every) {
-                        Err(RecvTimeoutError::Timeout) => {
-                            look();
-                        }
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return look(),
+                let mut sampled = false;
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    let now = measure(&|| flag.load(Ordering::SeqCst));
+                    if flag.load(Ordering::SeqCst) {
+                        break;
                     }
+                    keep(Some(now));
+                    sampled = true;
+                }
+                if sampled {
+                    keep(None)
+                } else {
+                    keep(Some(measure(&|| false)))
                 }
             })
             .ok();
@@ -550,6 +592,7 @@ impl Meter {
             dirs: None,
             scope: None,
             shared,
+            halted,
             stop: Some(stop),
             thread,
         }
@@ -561,8 +604,8 @@ impl Meter {
         self.start
     }
 
-    /// End the run: measure once more, let its claim go, and return what it took, tagged with
-    /// the directories it measured and what it built there.
+    /// End the run: let its claim go, and return what it took, tagged with the directories it
+    /// measured and what it built there. It walks them only where no sample completed.
     #[must_use]
     pub fn finish(mut self) -> Footprint {
         let peak = self.halt();
@@ -575,8 +618,10 @@ impl Meter {
         }
     }
 
-    /// Stop the thread after its last look and let the claim go: the most the directories held.
+    /// Halt a walk under way, stop the thread, and let the claim go: the most the directories
+    /// held, as the completed samples read it, or, with none, as one last look reads it.
     fn halt(&mut self) -> u64 {
+        self.halted.store(true, Ordering::SeqCst);
         drop(self.stop.take());
         let joined = self.thread.take().and_then(|t| t.join().ok());
         let mut s = self.shared.lock().unwrap_or_else(PoisonError::into_inner);

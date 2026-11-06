@@ -166,6 +166,8 @@ impl Drop for KeptUntilRan {
             let _ = std::fs::remove_dir_all(&self.dir);
             return;
         }
+        // The copy may lie under this test binary's own root, which then outlives its exit.
+        crate::test_binary::hold_own_root();
         let kept = format!(
             "KEPT {}: a program copied there was started and never showed it ran, so macOS may \
              still be assessing its first exec; remove it once no process runs from it",

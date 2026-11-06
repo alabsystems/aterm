@@ -1210,108 +1210,161 @@ const fn kind(i: &PaneInput) -> &'static str {
     }
 }
 
+pub(crate) fn check_step(cursor: u64, input: &PaneInput, obs: &PaneObservation) -> Option<Verdict> {
+    match (input, obs) {
+        (
+            PaneInput::Bytes { .. },
+            PaneObservation::Parsed {
+                clocked, replies, ..
+            },
+        ) => {
+            if !clocked {
+                return Some(fail(
+                    cursor,
+                    CLOCK_RECORDED,
+                    "the slice carries no clock; it was parsed at the origin".into(),
+                ));
+            }
+            if let ReplyMatch::Diverged(d) = replies {
+                return Some(fail(cursor, REPLIES_MATCH, d.to_string()));
+            }
+        }
+        (PaneInput::Resize { .. }, PaneObservation::Resized { .. })
+        | (PaneInput::CellPx { .. }, PaneObservation::CellPx { .. }) => {}
+        (PaneInput::Host { op: expected, .. }, PaneObservation::Host { op: seen, clocked })
+            if expected == seen =>
+        {
+            if !clocked {
+                match expected {
+                    HostOp::LeaveAlternateScreen => {
+                        return Some(fail(
+                            cursor,
+                            CLOCK_RECORDED,
+                            "the host alternate-screen leave carries no clock; it ran at the origin"
+                                .into(),
+                        ));
+                    }
+                    HostOp::AdvanceKittyAnimations => {
+                        return Some(fail(
+                            cursor,
+                            CLOCK_RECORDED,
+                            "the Kitty animation step carries no clock; it ran at the origin"
+                                .into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (PaneInput::Witness { .. }, PaneObservation::Witnessed { live, replayed }) => {
+            if *replayed != Some(*live) {
+                return Some(fail(
+                    cursor,
+                    WITNESS_MATCHES,
+                    format!(
+                        "the live screen is {}, the replay's {}",
+                        live.short_display(),
+                        replayed.map_or_else(|| "inside a partial sequence".into(), |d| d.short())
+                    ),
+                ));
+            }
+        }
+        (input, obs) => {
+            return Some(fail(
+                cursor,
+                WITNESS_MATCHES,
+                format!("a {} input observed {obs:?}", kind(input)),
+            ));
+        }
+    }
+    None
+}
+
+pub(crate) fn finish_verdict(
+    first_fail: Option<Verdict>,
+    refused: Option<&(u64, StepRefusal)>,
+    observed_len: usize,
+    inputs_len: usize,
+    cursor_at_end: impl FnOnce() -> u64,
+) -> Verdict {
+    if let Some(v) = first_fail {
+        return v;
+    }
+    if let Some((cursor, r)) = refused {
+        return fail(*cursor, WITNESS_MATCHES, format!("the replay stopped: {r}"));
+    }
+    if observed_len != inputs_len {
+        return fail(
+            cursor_at_end(),
+            WITNESS_MATCHES,
+            format!("the run observed {observed_len} of {inputs_len} inputs"),
+        );
+    }
+    Verdict::Pass
+}
+
 impl Contract<PaneSchema> for FaithfulReplay {
     fn id(&self) -> &ArtifactId {
         &self.id
     }
 
     fn judge(&self, _schema: &PaneSchema, inputs: &[PaneInput], run: &Run<PaneSchema>) -> Verdict {
+        let mut first_fail = None;
         for ((cursor, obs), input) in run.observations.iter().zip(inputs) {
-            let cursor = *cursor;
-            match (input, obs) {
-                (
-                    PaneInput::Bytes { .. },
-                    PaneObservation::Parsed {
-                        clocked, replies, ..
-                    },
-                ) => {
-                    if !clocked {
-                        return fail(
-                            cursor,
-                            CLOCK_RECORDED,
-                            "the slice carries no clock; it was parsed at the origin".into(),
-                        );
-                    }
-                    if let ReplyMatch::Diverged(d) = replies {
-                        return fail(cursor, REPLIES_MATCH, d.to_string());
-                    }
-                }
-                (PaneInput::Resize { .. }, PaneObservation::Resized { .. })
-                | (PaneInput::CellPx { .. }, PaneObservation::CellPx { .. }) => {}
-                (
-                    PaneInput::Host { op: expected, .. },
-                    PaneObservation::Host { op: seen, clocked },
-                ) if expected == seen => {
-                    if !clocked {
-                        match expected {
-                            HostOp::LeaveAlternateScreen => {
-                                return fail(
-                                    cursor,
-                                    CLOCK_RECORDED,
-                                    "the host alternate-screen leave carries no clock; it ran at the origin"
-                                        .into(),
-                                );
-                            }
-                            HostOp::AdvanceKittyAnimations => {
-                                return fail(
-                                    cursor,
-                                    CLOCK_RECORDED,
-                                    "the Kitty animation step carries no clock; it ran at the origin"
-                                        .into(),
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                (PaneInput::Witness { .. }, PaneObservation::Witnessed { live, replayed }) => {
-                    if *replayed != Some(*live) {
-                        return fail(
-                            cursor,
-                            WITNESS_MATCHES,
-                            format!(
-                                "the live screen is {}, the replay's {}",
-                                live.short_display(),
-                                replayed.map_or_else(
-                                    || "inside a partial sequence".into(),
-                                    |d| d.short()
-                                )
-                            ),
-                        );
-                    }
-                }
-                (input, obs) => {
-                    return fail(
-                        cursor,
-                        WITNESS_MATCHES,
-                        format!("a {} input observed {obs:?}", kind(input)),
-                    );
-                }
+            if let Some(v) = check_step(*cursor, input, obs) {
+                first_fail = Some(v);
+                break;
             }
         }
-        if let Some((cursor, r)) = &run.refused {
-            return fail(*cursor, WITNESS_MATCHES, format!("the replay stopped: {r}"));
-        }
-        if run.observations.len() != inputs.len() {
-            let cursor = run.observations.get(inputs.len()).map_or_else(
-                || {
-                    run.observations
-                        .last()
-                        .map_or(0, |(c, _)| c.saturating_add(1))
-                },
-                |(c, _)| *c,
-            );
-            return fail(
-                cursor,
-                WITNESS_MATCHES,
-                format!(
-                    "the run observed {} of {} inputs",
-                    run.observations.len(),
-                    inputs.len()
-                ),
-            );
-        }
-        Verdict::Pass
+        finish_verdict(
+            first_fail,
+            run.refused.as_ref(),
+            run.observations.len(),
+            inputs.len(),
+            || {
+                run.observations.get(inputs.len()).map_or_else(
+                    || {
+                        run.observations
+                            .last()
+                            .map_or(0, |(c, _)| c.saturating_add(1))
+                    },
+                    |(c, _)| *c,
+                )
+            },
+        )
+    }
+
+    fn replay_judged<C: Code<PaneSchema>>(
+        &self,
+        schema: &PaneSchema,
+        code: &C,
+        start: PaneState,
+        inputs: &[PaneInput],
+        first_cursor: u64,
+        port: &mut dyn EffectPort,
+    ) -> (aterm_aos::replay::FoldedRun<PaneSchema>, Verdict) {
+        let mut first_fail = None;
+        let folded = aterm_aos::replay::replay_fold(
+            schema,
+            code,
+            start,
+            inputs,
+            first_cursor,
+            port,
+            |_, at, input, obs| {
+                if first_fail.is_none() {
+                    first_fail = check_step(at, input, &obs);
+                }
+            },
+        );
+        let verdict = finish_verdict(
+            first_fail,
+            folded.refused.as_ref(),
+            folded.observations,
+            inputs.len(),
+            || folded.last_cursor.map_or(0, |c| c.saturating_add(1)),
+        );
+        (folded, verdict)
     }
 }
 
@@ -1329,10 +1382,12 @@ pub struct PaneCounts {
 }
 
 impl PaneCounts {
-    /// The counts over `inputs` and the witnesses `run` matched.
-    #[must_use]
-    pub fn of(inputs: &[PaneInput], run: &Run<PaneSchema>) -> Self {
-        let mut c = PaneCounts::default();
+    /// The input counts over `inputs`, with `matched` witnesses.
+    pub(crate) fn from_inputs_and_matched(inputs: &[PaneInput], matched: usize) -> Self {
+        let mut c = PaneCounts {
+            matched,
+            ..PaneCounts::default()
+        };
         for i in inputs {
             let slot = match i {
                 PaneInput::Bytes { .. } => &mut c.bytes,
@@ -1342,14 +1397,20 @@ impl PaneCounts {
             };
             *slot = slot.saturating_add(1);
         }
-        c.matched = run
+        c
+    }
+
+    /// The counts over `inputs` and the witnesses `run` matched.
+    #[must_use]
+    pub fn of(inputs: &[PaneInput], run: &Run<PaneSchema>) -> Self {
+        let matched = run
             .observations
             .iter()
             .filter(|(_, o)| {
                 matches!(o, PaneObservation::Witnessed { live, replayed } if *replayed == Some(*live))
             })
             .count();
-        c
+        Self::from_inputs_and_matched(inputs, matched)
     }
 }
 

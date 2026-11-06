@@ -10041,6 +10041,11 @@ impl App {
                 let _ = self.forget_all_history();
             }
             MenuAction::RecordUnseenKeys => self.toggle_unseen_keys(),
+            #[cfg(target_os = "macos")]
+            MenuAction::ChangeNickname => self.change_nickname(),
+            // Not offered here: the machine menu is macOS's.
+            #[cfg(not(target_os = "macos"))]
+            MenuAction::ChangeNickname => {}
             MenuAction::CloseTab => {
                 // As Cmd-W; the window closes when its last tab did.
                 if let Some(closed) = self.close_active_tab() {

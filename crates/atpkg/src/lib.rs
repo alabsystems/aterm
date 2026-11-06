@@ -42,6 +42,8 @@ pub mod adoption;
 pub mod alab;
 pub mod apply;
 pub mod build_admit;
+/// Strict owned Cargo source-cache in-use custody, compatible with native fetch.
+pub use aterm_toolchain::cargo_cache;
 pub mod build_cache;
 /// Programs built into aterm (`amacs`).
 pub mod builtin;
@@ -191,7 +193,7 @@ pub use flow::{
     InstallRequest, VendorFetchError, VendorGet, apply_channel, install, resolve_verified_index,
 };
 pub use gate::ApplyDecision;
-pub use install::{StageError, verify_and_stage};
+pub use install::{StageError, verify_and_stage, verify_for_publication};
 pub use linkmode::{
     LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
     linked_programs, linked_programs_checked, linked_tool_names, refresh, unlink,

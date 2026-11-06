@@ -66,6 +66,42 @@ fn candidate_origin(paths: &Paths) -> Option<Paths> {
     let original = Paths::for_home(paths.home.ancestors().nth(6)?);
     (candidate(&original) == *paths).then_some(original)
 }
+/// The bytes of a path a selection record cannot spell as text. A Unix path is bytes, so a home
+/// or config that is not UTF-8 is kept as hex under `<name>_hex` beside its null text and reads
+/// back the same ([`path_field`]); a UTF-8 path is text alone, so its record is unchanged.
+/// Elsewhere a path the record cannot spell has no such form and reads back as unavailable.
+fn unspelled(path: &Path) -> Option<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.to_str().is_none().then(|| path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+/// The path a selection record holds under `name`: its text, or, where that is null, the bytes
+/// [`unspelled`] kept under `<name>_hex`. Those must not be UTF-8 (text would have spelled
+/// them, so each path has one spelling) and hold no NUL.
+fn path_field(value: &Value, name: &str) -> Result<PathBuf> {
+    if let Some(text) = value[name].as_str() {
+        return Ok(PathBuf::from(text));
+    }
+    #[cfg(unix)]
+    if value[name].is_null()
+        && let Some(hex) = value[format!("{name}_hex").as_str()].as_str()
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or_else(fail)?;
+        if std::str::from_utf8(&raw).is_ok() || raw.contains(&0) {
+            return Err(fail());
+        }
+        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&raw)));
+    }
+    Err(fail())
+}
 fn fail() -> Error {
     Error::new("Commons writer generation is unavailable or changed")
 }
@@ -100,11 +136,20 @@ struct Selection {
 }
 impl Selection {
     fn bytes(&self) -> Vec<u8> {
-        json!({"version":1, "home":self.original.home.to_str(),
+        let mut record = json!({"version":1, "home":self.original.home.to_str(),
             "config":self.config.to_str(), "actor":self.actor, "trust":self.trust,
-            "complete":self.complete.map(|v| aterm_codec::hex::encode_lower(&v))})
-        .to_string()
-        .into_bytes()
+            "complete":self.complete.map(|v| aterm_codec::hex::encode_lower(&v))});
+        if let Some(fields) = record.as_object_mut() {
+            for (name, path) in [("home", &self.original.home), ("config", &self.config)] {
+                if let Some(raw) = unspelled(path) {
+                    fields.insert(
+                        format!("{name}_hex"),
+                        Value::String(aterm_codec::hex::encode_lower(raw)),
+                    );
+                }
+            }
+        }
+        record.to_string().into_bytes()
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
         let value: Value = aterm_json::from_slice(bytes).map_err(|_| fail())?;
@@ -112,8 +157,8 @@ impl Selection {
         if value["version"].as_u64() != Some(1) {
             return Err(fail());
         }
-        let original = Paths::for_home(Path::new(word("home")?));
-        let config = PathBuf::from(word("config")?);
+        let original = Paths::for_home(&path_field(&value, "home")?);
+        let config = path_field(&value, "config")?;
         if !original.home.is_absolute() || !config.is_absolute() {
             return Err(fail());
         }

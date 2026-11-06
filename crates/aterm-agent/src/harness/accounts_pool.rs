@@ -467,20 +467,47 @@ pub fn prepare_google_worker(
     program: &Path,
     starter: super::worker::Starter,
 ) -> Result<Option<GooglePoolWorker>, String> {
-    recover_google_worker_with(
+    let lifetime = super::account_work::Lifetime::default();
+    let scope = lifetime.enter().expect("new account lifetime admits work");
+    prepare_google_worker_scoped(scope, seat, program, starter)
+}
+
+/// Prepares App-owned native Google account work under an admitted operation.
+/// The returned terminal worker does not retain the preparation scope.
+#[cfg(unix)]
+pub fn prepare_google_worker_scoped(
+    scope: super::account_work::Scope,
+    seat: &Seat<'_>,
+    program: &Path,
+    starter: super::worker::Starter,
+) -> Result<Option<GooglePoolWorker>, String> {
+    if scope.cancelled() {
+        return Err("account work was cancelled".into());
+    }
+    let result = recover_google_worker_with(
         seat,
         starter,
         |row, profile| {
-            super::agy_signin::check_google_published(
+            if scope.cancelled() {
+                return Err("account work was cancelled".into());
+            }
+            let result = super::agy_signin::check_google_published(
                 program,
                 seat.state,
                 &row.label,
                 row.expected_identity_email()
                     .ok_or("Native Google row has no expected email")?,
                 profile,
-            )
+            );
+            if scope.cancelled() {
+                return Err("account work was cancelled".into());
+            }
+            result
         },
         |row, logins| {
+            if scope.cancelled() {
+                return Err("account work was cancelled".into());
+            }
             let raw = seat.roster(Cli::Agy)?;
             let own_dir = raw
                 .row(&row.label)
@@ -494,13 +521,16 @@ pub fn prepare_google_worker(
             let result = super::cli::renew_one_for(
                 Cli::Agy,
                 seat.now,
-                &super::cli::LiveAccounts,
+                &super::cli::LiveAccounts::with_work(scope.clone()),
                 &seat.store(Cli::Agy),
                 (row, &path, logins),
                 (own_dir, sign_in),
                 &mut io::sink(),
                 &mut io::sink(),
             );
+            if scope.cancelled() {
+                return Err("account work was cancelled".into());
+            }
             if result == super::cli::Renewal::Renewed {
                 Ok(())
             } else {
@@ -509,7 +539,11 @@ pub fn prepare_google_worker(
                 ))
             }
         },
-    )
+    );
+    if scope.cancelled() {
+        return Err("account work was cancelled".into());
+    }
+    result
 }
 
 #[cfg(unix)]

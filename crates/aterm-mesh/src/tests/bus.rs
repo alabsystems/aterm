@@ -744,6 +744,7 @@ fn quit_mesh(state: &Path) -> std::io::Result<Arc<crate::Mesh>> {
         changed: None,
         watch_every: HANG,
         observe: None,
+        stores: None,
     })
 }
 
@@ -958,4 +959,66 @@ fn held_topics_are_what_this_macs_newest_topics_record_names() {
             .expect("named");
     }
     assert_eq!(crate::mail::held_topics(a.mesh()), ["build", "deploy"]);
+}
+
+/// §11 C3c, the person key: each pass of the mail pushes vouches with this Mac's node key for
+/// its person key, made the first time and asking nothing. The certificate names the node key and
+/// is a record of it under aterm-net's framing (`record_message`), so it is what
+/// `NodeIdentity::sign_record` signs and no other record of the node key reads as one. A lost
+/// person key is made anew at the next pass, its certificate naming the new key, with nothing
+/// asked.
+#[test]
+fn each_pass_vouches_for_the_person_key() {
+    use aterm_link::person_key::{self, Cert, PersonKey, Signer, Vouched};
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let a = &macs[0];
+    let root = Root::new(62);
+    let _slot = host_bus(a, &root);
+    let me = aterm_net::fleet::NodeIdentity::from_seed(&a.principal, &a.seed).expect("a node");
+    let table = &a.run.as_ref().expect("runs").table;
+    let no_hints: crate::overlay::Hints = Arc::new(Vec::new);
+    let links =
+        crate::mail::MailLinks::start(&me, a.mesh(), table, no_hints).expect("the pushes start");
+    links.pass();
+    let state = a.dir.path();
+    let key = PersonKey::read(state).expect("reads").expect("made");
+    let cert = person_key::read_cert(state)
+        .expect("reads")
+        .expect("signed");
+    assert_eq!((cert.node, cert.person), (a.key, key.public()));
+    assert_eq!(cert.check(Signer::Key(&a.key), cert.issued_ms), Ok(()));
+    assert_eq!(
+        cert.check(Signer::Node(&a.principal), cert.issued_ms),
+        Ok(())
+    );
+    let mut body = cert.person.to_vec();
+    body.extend_from_slice(&cert.issued_ms.to_le_bytes());
+    assert_eq!(
+        Cert::message(&cert.person, cert.issued_ms),
+        aterm_net::fleet::record_message(person_key::CERT_DOMAIN, &body),
+        "a node-key record"
+    );
+    assert_eq!(me.sign_record(person_key::CERT_DOMAIN, &body), cert.sig);
+    assert_eq!(
+        person_key::vouch(state, &a.seed, cert.issued_ms).expect("vouched"),
+        Vouched::Kept,
+        "the pass left a certificate in force"
+    );
+
+    std::fs::remove_file(state.join(person_key::KEY_FILE)).expect("lost");
+    links.pass();
+    let made = PersonKey::read(state).expect("reads").expect("made anew");
+    assert_ne!(made.public(), key.public());
+    let cert = person_key::read_cert(state)
+        .expect("reads")
+        .expect("signed");
+    assert_eq!(
+        cert.person,
+        made.public(),
+        "the certificate names the new key"
+    );
+    assert_eq!(cert.check(Signer::Key(&a.key), cert.issued_ms), Ok(()));
+    links.stop_soon();
+    drop(links);
 }

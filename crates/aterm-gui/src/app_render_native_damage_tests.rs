@@ -18,6 +18,394 @@ fn about_view(app: &App) -> crate::native_app::AppViewState {
     crate::native_app::AppViewState::Settings(Box::new(state))
 }
 
+/// Present `wid`'s native page the way the render loop finishes a frame.
+#[cfg(a11y_tree)]
+fn present_page(app: &mut App, wid: WindowId, view: crate::tab_model::ViewId) {
+    assert!(app.prepare_native_input_scratch(wid));
+    let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
+    let presented_stamp = app.windows[&wid]
+        .native_ui_compiled
+        .as_ref()
+        .map(|frame| frame.stamp);
+    app.finalize_successful_present(
+        wid,
+        crate::metrics::StartupPresentTiming::collapsed(std::time::Instant::now()),
+        0,
+        None,
+        SuccessfulPresentRoute::Native {
+            view,
+            presented_stamp,
+        },
+        route,
+        HostVisualState::default(),
+        None,
+        &plan,
+    );
+}
+
+#[cfg(a11y_tree)]
+fn about_page_with_a_client() -> (App, WindowId, crate::tab_model::ViewId) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.first_present_done = true;
+    let window = app.windows.get_mut(&wid).unwrap();
+    window.cols = 140;
+    window.rows = 50;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.windows.get_mut(&wid).unwrap().a11y_active = true;
+    present_page(&mut app, wid, view);
+    assert!(
+        app.windows[&wid].native_a11y_published.is_some(),
+        "the client reads the presented page"
+    );
+    (app, wid, view)
+}
+
+/// A screen reader's action owes the page a paint, and a window that cannot present never pays it,
+/// so nothing here presents. Its tree comes at once and is the model: not a root-only tree, which
+/// would lose the client's place, and not the old one, whose routes lead to what is gone.
+#[cfg(a11y_tree)]
+#[test]
+fn a_client_reads_the_model_as_soon_as_its_action_owes_a_paint() {
+    use crate::native_settings::SettingsRoute;
+    let (mut app, wid, view) = about_page_with_a_client();
+    let about = app.compiled_native_ui(wid).unwrap();
+    let key = about.focus_order.first().cloned().unwrap();
+    let focus = app.accessibility_request_for_test(
+        wid,
+        view,
+        key.as_str(),
+        aterm_a11y::model::Action::Focus,
+        None,
+    );
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.on_native_accessibility_action(wid, focus);
+
+    let node = |key: &crate::native_ui::UiKey| {
+        crate::native_accessibility::stable_node_id_for_view(view, key)
+    };
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1, "the action's own publish");
+    assert_eq!(
+        sent[0].focus,
+        node(&key),
+        "the client's focus is where it put it"
+    );
+
+    let press = app.request_on_the_sent_tree(
+        wid,
+        view,
+        "settings/nav/appearance",
+        aterm_a11y::model::Action::Click,
+        None,
+    );
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.on_native_accessibility_action(wid, press);
+
+    assert!(matches!(
+        app.native_runtime.view_state(view),
+        Some(crate::native_app::AppViewState::Settings(settings))
+            if settings.route == SettingsRoute::Appearance
+    ));
+    let appearance = app.compiled_native_ui(wid).unwrap();
+    let only_here = appearance
+        .focus_order
+        .iter()
+        .find(|key| !about.focus_order.contains(key))
+        .expect("a control only Appearance has");
+    let gone = about
+        .focus_order
+        .iter()
+        .find(|key| appearance.semantic(key).is_none())
+        .expect("a control only About has");
+    let sent = app.windows[&wid]
+        .a11y_sent
+        .last()
+        .expect("the press's publish");
+    let carries = |key| sent.nodes.iter().any(|(id, _)| *id == node(key));
+    assert!(
+        carries(only_here),
+        "the tree is the page the press moved to"
+    );
+    assert!(!carries(gone), "and no longer the page it left");
+}
+
+/// The paint a client's edit owes must not leave it reading the old text: every later selection it
+/// makes is a byte offset into what it read, and one taken from before the edit selects the wrong
+/// text in the person's document.
+#[cfg(a11y_tree)]
+#[test]
+fn a_client_reads_its_own_edit_before_any_frame() {
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let path = scratch.path().join("edit.txt");
+    std::fs::write(&path, "hello world\n").unwrap();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.first_present_done = true;
+    app.open_document_tab_in_window(
+        wid,
+        crate::native_app::AppKind::Editor,
+        &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+    )
+    .unwrap();
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.windows.get_mut(&wid).unwrap().a11y_active = true;
+    present_page(&mut app, wid, view);
+    let edit = app.accessibility_request_for_test(
+        wid,
+        view,
+        "editor/buffer",
+        aterm_a11y::model::Action::ReplaceSelectedText,
+        Some(aterm_a11y::model::ActionData::Value("XX".into())),
+    );
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.on_accessibility_action(wid, edit);
+
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1, "the edit's own publish");
+    let line = app.windows[&wid]
+        .native_a11y_published
+        .as_ref()
+        .and_then(|published| published.first_text_line())
+        .expect("the tree carries the document's text");
+    assert_eq!(
+        line.text.trim_end(),
+        "XXhello world",
+        "the tree the client holds has the text it just wrote"
+    );
+
+    let position = |character_index| aterm_a11y::model::TextPosition {
+        node: line.node,
+        character_index,
+    };
+    let select = app.request_on_the_sent_tree(
+        wid,
+        view,
+        "editor/buffer",
+        aterm_a11y::model::Action::SetTextSelection,
+        Some(aterm_a11y::model::ActionData::SetTextSelection(
+            aterm_a11y::model::TextSelection {
+                anchor: position(2),
+                focus: position(7),
+            },
+        )),
+    );
+    app.on_accessibility_action(wid, select);
+    let replace = app.request_on_the_sent_tree(
+        wid,
+        view,
+        "editor/buffer",
+        aterm_a11y::model::Action::ReplaceSelectedText,
+        Some(aterm_a11y::model::ActionData::Value("Y".into())),
+    );
+    app.on_accessibility_action(wid, replace);
+
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(instance).unwrap();
+    assert_eq!(
+        &*app.document_store.snapshot(document).unwrap().text,
+        "XXY world\n",
+        "a selection made in the text the client read lands on those bytes"
+    );
+}
+
+/// A first ask with a paint owed gets the page, where it used to get a root-only tree.
+#[cfg(a11y_tree)]
+#[test]
+fn a_first_ask_with_a_paint_owed_gets_the_page() {
+    let (mut app, wid, view) = about_page_with_a_client();
+    let winit_id = aterm_window::window::WindowId::from(1u64);
+    app.winit_to_window.insert(winit_id, wid);
+    let key = app.compiled_native_ui(wid).unwrap().focus_order[0].clone();
+    app.invalidate_native_ui_cache(wid);
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.on_accessibility_event(crate::a11y_adapter::Event {
+        window_id: winit_id,
+        window_event: crate::a11y_adapter::WindowEvent::InitialTreeRequested,
+    });
+
+    let control = crate::native_accessibility::stable_node_id_for_view(view, &key);
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].nodes.iter().any(|(id, _)| *id == control));
+}
+
+/// Compiling for a client leaves the paint it found: the page still owes it, and the frame that
+/// pays it is not skipped.
+#[cfg(a11y_tree)]
+#[test]
+fn a_tree_read_from_the_model_leaves_the_owed_paint_owed() {
+    let (mut app, wid, view) = about_page_with_a_client();
+    app.invalidate_native_ui_cache(wid);
+    let owed = |app: &App| {
+        let cache = &app.windows[&wid].leaf_render_cache[&view];
+        (
+            cache.native_damage,
+            cache.native.as_ref().map(|raster| raster.paint_serial),
+            cache.native_paint_serial,
+        )
+    };
+    let before = owed(&app);
+    let compiles = crate::app_native::native_ui_compile_count();
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.push_a11y_tree(wid);
+
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1);
+    assert_ne!(sent[0], crate::a11y_tree::empty_tree());
+    assert_eq!(crate::app_native::native_ui_compile_count(), compiles + 1);
+    assert_eq!(owed(&app), before);
+}
+
+/// A press can bring in a page no frame has shown: it goes on the plan's slot, so the client reads
+/// it at once and keeps a place, where a root-only tree would drop it to the window.
+#[cfg(a11y_tree)]
+#[test]
+fn a_page_with_no_frame_yet_is_read_from_the_model() {
+    let (mut app, wid, _) = about_page_with_a_client();
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let path = scratch.path().join("new-tab.txt");
+    std::fs::write(&path, "text\n").unwrap();
+    app.open_document_tab_in_window(
+        wid,
+        crate::native_app::AppKind::Editor,
+        &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+    )
+    .unwrap();
+    let (_, editor) = app.active_native_view(wid).unwrap();
+    assert!(
+        app.windows[&wid]
+            .leaf_render_cache
+            .get(&editor)
+            .is_none_or(|cache| cache.native.is_none()),
+        "no frame has shown this page"
+    );
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.push_a11y_tree(wid);
+
+    let buffer = crate::native_accessibility::stable_node_id_for_view(
+        editor,
+        &crate::native_ui::UiKey::new("editor/buffer"),
+    );
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].nodes.iter().any(|(id, _)| *id == buffer));
+    assert!(app.windows[&wid].native_a11y_published.is_some());
+}
+
+/// A hidden tab's raster is released at the next frame, so a page brought back has no frame either,
+/// though it painted before.
+#[cfg(a11y_tree)]
+#[test]
+fn a_page_released_while_hidden_is_read_when_it_comes_back() {
+    let (mut app, wid, about) = about_page_with_a_client();
+    let key = app.compiled_native_ui(wid).unwrap().focus_order[0].clone();
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let path = scratch.path().join("in-front.txt");
+    std::fs::write(&path, "text\n").unwrap();
+    app.open_document_tab_in_window(
+        wid,
+        crate::native_app::AppKind::Editor,
+        &crate::native_document_host::path_to_file_uri(&path).unwrap(),
+    )
+    .unwrap();
+    let (_, editor) = app.active_native_view(wid).unwrap();
+    present_page(&mut app, wid, editor);
+    assert!(
+        !app.windows[&wid].leaf_render_cache.contains_key(&about),
+        "the frame released the hidden page"
+    );
+    let tab = app.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .position(|tab| tab.root.contains(about))
+        .unwrap();
+    app.switch_tab_in(wid, tab);
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.push_a11y_tree(wid);
+
+    let control = crate::native_accessibility::stable_node_id_for_view(about, &key);
+    let sent = &app.windows[&wid].a11y_sent;
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].nodes.iter().any(|(id, _)| *id == control));
+}
+
+/// A page that cannot compile has nothing to say, so the client gets the root and no routes.
+#[cfg(a11y_tree)]
+#[test]
+fn a_read_that_fails_leaves_the_root_only_tree() {
+    let (mut app, wid, _) = about_page_with_a_client();
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    assert!(app.native_runtime.remove_instance(instance).is_some());
+    app.invalidate_native_ui_cache(wid);
+    app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
+
+    app.push_a11y_tree(wid);
+
+    assert_eq!(
+        app.windows[&wid].a11y_sent,
+        vec![crate::a11y_tree::empty_tree()]
+    );
+    assert!(app.windows[&wid].native_a11y_published.is_none());
+}
+
+/// A reveal is spent by the first compile after it, which here is the client's own publish. That
+/// compile has to be at the height the frame will have, or the row lands past the rail's new edge.
+#[cfg(a11y_tree)]
+#[test]
+fn a_reveal_asked_on_a_shrunken_window_shows_the_row_whole() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.first_present_done = true;
+    let window = app.windows.get_mut(&wid).unwrap();
+    window.cols = 140;
+    window.rows = 40;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.windows.get_mut(&wid).unwrap().a11y_active = true;
+    present_page(&mut app, wid, view);
+    let shown = app.compiled_native_ui(wid).unwrap();
+    let last_row = shown
+        .semantics
+        .iter()
+        .rfind(|node| node.key.as_str().starts_with("settings/nav/") && node.offscreen)
+        .expect("a rail row past the edge")
+        .key
+        .clone();
+    app.windows.get_mut(&wid).unwrap().rows = 24;
+    let reveal = app.request_on_the_sent_tree(
+        wid,
+        view,
+        last_row.as_str(),
+        aterm_a11y::model::Action::ScrollIntoView,
+        None,
+    );
+
+    app.on_native_accessibility_action(wid, reveal);
+
+    present_page(&mut app, wid, view);
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    let row = compiled.semantic(&last_row).expect("the rail's row");
+    let list = compiled
+        .semantic(&crate::native_ui::UiKey::new("settings/navigation/list"))
+        .expect("the rail's list");
+    assert!(
+        !row.offscreen && row.rect.bottom() <= list.rect.bottom() + 0.01,
+        "{last_row:?} is whole on the rail: {:?} in {:?}",
+        row.rect,
+        list.rect
+    );
+}
+
 #[test]
 fn native_leaf_cache_releases_hidden_tab_rasters_without_repainting_visible_leaf() {
     let mut app = App::headless_for_test();

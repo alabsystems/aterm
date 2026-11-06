@@ -117,6 +117,7 @@ pub struct MemoryBrowser {
     _identity: Option<Session>,
     identity: Identity,
     previous_snapshot: Option<[u8; 32]>,
+    _work: Option<super::account_work::Scope>,
 }
 
 /// Unpublished Google cookies, wiped on drop and protected by the original identity claim.
@@ -127,9 +128,15 @@ pub(super) struct PendingSession {
     claim: Session,
     home: std::path::PathBuf,
     previous: Option<[u8; 32]>,
+    _work: Option<super::account_work::Scope>,
 }
 
 impl PendingSession {
+    pub(super) fn retain_work(&mut self, work: Option<super::account_work::Scope>) {
+        if self._work.is_none() {
+            self._work = work;
+        }
+    }
     pub(super) fn recovery_cookies(
         &self,
         identity: &Identity,
@@ -152,6 +159,17 @@ impl PendingSession {
         cookies: aterm_secrets::SecretBytes,
         previous: Option<[u8; 32]>,
     ) -> Result<Self, Error> {
+        Self::recover_scoped(identity, state, home, cookies, previous, None)
+    }
+
+    pub(super) fn recover_scoped(
+        identity: &Identity,
+        state: &Path,
+        home: &Path,
+        cookies: aterm_secrets::SecretBytes,
+        previous: Option<[u8; 32]>,
+        work: Option<super::account_work::Scope>,
+    ) -> Result<Self, Error> {
         if cookies.is_empty() || cookies.len() > super::google_browser_store::MAX_BYTES {
             return Err(Error::Session);
         }
@@ -161,6 +179,7 @@ impl PendingSession {
             claim: identity.claim(state).map_err(|_| Error::IdentityBusy)?,
             home: home.into(),
             previous,
+            _work: work,
         })
     }
 
@@ -194,13 +213,34 @@ impl PendingSession {
     }
 
     fn commit_using(self, check: impl Fn(&Identity) -> Result<(), Error>) -> Result<(), Error> {
+        if self
+            ._work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err(Error::Session);
+        }
         check(&self.identity)?;
         if super::google_browser_store::fingerprint(&self.claim).map_err(|_| Error::Session)?
             != self.previous
         {
             // A publication made while this candidate was stopped wins. The native
             // proof can still be used without rolling its newer browser session back.
+            if self
+                ._work
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return Err(Error::Session);
+            }
             return check(&self.identity);
+        }
+        if self
+            ._work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err(Error::Session);
         }
         super::google_browser_store::save(
             &self.home,
@@ -227,6 +267,7 @@ pub(super) fn pending_fixture(
         previous: super::google_browser_store::fingerprint(&claim).unwrap(),
         claim,
         home: home.into(),
+        _work: None,
     }
 }
 
@@ -242,6 +283,23 @@ impl MemoryBrowser {
         home: Option<&Path>,
         deadline: Instant,
     ) -> Result<Self, Error> {
+        Self::start_scoped(identity, machine_state, home, deadline, None)
+    }
+
+    /// Start with the caller's automatic lifetime retained by actual CDP workers.
+    pub fn start_scoped(
+        identity: &Identity,
+        machine_state: &Path,
+        home: Option<&Path>,
+        deadline: Instant,
+        work: Option<super::account_work::Scope>,
+    ) -> Result<Self, Error> {
+        if work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err(Error::Prepare);
+        }
         remaining(deadline)?;
         let claim = identity
             .claim(machine_state)
@@ -251,7 +309,12 @@ impl MemoryBrowser {
         let browser = super::browser_window::fetch_window_browser(
             home,
             &mut super::headless_fetch::Curl,
-            &|| Instant::now() >= deadline,
+            &|| {
+                Instant::now() >= deadline
+                    || work
+                        .as_ref()
+                        .is_some_and(super::account_work::Scope::cancelled)
+            },
         )
         .map_err(|_| Error::Prepare)?;
         remaining(deadline)?;
@@ -266,6 +329,12 @@ impl MemoryBrowser {
             super::headless_oauth::headless_browser_command(&browser, profile.path(), &|name| {
                 std::env::var_os(name)
             });
+        if work
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return Err(Error::Prepare);
+        }
         let child = aterm_uds::spawnfd::spawn_with_two_fds(
             command,
             OwnedFd::from(commands),
@@ -273,7 +342,8 @@ impl MemoryBrowser {
         )
         .map_err(|_| Error::Launch)?;
         let child = BrowserChild::new(child);
-        let mut cdp = CdpClient::new(to_browser, from_browser);
+        let mut cdp = CdpClient::new_scoped(to_browser, from_browser, work.clone())
+            .map_err(|_| Error::Launch)?;
         let context = cdp
             .call(
                 None,
@@ -291,6 +361,7 @@ impl MemoryBrowser {
         }
         Ok(Self {
             _child: child,
+            _work: work,
             cdp,
             context,
             deadline,
@@ -371,6 +442,7 @@ impl MemoryBrowser {
             claim,
             home: home.into(),
             previous: self.previous_snapshot,
+            _work: self._work.clone(),
         })
     }
 
@@ -753,6 +825,85 @@ fn remaining(deadline: Instant) -> Result<Duration, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_google_cookies_retain_work_until_the_identity_claim_retires() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let registry = super::super::google_identity::Registry::parse(
+            "[[identities]]\nid='scope-fixture'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='fixture'\naccount='one'\nidentity='scope-fixture'\nexpected_email='fixture@example.invalid'\n",
+        ).unwrap();
+        let identity = registry.resolve("fixture", "one").unwrap().0;
+        let lifetime = super::super::account_work::Lifetime::default();
+        let mut pending = pending_fixture(identity, root.path(), root.path(), b"synthetic cookies");
+        pending._work = lifetime.enter();
+        let pause = lifetime.pause().unwrap().try_wait().unwrap_err();
+        assert!(identity.claim(root.path()).is_err());
+        drop(pending);
+        let drained = pause.try_wait().unwrap();
+        let claim = identity.claim(root.path()).unwrap();
+        assert!(drained.resume().is_ok());
+        drop(claim);
+    }
+
+    #[test]
+    fn pending_google_cookies_do_not_recheck_a_proof_after_work_closes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let registry = super::super::google_identity::Registry::parse(
+            "[[identities]]\nid='scope-fixture'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='fixture'\naccount='one'\nidentity='scope-fixture'\nexpected_email='fixture@example.invalid'\n",
+        ).unwrap();
+        let identity = registry.resolve("fixture", "one").unwrap().0;
+        let lifetime = super::super::account_work::Lifetime::default();
+        let mut pending = pending_fixture(identity, root.path(), root.path(), b"synthetic cookies");
+        pending._work = lifetime.enter();
+        assert_eq!(
+            super::super::google_browser_store::fingerprint(&pending.claim).unwrap(),
+            None
+        );
+        pending.previous = Some([42; 32]);
+        let checks = std::cell::Cell::new(0);
+        let pause = std::cell::RefCell::new(None);
+        let result = pending.commit_using(|_| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 1 {
+                *pause.borrow_mut() = lifetime.pause();
+            }
+            Ok(())
+        });
+        assert_eq!(result, Err(Error::Session));
+        assert_eq!(checks.get(), 1);
+        assert!(pause.into_inner().unwrap().try_wait().is_ok());
+    }
+
+    #[test]
+    fn recovered_google_cookies_keep_work_and_refuse_a_closed_commit() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let registry = super::super::google_identity::Registry::parse(
+            "[[identities]]\nid='scope-fixture'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='fixture'\naccount='one'\nidentity='scope-fixture'\nexpected_email='fixture@example.invalid'\n",
+        ).unwrap();
+        let identity = registry.resolve("fixture", "one").unwrap().0;
+        let lifetime = super::super::account_work::Lifetime::default();
+        let pending = PendingSession::recover_scoped(
+            identity,
+            root.path(),
+            root.path(),
+            aterm_secrets::SecretBytes::from(b"synthetic cookies".as_slice()),
+            None,
+            lifetime.enter(),
+        )
+        .unwrap();
+        let pause = lifetime.pause().unwrap().try_wait().unwrap_err();
+        let checks = std::cell::Cell::new(0);
+        assert_eq!(
+            pending.commit_using(|_| {
+                checks.set(checks.get() + 1);
+                Err(Error::Session)
+            }),
+            Err(Error::Session)
+        );
+        assert_eq!(checks.get(), 0);
+        assert!(pause.try_wait().is_ok());
+        assert!(identity.claim(root.path()).is_ok());
+    }
 
     #[test]
     fn only_the_owned_main_frame_can_supply_a_same_tab_handoff() {

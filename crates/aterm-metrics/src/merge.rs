@@ -126,16 +126,16 @@ impl Snapshots {
             return Err(OfferError::Row(RowError::NoCodec));
         }
         let row = Row::decode_at(&subject, body).map_err(OfferError::Row)?;
-        Ok(match self.rows.get_mut(&subject) {
-            None => {
-                self.rows.insert(subject, (seq, row));
+        Ok(match self.rows.entry(subject) {
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                vacant.insert((seq, row));
                 Offered::Added
             }
-            Some(held) if seq > held.0 => {
-                *held = (seq, row);
+            std::collections::btree_map::Entry::Occupied(mut held) if seq > held.get().0 => {
+                held.insert((seq, row));
                 Offered::Replaced
             }
-            Some(_) => Offered::Kept,
+            std::collections::btree_map::Entry::Occupied(_) => Offered::Kept,
         })
     }
 
@@ -238,8 +238,8 @@ fn figure<'r>(list: impl IntoIterator<Item = &'r Reading>) -> Option<&'r Reading
 }
 
 /// The newest reading, the greater node id among equals.
-fn newest<'r>(list: &[&'r Reading]) -> Option<&'r Reading> {
-    list.iter().copied().max_by_key(|r| (r.t, r.by))
+fn newest<'r>(list: impl IntoIterator<Item = &'r Reading>) -> Option<&'r Reading> {
+    list.into_iter().max_by_key(|r| (r.t, r.by))
 }
 
 /// One window's figure from its readings at `now`: the journal reader's rule
@@ -256,13 +256,11 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
     };
     let reset_by = |r: &Reading| r.t.saturating_add(length);
     let fresh = |r: &&Reading| reset_by(r).saturating_add(RESET_TOLERANCE_S) > now;
-    let (known, less): (Vec<&Reading>, Vec<&Reading>) =
-        readings.iter().partition(|r| r.reset.is_some());
     let reset_of = |r: &Reading| r.reset.unwrap_or(0);
-    let Some(last_reset) = known.iter().map(|r| reset_of(r)).max() else {
+    let Some(last_reset) = readings.iter().filter_map(|r| r.reset).max() else {
         // No reading names its window: the newest one, its reset unknown, while its window
         // can still be the current one.
-        let last = newest(&less)?;
+        let last = newest(readings.iter())?;
         return Some(if fresh(&last) {
             current_of(last)
         } else {
@@ -273,20 +271,27 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
             }
         });
     };
-    let mut current: Vec<&Reading> = known
+    let mut current: Vec<&Reading> = readings
         .iter()
-        .copied()
-        .filter(|r| reset_of(r).saturating_add(RESET_TOLERANCE_S) > now)
+        .filter(|r| {
+            r.reset
+                .is_some_and(|res| res.saturating_add(RESET_TOLERANCE_S) > now)
+        })
         .collect();
     if current.is_empty() {
         // Every reset has passed: only a reading made since speaks for the new window, while
         // that window can still be the current one.
-        let since: Vec<&Reading> = less.iter().copied().filter(|r| r.t > last_reset).collect();
-        if let Some(fig) = figure(since.iter().copied().filter(fresh)) {
+        let since = || {
+            readings
+                .iter()
+                .filter(|r| r.reset.is_none() && r.t > last_reset)
+        };
+        if let Some(fig) = figure(since().filter(fresh)) {
             return Some(current_of(fig));
         }
-        let last = newest(&since).or_else(|| newest(&known))?;
-        let reset = since.iter().map(|r| reset_by(r)).fold(last_reset, u64::max);
+        let last =
+            newest(since()).or_else(|| newest(readings.iter().filter(|r| r.reset.is_some())))?;
+        let reset = since().map(reset_by).fold(last_reset, u64::max);
         return Some(Usage::ResetUnread {
             reset,
             read: last.t,
@@ -296,23 +301,19 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
     // Group by window identity: sorted by reset, a reading joins the group before it when the
     // two resets lie within the tolerance.
     current.sort_by_key(|r| (r.reset, r.t, r.by));
-    let mut groups: Vec<Vec<&Reading>> = Vec::new();
-    for r in current {
-        match groups.last_mut() {
-            Some(group)
-                if group.last().is_some_and(|prev| {
-                    reset_of(r).abs_diff(reset_of(prev)) <= RESET_TOLERANCE_S
-                }) =>
-            {
-                group.push(r);
-            }
-            _ => groups.push(vec![r]),
+    let mut groups: Vec<&[&Reading]> = Vec::new();
+    let mut group_start = 0;
+    for i in 1..current.len() {
+        if reset_of(current[i]).abs_diff(reset_of(current[i - 1])) > RESET_TOLERANCE_S {
+            groups.push(&current[group_start..i]);
+            group_start = i;
         }
     }
+    groups.push(&current[group_start..]);
     // The newest group names the current window; a group a whole window before it is the
     // window that ended, not a disagreement about this one.
     let newest_reset = groups.last()?.iter().map(|r| reset_of(r)).min()?;
-    let overlapping: Vec<&Vec<&Reading>> = groups
+    let overlapping: Vec<&&[&Reading]> = groups
         .iter()
         .filter(|g| {
             let reset = g.iter().map(|r| reset_of(r)).max().unwrap_or(0);
@@ -329,10 +330,11 @@ fn usage(length: u64, readings: &[Reading], now: u64) -> Option<Usage> {
         .min()
         .map_or(0, |reset| reset.saturating_sub(length));
     let fig = figure(
-        overlapping
-            .iter()
-            .flat_map(|g| g.iter().copied())
-            .chain(less.iter().copied().filter(|r| r.t >= start)),
+        overlapping.iter().flat_map(|g| g.iter().copied()).chain(
+            readings
+                .iter()
+                .filter(|r| r.reset.is_none() && r.t >= start),
+        ),
     )?;
     let reset = match overlapping.as_slice() {
         // Every reset has one tolerance, so the newest reading's reset.

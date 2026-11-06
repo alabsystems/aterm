@@ -114,6 +114,7 @@ mod alert_keys;
 mod allocation_monitor_host;
 mod alt_screen_resync;
 mod app_about;
+mod app_account_work;
 mod app_allocation;
 mod app_colorscheme;
 mod app_config;
@@ -568,7 +569,6 @@ fn mend_secrets_subscriber_once(headless: bool) {
     );
 }
 
-pub use clt_install::offer_developer_tools_install;
 /// The lost-wake watch `about_to_wait` hands each turn to, for `tests/headless_event_loop.rs`.
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 #[doc(hidden)]
@@ -3435,6 +3435,10 @@ impl OutageWait {
 
 #[derive(Debug)]
 enum Wake {
+    AccountsDrained {
+        serial: u64,
+        drained: aterm_agent::harness::account_work::Drained,
+    },
     MailChanged,
     #[cfg(target_os = "macos")]
     AllocationMonitorChanged,
@@ -3444,9 +3448,6 @@ enum Wake {
     Record(aterm_messages::Message),
     AccountMenuRead(account_menu_read::Completion),
     WorkstationSetup(workstation_setup::Request),
-    /// Whether a setup pass's Repositories stage, at its end, waits on Apple's Command Line
-    /// Tools: a tab installs them ([`clt_install`]).
-    DeveloperToolsInstall(u64, bool),
     /// The second of a watch for Apple's Command Line Tools, on a Mac that lacks them, with what it
     /// read of this Mac's installers on its own thread; `None` once the tools exist and the watch
     /// ends ([`clt_install::watch_for_tools`]).
@@ -3979,6 +3980,7 @@ enum Wake {
         prompt: task_launch::PromptFence,
         line: String,
         reply: std::sync::mpsc::Sender<Result<&'static str, task_launch::Untyped>>,
+        account_scope: Option<aterm_agent::harness::account_work::Scope>,
     },
     HwKeyTarget {
         reply: std::sync::mpsc::Sender<Result<(i64, bool), &'static str>>,
@@ -4080,6 +4082,10 @@ enum Wake {
     /// reader: the menu bar's machine title follows it.
     #[cfg(target_os = "macos")]
     MachineName(machine_title::MachineView),
+    /// The nickname the person chose in Change Nickname… was not set, and why: the next press
+    /// shows the reason ([`App::nickname_not_set`]).
+    #[cfg(target_os = "macos")]
+    NicknameNotSet(machine_title::NickUnset),
     #[cfg(target_os = "macos")]
     SiblingRaised {
         pid: u32,
@@ -7735,6 +7741,9 @@ struct WindowState {
     current_title: String,
     store_title: (u64, String),
     input_scratch: RenderInput,
+    /// The layout `input_scratch`'s cells were composed under.
+    #[cfg(a11y_tree)]
+    composed_layout: a11y_tree::ComposedLayout,
     pane_scratch: RenderInput,
     composed_focus_scratch: RenderInput,
     unfocused_pane_scratch: std::collections::BTreeMap<usize, RenderInput>,
@@ -7818,6 +7827,9 @@ struct WindowState {
     native_a11y_staged: Option<native_accessibility::StagedNativeAccessibility>,
     #[cfg(a11y_tree)]
     native_a11y_published: Option<native_accessibility::PublishedNativeAccessibility>,
+    /// Each tree published to the client: a headless window has no adapter a test could read.
+    #[cfg(all(test, a11y_tree))]
+    a11y_sent: Vec<aterm_a11y::model::TreeUpdate>,
     native_ui_compiled: Option<app_native::NativeCompiledFrame>,
     settings_card: Option<SettingsCard>,
     route_card: Option<SettingsCard>,
@@ -8860,6 +8872,8 @@ impl WindowState {
             current_title: "aterm".to_string(),
             store_title: (u64::MAX, String::new()),
             input_scratch: RenderInput::empty(),
+            #[cfg(a11y_tree)]
+            composed_layout: a11y_tree::ComposedLayout::default(),
             pane_scratch: RenderInput::empty(),
             composed_focus_scratch: RenderInput::empty(),
             unfocused_pane_scratch: std::collections::BTreeMap::new(),
@@ -8944,6 +8958,8 @@ impl WindowState {
             native_a11y_staged: None,
             #[cfg(a11y_tree)]
             native_a11y_published: None,
+            #[cfg(all(test, a11y_tree))]
+            a11y_sent: Vec::new(),
             native_ui_compiled: None,
             settings_card: None,
             route_card: None,
@@ -10247,6 +10263,8 @@ const fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
 type HostResumeProbe = Box<dyn FnOnce(&App)>;
 
 struct App {
+    account_work: aterm_agent::harness::account_work::Lifetime,
+    account_drain: app_account_work::Drain,
     network_snapshot: Arc<aterm_types::network_state::NetworkStateSnapshot>,
     /// The Stats deck's lab account rows as last projected ([`lab_deck::Feed`]).
     lab_deck: Arc<lab_deck::LabDeck>,
@@ -10580,6 +10598,13 @@ struct App {
     /// The machine title's view, from [`Wake::MachineName`]; `None` until its reader's first read.
     #[cfg(target_os = "macos")]
     machine_view: Option<machine_title::MachineView>,
+    /// The last nickname set's failure, kept for the next Change Nickname… to show.
+    #[cfg(target_os = "macos")]
+    nickname_unset: Option<machine_title::NickUnset>,
+    /// How many nickname sets Change Nickname… has started: each failure names its own, so one a
+    /// later press superseded is dropped.
+    #[cfg(target_os = "macos")]
+    nickname_sets: u64,
     _status_item: Option<status_item::StatusItemHandle>,
     status_fingerprint: Option<u64>,
     status_drawn: Vec<status_item::Glance>,
@@ -15693,6 +15718,10 @@ impl App {
             _menu: None,
             #[cfg(target_os = "macos")]
             machine_view: None,
+            #[cfg(target_os = "macos")]
+            nickname_unset: None,
+            #[cfg(target_os = "macos")]
+            nickname_sets: 0,
             _status_item: None,
             status_fingerprint: None,
             status_drawn: Vec::new(),
@@ -15803,6 +15832,8 @@ impl App {
             restored_sids: std::collections::HashMap::new(),
             managers_gone: std::collections::HashSet::new(),
             tree_probe: tab_marks::TreeProbe::INERT,
+            account_work: Default::default(),
+            account_drain: Default::default(),
             quit_by: None,
             task_exited: std::collections::HashMap::new(),
             turn_end_seen: std::collections::HashMap::new(),
@@ -16790,24 +16821,13 @@ impl App {
     }
 
     #[cfg(a11y_tree)]
-    fn update_accessibility(
-        &mut self,
-        id: WindowId,
-        _window: &Window,
-        plan: &tab_model::VisibleLeafPlan,
-    ) {
+    fn update_accessibility(&mut self, id: WindowId, plan: &tab_model::VisibleLeafPlan) {
         self.push_a11y_tree_with_plan(id, Some(plan));
     }
 
     #[cfg(not(a11y_tree))]
     #[inline]
-    fn update_accessibility(
-        &mut self,
-        _id: WindowId,
-        _window: &Window,
-        _plan: &tab_model::VisibleLeafPlan,
-    ) {
-    }
+    fn update_accessibility(&mut self, _id: WindowId, _plan: &tab_model::VisibleLeafPlan) {}
 
     #[cfg(windows)]
     fn window_hwnd(&self, wid: WindowId) -> isize {
@@ -18269,6 +18289,10 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let _root = crate::watchdog::enter_about_to_wait();
+        self.poll_account_drain(el);
+        if el.exiting() {
+            return;
+        }
         self.settle_update_boundary_latch();
         self.prune_deferred_gpu_captures();
         self.drain_message_inbox();
@@ -19299,7 +19323,7 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline,
                 &mut deadline_owner,
                 wake,
-                metrics::DeadlineOwner::SessionStatus,
+                metrics::DeadlineOwner::AccountProgress,
             );
         }
         // Other idle-pass work can outlive an effect slot. Service that slot now and
@@ -19331,6 +19355,14 @@ impl ApplicationHandler<Wake> for App {
                     metrics::DeadlineOwner::CursorEffect,
                 );
             }
+        }
+        if self.account_drain_needs_park_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                Instant::now() + Duration::from_millis(100),
+                metrics::DeadlineOwner::AccountDrain,
+            );
         }
         let now = Instant::now();
         let heal = self
@@ -19401,7 +19433,9 @@ impl ApplicationHandler<Wake> for App {
             crate::logging::stderr_line!(
                 "aterm-gui: could not create the initial window surface; exiting"
             );
-            el.exit();
+            if self.initial_surface_exit_ready() {
+                el.exit();
+            }
             return;
         }
         metrics::mark_initial_surface_ready();
@@ -19540,6 +19574,9 @@ impl App {
             self.finalize_backend();
         }
         match ev {
+            Wake::AccountsDrained { serial, drained } => {
+                self.finish_account_drain(el, serial, drained)
+            }
             Wake::ProgramResolved { session } => {
                 self.session_status.note_program_answered(session);
                 let _ = self.apply_launch_no_harness(session);
@@ -19880,9 +19917,6 @@ impl App {
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
-            Wake::DeveloperToolsInstall(revision, wanted) => {
-                self.want_developer_tools_install(revision, wanted)
-            }
             Wake::DeveloperToolsWatch(reading) => self.developer_tools_watch(reading),
             Wake::DeveloperToolsLowData(on) => self.developer_tools_low_data(on),
             Wake::RootStepsOwed(owed) => self.root_steps_owed(owed),
@@ -20228,6 +20262,7 @@ impl App {
                         self.replay_window_event(el, winit_id, deferred, origin);
                     }
                 }
+                self.resume_drained_accounts();
                 self.take_over_supervision_at_commit();
                 self.carry_cut_restarts();
                 self.messages.after_handoff_commit(Instant::now());
@@ -20258,6 +20293,7 @@ impl App {
                 ) {
                     aterm_log::warn!("native document save: {error}");
                     if self.cancel_failed_quit_document_shutdown() {
+                        self.resume_drained_accounts();
                         let _ = crate::menu::cancel_current_native_termination();
                     }
                 }
@@ -20872,8 +20908,16 @@ impl App {
                 prompt,
                 line,
                 reply,
+                account_scope,
             } => {
-                let result = task_launch::type_launch_line(&self.store, &sid, nonce, prompt, &line);
+                let result = task_launch::type_scoped_launch_line(
+                    &self.store,
+                    &sid,
+                    nonce,
+                    prompt,
+                    &line,
+                    account_scope.as_ref(),
+                );
                 let _ = reply.send(result);
             }
             Wake::Input {
@@ -21109,10 +21153,9 @@ impl App {
                 }
             }
             #[cfg(target_os = "macos")]
-            Wake::MachineName(view) => {
-                self.machine_view = Some(view);
-                self.refresh_machine_menu();
-            }
+            Wake::MachineName(view) => self.machine_name_read(view),
+            #[cfg(target_os = "macos")]
+            Wake::NicknameNotSet(unset) => self.nickname_not_set(unset),
             #[cfg(target_os = "macos")]
             Wake::NativeTerminateRequested { generation } => {
                 self.on_native_terminate_requested(el, generation);
@@ -26697,6 +26740,11 @@ pub fn main_entry_with_network(
     let handoff_reader_gate = handoff_ready
         .is_some()
         .then(crate::spawn::DeferredReaderGate::closed);
+    // The control listener can publish account services before the host is constructed.
+    // Give both the same epoch, already closed for an incoming successor before publication.
+    let account_work = aterm_agent::harness::account_work::Lifetime::default();
+    let account_drain =
+        app_account_work::Drain::for_launch(&account_work, handoff_reader_gate.is_some());
     let incoming_socket_identity = control_socket_identity::consume_incoming_from(&mut handoff_env);
     #[cfg(unix)]
     let parent_reads_passing_exit = seamless::take_parent_reads_passing_exit_from(&mut handoff_env);
@@ -27632,6 +27680,7 @@ pub fn main_entry_with_network(
                 store.clone(),
                 event_loop.create_proxy(),
                 !headless,
+                account_work.clone(),
                 plan.clone(),
                 config.clone(),
                 Some((session0.ctx.self_id.clone(), session0.ctx.nonce)),
@@ -27752,6 +27801,7 @@ pub fn main_entry_with_network(
             headless,
             handoff_reader_gate.is_some(),
             event_loop.create_proxy(),
+            account_work.clone(),
         );
         host.defer_adopted_claims(adopted_claim_grace, harness_host::ADOPTED_CLAIM_GRACE);
         host
@@ -28376,6 +28426,10 @@ pub fn main_entry_with_network(
         _menu: None,
         #[cfg(target_os = "macos")]
         machine_view: None,
+        #[cfg(target_os = "macos")]
+        nickname_unset: None,
+        #[cfg(target_os = "macos")]
+        nickname_sets: 0,
         _status_item: None,
         status_fingerprint: None,
         status_drawn: Vec::new(),
@@ -28496,6 +28550,8 @@ pub fn main_entry_with_network(
         restored_sids: std::collections::HashMap::new(),
         managers_gone: std::collections::HashSet::new(),
         tree_probe: tab_marks::TreeProbe::HOST,
+        account_work,
+        account_drain,
         quit_by: None,
         task_exited: std::collections::HashMap::new(),
         turn_end_seen: std::collections::HashMap::new(),

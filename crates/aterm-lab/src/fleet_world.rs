@@ -157,9 +157,13 @@ pub struct Out {
     pub stderr: String,
 }
 
+/// Where a world's base folder is made: under `/private/tmp`, which `/tmp` links to.
+const BASE_PREFIX: &str = "/private/tmp/af.";
+
 /// The simulation's machines.
 pub struct World {
-    /// `/tmp/af.XXXXXX`.
+    /// `/private/tmp/af.XXXXXX`: `/tmp` is a link, and the lab writes its own scratch through
+    /// none (`crate::util::atomic_write`), so a world lives under the folder it names.
     pub base: PathBuf,
     /// `<base>/bin` directory holding the app and fixture symlinks.
     pub bin: PathBuf,
@@ -273,9 +277,9 @@ impl World {
     /// The layout or bounded image copy failed, or the copy did not print its version.
     /// An unproven copy is retained because macOS may still be assessing its first exec.
     pub fn new(aterm: &Path, keep: bool) -> Result<World, String> {
-        let base = crate::sys::make_temp_dir("/tmp/af.XXXXXX")
+        let base = crate::sys::make_temp_dir(&format!("{BASE_PREFIX}XXXXXX"))
             .map(PathBuf::from)
-            .map_err(|e| format!("cannot make the simulation's base under /tmp: {e}"))?;
+            .map_err(|e| format!("cannot make the simulation's base under /private/tmp: {e}"))?;
         let bin = base.join("bin");
         let me = &crate::paths::paths().exe;
         let image = base.join(".ubd/app.noindex/aterm");
@@ -540,7 +544,7 @@ impl World {
             }
         }
         self.insts.clear();
-        if !self.keep && self.base.to_string_lossy().starts_with("/tmp/af.") {
+        if !self.keep && self.base.to_string_lossy().starts_with(BASE_PREFIX) {
             for _ in 0..40 {
                 if std::fs::remove_dir_all(&self.base).is_ok() || !self.base.exists() {
                     break;

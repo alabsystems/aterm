@@ -1375,6 +1375,242 @@ fn record(pid: u32, start_ms: u64, need: Need, held: Option<u32>) -> Record {
     }
 }
 
+#[test]
+fn release_rank_orders_memory_waiters_and_reserves_cores_without_preempting_ordinary() {
+    use crate::Rank;
+    let reading = Reading::of_gib(48, 40, 14);
+    let ordinary = record(10, 1, Need::new("ordinary").mem_gib(30).cores(14), None);
+    let other = |r| Other {
+        record: r,
+        used: TreeUse::default(),
+        credited: TreeUse::default(),
+    };
+    let release = Need::new("release")
+        .rank(Rank::Release)
+        .mem_gib(30)
+        .cores(14);
+    assert_eq!(
+        decide(&release, (2, 11, 0), &reading, &[other(&ordinary)], 3)
+            .expect("release overtakes an earlier ordinary waiter")
+            .cores,
+        14
+    );
+    assert!(
+        decide(
+            &release.clone().rank(Rank::Ordinary),
+            (2, 11, 0),
+            &reading,
+            &[other(&ordinary)],
+            3
+        )
+        .is_err(),
+        "negative control: same rank keeps arrival order"
+    );
+    let held = record(10, 1, ordinary.need.clone(), Some(8));
+    assert_eq!(
+        decide(
+            &release.clone().mem(0),
+            (2, 11, 0),
+            &reading,
+            &[other(&held)],
+            3
+        )
+        .expect("running ordinary keeps its grant")
+        .cores,
+        6
+    );
+    let waiting = record(11, 2, release.clone().mem(0), None);
+    assert!(
+        decide(
+            &ordinary.need.clone().mem(0),
+            (3, 12, 0),
+            &reading,
+            &[other(&waiting)],
+            4
+        )
+        .is_err_and(|s| s.shorts.contains(&Short::Cores))
+    );
+    assert!(
+        decide(
+            &release.clone().mem(0),
+            (3, 12, 0),
+            &reading,
+            &[other(&waiting)],
+            4
+        )
+        .is_err_and(|s| s.shorts.contains(&Short::Cores)),
+        "same-rank waiters keep arrival order for cores too"
+    );
+    assert_eq!(
+        decide(
+            &release.clone().mem(0),
+            (1, 12, 0),
+            &reading,
+            &[other(&waiting)],
+            4
+        )
+        .expect("later waiter reserves nothing ahead of us")
+        .cores,
+        14
+    );
+    let held = record(11, 2, release.mem(0), Some(10));
+    assert_eq!(
+        decide(
+            &ordinary.need.clone().mem(0),
+            (3, 12, 0),
+            &reading,
+            &[other(&held)],
+            4
+        )
+        .expect("ordinary may use only the remainder")
+        .cores,
+        4
+    );
+}
+
+#[test]
+fn live_release_context_elevates_claims_but_isolated_machines_keep_their_rank() {
+    struct Context {
+        release: bool,
+        fixed: Fixed,
+    }
+    impl crate::Machine for Context {
+        fn release_run(&self) -> bool {
+            self.release
+        }
+        fn read(&self, path: Option<&Path>) -> Reading {
+            crate::Machine::read(&self.fixed, path)
+        }
+        fn procs(&self) -> Option<Procs> {
+            None
+        }
+    }
+    for release in [false, true] {
+        let s = scratch("release-context");
+        let m = Context {
+            release,
+            fixed: mac48(),
+        };
+        let claim = match Waiter::enter(&s.ledger, &m, Need::new("child"))
+            .unwrap()
+            .poll(&m)
+        {
+            Polled::Admitted(claim) => claim,
+            other => panic!("context admission: {other:?}"),
+        };
+        let expected = if release {
+            crate::Rank::Release
+        } else {
+            crate::Rank::Ordinary
+        };
+        assert_eq!(claim.record().need.rank, expected);
+        assert_eq!(
+            s.ledger.list().unwrap()[0].need.rank,
+            expected,
+            "rank survives the wire"
+        );
+        if release {
+            let text = std::fs::read_to_string(claim.path()).unwrap();
+            assert!(
+                Record::decode(&text.replace("\"rank\":\"release\"", "\"rank\":true"), true)
+                    .is_none(),
+                "invalid rank metadata cannot silently become Ordinary"
+            );
+        }
+    }
+}
+
+#[test]
+fn admit_now_cannot_bypass_a_release_core_reservation() {
+    let s = scratch("release-override");
+    let m = mac48();
+    let release = enter(
+        &s,
+        &m,
+        Need::new("release").rank(crate::Rank::Release).cores(14),
+    );
+    let waiter = enter(&s, &m, Need::new("ordinary override").cores(14));
+    let waiter = match waiter.force(&m).unwrap() {
+        crate::Forced::Turn(waiter, short) => {
+            assert!(short.shorts.contains(&Short::Cores));
+            waiter
+        }
+        other => panic!("release reservation was overridden: {other:?}"),
+    };
+    drop(release);
+    match waiter.force(&m).unwrap() {
+        crate::Forced::Admitted(claim, _) => assert_eq!(claim.cores(), 14),
+        other => panic!("negative control: released room stays blocked: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn background_standin() {
+    let Some(dir) = std::env::var_os("ATERM_TEST_BACKGROUND").map(PathBuf::from) else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let claim = admit_until(
+        &Ledger::at(dir.join("ledger")),
+        &mac48(),
+        Need::new("repeatable lane").cores(14),
+        Admit::Preemptible,
+        Pace::default(),
+        &mut |_| {},
+        &|| started.elapsed() >= MUST_HAPPEN,
+    )
+    .expect("dedicated background admission");
+    assert_eq!(claim.record().need.rank, crate::Rank::Background);
+    assert!(
+        !claim.should_yield().unwrap(),
+        "negative control: no foreground claim yet"
+    );
+    std::fs::write(dir.join("held"), "").unwrap();
+    until_within(MUST_HAPPEN, "foreground check", || {
+        dir.join("check").exists().then_some(())
+    });
+    assert!(claim.should_yield().unwrap());
+    std::fs::write(dir.join("yielded"), "").unwrap();
+    until_within(MUST_HAPPEN, "release to end background", || None::<()>);
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_waiters_request_yield_and_release_ends_only_background_groups() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let s = scratch("background");
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    let mut child = command
+        .args(["--exact", "tests::background_standin", "--nocapture"])
+        .env("ATERM_TEST_BACKGROUND", s.dir.path())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    until_within(MUST_HAPPEN, "background admission", || {
+        s.dir.path().join("held").exists().then_some(())
+    });
+    let ordinary = enter(&s, &mac48(), Need::new("foreground").cores(14));
+    std::fs::write(s.dir.path().join("check"), "").unwrap();
+    until_within(MUST_HAPPEN, "stage-boundary yield", || {
+        s.dir.path().join("yielded").exists().then_some(())
+    });
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "Ordinary must not terminate running work"
+    );
+    let release = enter(
+        &s,
+        &mac48(),
+        Need::new("release").rank(crate::Rank::Release).cores(14),
+    );
+    let status = until_within(MUST_HAPPEN, "release cancellation", || {
+        child.try_wait().unwrap()
+    });
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    drop((ordinary, release));
+}
+
 /// A claim's reservation is its peak less what its process tree already uses: memory in use
 /// is not counted twice. Negative control: with no sweep, the whole peak is reserved.
 #[test]
@@ -3347,43 +3583,8 @@ fn cores14_at(load: f64) -> Reading {
     }
 }
 
-/// CORES-GRANT's acceptance: cores are granted, never waited for, as a share of the machine
-/// weighed against the work that runs on it. On 14 cores at a 5-minute load of 60, two claims
-/// that each ask for lima's 8 are each granted the stated share, the cores over the parties: the
-/// two claims and the 60 of load no claim holds, in machines' worth. CAP-1's first rule (the idle
-/// cores) granted each 1. Alone at that load a claim gets 3; on an idle machine, the whole
-/// machine.
-#[test]
-fn two_claims_at_load_60_on_14_cores_each_get_their_share() {
-    let s = scratch("share");
-    let m = Fixed::new(cores14_at(60.0));
-    let stated = (14.0_f64 / (2.0 + 60.0 / 14.0)).round() as u32;
-    assert_eq!(stated, 2, "the share this test states");
-    let a = enter(&s, &m, Need::new("lima guest").cores(8));
-    let b = enter(&s, &m, Need::new("windows guest").cores(8));
-    let a = admitted(a, &m);
-    assert_eq!(
-        a.cores(),
-        stated,
-        "the first, beside the second not yet admitted"
-    );
-    let b = admitted(b, &m);
-    assert_eq!(
-        b.cores(),
-        stated,
-        "the second, beside the first's jobs held"
-    );
-    drop((a, b));
-    let alone = admitted(enter(&s, &m, Need::new("alone").cores(8)), &m);
-    assert_eq!(alone.cores(), 3, "14 / (1 + 60/14), rounded");
-    drop(alone);
-    m.set(cores14_at(0.0));
-    let whole = admitted(enter(&s, &m, Need::new("whole").cores(14)), &m);
-    assert_eq!(whole.cores(), 14, "the whole machine, at load 0");
-}
-
 /// A claim's share is of the room, the cores less what the held claims were granted: on an
-/// idle 14-core machine lima's 8 leave Windows its 6, and a third claim gets 1. A held claim's
+/// idle 14-core machine lima's 8 leave Windows its 6, and a third claim waits. A held claim's
 /// jobs leave the unclaimed load as they reach the 5-minute load, and a claim of cores not yet
 /// admitted, whatever it waits for, is a party. A grant is 1 only where the work really is that
 /// contended (a load of about 117 alone), never more than asked, and 0 when none was asked; a
@@ -3411,10 +3612,10 @@ fn a_grant_is_a_share_of_the_room_the_held_claims_leave() {
     let held = [other(&lima)];
     assert_eq!(cores_of(&want(6), (1, 1, 0), &idle, &held, 2_000), Ok(6));
     let both = [other(&lima), other(&windows)];
-    assert_eq!(
-        cores_of(&want(8), (1, 1, 0), &idle, &both, 2_000),
-        Ok(1),
-        "the room is spent"
+    assert!(
+        cores_of(&want(8), (1, 1, 0), &idle, &both, 2_000)
+            .is_err_and(|s| s.shorts.contains(&Short::Cores)),
+        "spent room must never over-grant"
     );
 
     let six = record(12, 0, Need::new("held").cores(6), Some(6));
@@ -3434,8 +3635,8 @@ fn a_grant_is_a_share_of_the_room_the_held_claims_leave() {
     let waiting = record(13, 0, Need::new("waits").cores(8), None);
     assert_eq!(
         cores_of(&want(14), (1, 1, 0), &idle, &[other(&waiting)], 1),
-        Ok(7),
-        "half, beside a claim of cores not yet admitted"
+        Ok(6),
+        "the earlier waiter reserves 8, leaving 6 of the 14 cores"
     );
     assert_eq!(
         cores_of(&want(8), (1, 1, 0), &cores14_at(11.0), &[], 1),
@@ -4751,7 +4952,7 @@ fn a_meter_says_what_its_run_wrote() {
     let theirs = std::sync::Arc::clone(&size);
     let meter = crate::Meter::start_with(
         10 * GIB,
-        Box::new(move || theirs.load(Ordering::SeqCst)),
+        Box::new(move |_| theirs.load(Ordering::SeqCst)),
         Some(claim),
         Duration::from_millis(5),
     );
@@ -4766,6 +4967,90 @@ fn a_meter_says_what_its_run_wrote() {
     assert!(
         s.ledger.list().expect("listed").is_empty(),
         "the claim went with the run"
+    );
+}
+
+/// A RUN'S END WALKS NOTHING ONCE A SAMPLE COMPLETED: the meter's first look reads 30 GiB and its
+/// second is a long walk still under way when the run ends; the end halts it, discards what it
+/// had counted (99 GiB here, a figure no complete look read) and measures nothing more, so the
+/// run took the 30 GiB the completed sample read, after two looks in all. NEGATIVE CONTROLS: with
+/// the halted walk's count kept, the run peaks at 99 GiB; with a last look at the end whatever
+/// completed (the meter before A4), it makes a third.
+#[test]
+fn a_meter_halted_after_a_completed_sample_walks_nothing_more() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let theirs = std::sync::Arc::clone(&calls);
+    let meter = crate::Meter::start_with(
+        10 * GIB,
+        Box::new(move |stopped| {
+            if theirs.fetch_add(1, Ordering::SeqCst) != 1 {
+                return 30 * GIB;
+            }
+            while !stopped() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            99 * GIB
+        }),
+        None,
+        Duration::from_millis(1),
+    );
+    until_within(MUST_HAPPEN, "the second look to begin", || {
+        (calls.load(Ordering::SeqCst) >= 2).then_some(())
+    });
+    let run = meter.finish();
+    assert_eq!((run.peak, run.grew), (30 * GIB, 20 * GIB));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "no look after the halt");
+}
+
+/// A RUN THAT ENDED BEFORE ANY SAMPLE COMPLETED IS MEASURED ONCE AT ITS END, so its growth is what
+/// it wrote: a run shorter than the meter's pace grew its directories from 10 to 30 GiB, and its
+/// end's one look reads it; one whose first walk was still under way at its end discards that
+/// walk's count (99 GiB) and looks once more, unhalted. NEGATIVE CONTROL: with no last look, the
+/// short run grew them by 0 and the halted one kept nothing it read.
+#[test]
+fn a_meter_with_no_completed_sample_looks_once_at_the_end() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let theirs = std::sync::Arc::clone(&calls);
+    let short = crate::Meter::start_with(
+        10 * GIB,
+        Box::new(move |_| {
+            theirs.fetch_add(1, Ordering::SeqCst);
+            30 * GIB
+        }),
+        None,
+        Duration::from_secs(3600),
+    );
+    let run = short.finish();
+    assert_eq!((run.peak, run.grew), (30 * GIB, 20 * GIB));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one look, at its end");
+
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let theirs = std::sync::Arc::clone(&calls);
+    let halted = crate::Meter::start_with(
+        10 * GIB,
+        Box::new(move |stopped| {
+            if theirs.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !stopped() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return 99 * GIB;
+            }
+            30 * GIB
+        }),
+        None,
+        Duration::from_millis(1),
+    );
+    until_within(MUST_HAPPEN, "the first look to begin", || {
+        (calls.load(Ordering::SeqCst) >= 1).then_some(())
+    });
+    let run = halted.finish();
+    assert_eq!((run.peak, run.grew), (30 * GIB, 20 * GIB));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the halted walk, then one look"
     );
 }
 

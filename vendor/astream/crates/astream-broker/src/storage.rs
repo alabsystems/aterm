@@ -5,12 +5,17 @@
 //! writes on its own file, and every read and atomic replacement of its identity
 //! sidecar, goes through the two enums here.
 //!
-//! In production each has one variant — `Os`, a real `File` and the log's real path —
-//! so every match compiles away to the call it wraps. Under `cfg(test)` each gains a
-//! `Sim` variant backed by the crash simulation's device (`crash_sim.rs`), which is how
-//! the REAL writer (`stage_*` + `commit_batch`) and the REAL open (recovery, the
-//! identity rules, both sidecar phases) run unchanged against a device that can lose
-//! power after any operation. The seam covers the sidecar as well as the log on
+//! In a release build each has one variant — `Os`, a real `File` and the log's real
+//! path — so every match compiles away to the call it wraps, and a build that gave one
+//! another would not compile (the release-build check below, THE RELEASE BUILD HOLDS
+//! THE REAL FILE ALONE, and `store.rs`'s on `Storage`). Under
+//! `cfg(any(test, debug_assertions))` (aterm's seam rule: a dependent's tests see it
+//! with no feature a dev-dependency would flip) each gains a `Sim` variant backed by the
+//! simulated device (`sim_device.rs`), which is how the REAL writer (`stage_*` +
+//! `commit_batch`) and the REAL open (recovery, the identity rules, both sidecar phases)
+//! run unchanged against a device that can lose power after any operation: the crash
+//! simulation's (`crash_sim.rs`), and an embedder's through
+//! [`SimDevice`](crate::SimDevice). The seam covers the sidecar as well as the log on
 //! purpose: a seam over the log alone would make a sidecar written in the wrong order
 //! relative to the log's flush invisible, and that order is half of what recovery
 //! rests on.
@@ -52,10 +57,26 @@ pub(crate) enum Backing {
     /// descriptor — with the [`FlushHandle`]s the writer takes to flush it outside the
     /// log's lock ([`flush_handle`](Self::flush_handle) says why).
     Os(Arc<File>),
-    /// The crash simulation's device.
-    #[cfg(test)]
-    Sim(crate::crash_sim::Sim),
+    /// The simulated device.
+    #[cfg(any(test, debug_assertions))]
+    Sim(crate::sim_device::Sim),
 }
+
+/// THE RELEASE BUILD HOLDS THE REAL FILE ALONE: each match here names `Os` and nothing
+/// else, so it compiles only while that is every variant — a release build in which the
+/// seam's enums kept a simulated variant (or gained any other) stops compiling here.
+#[cfg(not(any(test, debug_assertions)))]
+const _: (fn(&Backing), fn(&HandleBacking), fn(&Dir)) = (
+    |b| match b {
+        Backing::Os(_) => {}
+    },
+    |h| match h {
+        HandleBacking::Os(_) => {}
+    },
+    |d| match d {
+        Dir::Os(_) => {}
+    },
+);
 
 impl Drop for Backing {
     fn drop(&mut self) {
@@ -81,7 +102,7 @@ impl Backing {
                 f.seek(SeekFrom::Start(0))?;
                 f.read_to_end(out)
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => Ok(s.read_log(out)),
         }
     }
@@ -91,7 +112,7 @@ impl Backing {
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Backing::Os(f) => (&**f).write_all(bytes),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 s.append(bytes);
                 Ok(())
@@ -106,9 +127,9 @@ impl Backing {
                 let op: fn(&File, u64) -> io::Result<()> = File::set_len;
                 op(f, len)
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
-                let op: fn(&crate::crash_sim::Sim, u64) = crate::crash_sim::Sim::set_len;
+                let op: fn(&crate::sim_device::Sim, u64) = crate::sim_device::Sim::set_len;
                 op(s, len);
                 Ok(())
             }
@@ -122,7 +143,7 @@ impl Backing {
                 let _ = (&**f).seek(SeekFrom::End(0))?;
                 Ok(())
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(_) => Ok(()),
         }
     }
@@ -132,7 +153,7 @@ impl Backing {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         match self {
             Backing::Os(f) => astream_sys::full_sync_data(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 s.full_flush();
                 Ok(())
@@ -146,7 +167,7 @@ impl Backing {
     pub(crate) fn barrier(&self) -> io::Result<()> {
         match self {
             Backing::Os(f) => astream_sys::barrier_sync(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 s.barrier();
                 Ok(())
@@ -160,7 +181,7 @@ impl Backing {
     pub(crate) fn barrier_exists(&self) -> bool {
         match self {
             Backing::Os(_) => cfg!(target_vendor = "apple"),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(_) => true,
         }
     }
@@ -182,7 +203,7 @@ impl Backing {
             }
             #[cfg(not(unix))]
             Backing::Os(_) => None,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(_) => None,
         }
     }
@@ -204,7 +225,7 @@ impl Backing {
     pub(crate) fn flush_handle(&self, fail: bool) -> FlushHandle {
         let backing = match self {
             Backing::Os(f) => HandleBacking::Os(Arc::clone(f)),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => HandleBacking::Sim(s.clone()),
         };
         FlushHandle { backing, fail }
@@ -219,7 +240,7 @@ impl Backing {
     pub(crate) fn batch_out(&self) -> BatchOut {
         BatchOut(match self {
             Backing::Os(f) => HandleBacking::Os(Arc::clone(f)),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => HandleBacking::Sim(s.clone()),
         })
     }
@@ -228,7 +249,7 @@ impl Backing {
     pub(crate) fn sync_all(&self) -> io::Result<()> {
         match self {
             Backing::Os(f) => astream_sys::full_sync(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 s.full_flush();
                 Ok(())
@@ -242,7 +263,7 @@ impl Backing {
             Backing::Os(f) => {
                 let _ = f.unlock();
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(_) => {}
         }
     }
@@ -264,7 +285,7 @@ impl Backing {
                 }
                 Ok(buf)
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 let mut all = Vec::new();
                 s.read_log(&mut all);
@@ -286,7 +307,7 @@ impl Backing {
                 read_exact_at(f, &mut buf, start)?;
                 Ok(buf)
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 let mut all = Vec::new();
                 s.read_log(&mut all);
@@ -308,7 +329,7 @@ impl Backing {
                 };
                 b
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(s) => {
                 let mut all = Vec::new();
                 s.read_log(&mut all);
@@ -323,7 +344,7 @@ impl Backing {
     pub(crate) fn os(&self) -> io::Result<&File> {
         match self {
             Backing::Os(f) => Ok(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Backing::Sim(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not on a simulated log",
@@ -377,8 +398,8 @@ pub(crate) struct FlushHandle {
 
 enum HandleBacking {
     Os(Arc<File>),
-    #[cfg(test)]
-    Sim(crate::crash_sim::Sim),
+    #[cfg(any(test, debug_assertions))]
+    Sim(crate::sim_device::Sim),
 }
 
 impl FlushHandle {
@@ -389,7 +410,7 @@ impl FlushHandle {
         }
         match &self.backing {
             HandleBacking::Os(f) => astream_sys::full_sync_data(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             HandleBacking::Sim(s) => {
                 s.full_flush();
                 Ok(())
@@ -433,7 +454,7 @@ impl BatchOut {
     pub(crate) fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         match &self.0 {
             HandleBacking::Os(f) => (&**f).write_all(bytes),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             HandleBacking::Sim(s) => {
                 s.append(bytes);
                 Ok(())
@@ -445,7 +466,7 @@ impl BatchOut {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         match &self.0 {
             HandleBacking::Os(f) => astream_sys::full_sync_data(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             HandleBacking::Sim(s) => {
                 s.full_flush();
                 Ok(())
@@ -457,7 +478,7 @@ impl BatchOut {
     pub(crate) fn barrier(&self) -> io::Result<()> {
         match &self.0 {
             HandleBacking::Os(f) => astream_sys::barrier_sync(f),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             HandleBacking::Sim(s) => {
                 s.barrier();
                 Ok(())
@@ -480,9 +501,9 @@ impl BatchOut {
 pub(crate) enum Dir {
     /// The real directory; holds the LOG's path, from which each sidecar's is derived.
     Os(PathBuf),
-    /// The crash simulation's device, which keeps the sidecar beside its log.
-    #[cfg(test)]
-    Sim(crate::crash_sim::Sim),
+    /// The simulated device, which keeps the sidecar beside its log.
+    #[cfg(any(test, debug_assertions))]
+    Sim(crate::sim_device::Sim),
 }
 
 impl Dir {
@@ -490,7 +511,7 @@ impl Dir {
     pub(crate) fn log_path(&self) -> &Path {
         match self {
             Dir::Os(p) => p,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Dir::Sim(s) => s.path(),
         }
     }
@@ -509,7 +530,7 @@ impl Dir {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
             },
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Dir::Sim(s) => Ok(s.read_id()),
         }
     }
@@ -534,7 +555,7 @@ impl Dir {
                 crate::store::rename_path(&tmp, &path)?;
                 sync_parent_dir(&path)
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Dir::Sim(s) => {
                 s.replace_id(bytes);
                 Ok(())

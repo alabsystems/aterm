@@ -258,8 +258,9 @@ pub const DEV: [Check; 5] = [
     Check::Doc,
 ];
 
-/// What publication requires: the whole workspace, and a skip is not a pass.
-pub const RELEASE: [Check; 10] = [
+/// The release's tree half (`verify release --tree`): what the release's tree alone answers,
+/// with no bundle to judge.
+pub const RELEASE_TREE: [Check; 8] = [
     Check::Fmt,
     Check::Lint,
     Check::Test,
@@ -268,9 +269,35 @@ pub const RELEASE: [Check; 10] = [
     Check::Forge,
     Check::Libc,
     Check::Spec,
-    Check::Appkit,
-    Check::Measure,
 ];
+
+/// The release's bundle half (`verify release --bundle --app A`): the timed stages, appkit's
+/// windows and the bundle's measure, which run where timed work runs, after the build and the
+/// tree.
+pub const RELEASE_BUNDLE: [Check; 2] = [Check::Appkit, Check::Measure];
+
+/// What publication requires: the whole workspace, and a skip is not a pass. It is the union of
+/// its two halves, [`RELEASE_TREE`] and [`RELEASE_BUNDLE`].
+pub const RELEASE: [Check; RELEASE_TREE.len() + RELEASE_BUNDLE.len()] =
+    joined(RELEASE_TREE, RELEASE_BUNDLE);
+
+/// `a` then `b`, as one array.
+const fn joined<const A: usize, const B: usize, const N: usize>(
+    a: [Check; A],
+    b: [Check; B],
+) -> [Check; N] {
+    let mut out = [Check::Fmt; N];
+    let mut i = 0;
+    while i < A {
+        out[i] = a[i];
+        i += 1;
+    }
+    while i < N {
+        out[i] = b[i - A];
+        i += 1;
+    }
+    out
+}
 
 impl Check {
     /// This check's definition.
@@ -422,8 +449,11 @@ pub fn sets_of(check: Check) -> String {
     if DEV.contains(&check) {
         v.push("dev");
     }
-    if RELEASE.contains(&check) {
-        v.push("release");
+    if RELEASE_TREE.contains(&check) {
+        v.push("release --tree");
+    }
+    if RELEASE_BUNDLE.contains(&check) {
+        v.push("release --bundle");
     }
     if v.is_empty() {
         "-".to_string()
@@ -567,6 +597,21 @@ pub fn list_table() -> String {
 mod tests {
     use super::*;
     use crate::scope::Scope;
+
+    /// The release is its tree half then its bundle half, which share no check, and a release
+    /// check is in the bundle half exactly when it plans a timed stage: the tree half runs nothing
+    /// that wants a quiet machine. Negative control: appkit back in the tree half (the set before
+    /// B3) plans its timed redraw and objc stages there, and the second law fails.
+    #[test]
+    fn the_release_is_its_tree_half_and_its_timed_bundle_half() {
+        assert_eq!(RELEASE[..RELEASE_TREE.len()], RELEASE_TREE);
+        assert_eq!(RELEASE[RELEASE_TREE.len()..], RELEASE_BUNDLE);
+        assert!(RELEASE_TREE.iter().all(|c| !RELEASE_BUNDLE.contains(c)));
+        for c in RELEASE {
+            let timed = stages_of(&[c]).into_iter().any(StageId::timed);
+            assert_eq!(RELEASE_BUNDLE.contains(&c), timed, "{c:?}");
+        }
+    }
 
     #[test]
     fn list_renders_each_checks_needs_from_the_tools_table() {

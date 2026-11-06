@@ -1669,6 +1669,10 @@ pub(crate) struct RenderConfig {
 pub(crate) struct HarnessPolicy {
     pub(crate) policy: aterm_agent::supervise::SupervisorConfig,
     pub(crate) notes: Vec<String>,
+    /// The owner's source and rule tables, read from the root `[harness]` table of the same
+    /// parse as `policy`, so the mode and the tables ride one stamped writer
+    /// (`adopt_harness_policy`). Nothing reads a source or judges a rule from them yet.
+    pub(crate) owner: aterm_agent::supervise::occupancy::owner_rules::OwnerTables,
 }
 
 /// The `[ai]` table as the window holds it.
@@ -1760,14 +1764,24 @@ impl AiPolicy {
 impl HarnessPolicy {
     /// The policy `text` — the whole `aterm.toml` — writes.
     pub(crate) fn read(text: &str) -> Self {
-        let (policy, notes) = aterm_agent::supervise::SupervisorConfig::from_aterm_toml(text);
-        Self { policy, notes }
+        let (policy, owner, notes) =
+            aterm_agent::supervise::SupervisorConfig::with_owner_tables(text);
+        Self {
+            policy,
+            notes,
+            owner,
+        }
     }
 
     /// The policy the file at `path` writes.
     pub(crate) fn read_path(path: Option<&std::path::Path>) -> Self {
-        let (policy, notes) = aterm_agent::supervise::SupervisorConfig::from_path(path);
-        Self { policy, notes }
+        let (policy, owner, notes) =
+            aterm_agent::supervise::SupervisorConfig::with_owner_tables_at(path);
+        Self {
+            policy,
+            notes,
+            owner,
+        }
     }
 
     /// The policy as Settings ▸ Harness says it aloud (the switch's spoken label and the save's feedback).
@@ -10680,6 +10694,44 @@ mod output_streak_cfg_tests {
             misplaced.harness_notices()[0].contains("`packages.harness.enabled`"),
             "{:?}",
             misplaced.harness_notices()
+        );
+    }
+
+    /// THE OWNER'S TABLES RIDE THE POLICY: the mode and the tables a window adopts come from one
+    /// parse of one text, and a copy written below another table's header is no table at all
+    /// (NEGATIVE CONTROL: the same rule at the root reads).
+    #[test]
+    fn the_owner_tables_ride_the_harness_policy_from_the_root_alone() {
+        let cfg = |text: &str| Config::parse(text).expect("valid config");
+        let rule = "occupancy_rule]]\nname = \"r\"\nwhen = \"workflow.returned\"\n\
+                    text = \"Re-read the base.\"\n";
+        let root = format!("[harness]\noccupancy = \"prompt\"\n\n[[harness.{rule}");
+        let read = cfg(&root);
+        assert_eq!(read.harness, super::HarnessPolicy::read(&root));
+        assert_eq!(read.harness.owner.rules().len(), 1);
+        assert!(
+            read.harness_notices().is_empty(),
+            "{:?}",
+            read.harness_notices()
+        );
+
+        let misplaced = cfg(&format!("[packages]\n\n[[packages.harness.{rule}"));
+        assert!(
+            misplaced.harness.owner.is_empty(),
+            "{:?}",
+            misplaced.harness.owner
+        );
+        assert_eq!(
+            misplaced.harness.policy.occupancy,
+            aterm_agent::supervise::SupervisorConfig::default().occupancy
+        );
+        let notices = misplaced.harness_notices();
+        assert!(
+            notices.len() == 1
+                && notices[0].contains("`packages.harness.occupancy_rule`")
+                && notices[0].contains("root [harness] table alone")
+                && !notices[0].contains("Re-read"),
+            "{notices:?}"
         );
     }
 }

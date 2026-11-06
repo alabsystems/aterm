@@ -10,6 +10,47 @@ use super::*;
 /// What trust's installer prints first when it installs.
 const INSTALLED: &str = "Trust git hooks: installed (core.hooksPath = scripts/hooks)";
 
+#[test]
+fn the_hook_installer_uses_only_its_execution_accounts_git_path() {
+    let sys = Fake::root();
+    let alice = user("alice", 501);
+    let bob = user("bob", 502);
+    sys.logged_in(&alice);
+    let prefix = Path::new(&alice.home).join("Library/Application Support/aterm/pkg");
+    let store = prefix.join("store/git");
+    let exec = Stat {
+        uid: alice.uid,
+        gid: 20,
+        mode: 0o755,
+        dir: false,
+        symlink: false,
+        len: 1,
+    };
+    sys.link(store.join("current").to_str().unwrap(), "12");
+    sys.stat_of(store.join("12.ready").to_str().unwrap(), exec);
+    sys.stat_of(store.join("12/bin/git").to_str().unwrap(), exec);
+    sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
+    sys.stat_of(crate::items::github::CLT_GIT, exec);
+    for (who, bin) in [
+        (&alice, prefix.join("bin")),
+        (
+            &bob,
+            PathBuf::from("/Library/Developer/CommandLineTools/usr/bin"),
+        ),
+    ] {
+        let command = installer_command(&sys, who, &Path::new(&who.home).join("checkout"));
+        assert_eq!(command.user.as_ref(), Some(who));
+        assert!(command.env.contains(&(
+            "PATH".to_owned(),
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+        )));
+    }
+    assert!(
+        sys.calls().is_empty(),
+        "selecting the installer path spawns nothing"
+    );
+}
+
 /// The fake clone of github.com/alice/new, carrying an installer when `carries`, and the run
 /// of it [`install_hooks`] makes once it is published.
 fn clone_carrying(carries: bool) -> (Fake, User, Repo, String, String) {
@@ -53,6 +94,40 @@ fn a_required_dependency_failure_does_not_suppress_the_new_parents_advisory_inst
             .filter(|call| **call == installer)
             .count(),
         1
+    );
+    assert!(cloned.hooks.iter().any(|line| line.contains(INSTALLED)));
+}
+
+/// A published clone whose private staging stayed behind and whose required dependency then
+/// failed: the row names both, and its installer still runs. NEGATIVE CONTROL: noting the
+/// staging only for a clone whose dependencies came through drops that line here.
+#[test]
+fn a_clone_whose_staging_stayed_and_whose_dependency_failed_says_both() {
+    let (sys, who, mut repo, _, installer) = clone_carrying(true);
+    repo.required_submodules = vec!["vendor/library".into()];
+    let parent = Path::new(&who.home).join("new");
+    script_existing(&sys, &who, &parent, "new");
+    crate::init_github::dependencies::tests::declarations(&sys, &who, &parent, &["vendor/library"]);
+    crate::init_github::dependencies::tests::download(&sys, &who, &parent, "vendor/library", 1);
+    sys.on(&installer, Ran::ok(INSTALLED));
+    sys.scratch_close_fails(
+        &Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0),
+        Some(io::ErrorKind::PermissionDenied),
+    );
+    sys.simulate(|_, command| {
+        command
+            .display()
+            .contains(" clone --no-checkout ")
+            .then(|| Ran::exit(128, "synthetic unavailable dependency"))
+    });
+    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    assert_eq!(cloned.failed.len(), 2, "{:?}", cloned.failed);
+    assert!(
+        cloned.failed[1].ends_with(
+            "repository published, but its private empty staging directory could not be removed"
+        ),
+        "{:?}",
+        cloned.failed
     );
     assert!(cloned.hooks.iter().any(|line| line.contains(INSTALLED)));
 }
@@ -423,6 +498,35 @@ fn a_guard_or_switch_after_the_clones_still_says_what_their_installers_did() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// A pass its guard stopped once the clones were done says why, then every failure its clones
+/// met besides the stop (a clone the guard stopped repeats only the stop, left out), the room it
+/// found short, and what the installers did. NEGATIVE CONTROL: keeping only why and the
+/// installers drops the published clone whose staging stayed behind and the room line.
+#[test]
+fn a_stopped_pass_keeps_every_line_besides_the_stop() {
+    let failed = vec![
+        "~/a: late Stop".to_owned(),
+        "~/b: repository published, but its private empty staging directory could not be removed"
+            .to_owned(),
+        "~/c: clone failed: late Stop came too".to_owned(),
+    ];
+    let hooks = [format!("~/b: ran its {HOOK_INSTALLER}: {INSTALLED}")];
+    assert_eq!(
+        stopped_after_clones(
+            "late Stop".to_owned(),
+            failed,
+            Some("1 repository left for want of room".to_owned()),
+            &hooks,
+        ),
+        format!(
+            "late Stop; ~/b: repository published, but its private empty staging directory could \
+             not be removed; ~/c: clone failed: late Stop came too; 1 repository left for want of \
+             room; {}",
+            hooks[0]
+        )
+    );
 }
 
 /// Whatever the read-back answers, its line ends with every installer outcome, so a read-back

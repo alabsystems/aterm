@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 /// The system TCC database.
 pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
-/// `hidutil list`'s matching dictionary for keyboards (Generic Desktop page, Keyboard usage).
-pub const KEYBOARD_MATCHING: &str = r#"{"PrimaryUsagePage":1,"PrimaryUsage":6}"#;
+/// `hidutil list`'s keyboard-conformance match, including composite secondary collections.
+pub const KEYBOARD_MATCHING: &str = crate::port::keyboard_usage::MATCHING;
 
 /// The lowest uid macOS gives an account a person logs in to.
 pub const FIRST_PERSON_UID: i64 = 501;
@@ -149,7 +149,7 @@ pub fn user(sys: &dyn System, name: &str) -> Result<User, String> {
     read_user(sys, name, &admins)
 }
 
-/// The keyboards in `hidutil list --matching '{"PrimaryUsagePage":1,"PrimaryUsage":6}'`.
+/// The keyboard-capable services returned by [`hidutil_keyboards`], deduplicated by model.
 #[must_use]
 pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
     hidutil_keyboards_from(text, false).unwrap_or_default()
